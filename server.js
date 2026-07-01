@@ -341,33 +341,65 @@ function collectWorkspace(dir = WORKSPACE_DIR, prefix = '') {
   return out;
 }
 
+function compileToPdf(mainPath, outPath) {
+  return new Promise((resolve) => {
+    const proc = spawn('typst', ['compile', mainPath, outPath], { cwd: WORKSPACE_DIR });
+    const timer = setTimeout(() => proc.kill('SIGKILL'), 30000);
+    proc.on('error', () => { clearTimeout(timer); resolve(false); });
+    proc.on('close', code => { clearTimeout(timer); resolve(code === 0 && existsSync(outPath)); });
+  });
+}
+
 app.post('/webdav/sync', async (req, res) => {
-  const { url, username, password } = req.body || {};
+  const { url, username, password, projectName } = req.body || {};
   if (!url) return res.status(400).json({ error: 'WebDAV URL required.' });
   const auth = 'Basic ' + Buffer.from(`${username || ''}:${password || ''}`).toString('base64');
-  const base = url.endsWith('/') ? url : url + '/';
+  const root = url.endsWith('/') ? url : url + '/';
+  // Everything goes inside a folder named after the project.
+  const proj = String(projectName || 'Typst Project').replace(/[\\/:*?"<>|]+/g, '_').trim() || 'Typst Project';
+  const base = root + encodeURIComponent(proj) + '/';
+
+  const put = async (relPath, body) => {
+    const r = await fetch(base + relPath.split('/').map(encodeURIComponent).join('/'), { method: 'PUT', headers: { Authorization: auth }, body });
+    if (!r.ok && ![200, 201, 204].includes(r.status)) {
+      if (r.status === 401) throw new Error('Authentication failed (check username / app password).');
+      throw new Error(`Upload of ${relPath} failed (HTTP ${r.status}).`);
+    }
+  };
+
   try {
+    // Create the project folder (and it also verifies auth early).
+    const mk = await fetch(base, { method: 'MKCOL', headers: { Authorization: auth } });
+    if (mk.status === 401) throw new Error('Authentication failed (check username / app password).');
+
     const files = collectWorkspace();
     const madeDirs = new Set();
     let count = 0;
+    const tmp = mkdtempSync(join(tmpdir(), 'typst-dav-'));
+
     for (const f of files) {
-      // Ensure parent collections exist (MKCOL is idempotent-ish; ignore failures).
+      // Ensure parent collections exist inside the project folder.
       const parts = f.rel.split('/');
       let acc = '';
       for (let i = 0; i < parts.length - 1; i++) {
         acc += (acc ? '/' : '') + parts[i];
-        if (!madeDirs.has(acc)) { madeDirs.add(acc); await fetch(base + acc, { method: 'MKCOL', headers: { Authorization: auth } }).catch(() => {}); }
+        if (!madeDirs.has(acc)) { madeDirs.add(acc); await fetch(base + acc.split('/').map(encodeURIComponent).join('/'), { method: 'MKCOL', headers: { Authorization: auth } }).catch(() => {}); }
       }
-      const put = await fetch(base + f.rel.split('/').map(encodeURIComponent).join('/'), {
-        method: 'PUT', headers: { Authorization: auth }, body: readFileSync(f.full)
-      });
-      if (!put.ok && ![200, 201, 204].includes(put.status)) {
-        if (put.status === 401) throw new Error('Authentication failed (check username / app password).');
-        throw new Error(`Upload of ${f.rel} failed (HTTP ${put.status}).`);
-      }
+      await put(f.rel, readFileSync(f.full));
       count++;
+
+      // Compile .typ files to PDF and upload alongside (skip ones that don't compile standalone).
+      if (f.rel.endsWith('.typ')) {
+        const outPdf = join(tmp, 'out.pdf');
+        if (await compileToPdf(f.full, outPdf)) {
+          await put(f.rel.replace(/\.typ$/, '.pdf'), readFileSync(outPdf));
+          count++;
+          try { unlinkSync(outPdf); } catch {}
+        }
+      }
     }
-    res.json({ ok: true, count });
+    try { rmSync(tmp, { recursive: true, force: true }); } catch {}
+    res.json({ ok: true, count, folder: proj });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }

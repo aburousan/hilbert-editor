@@ -1,21 +1,13 @@
-#import "@preview/fletcher:0.5.8" as fletcher: diagram, node, edge
+#set page(paper: "a4")
+#set text(font: "New Computer Modern", size: 11pt)
 
-#figure(
-  diagram(
-    spacing: 1.6cm,
-    node((0, 2), $gamma$), node((0, 0), $e^-$),
-    node((1.5, 1), $$, name: <a>),
-    node((3, 1), $$, name: <b>),
-    node((4.5, 2), $gamma$), node((4.5, 0), $e^-$),
-    edge((0, 0), <a>, "-|>"),
-    edge((0, 2), <a>, "wave"),
-    edge(<a>, <b>, $e^-$, "-|>"),
-    edge(<b>, (4.5, 0), "-|>"),
-    edge(<b>, (4.5, 2), "wave"),
-  ),
-  caption: [Feynman diagram],
-)
+// Sections and equations are numbered by default:
+#set heading(numbering: "1.")
+#set math.equation(numbering: "(1)")
 
-#set page(paper:"a4")
+#import "@preview/cetz:0.3.2"
+#import "@preview/physica:0.9.3": *
 
-Doc.
+= Typst with Physics and CeTZ!
+
+This is a local, offline editor for *Typst*. It comes pre-configured with packages!

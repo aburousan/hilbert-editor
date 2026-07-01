@@ -68,9 +68,9 @@ export default function DriveSyncModal({ onClose, projectName = 'Typst Project' 
     localStorage.setItem('webdav_user', dav.username);
     setBusy(true); setStatus('Uploading over WebDAV…');
     try {
-      const res = await fetch(`${API}/webdav/sync`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(dav) });
+      const res = await fetch(`${API}/webdav/sync`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...dav, projectName }) });
       const d = await res.json();
-      setStatus(res.ok ? `✓ Uploaded ${d.count} file(s) over WebDAV` : `✗ ${d.error || 'Failed.'}`);
+      setStatus(res.ok ? `✓ Uploaded ${d.count} item(s) to ${d.folder}/ over WebDAV` : `✗ ${d.error || 'Failed.'}`);
     } catch { setStatus('✗ Could not reach the local server.'); } finally { setBusy(false); }
   };
 
@@ -136,7 +136,7 @@ export default function DriveSyncModal({ onClose, projectName = 'Typst Project' 
 
           {mode === 'webdav' && (
             <>
-              <p className="form-hint">Upload the project to any WebDAV server (Nextcloud, ownCloud, …). Use an app password, not your main password.</p>
+              <p className="form-hint">Upload to any WebDAV server (Nextcloud, ownCloud, …). A subfolder named <b>{projectName}</b> is created inside the URL below, holding your source files and their compiled PDFs. Use an app password, not your main password.</p>
               <label className="form-field"><span>WebDAV URL</span>
                 <input type="text" value={dav.url} onChange={e => setDav({ ...dav, url: e.target.value })} placeholder="https://cloud.example.com/remote.php/dav/files/you/Typst" style={inputStyle} />
               </label>

@@ -16,16 +16,26 @@ export default function PdfPreview({ url, onWordClick }: { url: string, onWordCl
   // responsive to pane resizing at every zoom level.
   const [zoomFactor, setZoomFactor] = useState(1);
 
-  // Watch the pane width, but debounce so dragging the splitter doesn't
-  // re-rasterise the PDF on every pixel.
+  // Width the pages were last rasterised at — used to CSS-scale them instantly
+  // while resizing, then re-rasterise (crisply) once the drag settles.
+  const rasterWRef = useRef(0);
+
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     let t: ReturnType<typeof setTimeout>;
     const ro = new ResizeObserver(entries => {
       const w = entries[0].contentRect.width;
+      // Instant, cheap visual response: scale the already-rendered pages.
+      const pages = pagesRef.current;
+      if (pages && rasterWRef.current > 0 && Math.abs(w - rasterWRef.current) > 1) {
+        const s = (w - 28) / (rasterWRef.current - 28);
+        pages.style.transformOrigin = 'top center';
+        pages.style.transform = s < 1 ? `scale(${s.toFixed(4)})` : 'none';
+      }
+      // Re-rasterise only after resizing stops.
       clearTimeout(t);
-      t = setTimeout(() => setContainerW(w), 120);
+      t = setTimeout(() => setContainerW(w), 200);
     });
     ro.observe(el);
     setContainerW(el.clientWidth);
@@ -79,7 +89,9 @@ export default function PdfPreview({ url, onWordClick }: { url: string, onWordCl
         await tl.render();
       }
       if (token !== renderTokenRef.current) return;
+      pagesEl.style.transform = 'none';       // drop the interim resize scale
       pagesEl.replaceChildren(frag);
+      rasterWRef.current = containerW;         // pages are now crisp at this width
       scrollEl.scrollTop = prevScroll;
     })();
   }, [url, containerW, zoomFactor]);
