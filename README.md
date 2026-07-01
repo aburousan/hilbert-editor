@@ -8,6 +8,16 @@ dropped straight into the document.
 
 ![Typst Editor](docs/screenshot.png)
 
+## Demo
+
+Live editing with an instant PDF preview:
+
+![Live preview](docs/gifs/live-preview.gif)
+
+Run Python/Julia/Wolfram and drop the result in as a typeset equation:
+
+![Run code → equation](docs/gifs/run-code-equation.gif)
+
 > Everything runs on your machine. A tiny local Node server drives the Typst compiler
 > and (optional) code execution; nothing is sent to the cloud unless you explicitly use
 > Google Drive sync.
