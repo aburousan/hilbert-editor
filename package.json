@@ -1,7 +1,7 @@
 {
   "name": "typst-editor",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A local, offline editor for Typst aimed at maths/physics writing.",
   "author": "Kazi Abu Rousan",
   "license": "MIT",
