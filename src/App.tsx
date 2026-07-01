@@ -364,7 +364,21 @@ export default function App() {
       await fetchTree();
       const ext = (name.split('.').pop() || '').toLowerCase();
       let snippet: string;
-      if (ext === 'csv') snippet = `#let data = csv("${name}")\n// Preview: header + first 10 rows. \`data\` holds every row — widen the slice below to show more.\n#table(\n  columns: data.first().len(),\n  table.header(..data.first()),\n  ..data.slice(1, calc.min(11, data.len())).flatten(),\n)`;
+      if (ext === 'csv') snippet =
+`#let data = csv("${name}")
+// Preview: header + first 10 rows, auto-scaled to fit the page. \`data\` holds every row.
+#let _rows = data.slice(0, calc.min(11, data.len()))
+#let _tbl = text(size: 8pt, table(
+  columns: data.first().len(),
+  align: left,
+  table.header(.._rows.first()),
+  .._rows.slice(1).flatten(),
+))
+#layout(size => scale(
+  calc.min(1, size.width / measure(_tbl).width) * 100%,
+  reflow: true,
+  _tbl,
+))`;
       else if (ext === 'json') snippet = `#let data = json("${name}")\n// e.g. #data.at("key")`;
       else if (ext === 'yaml' || ext === 'yml') snippet = `#let data = yaml("${name}")`;
       else if (ext === 'toml') snippet = `#let data = toml("${name}")`;
