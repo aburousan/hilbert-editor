@@ -349,6 +349,34 @@ export default function App() {
     input.click();
   };
 
+  // Import an entire folder (with subfolders) from disk into the workspace.
+  const openFolderFromDisk = () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    (input as any).webkitdirectory = true;
+    input.multiple = true;
+    input.onchange = async () => {
+      const files = Array.from(input.files || []);
+      if (!files.length) return;
+      if (files.length > 400 && !confirm(`Import ${files.length} files? This may take a moment.`)) return;
+      const TEXT_EXT = ['typ', 'bib', 'txt', 'md', 'csv', 'json', 'yml', 'yaml', 'toml', 'xml', 'tex', 'html', 'css', 'js'];
+      for (const f of files) {
+        const rel = (f as any).webkitRelativePath || f.name;
+        if (rel.includes('/.') || rel.includes('node_modules/')) continue;
+        const ext = (f.name.split('.').pop() || '').toLowerCase();
+        if (TEXT_EXT.includes(ext)) {
+          const text = await f.text();
+          await fetch(`http://localhost:3001/workspace/file?path=${encodeURIComponent(rel)}`, { method: 'POST', body: text, headers: { 'Content-Type': 'text/plain' } });
+        } else {
+          const buf = await f.arrayBuffer();
+          await fetch(`http://localhost:3001/workspace/upload?path=${encodeURIComponent(rel)}`, { method: 'POST', body: buf, headers: { 'Content-Type': 'application/octet-stream' } });
+        }
+      }
+      await fetchTree();
+    };
+    input.click();
+  };
+
   // Import a data file (CSV/JSON/…) into the workspace and insert the matching
   // Typst read function so it can be used in the document.
   const insertDataFile = () => {
@@ -611,36 +639,100 @@ export default function App() {
     }
   });
 
+  // Wrap the selected element (figure/table/plot/image/…) in a numbered #figure
+  // with a caption, so it gets a "Figure N" number and can be cross-referenced.
+  const wrapInFigure = () => {
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    if (!editor || !model) return;
+    editor.focus();
+    const sel = editor.getSelection();
+    const selected = sel && !sel.isEmpty() ? model.getValueInRange(sel).trim() : '';
+    setInputModal({
+      title: 'Wrap in Figure',
+      fields: [
+        { key: 'caption', label: 'Caption', default: 'Caption' },
+        { key: 'label', label: 'Label (optional)', placeholder: 'plot1', hint: 'Referenced later as @fig:plot1' },
+      ],
+      submitLabel: 'Wrap',
+      onSubmit: (v) => {
+        // Inside #figure(...) the content must be an expression (no leading #) or a [content] block.
+        let inner = selected || 'image("image.png", width: 80%)';
+        if (inner.startsWith('#')) inner = inner.slice(1);
+        else if (selected) inner = `[${inner}]`;
+        const tag = v.label ? ` <fig:${v.label}>` : '';
+        const fig = `#figure(\n  ${inner},\n  caption: [${v.caption}],\n)${tag}`;
+        if (sel && !sel.isEmpty()) {
+          editor.executeEdits('wrap-figure', [{ range: sel, text: fig, forceMoveMarkers: true }]);
+          editor.focus();
+        } else {
+          insertCode('\n' + fig + '\n\n');
+        }
+      }
+    });
+  };
+
   const insertCetz3D = () => setInputModal({
     title: 'Insert 3D Surface (cetz)',
     fields: [
       { key: 'expr', label: 'z = f(x, y)  (Typst calc syntax)', default: 'calc.sin(calc.sqrt(x*x + y*y))' },
       { key: 'range', label: 'Range (± value on x and y)', default: '4' },
-      { key: 'center', label: 'Center on page', type: 'checkbox', default: 'true' },
+      { key: 'caption', label: 'Figure caption', default: '3D surface' },
+      { key: 'label', label: 'Label (optional)', placeholder: 'surf1 → @fig:surf1' },
     ],
     onSubmit: (v) => {
       const R = Math.abs(parseFloat(v.range)) || 4;
       const s = (2 * R / 16).toFixed(3);
-      const canvas = `#canvas({
-  import draw: *
-  rotate(x: 70deg, z: 30deg)
-  let f(x, y) = ${v.expr}
-  let n = 16
-  let s = ${s}
-  for i in range(n) {
-    for j in range(n) {
-      let x = (i - n/2)*s
-      let y = (j - n/2)*s
-      let x2 = (i + 1 - n/2)*s
-      let y2 = (j + 1 - n/2)*s
-      if i < n - 1 { line((x, y, f(x, y)), (x2, y, f(x2, y)), stroke: blue.darken(10%)) }
-      if j < n - 1 { line((x, y, f(x, y)), (x, y2, f(x, y2)), stroke: blue.darken(10%)) }
+      const canvas = `canvas({
+    import draw: *
+    rotate(x: 70deg, z: 30deg)
+    let f(x, y) = ${v.expr}
+    let n = 16
+    let s = ${s}
+    for i in range(n) {
+      for j in range(n) {
+        let x = (i - n/2)*s
+        let y = (j - n/2)*s
+        let x2 = (i + 1 - n/2)*s
+        let y2 = (j + 1 - n/2)*s
+        if i < n - 1 { line((x, y, f(x, y)), (x2, y, f(x2, y)), stroke: blue.darken(10%)) }
+        if j < n - 1 { line((x, y, f(x, y)), (x, y2, f(x, y2)), stroke: blue.darken(10%)) }
+      }
     }
-  }
-})`;
+  })`;
       const imp = '#import "@preview/cetz:0.3.2": canvas, draw\n';
-      const block = v.center === 'true' ? `${imp}#align(center)[\n${canvas}\n]` : `${imp}${canvas}`;
-      insertCode(`\n${block}\n\n`);
+      const tag = v.label ? ` <fig:${v.label}>` : '';
+      insertCode(`\n${imp}#figure(\n  ${canvas},\n  caption: [${v.caption}],\n)${tag}\n\n`);
+    }
+  });
+
+  const insertFeynman = () => setInputModal({
+    title: 'Insert Feynman Diagram (fletcher)',
+    fields: [
+      { key: 'caption', label: 'Caption', default: '$e^- e^+ -> mu^- mu^+$ scattering' },
+      { key: 'label', label: 'Label (optional)', placeholder: 'feyn1 → @fig:feyn1' },
+    ],
+    onSubmit: (v) => {
+      ensureRule('@preview/fletcher', '#import "@preview/fletcher:0.5.5" as fletcher: diagram, node, edge');
+      const tag = v.label ? ` <fig:${v.label}>` : '';
+      insertCode(
+`\n#figure(
+  diagram(
+    spacing: 2cm,
+    node((0, 0), $e^-$),
+    node((0, 2), $e^+$),
+    node((1, 1), $$, name: <v1>),
+    node((2, 1), $$, name: <v2>),
+    node((3, 1), $mu^-$),
+    node((3, -1), $mu^+$),
+    edge((0, 0), <v1>, "-|>"),
+    edge((0, 2), <v1>, "<|-"),
+    edge(<v1>, <v2>, $gamma$, "wave"),
+    edge(<v2>, (3, 1), "-|>"),
+    edge(<v2>, (3, -1), "<|-"),
+  ),
+  caption: [${v.caption}],
+)${tag}\n\n`);
     }
   });
 
@@ -878,6 +970,7 @@ export default function App() {
                 <div className="dropdown">
                   <div className="dropdown-item" onClick={createNewFile}>New File...</div>
                   <div className="dropdown-item" onClick={() => { openFromDisk(); setActiveMenu(null); }}>Open File...</div>
+                  <div className="dropdown-item" onClick={() => { openFolderFromDisk(); setActiveMenu(null); }}>Open Folder...</div>
                   <div className="dropdown-item" onClick={() => setShowTemplateInstaller(true)}>New from Template...</div>
                   <div className="dropdown-divider"></div>
                   <div className="dropdown-item" onClick={() => { saveActiveFile(); setActiveMenu(null); }}>Save <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘S</span></div>
@@ -950,6 +1043,7 @@ export default function App() {
                       <div className="dropdown-item" onClick={() => { setShowDiagramBuilder(true); setActiveMenu(null); }}>Diagram / Plot (2D, cetz)...</div>
                       <div className="dropdown-item" onClick={() => { insertCetz3D(); setActiveMenu(null); }}>3D Surface (cetz)...</div>
                       <div className="dropdown-item" onClick={() => { setCodeRunner({ initialLang: 'python', initialCode: SURFACE_3D_TEMPLATE }); setActiveMenu(null); }}>3D Surface (Python/matplotlib)...</div>
+                      <div className="dropdown-item" onClick={() => { insertFeynman(); setActiveMenu(null); }}>Feynman Diagram (fletcher)...</div>
                     </div>
                   </div>
                   <div className="dropdown-item has-submenu">
@@ -1064,6 +1158,7 @@ export default function App() {
           <button className="tool-btn" onClick={insertHeading} title="Heading"><b style={{ fontSize: 14 }}>H</b></button>
           <button className="tool-btn" onClick={insertNumberedEquation} title="Numbered Equation"><span style={{ fontStyle: 'italic' }}>f(x)</span></button>
           <button className="tool-btn" onClick={insertTable} title="Table"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="1"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="3" y1="15" x2="21" y2="15"></line><line x1="9" y1="3" x2="9" y2="21"></line></svg></button>
+          <button className="tool-btn" onClick={wrapInFigure} title="Wrap selection in a numbered Figure (caption + number)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="14" rx="1"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 13 16 9 5 17"></polyline><line x1="7" y1="21" x2="17" y2="21"></line></svg></button>
           <button className="tool-btn" onClick={() => setShowSymbolPicker(true)} title="Math & Physics Symbols"><b>Ω</b></button>
           <button className="tool-btn" onClick={() => setCodeRunner({})} title="Run Code / Live Output"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="6 4 20 12 6 20 6 4"></polygon></svg></button>
         </div>
@@ -1175,8 +1270,12 @@ export default function App() {
                 path={activeTab.path}
                 value={activeTab.content}
                 onChange={handleEditorChange}
-                onMount={(e) => {
+                beforeMount={(monacoInstance) => setupTypstLanguage(monacoInstance)}
+                onMount={(e, monacoInstance) => {
                   editorRef.current = e;
+                  // Ensure our custom themes are applied on the very first paint
+                  // (otherwise the editor briefly renders in the default light theme).
+                  monacoInstance.editor.setTheme(theme);
                   const m = e.getModel();
                   if (m) { const last = m.getLineCount(); e.setPosition({ lineNumber: last, column: m.getLineMaxColumn(last) }); }
                 }}

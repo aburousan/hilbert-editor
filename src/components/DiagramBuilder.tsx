@@ -22,6 +22,9 @@ export default function DiagramBuilder({ onClose, onInsert }: { onClose: () => v
   const [domain, setDomain] = useState('-5, 5');
 
   const [alignCenter, setAlignCenter] = useState(true);
+  const [asFigure, setAsFigure] = useState(true);
+  const [caption, setCaption] = useState('Diagram');
+  const [label, setLabel] = useState('');
 
   const buildPlot = () => {
     // cetz-plot 0.1.1 must be paired with cetz 0.3.2 (canvas + plot drawables
@@ -35,11 +38,9 @@ export default function DiagramBuilder({ onClose, onInsert }: { onClose: () => v
     } else {
       body = `      plot.add(domain: (${domain}), t => (${paramX}, ${paramY}))\n`;
     }
-    let code = `#import "@preview/cetz:0.3.2"\n#import "@preview/cetz-plot:0.1.1": plot\n`;
-    if (alignCenter) code += '#align(center)[\n';
-    code += `#cetz.canvas({\n  plot.plot(size: (8, 6),\n    x-label: [${plotX}], y-label: [${plotY}],\n    {\n${body}    })\n})\n`;
-    if (alignCenter) code += ']\n';
-    return code;
+    const imports = `#import "@preview/cetz:0.3.2"\n#import "@preview/cetz-plot:0.1.1": plot\n`;
+    const canvas = `cetz.canvas({\n  plot.plot(size: (8, 6),\n    x-label: [${plotX}], y-label: [${plotY}],\n    {\n${body}    })\n})`;
+    return { imports, canvas };
   };
 
   const buildCanvas = () => {
@@ -53,15 +54,21 @@ export default function DiagramBuilder({ onClose, onInsert }: { onClose: () => v
     } else {
       inner = `  grid((0, 0), (4, 4), step: 1, stroke: gray.lighten(50%))\n  circle((2, 2), radius: 1, fill: red.transparentize(20%))\n  content((2, 2), [*Center*])\n`;
     }
-    let code = `#import "@preview/cetz:0.3.2": canvas, draw\n`;
-    if (alignCenter) code += '#align(center)[\n';
-    code += `#canvas({\n  import draw: *\n${inner}})\n`;
-    if (alignCenter) code += ']\n';
-    return code;
+    const imports = `#import "@preview/cetz:0.3.2": canvas, draw\n`;
+    const canvas = `canvas({\n  import draw: *\n${inner}})`;
+    return { imports, canvas };
   };
 
   const handleInsert = () => {
-    onInsert('\n' + (tab === 'plot' ? buildPlot() : buildCanvas()) + '\n');
+    const { imports, canvas } = tab === 'plot' ? buildPlot() : buildCanvas();
+    let body;
+    if (asFigure) {
+      const tag = label.trim() ? ` <fig:${label.trim()}>` : '';
+      body = `${imports}#figure(\n  ${canvas},\n  caption: [${caption}],\n)${tag}`;
+    } else {
+      body = alignCenter ? `${imports}#align(center)[\n${canvas}\n]` : `${imports}${canvas}`;
+    }
+    onInsert('\n' + body + '\n\n');
   };
 
   const field = (label: string, el: React.ReactNode) => (
@@ -136,9 +143,20 @@ export default function DiagramBuilder({ onClose, onInsert }: { onClose: () => v
           )}
 
           <label className="form-check">
-            <input type="checkbox" checked={alignCenter} onChange={e => setAlignCenter(e.target.checked)} />
-            Center the diagram on the page
+            <input type="checkbox" checked={asFigure} onChange={e => setAsFigure(e.target.checked)} />
+            Wrap in a numbered figure (adds “Figure N” + caption)
           </label>
+          {asFigure ? (
+            <div className="form-row">
+              {field('Caption', <input type="text" value={caption} onChange={e => setCaption(e.target.value)} />)}
+              {field('Label (optional)', <input type="text" value={label} onChange={e => setLabel(e.target.value)} placeholder="plot1 → @fig:plot1" />)}
+            </div>
+          ) : (
+            <label className="form-check">
+              <input type="checkbox" checked={alignCenter} onChange={e => setAlignCenter(e.target.checked)} />
+              Center on the page
+            </label>
+          )}
         </div>
 
         <div className="modal-footer">
