@@ -50,8 +50,8 @@ dropped straight into the document.
 ## Install & run
 
 ```bash
-git clone https://github.com/<you>/typst-editor.git
-cd typst-editor
+git clone https://github.com/aburousan/typsteditor.git
+cd typsteditor
 npm install
 npm run dev
 ```
