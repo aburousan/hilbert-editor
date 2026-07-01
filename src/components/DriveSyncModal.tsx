@@ -59,13 +59,14 @@ export default function DriveSyncModal({ onClose, projectName = 'Typst Project' 
   const [dav, setDav] = useState({
     url: localStorage.getItem('webdav_url') || '',
     username: localStorage.getItem('webdav_user') || '',
-    password: '',
+    password: localStorage.getItem('webdav_pass') || '',
   });
 
   const syncWebdav = async () => {
     if (!dav.url.trim()) { setStatus('Enter your WebDAV URL.'); return; }
     localStorage.setItem('webdav_url', dav.url);
     localStorage.setItem('webdav_user', dav.username);
+    localStorage.setItem('webdav_pass', dav.password);
     setBusy(true); setStatus('Uploading over WebDAV…');
     try {
       const res = await fetch(`${API}/webdav/sync`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...dav, projectName }) });

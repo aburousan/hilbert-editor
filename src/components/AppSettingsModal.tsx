@@ -187,11 +187,38 @@ export default function AppSettingsModal({ onClose }: { onClose: () => void }) {
 
           {activeTab === 'cloud' && (
             <div>
-              <h2 style={{ marginTop: 0 }}>Cloud Accounts</h2>
+              <h2 style={{ marginTop: 0 }}>WebDAV (Nextcloud / ownCloud)</h2>
               <p style={{ fontSize: '13px', color: 'var(--text-muted)' }}>
-                <b>Google Drive sign-in.</b> To upload directly to Drive (File → Sync → Google Drive) you need a
-                one-time OAuth <b>Client ID</b>: create one in Google Cloud Console → APIs &amp; Services → Credentials
-                (OAuth client, type <i>Web application</i>) with authorized JavaScript origin <code>http://localhost:5173</code>.
+                Uploads to a <b>subfolder named after your project</b> (source + compiled PDFs). Credentials are stored only
+                in this browser (never in the repo or the app bundle).
+              </p>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
+                WebDAV URL:
+                <input type="text" placeholder="https://cloud.example.com/remote.php/dav/files/you/Typst" defaultValue={localStorage.getItem('webdav_url') || ''}
+                  onChange={e => localStorage.setItem('webdav_url', e.target.value.trim())} style={inputStyle} />
+              </label>
+              <div style={{ display: 'flex', gap: 10, marginTop: 10 }}>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: '5px', flex: 1 }}>
+                  Username:
+                  <input type="text" defaultValue={localStorage.getItem('webdav_user') || ''}
+                    onChange={e => localStorage.setItem('webdav_user', e.target.value)} style={inputStyle} />
+                </label>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: '5px', flex: 1 }}>
+                  App password:
+                  <input type="password" defaultValue={localStorage.getItem('webdav_pass') || ''}
+                    onChange={e => localStorage.setItem('webdav_pass', e.target.value)} style={inputStyle} />
+                </label>
+              </div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12, fontSize: 13, cursor: 'pointer' }}>
+                <input type="checkbox" defaultChecked={localStorage.getItem('webdav_autosync') === 'true'}
+                  onChange={e => localStorage.setItem('webdav_autosync', e.target.checked ? 'true' : 'false')} />
+                Auto-sync to WebDAV on every save (⌘S)
+              </label>
+
+              <h2 style={{ fontSize: '1rem', marginTop: 22 }}>Google Drive</h2>
+              <p style={{ fontSize: '13px', color: 'var(--text-muted)' }}>
+                Optional. Needs a one-time OAuth <b>Client ID</b> (Google Cloud Console → Credentials → OAuth client,
+                <i> Web application</i>, origin <code>http://localhost:5173</code>).
               </p>
               <label style={{ display: 'flex', flexDirection: 'column', gap: '5px', marginBottom: 18 }}>
                 Google OAuth Client ID:

@@ -277,8 +277,20 @@ export default function App() {
       setTabs(prev => prev.map(t => t.path === activeTab.path ? { ...t, isDirty: false } : t));
       fetchTree();
       compileTypst(currentMain);
+      webdavAutoSync();
     } catch (e) {}
   }, [activeTab, currentMain, compileTypst]);
+
+  // If the user enabled WebDAV auto-sync, push the project on every save.
+  const webdavAutoSync = () => {
+    if (localStorage.getItem('webdav_autosync') !== 'true') return;
+    const url = localStorage.getItem('webdav_url');
+    if (!url) return;
+    fetch('http://localhost:3001/webdav/sync', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, username: localStorage.getItem('webdav_user') || '', password: localStorage.getItem('webdav_pass') || '', projectName })
+    }).catch(() => {});
+  };
 
   // Intercept Cmd/Ctrl+S so the browser "Save As" dialog never appears.
   useEffect(() => {
@@ -1049,8 +1061,6 @@ export default function App() {
                   <div className="dropdown-divider"></div>
                   <div className="dropdown-item" onClick={() => { saveActiveFile(); setActiveMenu(null); }}>Save <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘S</span></div>
                   <div className="dropdown-item" onClick={() => { setShowSaveAs(true); setActiveMenu(null); }}>Save As / Export...</div>
-                  <div className="dropdown-divider"></div>
-                  <div className="dropdown-item" onClick={() => setShowDriveSync(true)}>Sync with Google Drive...</div>
                 </div>
               )}
             </div>
