@@ -10,13 +10,25 @@ dropped straight into the document.
 
 ## Demo
 
-Live editing with an instant PDF preview:
+**Live editing with an instant PDF preview:**
 
 ![Live preview](docs/gifs/live-preview.gif)
 
-Run Python/Julia/Wolfram and drop the result in as a typeset equation:
+**Run Python/Julia/Wolfram and drop the result in as a typeset equation:**
 
 ![Run code → equation](docs/gifs/run-code-equation.gif)
+
+**Insert plots (cetz) without leaving the editor:**
+
+![Insert a plot](docs/gifs/insert-plot.gif)
+
+**Browse Typst Universe templates with a rendered preview:**
+
+![Template preview](docs/gifs/template-preview.gif)
+
+**Toggle a dark PDF preview (like Overleaf):**
+
+![Dark PDF](docs/gifs/dark-pdf.gif)
 
 > Everything runs on your machine. A tiny local Node server drives the Typst compiler
 > and (optional) code execution; nothing is sent to the cloud unless you explicitly use
