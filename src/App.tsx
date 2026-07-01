@@ -14,6 +14,9 @@ import CodeRunnerModal from './components/CodeRunnerModal';
 import SaveAsModal from './components/SaveAsModal';
 import PdfPreview from './components/PdfPreview';
 import Plot3DStudio from './components/Plot3DStudio';
+import SymbolDraw from './components/SymbolDraw';
+import RefManager from './components/RefManager';
+import BibManager from './components/BibManager';
 import './index.css';
 
 const SURFACE_3D_TEMPLATE = `import matplotlib
@@ -176,9 +179,12 @@ export default function App() {
   const [projectName, setProjectName] = useState('Project Report');
   const [editingTitle, setEditingTitle] = useState(false);
   const [inputModal, setInputModal] = useState<InputModalConfig | null>(null);
-  const [codeRunner, setCodeRunner] = useState<null | { initialLang?: 'python' | 'julia' | 'wolfram'; initialCode?: string }>(null);
+  const [codeRunner, setCodeRunner] = useState<null | { initialLang?: 'python' | 'julia' | 'wolfram'; initialCode?: string; initialMode?: 'text' | 'equation' }>(null);
   const [showSaveAs, setShowSaveAs] = useState(false);
   const [showPlot3D, setShowPlot3D] = useState(false);
+  const [showSymbolDraw, setShowSymbolDraw] = useState(false);
+  const [showRefManager, setShowRefManager] = useState(false);
+  const [showBibManager, setShowBibManager] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   
   const [sidebarWidth, setSidebarWidth] = useState(250);
@@ -871,6 +877,59 @@ export default function App() {
     onSubmit: (v) => { if (v.label) insertCode(` <${v.label}>`); }
   });
 
+  // Best-effort Typst-math → sympy translation for the compute dialog.
+  const typstToSympy = (s: string) => s.replace(/\$/g, '').replace(/\^/g, '**').replace(/\bdif\b/g, 'd').trim();
+
+  // Compute on the current selection: send it to sympy (simplify / solve / diff /
+  // integrate / numeric) and return the result as a typeset equation. Reuses the
+  // existing code runner (equation mode → "Insert as equation").
+  const computeSelection = () => {
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    const sel = editor?.getSelection();
+    const selected = sel && model && !sel.isEmpty() ? model.getValueInRange(sel).trim() : '';
+    setInputModal({
+      title: 'Compute Selection (sympy)',
+      fields: [
+        { key: 'op', label: 'Operation', type: 'select', default: 'simplify', options: ['simplify', 'expand', 'factor', 'solve = 0', 'differentiate', 'integrate', 'numeric value'] },
+        { key: 'expr', label: 'Expression (sympy syntax: ** for powers, * for ×)', type: 'textarea', default: typstToSympy(selected) || 'x**2 - 1' },
+        { key: 'var', label: 'Variable', default: 'x' },
+      ],
+      submitLabel: 'Open in runner',
+      onSubmit: (v) => {
+        const expr = typstToSympy(v.expr);
+        const va = (v.var || 'x').trim() || 'x';
+        let code = expr;
+        switch (v.op) {
+          case 'simplify': code = `simplify(${expr})`; break;
+          case 'expand': code = `expand(${expr})`; break;
+          case 'factor': code = `factor(${expr})`; break;
+          case 'solve = 0': {
+            const eq = expr.includes('=') && !expr.includes('==')
+              ? `Eq(${expr.split('=')[0]}, ${expr.split('=').slice(1).join('=')})`
+              : `Eq(${expr}, 0)`;
+            code = `solve(${eq}, ${va})`; break;
+          }
+          case 'differentiate': code = `diff(${expr}, ${va})`; break;
+          case 'integrate': code = `integrate(${expr}, ${va})`; break;
+          case 'numeric value': code = `N(${expr})`; break;
+        }
+        setCodeRunner({ initialLang: 'python', initialMode: 'equation', initialCode: code });
+      }
+    });
+  };
+
+  // Add a #bibliography(...) call at the end of the document if it isn't there yet.
+  const ensureBibliography = () => {
+    const editor = editorRef.current, model = editor?.getModel();
+    if (!editor || !model) return;
+    if (model.getValue().includes('#bibliography(')) return;
+    const last = model.getLineCount();
+    const col = model.getLineMaxColumn(last);
+    editor.executeEdits('bib', [{ range: { startLineNumber: last, startColumn: col, endLineNumber: last, endColumn: col } as any, text: '\n\n#bibliography("refs.bib")\n', forceMoveMarkers: true }]);
+    editor.focus();
+  };
+
   // Toggle numbering on the heading or block-equation under the cursor.
   const toggleNumbering = () => {
     const editor = editorRef.current;
@@ -1129,6 +1188,8 @@ export default function App() {
                       <div className="dropdown-item" onClick={() => { insertNumberedEquation(); setActiveMenu(null); }}>Numbered Equation...</div>
                       <div className="dropdown-item" onClick={() => { insertMatrix(); setActiveMenu(null); }}>Matrix...</div>
                       <div className="dropdown-item" onClick={() => { setShowSymbolPicker(true); setActiveMenu(null); }}>Math &amp; Physics Symbols...</div>
+                      <div className="dropdown-item" onClick={() => { setShowSymbolDraw(true); setActiveMenu(null); }}>Draw a Symbol → Typst...</div>
+                      <div className="dropdown-item" onClick={() => { computeSelection(); setActiveMenu(null); }}>Compute Selection (simplify / solve)...</div>
                     </div>
                   </div>
                   <div className="dropdown-item has-submenu">
@@ -1172,6 +1233,9 @@ export default function App() {
                       <div className="dropdown-item" onClick={() => { insertWebLink(); setActiveMenu(null); }}>Link (Web)...</div>
                       <div className="dropdown-item" onClick={() => { insertCrossRef(); setActiveMenu(null); }}>Cross-reference (Internal)...</div>
                       <div className="dropdown-item" onClick={() => { insertLabel(); setActiveMenu(null); }}>Label...</div>
+                      <div className="dropdown-divider"></div>
+                      <div className="dropdown-item" onClick={() => { setShowRefManager(true); setActiveMenu(null); }}>Reference &amp; Label Manager...</div>
+                      <div className="dropdown-item" onClick={() => { setShowBibManager(true); setActiveMenu(null); }}>Citations &amp; Bibliography (DOI/arXiv)...</div>
                     </div>
                   </div>
                 </div>
@@ -1272,6 +1336,8 @@ export default function App() {
           <button className="tool-btn" onClick={insertTable} title="Table"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="1"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="3" y1="15" x2="21" y2="15"></line><line x1="9" y1="3" x2="9" y2="21"></line></svg></button>
           <button className="tool-btn" onClick={wrapInFigure} title="Wrap selection in a numbered Figure (caption + number)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="14" rx="1"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 13 16 9 5 17"></polyline><line x1="7" y1="21" x2="17" y2="21"></line></svg></button>
           <button className="tool-btn" onClick={() => setShowSymbolPicker(true)} title="Math & Physics Symbols"><b>Ω</b></button>
+          <button className="tool-btn" onClick={() => setShowSymbolDraw(true)} title="Draw a symbol → Typst code"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 19l7-7 3 3-7 7-3-3z"></path><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"></path><path d="M2 2l7.586 7.586"></path><circle cx="11" cy="11" r="2"></circle></svg></button>
+          <button className="tool-btn" onClick={() => setShowBibManager(true)} title="Citations & Bibliography (DOI/arXiv)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path></svg></button>
           <button className="tool-btn" onClick={() => setCodeRunner({})} title="Run Code / Live Output"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="6 4 20 12 6 20 6 4"></polygon></svg></button>
         </div>
 
@@ -1446,6 +1512,9 @@ export default function App() {
       {codeRunner && <CodeRunnerModal {...codeRunner} onClose={() => setCodeRunner(null)} onInsert={(code) => { insertCode(code); setCodeRunner(null); }} onInsertEquation={(latex, codeBlock) => { insertEquationFromLatex(latex, codeBlock); setCodeRunner(null); }} onChanged={fetchTree} />}
       {showSaveAs && activeTab && <SaveAsModal onClose={() => setShowSaveAs(false)} fileName={activeTabPath} content={activeTab.content} pdfUrl={pdfUrl} projectName={projectName} mainFile={currentMain} />}
       {showPlot3D && <Plot3DStudio onClose={() => setShowPlot3D(false)} onGenerate={(code) => { setShowPlot3D(false); setCodeRunner({ initialLang: 'python', initialCode: code }); }} />}
+      {showSymbolDraw && <SymbolDraw onClose={() => setShowSymbolDraw(false)} onInsert={(name) => { insertCode(name + ' '); setShowSymbolDraw(false); }} />}
+      {showRefManager && activeTab && <RefManager content={activeTab.content} onClose={() => setShowRefManager(false)} onJump={jumpToLine} onInsertRef={(name) => insertCode(`@${name}`)} />}
+      {showBibManager && <BibManager onClose={() => setShowBibManager(false)} onCite={(key) => insertCode(`@${key}`)} onEnsureBib={ensureBibliography} onChanged={fetchTree} />}
       
       {showHistoryModal && (
         <div className="modal-overlay" onClick={() => setShowHistoryModal(false)}>

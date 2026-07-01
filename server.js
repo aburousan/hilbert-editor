@@ -650,6 +650,74 @@ app.post('/packages/download', (req, res) => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Bibliography lookup — turn a DOI or arXiv id into a BibTeX entry so citations
+// can be managed from inside the editor (writes go to the workspace refs.bib).
+// ---------------------------------------------------------------------------
+function fetchWithTimeout(url, opts = {}, ms = 15000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  return fetch(url, { ...opts, signal: ctrl.signal, redirect: 'follow' }).finally(() => clearTimeout(timer));
+}
+
+const unesc = (s) => (s || '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim();
+const citeKey = (author, year) => {
+  const last = (author || 'ref').split(/\s+and\s+/)[0].split(',')[0].trim().split(/\s+/).pop() || 'ref';
+  return (last.replace(/[^a-zA-Z]/g, '') || 'ref').toLowerCase() + (year || '');
+};
+
+function arxivToBibtex(xml, id) {
+  const entry = (xml.match(/<entry>([\s\S]*?)<\/entry>/) || [, ''])[1];
+  if (!entry) return null;
+  const title = unesc((entry.match(/<title>([\s\S]*?)<\/title>/) || [, ''])[1]);
+  const authors = [...entry.matchAll(/<name>([\s\S]*?)<\/name>/g)].map(m => unesc(m[1]));
+  const year = ((entry.match(/<published>(\d{4})/) || [, ''])[1]) || '';
+  const doi = unesc((entry.match(/<arxiv:doi[^>]*>([\s\S]*?)<\/arxiv:doi>/) || [, ''])[1]);
+  const cleanId = id.replace(/v\d+$/, '');
+  const key = citeKey(authors[0] || '', year);
+  const fields = [
+    `  title = {${title}}`,
+    `  author = {${authors.join(' and ')}}`,
+    `  year = {${year}}`,
+    `  eprint = {${id}}`,
+    `  archivePrefix = {arXiv}`,
+    doi ? `  doi = {${doi}}` : '',
+    `  url = {https://arxiv.org/abs/${cleanId}}`,
+  ].filter(Boolean);
+  return { key, bibtex: `@article{${key},\n${fields.join(',\n')},\n}\n` };
+}
+
+app.post('/bib/fetch', async (req, res) => {
+  const raw = String((req.body && req.body.id) || '').trim();
+  if (!raw) return res.status(400).json({ error: 'Enter a DOI or arXiv id.' });
+  try {
+    // arXiv? (2101.12345, arXiv:2101.12345v2, or an arxiv.org URL)
+    const arxivMatch = raw.match(/arxiv[:/ ]?\s*([0-9]{4}\.[0-9]{4,5}(?:v\d+)?)/i) || raw.match(/^([0-9]{4}\.[0-9]{4,5}(?:v\d+)?)$/);
+    if (arxivMatch) {
+      const id = arxivMatch[1];
+      const r = await fetchWithTimeout(`http://export.arxiv.org/api/query?id_list=${encodeURIComponent(id)}`);
+      const xml = await r.text();
+      const out = arxivToBibtex(xml, id);
+      if (!out) return res.status(404).json({ error: 'arXiv paper not found.' });
+      return res.json(out);
+    }
+    // DOI? (bare 10.xxxx/… or a doi.org URL)
+    const doiMatch = raw.match(/(10\.\d{4,9}\/[^\s"'<>]+)/);
+    if (doiMatch) {
+      const doi = doiMatch[1].replace(/[.,;]+$/, '');
+      const r = await fetchWithTimeout(`https://doi.org/${doi}`, { headers: { Accept: 'application/x-bibtex; charset=utf-8' } });
+      if (!r.ok) return res.status(404).json({ error: `DOI lookup failed (HTTP ${r.status}).` });
+      let bibtex = (await r.text()).trim();
+      if (!bibtex.startsWith('@')) return res.status(404).json({ error: 'No BibTeX returned for that DOI.' });
+      const key = (bibtex.match(/@\w+\{\s*([^,\s]+)/) || [, citeKey('', '')])[1];
+      return res.json({ key, bibtex: bibtex + '\n' });
+    }
+    res.status(400).json({ error: 'Could not recognise a DOI or arXiv id in that input.' });
+  } catch (e) {
+    res.status(500).json({ error: e.name === 'AbortError' ? 'Lookup timed out.' : String(e.message || e) });
+  }
+});
+
 // Serve the built front-end (desktop / single-origin mode). Registered LAST so
 // all API routes above take precedence; anything else falls back to the SPA.
 if (existsSync(DIST_DIR)) {

@@ -43,11 +43,11 @@ const EQ_TEMPLATES: Record<Lang, { label: string; code: string }[]> = {
   ],
 };
 
-export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, onChanged, initialLang, initialCode }: { onClose: () => void, onInsert: (code: string) => void, onInsertEquation?: (latex: string, codeBlock?: string) => void, onChanged?: () => void, initialLang?: Lang, initialCode?: string }) {
+export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, onChanged, initialLang, initialCode, initialMode }: { onClose: () => void, onInsert: (code: string) => void, onInsertEquation?: (latex: string, codeBlock?: string) => void, onChanged?: () => void, initialLang?: Lang, initialCode?: string, initialMode?: 'text' | 'equation' }) {
   const [tools, setTools] = useState<Tools | null>(null);
   const [lang, setLang] = useState<Lang>(initialLang ?? 'python');
   const [bin, setBin] = useState<string>('');
-  const [outputMode, setOutputMode] = useState<'text' | 'equation'>('text');
+  const [outputMode, setOutputMode] = useState<'text' | 'equation'>(initialMode ?? 'text');
   const [code, setCode] = useState(initialCode ?? TEMPLATES[initialLang ?? 'python'][0].code);
   const [includeCode, setIncludeCode] = useState(true);
   const templatesFor = (l: Lang, mode: 'text' | 'equation') => (mode === 'equation' ? EQ_TEMPLATES : TEMPLATES)[l];
