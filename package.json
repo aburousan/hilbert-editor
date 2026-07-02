@@ -35,6 +35,7 @@
       "dist/**",
       "server.js",
       "electron/**",
+      "electron/typst-packages/**",
       "package.json"
     ],
     "afterPack": "electron/afterPack.cjs",

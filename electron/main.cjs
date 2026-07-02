@@ -25,6 +25,31 @@ const WORKSPACE = path.join(app.getPath('documents'), 'TypstEditor');
 fs.mkdirSync(WORKSPACE, { recursive: true });
 
 let serverProc = null;
+let PKG_CACHE = null;
+
+// Copy the Typst packages bundled with the app into a writable cache dir and
+// return that dir (which contains preview/<name>/<version>). Pointing typst at
+// it means documents compile on any machine with no network / no downloads.
+// Newly downloaded packages also land here, so the two stay consistent.
+function seedPackages() {
+  const cacheRoot = path.join(app.getPath('userData'), 'typst-cache');
+  const bundled = path.join(__dirname, 'typst-packages', 'preview');
+  try {
+    if (!fs.existsSync(bundled)) return cacheRoot;
+    for (const name of fs.readdirSync(bundled)) {
+      const nameDir = path.join(bundled, name);
+      if (!fs.statSync(nameDir).isDirectory()) continue;
+      for (const ver of fs.readdirSync(nameDir)) {
+        const dst = path.join(cacheRoot, 'preview', name, ver);
+        if (!fs.existsSync(dst)) {
+          fs.mkdirSync(path.dirname(dst), { recursive: true });
+          fs.cpSync(path.join(nameDir, ver), dst, { recursive: true });
+        }
+      }
+    }
+  } catch (e) { console.error('[typst-editor] package seed failed:', e.message); }
+  return cacheRoot;
+}
 
 function startServer() {
   serverProc = utilityProcess.fork(path.join(ROOT, 'server.js'), [], {
@@ -35,6 +60,7 @@ function startServer() {
       PATH: augmentedPath(),
       TYPST_WORKSPACE: WORKSPACE,
       TYPST_DIST: path.join(ROOT, 'dist'),
+      ...(PKG_CACHE ? { TYPST_PACKAGE_CACHE_PATH: PKG_CACHE } : {}),
     },
   });
   // Surface a crashed backend instead of leaving a blank window.
@@ -85,8 +111,30 @@ ipcMain.handle('pick-folder', async () => {
   return r.canceled || !r.filePaths.length ? null : r.filePaths[0];
 });
 
-app.whenReady().then(() => { startServer(); waitForServer(createWindow); });
+// Is the backend currently responding?
+function serverAlive(cb) {
+  const req = http.get('http://127.0.0.1:3001/tools', () => { req.destroy(); cb(true); });
+  req.on('error', () => cb(false));
+  req.setTimeout(1000, () => { req.destroy(); cb(false); });
+}
 
-app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
-app.on('window-all-closed', () => { if (serverProc) serverProc.kill(); if (process.platform !== 'darwin') app.quit(); });
+// Make sure the backend is up (restart it if it died), then run cb.
+function ensureServerThen(cb) {
+  serverAlive((alive) => {
+    if (alive) return cb();
+    try { if (serverProc) serverProc.kill(); } catch { /* ignore */ }
+    startServer();
+    waitForServer(cb);
+  });
+}
+
+app.whenReady().then(() => { PKG_CACHE = seedPackages(); startServer(); waitForServer(createWindow); });
+
+// Reopening from the dock: the server may have been left running (good) or died —
+// ensure it's up before loading the window, so we never land on a blank page.
+app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) ensureServerThen(createWindow); });
+
+// On macOS keep the app AND its backend alive when the window closes, so
+// reopening is instant. On Windows/Linux, quitting stops the backend.
+app.on('window-all-closed', () => { if (process.platform !== 'darwin') { if (serverProc) serverProc.kill(); app.quit(); } });
 app.on('before-quit', () => { if (serverProc) serverProc.kill(); });

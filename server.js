@@ -671,6 +671,14 @@ app.get('/template/preview', (req, res) => {
 // Typst package cache — list what's installed locally, and download new ones.
 // ---------------------------------------------------------------------------
 function typstCacheDir() {
+  // In the desktop app, packages live in the app-managed cache (seeded from the
+  // bundled packages) — keep the Packages UI and the compiler pointed at the
+  // same place.
+  if (process.env.TYPST_PACKAGE_CACHE_PATH) {
+    const dir = join(process.env.TYPST_PACKAGE_CACHE_PATH, 'preview');
+    try { if (!existsSync(dir)) mkdirSync(dir, { recursive: true }); } catch {}
+    return dir;
+  }
   const home = process.env.HOME || homedir();
   return [
     join(home, 'Library', 'Caches', 'typst', 'packages', 'preview'),
