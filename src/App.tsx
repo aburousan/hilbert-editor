@@ -1506,7 +1506,7 @@ export default function App() {
       {showPlot3D && <Plot3DStudio onClose={() => setShowPlot3D(false)} onInsert={(code) => { insertCode(code); setShowPlot3D(false); fetchTree(); }} />}
       {showSymbolDraw && <SymbolDraw onClose={() => setShowSymbolDraw(false)} onInsert={(name) => { insertCode(name + ' '); setShowSymbolDraw(false); }} />}
       {showRefManager && activeTab && <RefManager content={activeTab.content} onClose={() => setShowRefManager(false)} onJump={jumpToLine} onInsertRef={(name) => insertCode(`@${name}`)} />}
-      {showBibManager && <BibManager onClose={() => setShowBibManager(false)} onCite={(key) => insertCode(`@${key}`)} onEnsureBib={ensureBibliography} onChanged={fetchTree} />}
+      {showBibManager && <BibManager onClose={() => setShowBibManager(false)} onCite={(key) => { insertCode(`@${key}`); ensureBibliography(); }} onEnsureBib={ensureBibliography} onChanged={fetchTree} />}
       
       {showHistoryModal && (
         <div className="modal-overlay" onClick={() => setShowHistoryModal(false)}>
