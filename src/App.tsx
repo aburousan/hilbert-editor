@@ -101,8 +101,8 @@ const DEFAULT_CODE = `#set page(paper: "a4")
 #set heading(numbering: "1.")
 #set math.equation(numbering: "(1)")
 
-#import "@preview/cetz:0.3.2"
-#import "@preview/physica:0.9.3": *
+#import "@preview/cetz:0.3.4"
+#import "@preview/physica:0.9.5": *
 
 = Typst with Physics and CeTZ!
 
@@ -921,7 +921,7 @@ export default function App() {
       }
     }
   })`;
-      const imp = '#import "@preview/cetz:0.3.2": canvas, draw\n';
+      const imp = '#import "@preview/cetz:0.3.4": canvas, draw\n';
       const tag = v.label ? ` <fig:${v.label}>` : '';
       insertCode(`\n${imp}#figure(\n  ${canvas},\n  caption: [${v.caption}],\n)${tag}\n\n`);
     }

@@ -12,7 +12,7 @@
     // Only check the top level, don't descend into the child, since we don't
     // care if the child is a parenthesis group that contains +/-.
     for child in seq.at("children") {
-      if child == [+] or child == [#sym.minus] { return true }
+      if child == [#math.plus] or child == [#sym.minus] { return true }
     }
     return false
   }
@@ -50,8 +50,8 @@
   for i in range(inner_children.len()) {
     let e = inner_children.at(i)
     if e == [ ] or e == [] { continue; }
-    if e != [,] { current_element_pieces.push(e) }
-    if e == [,] or (i == inner_children.len() - 1) {
+    if e != [#math.comma] { current_element_pieces.push(e) }
+    if e == [#math.comma] or (i == inner_children.len() - 1) {
       if current_element_pieces.len() > 0 {
         result_elements.push(current_element_pieces.join())
         current_element_pieces = ()
@@ -78,7 +78,7 @@
     let children = e.at("children")
     for i in range(children.len()) {
       let child = children.at(i)
-      if child == [+] {
+      if child == [#math.plus] {
         operands.push(current_operand.join())
         current_operand = ()
         continue;
@@ -137,7 +137,7 @@
     expr_terms.push([#num_sum])  // make a Content object holding the number
   }
 
-  return expr_terms.join([+])
+  return expr_terms.join([#math.plus])
 }
 
 // == Braces
@@ -160,7 +160,6 @@
 #let evaluated(content) = {
   $lr(zwj#content|)$
 }
-#let eval = evaluated
 
 #let expectationvalue(..sink) = {
   let args = sink.pos()  // array
@@ -179,21 +178,23 @@
 
 #let vecrow(..sink) = {
   let (args, kwargs) = (sink.pos(), sink.named())  // array, dictionary
-  let delim = kwargs.at("delim", default:"(")
-  let rdelim = if delim == "(" {
-    ")"
+  let delim = kwargs.at("delim", default: "(")
+  let (ldelim, rdelim) = if delim == "(" {
+    (math.paren.l, math.paren.r)
   } else if delim == "[" {
-    "]"
+    (math.bracket.l, math.bracket.r)
   } else if delim == "{" {
-    "}"
+    (math.brace.l, math.brace.r)
   } else if delim == "|" {
-    "|"
+    (math.bar.v, math.bar.v)
   } else if delim == "||" {
-    "||"
-  } else { delim }
+    (math.bar.v.double, math.bar.v.double)
+  } else {
+    (delim, delim)
+  }
   // not math.mat(), because the look would be off: the content
   // appear smaller than the sorrounding delimiter pair.
-  $lr(#delim #args.join([,]) #rdelim)$
+  $lr(#ldelim #args.join([#math.comma]) #rdelim)$
 }
 
 // Prefer using super-T-as-transpose() found below.
@@ -345,7 +346,7 @@
   assert(type(xs) == array, message: "expecting an array of variable names")
   let arrays = ()  // array of arrays
   for f in fs {
-    arrays.push(xs.map((x) => __mate(math.frac($diff#f$, $diff#x$), big)))
+    arrays.push(xs.map((x) => __mate(math.frac($partial#f$, $partial#x$), big)))
   }
   math.mat(delim: delim, ..arrays)
 }
@@ -364,8 +365,8 @@
     for c in range(order) {
       let xc = xs.at(c)
       row_array.push(__mate(math.frac(
-        $diff^2 #f$,
-        if xr == xc { $diff #xr^2$ } else { $diff #xr diff #xc$ }
+        $partial^2 #f$,
+        if xr == xc { $partial #xr^2$ } else { $partial #xr partial #xc$ }
       ), big))
     }
     row_arrays.push(row_array)
@@ -462,7 +463,7 @@
 #let bra(f) = $lr(angle.l #f|)$
 #let ket(f) = $lr(|#f angle.r)$
 
-#let braket(..sink) = style(styles => {
+#let braket(..sink) = {
   let args = sink.pos()  // array
 
   let bra = args.at(0, default: none)
@@ -474,9 +475,9 @@
     let middle = args.at(1)
     $ lr(angle.l bra#h(0pt)mid(|)#h(0pt)middle#h(0pt)mid(|)#h(0pt)ket angle.r) $
   }
-})
+}
 
-#let ketbra(..sink) = style(styles => {
+#let ketbra(..sink) = {
   let args = sink.pos()  // array
   assert(args.len() == 1 or args.len() == 2, message: "expecting 1 or 2 args")
 
@@ -484,11 +485,11 @@
   let bra = args.at(1, default: ket)
 
   $ lr(|ket#h(0pt)mid(angle.r#h(0pt)angle.l)#h(0pt)bra|) $
-})
+}
 
-#let matrixelement(n, M, m) = style(styles => {
+#let matrixelement(n, M, m) = {
   $ lr(angle.l #n#h(0pt)mid(|)#h(0pt)#M#h(0pt)mid(|)#h(0pt)#m angle.r) $
-})
+}
 
 #let mel = matrixelement
 
@@ -538,7 +539,9 @@
 #let Re = math.op("Re")
 #let Im = math.op("Im")
 
-#let sgn = $op("sgn")$
+#let sgn = math.op("sgn")
+
+#let lb = math.op("lb")
 
 // == Differentials
 
@@ -616,6 +619,25 @@
   return naive_result
 }
 
+#let __derivative_display(upper, func, denom, slash) = context {
+  if slash == none {
+    let num = $#upper#func$
+    math.frac(num, denom)
+  } else if slash == "large" {
+    let operator = $#upper/#denom$
+    /* Measure in math block mode for correct height
+     * (See eg. https://github.com/ssotoen/gridlock/issues/2) */
+    let size_op   = measure($ #operator $).height
+    let size_func = measure($ #func     $).height
+    let bestsize  = calc.max(size_op, size_func)
+    $#operator lr(#func, size: #bestsize)$
+  } else {
+    let num = $#upper#func$
+    let sep = (sym.zwj, slash, sym.zwj).join()
+    $#num#sep#denom$
+  }
+}
+
 #let derivative(f, ..sink) = {
   if f == [] { f = none }  // Convert empty content to none
 
@@ -628,23 +650,14 @@
   let var = args.at(0)
   assert(args.len() >= 1, message: "expecting at least one argument")
 
-  let display(num, denom, slash) = {
-    if slash == none {
-      $#num/#denom$
-    } else {
-      let sep = (sym.zwj, slash, sym.zwj).join()
-      $#num#sep#denom$
-    }
-  }
-
   if args.len() >= 2 {  // i.e. specified the order
     let order = args.at(1)  // Not necessarily representing a number
-    let upper = if f == none { $#d^#order$ } else { $#d^#order#f$ }
+    let upper = $#d^#order$
     let varorder = __combine_var_order(var, order)
-    display(upper, $#d#varorder$, slash)
+    __derivative_display(upper, f, $#d#varorder$, slash)
   } else {  // i.e. no order specified
-    let upper = if f == none { $#d$ } else { $#d#f$ }
-    display(upper, $#d#var$, slash)
+    let upper = $#d$
+    __derivative_display(upper, f, $#d#var$, slash)
   }
 }
 #let dv = derivative
@@ -691,35 +704,28 @@
     __bare_minimum_effort_symbolic_add(orders)
   }
 
+  let d = kwargs.at("d", default: $partial$)
+
   let lowers = ()
   for i in range(var_num) {
     let var = args.at(1 + i)  // 1st element is the function name, skip
     let order = orders.at(i)
     if order == [1] {
-      lowers.push($diff#var$)
+      lowers.push($#d#var$)
     } else {
       let varorder = __combine_var_order(var, order)
-      lowers.push($diff#varorder$)
+      lowers.push($#d#varorder$)
     }
   }
 
   let upper = if total_order != 1 and total_order != [1] {  // number or Content
-    if f == none { $diff^#total_order$ } else { $diff^#total_order#f$ }
+    $#d^#total_order$
   } else {
-    if f == none { $diff$ } else { $diff #f$ }
-  }
-
-  let display(num, denom, slash) = {
-    if slash == none {
-      math.frac(num, denom)
-    } else {
-      let sep = (sym.zwj, slash, sym.zwj).join()
-      $#num#sep#denom$
-    }
+    $#d$
   }
 
   let slash = kwargs.at("s", default: none)
-  display(upper, lowers.join(), slash)
+  __derivative_display(upper, f, lowers.join(), slash)
 }
 #let pdv = partialderivative
 
@@ -764,12 +770,12 @@
       if e.func() == math.equation {
         return __eligible(e.at("body"))
       }
-      ((e != [∫]) and (e != [|]) and (e != [‖])
-        and (e != [∑]/*U+2211, not greek Sigma U+03A3*/)
-        and (e != [∏]/*U+220F, not greek Pi U+03A0 */))
+      ((e != $∫$.body) and (e != $|$.body) and (e != $‖$.body)
+        and (e != $∑$.body/*U+2211, not greek Sigma U+03A3*/)
+        and (e != $∏$.body/*U+220F, not greek Pi U+03A0 */))
     }
 
-    if __eligible(elem.base) and elem.at("t", default: none) == [T] {
+    if __eligible(elem.base) and elem.at("t", default: none) == $T$.body {
       $attach(elem.base, t: TT, b: elem.at("b", default: #none))$
     } else {
       elem
@@ -801,7 +807,7 @@
       true
     }
 
-    if __eligible(elem.base) and elem.at("t", default: none) == [+] {
+    if __eligible(elem.base) and elem.at("t", default: none) == [#math.plus] {
       $attach(elem.base, t: dagger, b: elem.at("b", default: #none))$
     } else {
       elem
@@ -819,24 +825,25 @@
 
   for i in range(args.len()) {
     let arg = args.at(i)
-    let tuple = if arg.has("children") {
-      arg.at("children")
+    let tuple = if type(arg) == content and arg.has("children") {
+      if arg.children.at(0) in ([+], [#math.plus], [-], [#sym.minus]) {
+        arg.children
+      } else {
+        ([#math.plus],..arg.children)
+      }
     } else {
-      ([+], sym.square)
+      ([#math.plus], arg)
     }
     assert(type(tuple) == array, message: "shall be array")
 
     let pos = tuple.at(0)
-    let symbol = if tuple.len() >= 2 {
-      tuple.slice(1).join()
-    } else {
-      sym.square
-    }
-    if pos == [+] {
+    let symbol = tuple.slice(1).join()
+
+    if pos == [#math.plus] {
       let rendering = $#symbol$
       uppers.push(rendering)
       lowers.push(hphantom(rendering))
-    } else {  // Curiously, equality with [-] is always false, so we don't do it
+    } else {
       let rendering = $#symbol$
       uppers.push(hphantom(rendering))
       lowers.push(rendering)
@@ -898,9 +905,10 @@
   } else if e == "=" {
     return rect(width: W, height: 1em, stroke: (top: style, bottom: style))
   } else if e == "#" {
-    return path(stroke: style, closed: false,
-      (0em, 0em), (W * 50%, 0em), (0em, 1em), (W, 1em),
-      (W * 50%, 1em), (W, 0em), (W * 50%, 0em),
+    return curve(stroke: style,
+      curve.move((0em, 0em)), curve.line((W * 50%, 0em)), curve.line((0em, 1em)),
+      curve.line((W, 1em)), curve.line((W * 50%, 1em)), curve.line((W, 0em)),
+      curve.line((W * 50%, 0em)),
     )
   } else if e == "|" {
     return line(start: (0em, 0em), end: (0em, 1em), stroke: style)
@@ -913,21 +921,22 @@
   } else if e == "F" {
     return line(start: (0em, 0em), end: (W, 1em), stroke: style)
   } else if e == "<" {
-    return path(stroke: style, closed: false, (W, 0em), (0em, 0.5em), (W, 1em))
+    return curve(stroke: style,
+      curve.move((W, 0em)), curve.line((0em, 0.5em)), curve.line((W, 1em)))
   } else if e == ">" {
-    return path(stroke: style, closed: false, (0em, 0em), (W, 0.5em), (0em, 1em))
+    return curve(stroke: style,
+      curve.move((0em, 0em)), curve.line((W, 0.5em)), curve.line((0em, 1em)))
   } else if e == "C" {
-    return path(stroke: style, closed: false, (0em, 1em), ((W, 0em), (-W * 75%, 0.05em)))
-  } else if e == "c" {
-    return path(stroke: style, closed: false, (0em, 1em), ((W * 50%, 0em), (-W * 38%, 0.05em)))
+    return curve(stroke: style,
+      curve.move((0em, 1em)), curve.quad((W * 20%, 0.2em), (W, 0em)))
   } else if e == "D" {
-    return path(stroke: style, closed: false, (0em, 0em), ((W, 1em), (-W * 75%, -0.05em)))
-  } else if e == "d" {
-    return path(stroke: style, closed: false, (0em, 0em), ((W * 50%, 1em), (-W * 38%, -0.05em)))
+    return curve(stroke: style,
+      curve.move((0em, 0em)), curve.quad((W * 20%, 0.8em), (W, 1em)))
   } else if e == "X" {
-    return path(stroke: style, closed: false,
-      (0em, 0em), (W * 50%, 0.5em), (0em, 1em),
-      (W, 0em), (W * 50%, 0.5em), (W, 1em),
+    return curve(stroke: style,
+      curve.move((0em, 0em)), curve.line((W, 1em)),
+      curve.line((W * 50%, 0.5em)), curve.line((W, 0em)),
+      curve.line((0em, 1em))
     )
   } else {
     return "[" + e + "]"

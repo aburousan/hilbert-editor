@@ -38,7 +38,7 @@ export default function DiagramBuilder({ onClose, onInsert }: { onClose: () => v
     } else {
       body = `      plot.add(domain: (${domain}), t => (${paramX}, ${paramY}))\n`;
     }
-    const imports = `#import "@preview/cetz:0.3.2"\n#import "@preview/cetz-plot:0.1.1": plot\n`;
+    const imports = `#import "@preview/cetz:0.3.4"\n#import "@preview/cetz-plot:0.1.1": plot\n`;
     const canvas = `cetz.canvas({\n  plot.plot(size: (8, 6),\n    x-label: [${plotX}], y-label: [${plotY}],\n    {\n${body}    })\n})`;
     return { imports, canvas };
   };
@@ -54,7 +54,7 @@ export default function DiagramBuilder({ onClose, onInsert }: { onClose: () => v
     } else {
       inner = `  grid((0, 0), (4, 4), step: 1, stroke: gray.lighten(50%))\n  circle((2, 2), radius: 1, fill: red.transparentize(20%))\n  content((2, 2), [*Center*])\n`;
     }
-    const imports = `#import "@preview/cetz:0.3.2": canvas, draw\n`;
+    const imports = `#import "@preview/cetz:0.3.4": canvas, draw\n`;
     const canvas = `canvas({\n  import draw: *\n${inner}})`;
     return { imports, canvas };
   };
