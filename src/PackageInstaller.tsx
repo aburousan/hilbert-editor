@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import './PackageInstaller.css';
 
-const API = 'http://localhost:3001';
+import { API } from './api';
 
 interface Package { name: string; version: string; description: string; authors: string[]; }
 interface PackageInstallerProps { onInsert: (pkg: Package) => void; onClose: () => void; }

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo, lazy, Suspense } from 'react';
+import { API } from './api';
 import Editor, { useMonaco } from '@monaco-editor/react';
 import { setupTypstLanguage, lookupTypstDoc, type TypstDoc } from './typstMonaco';
 import { PackageInstaller } from './PackageInstaller';
@@ -256,7 +257,7 @@ export default function App() {
 
   const fetchTree = async () => {
     try {
-      const res = await fetch('http://localhost:3001/workspace');
+      const res = await fetch(`${API}/workspace`);
       if (res.ok) setFileTree(await res.json());
     } catch(e) {}
   };
@@ -267,14 +268,14 @@ export default function App() {
     try {
       for (const tab of tabs) {
         if (tab.isDirty || tab.path === mainFile) {
-          await fetch(`http://localhost:3001/workspace/file?path=${encodeURIComponent(tab.path)}`, {
+          await fetch(`${API}/workspace/file?path=${encodeURIComponent(tab.path)}`, {
             method: 'POST', body: tab.content, headers: { 'Content-Type': 'text/plain' }
           });
           if (tab.isDirty) syncToDisk(tab.path, tab.content);   // mirror edits to the opened folder on disk
         }
       }
       
-      const res = await fetch(`http://localhost:3001/compile?main=${encodeURIComponent(mainFile)}`, { method: 'POST' });
+      const res = await fetch(`${API}/compile?main=${encodeURIComponent(mainFile)}`, { method: 'POST' });
       if (!res.ok) {
         const errData = await res.json();
         setErrorLogs(errData.error || 'Compilation failed');
@@ -323,7 +324,7 @@ export default function App() {
   const saveActiveFile = useCallback(async () => {
     if (!activeTab) return;
     try {
-      await fetch(`http://localhost:3001/workspace/file?path=${encodeURIComponent(activeTab.path)}`, {
+      await fetch(`${API}/workspace/file?path=${encodeURIComponent(activeTab.path)}`, {
         method: 'POST', body: activeTab.content, headers: { 'Content-Type': 'text/plain' }
       });
       syncToDisk(activeTab.path, activeTab.content);   // mirror to the opened folder on disk
@@ -339,7 +340,7 @@ export default function App() {
     if (localStorage.getItem('webdav_autosync') !== 'true') return;
     const url = localStorage.getItem('webdav_url');
     if (!url) return;
-    fetch('http://localhost:3001/webdav/sync', {
+    fetch(`${API}/webdav/sync`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url, username: localStorage.getItem('webdav_user') || '', password: localStorage.getItem('webdav_pass') || '', projectName })
     }).catch(() => {});
@@ -387,7 +388,7 @@ export default function App() {
     }
     if (!tabs.find(t => t.path === path)) {
       try {
-        const res = await fetch(`http://localhost:3001/workspace/file?path=${encodeURIComponent(path)}`);
+        const res = await fetch(`${API}/workspace/file?path=${encodeURIComponent(path)}`);
         if (res.ok) {
           const content = await res.text();
           setTabs(prev => [...prev, { path, content, isDirty: false }]);
@@ -412,7 +413,7 @@ export default function App() {
     e.stopPropagation();
     if (!confirm(`Delete ${isDir ? 'folder' : 'file'} "${path}"?${isDir ? '\nAll of its contents will be removed.' : ''}`)) return;
     try {
-      await fetch(`http://localhost:3001/workspace/file?path=${encodeURIComponent(path)}`, { method: 'DELETE' });
+      await fetch(`${API}/workspace/file?path=${encodeURIComponent(path)}`, { method: 'DELETE' });
     } catch {}
     setTabs(prev => {
       const remaining = prev.filter(t => t.path !== path && !t.path.startsWith(path + '/'));
@@ -427,7 +428,7 @@ export default function App() {
   const createNewFile = async () => {
     const name = prompt('File name (use a slash for a subfolder, e.g. chapters/intro.typ):', 'new.typ');
     if (!name) return;
-    await fetch(`http://localhost:3001/workspace/file?path=${encodeURIComponent(name)}`, { method: 'POST', body: '' });
+    await fetch(`${API}/workspace/file?path=${encodeURIComponent(name)}`, { method: 'POST', body: '' });
     fetchTree();
     openFile(name);
   };
@@ -435,7 +436,7 @@ export default function App() {
   const createNewFolder = async () => {
     const name = prompt('Folder name (e.g. images):', 'images');
     if (!name) return;
-    await fetch(`http://localhost:3001/workspace/mkdir?path=${encodeURIComponent(name)}`, { method: 'POST' });
+    await fetch(`${API}/workspace/mkdir?path=${encodeURIComponent(name)}`, { method: 'POST' });
     fetchTree();
   };
 
@@ -449,7 +450,7 @@ export default function App() {
       const folder = (prompt('Destination folder (leave blank for the project root):', 'images') || '').replace(/^\/+|\/+$/g, '');
       const path = folder ? `${folder}/${file.name}` : file.name;
       const buf = await file.arrayBuffer();
-      await fetch(`http://localhost:3001/workspace/upload?path=${encodeURIComponent(path)}`, { method: 'POST', body: buf, headers: { 'Content-Type': 'application/octet-stream' } });
+      await fetch(`${API}/workspace/upload?path=${encodeURIComponent(path)}`, { method: 'POST', body: buf, headers: { 'Content-Type': 'application/octet-stream' } });
       await fetchTree();
       const ext = (file.name.split('.').pop() || '').toLowerCase();
       if (IMG_EXT.includes(ext)) insertCode(`\n#figure(\n  image("${path}", width: 80%),\n  caption: [],\n)\n`);
@@ -467,7 +468,7 @@ export default function App() {
       if (!file) return;
       const text = await file.text();
       const name = file.name;
-      await fetch(`http://localhost:3001/workspace/file?path=${encodeURIComponent(name)}`, { method: 'POST', body: text, headers: { 'Content-Type': 'text/plain' } });
+      await fetch(`${API}/workspace/file?path=${encodeURIComponent(name)}`, { method: 'POST', body: text, headers: { 'Content-Type': 'text/plain' } });
       await fetchTree();
       setTabs(prev => prev.find(t => t.path === name)
         ? prev.map(t => t.path === name ? { ...t, content: text, isDirty: false } : t)
@@ -494,10 +495,10 @@ export default function App() {
         const ext = (f.name.split('.').pop() || '').toLowerCase();
         if (TEXT_EXT.includes(ext)) {
           const text = await f.text();
-          await fetch(`http://localhost:3001/workspace/file?path=${encodeURIComponent(rel)}`, { method: 'POST', body: text, headers: { 'Content-Type': 'text/plain' } });
+          await fetch(`${API}/workspace/file?path=${encodeURIComponent(rel)}`, { method: 'POST', body: text, headers: { 'Content-Type': 'text/plain' } });
         } else {
           const buf = await f.arrayBuffer();
-          await fetch(`http://localhost:3001/workspace/upload?path=${encodeURIComponent(rel)}`, { method: 'POST', body: buf, headers: { 'Content-Type': 'application/octet-stream' } });
+          await fetch(`${API}/workspace/upload?path=${encodeURIComponent(rel)}`, { method: 'POST', body: buf, headers: { 'Content-Type': 'application/octet-stream' } });
         }
       }
       await fetchTree();
@@ -525,13 +526,13 @@ export default function App() {
     setErrorLogs(null);
     setPdfUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
     if (projectDisplayName) setProjectName(projectDisplayName);
-    const tree: FileNode[] = await (await fetch('http://localhost:3001/workspace')).json();
+    const tree: FileNode[] = await (await fetch(`${API}/workspace`)).json();
     setFileTree(tree);
     // Open a starter file directly (don't route through openFile, whose closure
     // still holds the pre-switch tab list).
     const first = findFirstTyp(tree);
     if (first) {
-      const r = await fetch(`http://localhost:3001/workspace/file?path=${encodeURIComponent(first)}`);
+      const r = await fetch(`${API}/workspace/file?path=${encodeURIComponent(first)}`);
       if (r.ok) { const content = await r.text(); setTabs([{ path: first, content, isDirty: false }]); setActiveTabPath(first); }
     }
   };
@@ -549,9 +550,9 @@ export default function App() {
       const file = await entry.getFile();
       const ext = (entry.name.split('.').pop() || '').toLowerCase();
       if (TEXT_EXT.includes(ext)) {
-        await fetch(`http://localhost:3001/workspace/file?path=${encodeURIComponent(rel)}`, { method: 'POST', body: await file.text(), headers: { 'Content-Type': 'text/plain' } });
+        await fetch(`${API}/workspace/file?path=${encodeURIComponent(rel)}`, { method: 'POST', body: await file.text(), headers: { 'Content-Type': 'text/plain' } });
       } else {
-        await fetch(`http://localhost:3001/workspace/upload?path=${encodeURIComponent(rel)}`, { method: 'POST', body: await file.arrayBuffer(), headers: { 'Content-Type': 'application/octet-stream' } });
+        await fetch(`${API}/workspace/upload?path=${encodeURIComponent(rel)}`, { method: 'POST', body: await file.arrayBuffer(), headers: { 'Content-Type': 'application/octet-stream' } });
       }
     }
   };
@@ -567,7 +568,7 @@ export default function App() {
       const folder: string | null = await desktop.pickFolder();
       if (!folder || !folder.trim()) return;
       try {
-        const res = await fetch('http://localhost:3001/workspace/root', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: folder }) });
+        const res = await fetch(`${API}/workspace/root`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: folder }) });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) { alert(data.error || 'Could not open that folder.'); return; }
         dirHandleRef.current = null;   // desktop backend edits the folder directly
@@ -586,7 +587,7 @@ export default function App() {
           alert('Write permission is needed so your edits save back to the folder.'); return;
         }
         if (!confirm(`Open “${dir.name}” as the workspace? Your edits will be saved back to this folder on disk.`)) return;
-        await fetch('http://localhost:3001/workspace/clear', { method: 'POST' });
+        await fetch(`${API}/workspace/clear`, { method: 'POST' });
         dirHandleRef.current = dir;
         await importDirHandle(dir, '');
         await loadWorkspace(dir.name);
@@ -605,7 +606,7 @@ export default function App() {
       const rootName = (((files[0] as any).webkitRelativePath || files[0].name).split('/')[0]) || 'Project';
       if (!confirm(`Open “${rootName}” as the workspace? This browser can't save edits back to disk, so a working copy is imported (${files.length} files). Use the desktop app or Chrome to edit the folder in place.`)) return;
       try {
-        await fetch('http://localhost:3001/workspace/clear', { method: 'POST' });
+        await fetch(`${API}/workspace/clear`, { method: 'POST' });
         dirHandleRef.current = null;
         for (const f of files) {
           const rel = (f as any).webkitRelativePath || f.name;
@@ -613,9 +614,9 @@ export default function App() {
           const dest = rel.split('/').slice(1).join('/') || f.name;   // drop the folder's own name
           const ext = (f.name.split('.').pop() || '').toLowerCase();
           if (TEXT_EXT.includes(ext)) {
-            await fetch(`http://localhost:3001/workspace/file?path=${encodeURIComponent(dest)}`, { method: 'POST', body: await f.text(), headers: { 'Content-Type': 'text/plain' } });
+            await fetch(`${API}/workspace/file?path=${encodeURIComponent(dest)}`, { method: 'POST', body: await f.text(), headers: { 'Content-Type': 'text/plain' } });
           } else {
-            await fetch(`http://localhost:3001/workspace/upload?path=${encodeURIComponent(dest)}`, { method: 'POST', body: await f.arrayBuffer(), headers: { 'Content-Type': 'application/octet-stream' } });
+            await fetch(`${API}/workspace/upload?path=${encodeURIComponent(dest)}`, { method: 'POST', body: await f.arrayBuffer(), headers: { 'Content-Type': 'application/octet-stream' } });
           }
         }
         await loadWorkspace(rootName);
@@ -635,7 +636,7 @@ export default function App() {
       if (!file) return;
       const text = await file.text();
       const name = file.name;
-      await fetch(`http://localhost:3001/workspace/file?path=${encodeURIComponent(name)}`, { method: 'POST', body: text, headers: { 'Content-Type': 'text/plain' } });
+      await fetch(`${API}/workspace/file?path=${encodeURIComponent(name)}`, { method: 'POST', body: text, headers: { 'Content-Type': 'text/plain' } });
       await fetchTree();
       const ext = (name.split('.').pop() || '').toLowerCase();
       let snippet: string;

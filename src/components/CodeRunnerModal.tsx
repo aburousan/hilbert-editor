@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 
-const API = 'http://localhost:3001';
+import { API } from '../api';
 
 type Lang = 'python' | 'julia' | 'wolfram';
 type Interp = { label: string; path: string };

@@ -26,6 +26,25 @@ fs.mkdirSync(WORKSPACE, { recursive: true });
 
 let serverProc = null;
 let PKG_CACHE = null;
+let PORT = 3001;
+
+// Prefer the standard port, but fall back to an ephemeral one when it's taken —
+// otherwise the window would silently attach to whatever is squatting on 3001
+// (a dev server, a second instance, an unrelated app) instead of our backend.
+function findFreePort(preferred) {
+  const net = require('net');
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.once('error', () => {
+      const any = net.createServer();
+      any.listen(0, '127.0.0.1', () => {
+        const port = any.address().port;
+        any.close(() => resolve(port));
+      });
+    });
+    probe.listen(preferred, '127.0.0.1', () => probe.close(() => resolve(preferred)));
+  });
+}
 
 // Copy the Typst packages bundled with the app into a writable cache dir and
 // return that dir (which contains preview/<name>/<version>). Pointing typst at
@@ -61,6 +80,7 @@ function startServer() {
     env: {
       ...process.env,
       PATH: augmentedPath(),
+      PORT: String(PORT),
       TYPST_WORKSPACE: WORKSPACE,
       TYPST_DIST: path.join(ROOT, 'dist'),
       ...(PKG_CACHE ? { TYPST_PACKAGE_CACHE_PATH: PKG_CACHE } : {}),
@@ -73,7 +93,7 @@ function startServer() {
 }
 
 function waitForServer(cb, tries = 0) {
-  http.get('http://127.0.0.1:3001/tools', () => cb())
+  http.get(`http://127.0.0.1:${PORT}/tools`, () => cb())
     .on('error', () => (tries < 100 ? setTimeout(() => waitForServer(cb, tries + 1), 200) : cb(new Error('backend-timeout'))));
 }
 
@@ -89,13 +109,12 @@ function createWindow(err) {
     win.loadURL('data:text/html,' + encodeURIComponent(
       `<body style="font:16px system-ui;background:#0f172a;color:#e2e8f0;padding:3rem;line-height:1.6">
        <h2>Typst Editor couldn't start its local engine.</h2>
-       <p>The built-in server didn't respond on port 3001 — another app may be using
-       that port. Quit anything on port 3001 and reopen. If it persists, please
+       <p>The built-in server didn't respond. Reopen the app; if it persists, please
        report it at <a style="color:#a78bfa" href="https://github.com/aburousan/typsteditor/issues">github.com/aburousan/typsteditor/issues</a>.</p>
        </body>`));
     return;
   }
-  const APP_URL = 'http://127.0.0.1:3001';
+  const APP_URL = `http://127.0.0.1:${PORT}`;
   win.loadURL(APP_URL);
   // If the page fails to load or the renderer dies (a transient race while the
   // backend is warming up, etc.), retry rather than leaving a blank window.
@@ -116,7 +135,7 @@ ipcMain.handle('pick-folder', async () => {
 
 // Is the backend currently responding?
 function serverAlive(cb) {
-  const req = http.get('http://127.0.0.1:3001/tools', () => { req.destroy(); cb(true); });
+  const req = http.get(`http://127.0.0.1:${PORT}/tools`, () => { req.destroy(); cb(true); });
   req.on('error', () => cb(false));
   req.setTimeout(1000, () => { req.destroy(); cb(false); });
 }
@@ -131,7 +150,12 @@ function ensureServerThen(cb) {
   });
 }
 
-app.whenReady().then(() => { PKG_CACHE = seedPackages(); startServer(); waitForServer(createWindow); });
+app.whenReady().then(async () => {
+  PORT = await findFreePort(3001);
+  PKG_CACHE = seedPackages();
+  startServer();
+  waitForServer(createWindow);
+});
 
 // Reopening from the dock: the server may have been left running (good) or died —
 // ensure it's up before loading the window, so we never land on a blank page.

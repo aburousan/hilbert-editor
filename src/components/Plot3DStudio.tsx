@@ -10,7 +10,7 @@ function toJs(expr: string): string {
     .replace(/\bY\b/g, 'y');
 }
 
-const API = 'http://localhost:3001';
+import { API } from '../api';
 
 export default function Plot3DStudio({ onClose, onInsert }: { onClose: () => void, onInsert: (code: string) => void }) {
   const mountRef = useRef<HTMLDivElement | null>(null);

@@ -1,6 +1,6 @@
 import { useState } from 'react';
 
-const API = 'http://localhost:3001';
+import { API } from '../api';
 
 type Fmt = 'pdf' | 'html' | 'typ' | 'folder';
 

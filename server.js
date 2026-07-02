@@ -888,7 +888,9 @@ app.post('/packages/remove', (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
-const PORT = 3001;
+// The desktop app passes PORT so it can pick a free one when 3001 is taken
+// (by the dev server, another instance, or an unrelated program).
+const PORT = Number(process.env.PORT) || 3001;
 // Bind to loopback by default so the server is never reachable from the network.
 // In Docker set HOST=0.0.0.0 and publish the port to 127.0.0.1 on the host.
 const HOST = process.env.HOST || '127.0.0.1';

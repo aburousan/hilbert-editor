@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 
-const API = 'http://localhost:3001';
+import { API } from '../api';
 const BIB = 'refs.bib';
 
 // ---------------------------------------------------------------------------

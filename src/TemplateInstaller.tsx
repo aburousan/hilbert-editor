@@ -4,7 +4,7 @@ import './PackageInstaller.css';
 interface Template { name: string; version: string; description: string; authors: string[]; }
 interface TemplateInstallerProps { onInsert: (code: string) => void; onClose: () => void; }
 
-const API = 'http://localhost:3001';
+import { API } from './api';
 
 export function TemplateInstaller({ onInsert, onClose }: TemplateInstallerProps) {
   const [query, setQuery] = useState('');
