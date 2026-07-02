@@ -1,6 +1,6 @@
 // Electron shell: runs the local backend (which also serves the built UI) and
 // opens it in a native window. Build the UI first with `npm run build`.
-const { app, BrowserWindow, shell, utilityProcess } = require('electron');
+const { app, BrowserWindow, shell, utilityProcess, ipcMain, dialog } = require('electron');
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
@@ -34,12 +34,18 @@ function createWindow() {
     width: 1440, height: 920, minWidth: 900, minHeight: 600,
     title: 'Typst Editor',
     backgroundColor: '#0f172a',
-    webPreferences: { contextIsolation: true },
+    webPreferences: { contextIsolation: true, preload: path.join(__dirname, 'preload.cjs') },
   });
   win.loadURL('http://127.0.0.1:3001');
   // Open external links (mailto:, https:) in the real browser, not the app.
   win.webContents.setWindowOpenHandler(({ url }) => { shell.openExternal(url); return { action: 'deny' }; });
 }
+
+// Native folder picker for "Open Folder" (renderer calls window.desktop.pickFolder()).
+ipcMain.handle('pick-folder', async () => {
+  const r = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'], title: 'Open Folder as Workspace' });
+  return r.canceled || !r.filePaths.length ? null : r.filePaths[0];
+});
 
 app.whenReady().then(() => { startServer(); waitForServer(createWindow); });
 

@@ -452,6 +452,51 @@ export default function App() {
     input.click();
   };
 
+  // Find a sensible file to open in a freshly-opened folder (prefer main.typ,
+  // then any .typ, searching nested folders last).
+  const findFirstTyp = (nodes: FileNode[]): string | null => {
+    const main = nodes.find(n => n.type === 'file' && n.name === 'main.typ');
+    if (main) return main.path;
+    const anyTyp = nodes.find(n => n.type === 'file' && n.name.endsWith('.typ'));
+    if (anyTyp) return anyTyp.path;
+    for (const n of nodes) if (n.type === 'directory' && n.children) { const r = findFirstTyp(n.children); if (r) return r; }
+    return null;
+  };
+
+  // "Open Folder" (VS Code style): repoint the whole app at a folder on disk.
+  // Nothing is uploaded, copied or deleted — the current workspace is just
+  // swapped out for the chosen one (the old files stay where they are).
+  const openFolderAsRoot = async () => {
+    let folder: string | null = null;
+    const desktop = (window as any).desktop;
+    if (desktop?.pickFolder) {
+      folder = await desktop.pickFolder();               // native dialog in the desktop app
+    } else {
+      folder = prompt('Open folder — paste the absolute path to the folder to use as the workspace.\n(In Finder: right-click the folder, hold Option, choose “Copy … as Pathname”.)', '');
+    }
+    if (!folder || !folder.trim()) return;
+    try {
+      const res = await fetch('http://localhost:3001/workspace/root', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: folder }) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { alert(data.error || 'Could not open that folder.'); return; }
+      // Reset editor state to the new root.
+      setTabs([]);
+      setActiveTabPath('');
+      setHistory([]);
+      setErrorLogs(null);
+      setPdfUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
+      const tree: FileNode[] = await (await fetch('http://localhost:3001/workspace')).json();
+      setFileTree(tree);
+      // Open a starter file directly (don't route through openFile, whose closure
+      // still holds the pre-switch tab list).
+      const first = findFirstTyp(tree);
+      if (first) {
+        const r = await fetch(`http://localhost:3001/workspace/file?path=${encodeURIComponent(first)}`);
+        if (r.ok) { const content = await r.text(); setTabs([{ path: first, content, isDirty: false }]); setActiveTabPath(first); }
+      }
+    } catch { alert('Could not reach the local server.'); }
+  };
+
   // Import a data file (CSV/JSON/…) into the workspace and insert the matching
   // Typst read function so it can be used in the document.
   const insertDataFile = () => {
@@ -1133,7 +1178,8 @@ export default function App() {
                 <div className="dropdown">
                   <div className="dropdown-item" onClick={createNewFile}>New File...</div>
                   <div className="dropdown-item" onClick={() => { openFromDisk(); setActiveMenu(null); }}>Open File...</div>
-                  <div className="dropdown-item" onClick={() => { openFolderFromDisk(); setActiveMenu(null); }}>Open Folder...</div>
+                  <div className="dropdown-item" onClick={() => { openFolderAsRoot(); setActiveMenu(null); }}>Open Folder... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.72rem' }}>as workspace</span></div>
+                  <div className="dropdown-item" onClick={() => { openFolderFromDisk(); setActiveMenu(null); }}>Import Folder into Project...</div>
                   <div className="dropdown-item" onClick={() => setShowTemplateInstaller(true)}>New from Template...</div>
                   <div className="dropdown-divider"></div>
                   <div className="dropdown-item" onClick={() => { saveActiveFile(); setActiveMenu(null); }}>Save <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘S</span></div>

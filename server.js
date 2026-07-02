@@ -13,11 +13,18 @@ app.use(express.json({ limit: '50mb' }));
 
 // Workspace and built-UI locations are overridable so the packaged desktop app
 // can point them at writable / bundled paths.
-const WORKSPACE_DIR = process.env.TYPST_WORKSPACE || join(process.cwd(), 'workspace');
+// Mutable so "Open Folder" can repoint the whole app at another folder on disk
+// (VS Code style) without moving or deleting anything.
+let WORKSPACE_DIR = process.env.TYPST_WORKSPACE || join(process.cwd(), 'workspace');
 if (!existsSync(WORKSPACE_DIR)) {
   mkdirSync(WORKSPACE_DIR, { recursive: true });
 }
 const DIST_DIR = process.env.TYPST_DIST || join(process.cwd(), 'dist');
+
+// Derived scratch locations — computed from the *current* workspace each call so
+// they follow WORKSPACE_DIR when it is switched at runtime.
+const sandboxDir = () => join(WORKSPACE_DIR, 'sandbox');
+const previewCacheDir = () => join(WORKSPACE_DIR, '.previews');
 
 // Confine a user-supplied path to the workspace, blocking `../` traversal and
 // absolute paths that would escape it. Returns null when the path is unsafe.
@@ -47,6 +54,26 @@ function getTree(dir) {
 
 app.get('/workspace', (req, res) => {
   res.json(getTree(WORKSPACE_DIR));
+});
+
+// Report / switch the workspace root folder (VS Code "Open Folder"). Switching
+// just repoints the app at an existing folder on disk — nothing is copied or
+// deleted, and the old folder is left untouched.
+app.get('/workspace/root', (req, res) => {
+  res.json({ root: WORKSPACE_DIR });
+});
+
+app.post('/workspace/root', (req, res) => {
+  let { path } = req.body || {};
+  if (typeof path !== 'string' || !path.trim()) return res.status(400).json({ error: 'Folder path required.' });
+  path = path.trim().replace(/^~(?=$|\/)/, homedir());
+  let resolved;
+  try {
+    resolved = resolve(path);
+    if (!existsSync(resolved) || !statSync(resolved).isDirectory()) return res.status(400).json({ error: `Not a folder: ${resolved}` });
+  } catch { return res.status(400).json({ error: 'Cannot access that folder.' }); }
+  WORKSPACE_DIR = resolved;
+  res.json({ ok: true, root: WORKSPACE_DIR });
 });
 
 app.get('/workspace/file', (req, res) => {
@@ -442,7 +469,6 @@ app.post('/webdav/sync', async (req, res) => {
 // exposing this server to anyone else — running arbitrary code is unsafe.
 // ---------------------------------------------------------------------------
 const ALLOW_EXEC = process.env.ALLOW_CODE_EXECUTION !== '0';
-const SANDBOX_DIR = join(WORKSPACE_DIR, 'sandbox');
 const IMAGE_EXT = ['.png', '.jpg', '.jpeg', '.svg', '.gif'];
 const EXEC_TIMEOUT_MS = Number(process.env.EXEC_TIMEOUT_MS || 45000);
 
@@ -551,6 +577,7 @@ app.post('/run', (req, res) => {
   const chosen = options.find(o => o.path === bin) || options[0];
   if (!chosen) return res.status(400).json({ error: `${lang} is not available on this system.` });
 
+  const SANDBOX_DIR = sandboxDir();
   mkdirSync(SANDBOX_DIR, { recursive: true });
   const scriptName = `_run.${EXT[lang]}`;
   const scriptPath = join(SANDBOX_DIR, scriptName);
@@ -590,11 +617,11 @@ app.post('/run', (req, res) => {
 // ---------------------------------------------------------------------------
 // Render a one-page preview of a Typst Universe template (cached on disk).
 // ---------------------------------------------------------------------------
-const PREVIEW_CACHE = join(WORKSPACE_DIR, '.previews');
 app.get('/template/preview', (req, res) => {
   const name = String(req.query.name || '');
   const version = String(req.query.version || '');
   if (!/^[\w-]+$/.test(name)) return res.status(400).json({ error: 'Invalid template name.' });
+  const PREVIEW_CACHE = previewCacheDir();
   mkdirSync(PREVIEW_CACHE, { recursive: true });
   const cached = join(PREVIEW_CACHE, `${name}-${version || 'latest'}.png`);
   if (existsSync(cached)) return res.sendFile(cached, { dotfiles: 'allow' });
