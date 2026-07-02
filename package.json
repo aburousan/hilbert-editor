@@ -30,6 +30,7 @@
     "directories": {
       "output": "release"
     },
+    "asar": false,
     "files": [
       "dist/**",
       "server.js",

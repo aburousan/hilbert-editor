@@ -170,6 +170,21 @@ documents persist in the mounted `workspace/`. Keep the port on `127.0.0.1` only
 - **Cite a paper**: Insert → References → Citations, look it up by DOI/arXiv, hit **Cite**.
 - **Compute**: select an expression, Insert → Math → Compute Selection.
 
+## Troubleshooting
+
+- **macOS says the app is "damaged" or won't open** — it's ad-hoc signed but not
+  notarised. Right-click the app → **Open** (once), or run
+  `xattr -cr "/Applications/Typst Editor.app"`.
+- **Window is blank / "couldn't start its local engine"** — something else is
+  using port 3001. Quit it and reopen.
+- **It opens but nothing compiles** — the **Typst CLI** isn't installed or isn't
+  found. Install it (`brew install typst`, `winget install Typst.Typst`, or a
+  release binary) and make sure `typst --version` works. The desktop app looks in
+  the usual install locations (Homebrew, cargo, `~/.local/bin`, …).
+- **`npm run dev` only prints `concurrently "node server.js" "vite"` and stops** —
+  the dev dependencies aren't installed. Run a full `npm install` (not
+  `--production`), then `npm run dev` again.
+
 ## Configuration
 
 | Variable | Default | Purpose |
