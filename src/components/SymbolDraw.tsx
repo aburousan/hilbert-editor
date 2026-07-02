@@ -3,18 +3,16 @@ import { useEffect, useRef, useState } from 'react';
 // ---------------------------------------------------------------------------
 // Draw a maths/physics symbol with the mouse/trackpad and get the Typst code.
 //
-// Recognition is fully offline and needs no trained model: for every symbol we
-// render its Unicode glyph to an offscreen canvas, take the glyph outline as a
-// point cloud, and match the drawn strokes against those clouds with the $P
-// point-cloud recognizer (Vatavu, Anthony & Wobbrock 2012) — which is rotation-
-// free but order- and direction-invariant, so it copes with natural handwriting.
+// Fully offline, no trained model: every symbol's Unicode glyph is rendered to
+// an off-screen canvas; both the glyph and the drawn strokes are reduced to a
+// centred, aspect-preserved, Gaussian-blurred 32×32 "ink map" and compared by
+// cosine similarity. Blurring bridges the gap between a thin hand-drawn stroke
+// and a solid glyph, so distinctive shapes (∫ ∑ √ α π → …) match well.
 // ---------------------------------------------------------------------------
 
-type Pt = { x: number; y: number; id: number };
+type Pt = { x: number; y: number };
 
-// Typst symbol name (what gets inserted) + the Unicode glyph used to build the
-// template. Kept to glyphs that common math fonts render, so templates are clean.
-const SYMBOLS: { name: string; ch: string; tip?: string }[] = [
+const SYMBOLS: { name: string; ch: string }[] = [
   // Greek (lower)
   { name: 'alpha', ch: 'α' }, { name: 'beta', ch: 'β' }, { name: 'gamma', ch: 'γ' },
   { name: 'delta', ch: 'δ' }, { name: 'epsilon', ch: 'ε' }, { name: 'zeta', ch: 'ζ' },
@@ -29,9 +27,9 @@ const SYMBOLS: { name: string; ch: string; tip?: string }[] = [
   { name: 'Sigma', ch: 'Σ' }, { name: 'Phi', ch: 'Φ' }, { name: 'Psi', ch: 'Ψ' },
   { name: 'Omega', ch: 'Ω' },
   // Operators / calculus
-  { name: 'integral', ch: '∫', tip: '∫' }, { name: 'integral.double', ch: '∬' },
+  { name: 'integral', ch: '∫' }, { name: 'integral.double', ch: '∬' },
   { name: 'integral.cont', ch: '∮' }, { name: 'sum', ch: '∑' }, { name: 'product', ch: '∏' },
-  { name: 'partial', ch: '∂' }, { name: 'nabla', ch: '∇' }, { name: 'sqrt(x)', ch: '√', tip: 'sqrt' },
+  { name: 'partial', ch: '∂' }, { name: 'nabla', ch: '∇' }, { name: 'sqrt(x)', ch: '√' },
   { name: 'infinity', ch: '∞' }, { name: 'plus.minus', ch: '±' }, { name: 'minus.plus', ch: '∓' },
   { name: 'times', ch: '×' }, { name: 'div', ch: '÷' }, { name: 'dot', ch: '⋅' },
   { name: 'plus.circle', ch: '⊕' }, { name: 'times.circle', ch: '⊗' },
@@ -55,109 +53,93 @@ const SYMBOLS: { name: string; ch: string; tip?: string }[] = [
   { name: 'dagger', ch: '†' }, { name: 'hbar', ch: 'ℏ' }, { name: 'star', ch: '⋆' },
 ];
 
-const N = 48; // points per cloud
+const GRID = 32;
 
-const dist = (a: Pt, b: Pt) => Math.hypot(a.x - b.x, a.y - b.y);
-
-// Path-length resample of an (ordered) multi-stroke gesture to exactly n points.
-function resample(points: Pt[], n: number): Pt[] {
-  const pts = points.slice();
-  let path = 0;
-  for (let i = 1; i < pts.length; i++) if (pts[i].id === pts[i - 1].id) path += dist(pts[i - 1], pts[i]);
-  const I = path / (n - 1) || 1;
-  let D = 0;
-  const out: Pt[] = [pts[0]];
-  for (let i = 1; i < pts.length; i++) {
-    if (pts[i].id !== pts[i - 1].id) continue;
-    const d = dist(pts[i - 1], pts[i]);
-    if (D + d >= I) {
-      const t = (I - D) / d;
-      const np = { x: pts[i - 1].x + t * (pts[i].x - pts[i - 1].x), y: pts[i - 1].y + t * (pts[i].y - pts[i - 1].y), id: pts[i].id };
-      out.push(np);
-      pts.splice(i, 0, np);
-      D = 0;
-    } else D += d;
+// One 3×3 Gaussian pass over a GRID×GRID map.
+function blur(v: Float32Array): Float32Array {
+  const out = new Float32Array(v.length);
+  for (let y = 0; y < GRID; y++) for (let x = 0; x < GRID; x++) {
+    let s = 0, w = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const nx = x + dx, ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= GRID || ny >= GRID) continue;
+      const k = (dx === 0 ? 2 : 1) * (dy === 0 ? 2 : 1);
+      s += v[ny * GRID + nx] * k; w += k;
+    }
+    out[y * GRID + x] = s / w;
   }
-  while (out.length < n) out.push({ ...pts[pts.length - 1] });
-  return out.slice(0, n);
+  return out;
 }
 
-// Farthest-point sampling of an (unordered) point set to exactly n points — used
-// for the glyph-outline templates, which have no meaningful stroke order.
-function farthest(pts: Pt[], n: number): Pt[] {
-  if (pts.length <= n) { const o = pts.slice(); while (o.length < n) o.push({ ...pts[pts.length - 1] }); return o; }
-  const chosen = [pts[0]];
-  const d = pts.map(p => dist(p, pts[0]));
-  while (chosen.length < n) {
-    let idx = 0, best = -1;
-    for (let i = 0; i < pts.length; i++) if (d[i] > best) { best = d[i]; idx = i; }
-    chosen.push(pts[idx]);
-    for (let i = 0; i < pts.length; i++) { const dd = dist(pts[i], pts[idx]); if (dd < d[i]) d[i] = dd; }
+// Crop a canvas to its ink, centre it (aspect-preserved) in a GRID×GRID box,
+// blur, and L2-normalize into a feature vector.
+function toVector(src: HTMLCanvasElement): Float32Array {
+  const sctx = src.getContext('2d', { willReadFrequently: true })!;
+  const W = src.width, H = src.height;
+  const d = sctx.getImageData(0, 0, W, H).data;
+  let minX = W, minY = H, maxX = -1, maxY = -1;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    if (d[(y * W + x) * 4 + 3] > 40) { if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y; }
   }
-  return chosen;
+  const g = document.createElement('canvas'); g.width = GRID; g.height = GRID;
+  const gctx = g.getContext('2d', { willReadFrequently: true })!;
+  if (maxX >= minX) {
+    const bw = maxX - minX + 1, bh = maxY - minY + 1;
+    const s = (GRID - 6) / Math.max(bw, bh);
+    const dw = bw * s, dh = bh * s;
+    gctx.imageSmoothingEnabled = true;
+    gctx.drawImage(src, minX, minY, bw, bh, (GRID - dw) / 2, (GRID - dh) / 2, dw, dh);
+  }
+  const gd = gctx.getImageData(0, 0, GRID, GRID).data;
+  let v: Float32Array = new Float32Array(GRID * GRID);
+  for (let i = 0; i < GRID * GRID; i++) v[i] = gd[i * 4 + 3] / 255;
+  v = blur(blur(v));
+  let n = 0; for (const x of v) n += x * x; n = Math.sqrt(n) || 1;
+  for (let i = 0; i < v.length; i++) v[i] /= n;
+  return v;
 }
 
-// Uniform-scale to a unit box, then centre on the centroid.
-function normalize(pts: Pt[]): Pt[] {
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-  for (const p of pts) { minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x); minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y); }
-  const s = Math.max(maxX - minX, maxY - minY) || 1;
-  let cx = 0, cy = 0;
-  const scaled = pts.map(p => { const q = { x: (p.x - minX) / s, y: (p.y - minY) / s, id: p.id }; cx += q.x; cy += q.y; return q; });
-  cx /= scaled.length; cy /= scaled.length;
-  return scaled.map(p => ({ x: p.x - cx, y: p.y - cy, id: p.id }));
-}
+const cosine = (a: Float32Array, b: Float32Array) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; };
 
-function cloudDistance(pts: Pt[], tmpl: Pt[], start: number): number {
-  const n = pts.length;
-  const matched = new Array(n).fill(false);
-  let sum = 0, i = start;
-  do {
-    let min = Infinity, index = -1;
-    for (let j = 0; j < n; j++) if (!matched[j]) { const d = dist(pts[i], tmpl[j]); if (d < min) { min = d; index = j; } }
-    if (index >= 0) matched[index] = true;
-    const weight = 1 - ((i - start + n) % n) / n;
-    sum += weight * min;
-    i = (i + 1) % n;
-  } while (i !== start);
-  return sum;
-}
+type Template = { name: string; ch: string; vec: Float32Array };
 
-function greedyMatch(pts: Pt[], tmpl: Pt[]): number {
-  const n = pts.length;
-  const step = Math.max(1, Math.floor(Math.pow(n, 0.5)));
-  let min = Infinity;
-  for (let i = 0; i < n; i += step) min = Math.min(min, cloudDistance(pts, tmpl, i), cloudDistance(tmpl, pts, i));
-  return min;
-}
-
-type Template = { name: string; ch: string; tip?: string; cloud: Pt[] };
-
-// Render each glyph and keep its outline (opaque pixels bordering a transparent
-// one) as a normalized point cloud template. Runs once, off-screen.
 function buildTemplates(): Template[] {
   const S = 128;
-  const cv = document.createElement('canvas');
-  cv.width = S; cv.height = S;
+  const cv = document.createElement('canvas'); cv.width = S; cv.height = S;
   const ctx = cv.getContext('2d', { willReadFrequently: true })!;
   const out: Template[] = [];
   for (const sym of SYMBOLS) {
     ctx.clearRect(0, 0, S, S);
-    ctx.fillStyle = '#000';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.font = `92px "STIX Two Math", "Cambria Math", "Latin Modern Math", "Segoe UI Symbol", serif`;
+    ctx.fillStyle = '#000'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.font = `96px "STIX Two Math", "Cambria Math", "STIXGeneral", "Apple Symbols", "Segoe UI Symbol", serif`;
     ctx.fillText(sym.ch, S / 2, S / 2);
-    const data = ctx.getImageData(0, 0, S, S).data;
-    const A = (x: number, y: number) => (x < 0 || y < 0 || x >= S || y >= S) ? 0 : data[(y * S + x) * 4 + 3];
-    const edge: Pt[] = [];
-    for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
-      if (A(x, y) > 80 && (A(x - 1, y) <= 80 || A(x + 1, y) <= 80 || A(x, y - 1) <= 80 || A(x, y + 1) <= 80)) edge.push({ x, y, id: 0 });
-    }
-    if (edge.length < 24) continue; // glyph not supported by the available fonts
-    out.push({ name: sym.name, ch: sym.ch, tip: sym.tip, cloud: normalize(farthest(edge, N)) });
+    const d = ctx.getImageData(0, 0, S, S).data;
+    let ink = 0; for (let i = 3; i < d.length; i += 4) if (d[i] > 40) ink++;
+    if (ink < 20) continue; // glyph unsupported by available fonts
+    out.push({ name: sym.name, ch: sym.ch, vec: toVector(cv) });
   }
   return out;
+}
+
+// Rasterize the drawn strokes (thin lines) into their own tight canvas.
+function gestureCanvas(strokes: Pt[][]): HTMLCanvasElement | null {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity, count = 0;
+  for (const s of strokes) for (const p of s) { count++; minX = Math.min(minX, p.x); minY = Math.min(minY, p.y); maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y); }
+  if (count < 3) return null;
+  const pad = 14;
+  const W = Math.max(8, Math.ceil(maxX - minX + pad * 2)), H = Math.max(8, Math.ceil(maxY - minY + pad * 2));
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const ctx = cv.getContext('2d')!;
+  ctx.strokeStyle = '#000'; ctx.fillStyle = '#000';
+  ctx.lineWidth = Math.max(3, Math.min(W, H) * 0.05);
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  for (const s of strokes) {
+    if (s.length < 2) { ctx.beginPath(); ctx.arc(s[0].x - minX + pad, s[0].y - minY + pad, ctx.lineWidth / 2, 0, 7); ctx.fill(); continue; }
+    ctx.beginPath(); ctx.moveTo(s[0].x - minX + pad, s[0].y - minY + pad);
+    for (let i = 1; i < s.length; i++) ctx.lineTo(s[i].x - minX + pad, s[i].y - minY + pad);
+    ctx.stroke();
+  }
+  return cv;
 }
 
 export default function SymbolDraw({ onClose, onInsert }: { onClose: () => void; onInsert: (name: string) => void }) {
@@ -165,11 +147,10 @@ export default function SymbolDraw({ onClose, onInsert }: { onClose: () => void;
   const templatesRef = useRef<Template[] | null>(null);
   const strokesRef = useRef<Pt[][]>([]);
   const drawingRef = useRef(false);
-  const [results, setResults] = useState<{ name: string; ch: string; tip?: string; score: number }[]>([]);
+  const [results, setResults] = useState<{ name: string; ch: string; score: number }[]>([]);
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    // Build templates after paint so the modal appears instantly.
     const t = setTimeout(() => { templatesRef.current = buildTemplates(); setReady(true); }, 0);
     return () => clearTimeout(t);
   }, []);
@@ -180,29 +161,25 @@ export default function SymbolDraw({ onClose, onInsert }: { onClose: () => void;
     const c = canvasRef.current, g = ctx();
     if (!c || !g) return;
     g.clearRect(0, 0, c.width, c.height);
-    g.strokeStyle = '#a78bfa';
-    g.lineWidth = 3;
-    g.lineJoin = 'round';
-    g.lineCap = 'round';
+    g.strokeStyle = '#a78bfa'; g.lineWidth = 3; g.lineJoin = 'round'; g.lineCap = 'round';
     for (const s of strokesRef.current) {
       if (s.length < 2) continue;
-      g.beginPath();
-      g.moveTo(s[0].x, s[0].y);
+      g.beginPath(); g.moveTo(s[0].x, s[0].y);
       for (let i = 1; i < s.length; i++) g.lineTo(s[i].x, s[i].y);
       g.stroke();
     }
   };
 
-  const pos = (e: React.PointerEvent) => {
+  const pos = (e: React.PointerEvent): Pt => {
     const r = canvasRef.current!.getBoundingClientRect();
-    return { x: e.clientX - r.left, y: e.clientY - r.top, id: strokesRef.current.length };
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
   };
 
   const down = (e: React.PointerEvent) => {
     e.preventDefault();
     drawingRef.current = true;
     strokesRef.current.push([pos(e)]);
-    canvasRef.current?.setPointerCapture(e.pointerId);
+    try { canvasRef.current?.setPointerCapture(e.pointerId); } catch { /* ignore */ }
   };
   const move = (e: React.PointerEvent) => {
     if (!drawingRef.current) return;
@@ -217,11 +194,12 @@ export default function SymbolDraw({ onClose, onInsert }: { onClose: () => void;
 
   const recognize = () => {
     const templates = templatesRef.current;
-    const all: Pt[] = strokesRef.current.flat();
-    if (!templates || all.length < 4) { setResults([]); return; }
-    const g = normalize(resample(all, N));
-    const scored = templates.map(t => ({ name: t.name, ch: t.ch, tip: t.tip, score: greedyMatch(g, t.cloud) }));
-    scored.sort((a, b) => a.score - b.score);
+    if (!templates) return;
+    const gc = gestureCanvas(strokesRef.current);
+    if (!gc) { setResults([]); return; }
+    const v = toVector(gc);
+    const scored = templates.map(t => ({ name: t.name, ch: t.ch, score: cosine(v, t.vec) }));
+    scored.sort((a, b) => b.score - a.score);
     setResults(scored.slice(0, 10));
   };
 

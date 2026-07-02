@@ -7,7 +7,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.mi
 const DPR = Math.min(typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1, 2);
 const PRESETS = [50, 75, 90, 100, 110, 125, 150, 200, 300];
 
-export default function PdfPreview({ url, onWordClick }: { url: string, onWordClick: (word: string) => void }) {
+export default function PdfPreview({ url, onWordClick }: { url: string, onWordClick: (word: string, context?: string) => void }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const pagesRef = useRef<HTMLDivElement | null>(null);
   const renderTokenRef = useRef(0);
@@ -111,8 +111,20 @@ export default function PdfPreview({ url, onWordClick }: { url: string, onWordCl
   }, [url, rasterTick, zoomFactor]);
 
   const handleDblClick = () => {
-    const word = (window.getSelection()?.toString() ?? '').trim();
-    if (word) onWordClick(word);
+    const sel = window.getSelection();
+    const word = (sel?.toString() ?? '').trim();
+    if (!word) return;
+    // Gather nearby words (the clicked text span plus its neighbours) so the
+    // editor can disambiguate a word that appears several times in the source.
+    let context = '';
+    const node = sel?.anchorNode;
+    const span = (node && (node.nodeType === 3 ? node.parentElement : (node as HTMLElement))) as HTMLElement | null;
+    if (span && span.closest('.textLayer')) {
+      const prev = span.previousElementSibling?.textContent || '';
+      const next = span.nextElementSibling?.textContent || '';
+      context = `${prev} ${span.textContent || ''} ${next}`.replace(/\s+/g, ' ').trim();
+    }
+    onWordClick(word, context);
   };
 
   const isFit = Math.abs(zoomFactor - 1) < 0.001;

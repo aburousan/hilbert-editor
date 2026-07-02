@@ -10,19 +10,24 @@ function toJs(expr: string): string {
     .replace(/\bY\b/g, 'y');
 }
 
-export default function Plot3DStudio({ onClose, onGenerate }: { onClose: () => void, onGenerate: (code: string) => void }) {
+const API = 'http://localhost:3001';
+
+export default function Plot3DStudio({ onClose, onInsert }: { onClose: () => void, onInsert: (code: string) => void }) {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const sceneRef = useRef<THREE.Scene | null>(null);
   const rebuildRef = useRef<() => void>(() => {});
   const [expr, setExpr] = useState('np.sin(np.sqrt(X**2 + Y**2))');
   const [range, setRange] = useState('5');
   const [err, setErr] = useState('');
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     const mount = mountRef.current;
     if (!mount) return;
     const W = mount.clientWidth || 640, H = mount.clientHeight || 360;
     const scene = new THREE.Scene();
+    sceneRef.current = scene;
     scene.background = new THREE.Color('#0f172a');
     const camera = new THREE.PerspectiveCamera(50, W / H, 0.1, 1000);
     cameraRef.current = camera;
@@ -30,7 +35,8 @@ export default function Plot3DStudio({ onClose, onGenerate }: { onClose: () => v
     camera.position.set(9, -9, 7);
 
     let renderer: THREE.WebGLRenderer;
-    try { renderer = new THREE.WebGLRenderer({ antialias: true }); }
+    // preserveDrawingBuffer lets us read the canvas back as a PNG on demand.
+    try { renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true }); }
     catch { setErr('WebGL is not available in this browser.'); return; }
     renderer.setSize(W, H);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -82,33 +88,37 @@ export default function Plot3DStudio({ onClose, onGenerate }: { onClose: () => v
 
   useEffect(() => { rebuildRef.current(); }, [expr, range]);
 
-  const insert = () => {
-    const cam = cameraRef.current;
-    if (!cam) return;
-    const p = cam.position, r = Math.hypot(p.x, p.y, p.z) || 1;
-    const elev = Math.round(Math.asin(p.z / r) * 180 / Math.PI);
-    const azim = Math.round(Math.atan2(p.y, p.x) * 180 / Math.PI);
-    const R = Math.abs(parseFloat(range)) || 5;
-    const code =
-`import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import numpy as np
+  // Capture exactly what's on screen (WYSIWYG) at higher resolution, save it into
+  // the workspace images/ folder, and insert a figure referencing it. No Python.
+  const insert = async () => {
+    const scene = sceneRef.current, cam = cameraRef.current;
+    if (!scene || !cam) return;
+    setSaving(true);
+    try {
+      // Render the current scene/camera into an off-screen high-res buffer.
+      const CW = 1600, CH = 1200;
+      const rt = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+      rt.setSize(CW, CH);
+      rt.setPixelRatio(1);
+      const snapCam = cam.clone() as THREE.PerspectiveCamera;
+      snapCam.aspect = CW / CH;
+      snapCam.updateProjectionMatrix();
+      rt.render(scene, snapCam);
+      const dataUrl = rt.domElement.toDataURL('image/png');
+      rt.dispose();
 
-x = np.linspace(-${R}, ${R}, 80)
-y = np.linspace(-${R}, ${R}, 80)
-X, Y = np.meshgrid(x, y)
-Z = ${expr}
-
-fig = plt.figure(figsize=(6, 5))
-ax = fig.add_subplot(111, projection="3d")
-ax.plot_surface(X, Y, Z, cmap="viridis", edgecolor="none")
-ax.view_init(elev=${elev}, azim=${azim})   # the view you picked
-ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
-plt.tight_layout()
-plt.savefig("surface3d.png", dpi=150, bbox_inches="tight")
-print("saved surface3d.png")`;
-    onGenerate(code);
+      const name = `images/surface3d-${Date.now().toString(36)}.png`;
+      const res = await fetch(`${API}/workspace/save-image`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: name, dataUrl })
+      });
+      if (!res.ok) { setErr('Could not save the image to the workspace.'); setSaving(false); return; }
+      const caption = expr.replace(/np\./g, '').replace(/\*\*/g, '^');
+      onInsert(`\n#figure(\n  image("${name}", width: 80%),\n  caption: [3D surface: $z = ${caption}$],\n)\n\n`);
+    } catch {
+      setErr('Could not capture the plot.');
+      setSaving(false);
+    }
   };
 
   return (
@@ -129,11 +139,11 @@ print("saved surface3d.png")`;
           </div>
           {err && <div className="form-hint" style={{ color: '#fca5a5' }}>{err}</div>}
           <div ref={mountRef} style={{ flex: 1, minHeight: 320, borderRadius: 8, overflow: 'hidden', border: '1px solid var(--border-color)' }} />
-          <div className="form-hint">Drag to rotate · scroll to zoom. “Use this view” generates a matplotlib surface at your chosen angle (run it in the next dialog to insert the figure — needs Python).</div>
+          <div className="form-hint">Drag to rotate · scroll to zoom. “Insert this view” saves exactly what you see into <code>images/</code> and drops in the figure — no Python needed.</div>
         </div>
         <div className="modal-footer">
           <button className="btn-ghost" onClick={onClose}>Cancel</button>
-          <button className="btn-primary" onClick={insert}>Use this view → Python plot</button>
+          <button className="btn-primary" onClick={insert} disabled={saving}>{saving ? 'Saving…' : 'Insert this view'}</button>
         </div>
       </div>
     </div>

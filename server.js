@@ -86,6 +86,34 @@ app.post('/workspace/upload', express.raw({ type: '*/*', limit: '50mb' }), (req,
   } catch (e) { res.status(500).send('Error'); }
 });
 
+// Save a base64 data-URL image into the workspace (used by the 3D Plot Studio to
+// store exactly what's shown on screen). Goes into images/ by default.
+app.post('/workspace/save-image', (req, res) => {
+  const { path, dataUrl } = req.body || {};
+  const full = safeWorkspacePath(path);
+  if (!full) return res.status(400).json({ error: 'Invalid path' });
+  const m = /^data:image\/\w+;base64,(.+)$/s.exec(dataUrl || '');
+  if (!m) return res.status(400).json({ error: 'Invalid image data.' });
+  try {
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, Buffer.from(m[1], 'base64'));
+    res.json({ ok: true, path });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Copy a file within the workspace (e.g. promote a sandbox plot into images/).
+app.post('/workspace/copy', (req, res) => {
+  const { from, to } = req.body || {};
+  const src = safeWorkspacePath(from), dst = safeWorkspacePath(to);
+  if (!src || !dst) return res.status(400).json({ error: 'Invalid path' });
+  try {
+    if (!existsSync(src)) return res.status(404).json({ error: 'Source not found.' });
+    mkdirSync(dirname(dst), { recursive: true });
+    cpSync(src, dst);
+    res.json({ ok: true, path: to });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
 app.delete('/workspace/file', (req, res) => {
   const full = safeWorkspacePath(req.query.path);
   if (!full || full === WORKSPACE_DIR) return res.status(400).send('Invalid path');

@@ -101,10 +101,19 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
     onClose();
   };
 
-  const insertFigure = (img: string) => {
+  const insertFigure = async (img: string) => {
+    // Promote the sandbox plot into the workspace images/ folder so it lives with
+    // the document (and survives sandbox cleanup), then reference it there.
+    const base = img.replace(/^sandbox\//, '');
+    const dest = `images/${base}`;
+    let ref = img;
+    try {
+      const r = await fetch(`${API}/workspace/copy`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: img, to: dest }) });
+      if (r.ok) { ref = dest; onChanged?.(); }
+    } catch { /* fall back to sandbox path */ }
     let out = '\n';
     if (includeCode) out += codeBlock() + '\n';
-    out += `#figure(\n  image("${img}", width: 70%),\n  caption: [${lang} output],\n)\n`;
+    out += `#figure(\n  image("${ref}", width: 70%),\n  caption: [${lang} output],\n)\n`;
     onInsert(out + '\n');
     onClose();
   };

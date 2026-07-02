@@ -36,55 +36,26 @@ ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
 plt.savefig("surface3d.png", dpi=150, bbox_inches="tight")
 print("saved surface3d.png")`;
 
-// Verified Feynman-diagram templates (fletcher). Each is a `diagram(...)` expression.
+// Feynman-diagram templates (fletcher, math-mode `diagram($...$)` syntax — the
+// grid layout reads like an equation and renders cleanly).
 const FEYNMAN: Record<string, string> = {
-  's-channel: e⁻e⁺ → μ⁻μ⁺': `diagram(
-    spacing: 2cm,
-    node((0, 0), $e^-$),
-    node((0, 2), $e^+$),
-    node((1, 1), $$, name: <v1>),
-    node((2, 1), $$, name: <v2>),
-    node((3, 1), $mu^-$),
-    node((3, -1), $mu^+$),
-    edge((0, 0), <v1>, "-|>"),
-    edge((0, 2), <v1>, "<|-"),
-    edge(<v1>, <v2>, $gamma$, "wave"),
-    edge(<v2>, (3, 1), "-|>"),
-    edge(<v2>, (3, -1), "<|-"),
-  )`,
-  'QED vertex: e⁻ → e⁻ γ': `diagram(
-    spacing: 2cm,
-    node((0, 0), $e^-$),
-    node((1, 0), $$, name: <x>),
-    node((2, 0), $e^-$),
-    node((1, -1.3), $gamma$),
-    edge((0, 0), <x>, "-|>"),
-    edge(<x>, (2, 0), "-|>"),
-    edge(<x>, (1, -1.3), "wave"),
-  )`,
-  'Compton: γe⁻ → γe⁻': `diagram(
-    spacing: 1.6cm,
-    node((0, 2), $gamma$), node((0, 0), $e^-$),
-    node((1.5, 1), $$, name: <a>),
-    node((3, 1), $$, name: <b>),
-    node((4.5, 2), $gamma$), node((4.5, 0), $e^-$),
-    edge((0, 0), <a>, "-|>"),
-    edge((0, 2), <a>, "wave"),
-    edge(<a>, <b>, $e^-$, "-|>"),
-    edge(<b>, (4.5, 0), "-|>"),
-    edge(<b>, (4.5, 2), "wave"),
-  )`,
-  'q q̄ → Z′ → b b̄ (math mode)': `diagram(
-    mark-scale: 130%,
-    $
-      edge("rdr", overline(q), "-<|-")
-      edge(#(4, 0), #(3.5, 0.5), b, "-<|-")
-      edge(#(4, 1), #(3.5, 0.5), overline(b), "-<|-", label-side: #left) \\
-      & & edge("d", "-<|-") & & edge(#(3.5, 0.5), #(2, 1), Z', "wave") \\
-      & & edge(#(3.5, 2.5), #(2, 2), gamma, "wave") \\
-      edge("rru", q, "-|>-") & \\
-    $
-  )`,
+  'e⁻e⁺ annihilation → γ (s-channel)': `diagram($
+    e^- edge("rd", "-<|-") & & & edge("ld", "-|>-") e^+ \\
+    & edge("r", gamma, "wave") & \\
+    e^+ edge("ru", "-|>-") & & & edge("lu", "-<|-") e^- \\
+  $)`,
+  'QED vertex: e⁻ → e⁻ γ': `diagram($
+    & gamma edge("d", "wave") & \\
+    e^- edge("r", "-|>-") & edge("r", "-|>-") & e^-
+  $)`,
+  'Møller scattering: e⁻e⁻ → e⁻e⁻ (t-channel)': `diagram($
+    e^- edge("r", "-|>-") & edge("d", gamma, "wave") edge("r", "-|>-") & e^- \\
+    e^- edge("r", "-|>-") & edge("r", "-|>-") & e^-
+  $)`,
+  'Compton scattering: γe⁻ → e⁻γ': `diagram($
+    gamma edge("r", "wave") & edge("d", e^-, "-|>-") edge("ru", gamma, "wave") & \\
+    e^- edge("r", "-|>-") & edge("ru", "-|>-") &
+  $)`,
 };
 
 // Boxed theorem-like environments (showybox). Each `kind` gets its own counter.
@@ -534,9 +505,14 @@ export default function App() {
     const model = editor?.getModel();
     if (!editor || !model) return;
     editor.focus();
-    // Insert at the live cursor; if none exists yet, append at the end of the file.
-    let range = editor.getSelection();
-    if (!range) {
+    // Insert at the cursor. If a selection is active (e.g. left over from a PDF
+    // double-click or symbol pick), collapse to its end so we insert *after* it
+    // rather than overwriting the selected text. With no cursor, append at EOF.
+    const sel = editor.getSelection();
+    let range;
+    if (sel) {
+      range = { startLineNumber: sel.endLineNumber, startColumn: sel.endColumn, endLineNumber: sel.endLineNumber, endColumn: sel.endColumn } as any;
+    } else {
       const last = model.getLineCount();
       const col = model.getLineMaxColumn(last);
       range = { startLineNumber: last, startColumn: col, endLineNumber: last, endColumn: col } as any;
@@ -1066,7 +1042,7 @@ export default function App() {
   // matched in the source and the editor jumps to it (best effort — works for
   // prose/headings; rendered math may not match the source token).
   const syncDecorations = useRef<string[]>([]);
-  const jumpToWord = (raw: string) => {
+  const jumpToWord = (raw: string, context?: string) => {
     const editor = editorRef.current;
     const model = editor?.getModel();
     if (!editor || !model) return;
@@ -1082,9 +1058,25 @@ export default function App() {
     });
     const matches = real.length ? real : all;
     if (!matches.length) { setErrorLogs(`"${word}" not found in source (rendered math/symbols may differ).`); return; }
+    // Use the surrounding words from the PDF (context) to pick the right instance
+    // when the word occurs more than once: score each match by how many of the
+    // neighbouring words appear on the same or an adjacent source line.
     const cur = editor.getPosition();
-    // Prefer the next match strictly after the cursor, so repeated clicks cycle.
-    const next = matches.find((m: any) => !cur || m.range.startLineNumber > cur.lineNumber ||
+    let next: any;
+    const ctxWords = (context || '').toLowerCase().split(/[^\p{L}\p{N}_]+/u).filter(w => w.length > 2 && w !== word.toLowerCase());
+    if (matches.length > 1 && ctxWords.length) {
+      const scoreAt = (m: any) => {
+        const from = Math.max(1, m.range.startLineNumber - 1), to = Math.min(model.getLineCount(), m.range.startLineNumber + 1);
+        let text = '';
+        for (let ln = from; ln <= to; ln++) text += ' ' + model.getLineContent(ln).toLowerCase();
+        return ctxWords.reduce((n, w) => n + (text.includes(w) ? 1 : 0), 0);
+      };
+      let best = -1;
+      for (const m of matches) { const s = scoreAt(m); if (s > best) { best = s; next = m; } }
+      if (best <= 0) next = undefined; // no context hit — fall back to cursor cycling
+    }
+    // Otherwise prefer the next match strictly after the cursor, so repeated clicks cycle.
+    if (!next) next = matches.find((m: any) => !cur || m.range.startLineNumber > cur.lineNumber ||
       (m.range.startLineNumber === cur.lineNumber && m.range.startColumn > cur.column)) || matches[0];
     editor.revealLineInCenter(next.range.startLineNumber);
     editor.setPosition({ lineNumber: next.range.startLineNumber, column: next.range.startColumn });
@@ -1511,7 +1503,7 @@ export default function App() {
       {inputModal && <InputModal {...inputModal} onClose={() => setInputModal(null)} />}
       {codeRunner && <CodeRunnerModal {...codeRunner} onClose={() => setCodeRunner(null)} onInsert={(code) => { insertCode(code); setCodeRunner(null); }} onInsertEquation={(latex, codeBlock) => { insertEquationFromLatex(latex, codeBlock); setCodeRunner(null); }} onChanged={fetchTree} />}
       {showSaveAs && activeTab && <SaveAsModal onClose={() => setShowSaveAs(false)} fileName={activeTabPath} content={activeTab.content} pdfUrl={pdfUrl} projectName={projectName} mainFile={currentMain} />}
-      {showPlot3D && <Plot3DStudio onClose={() => setShowPlot3D(false)} onGenerate={(code) => { setShowPlot3D(false); setCodeRunner({ initialLang: 'python', initialCode: code }); }} />}
+      {showPlot3D && <Plot3DStudio onClose={() => setShowPlot3D(false)} onInsert={(code) => { insertCode(code); setShowPlot3D(false); fetchTree(); }} />}
       {showSymbolDraw && <SymbolDraw onClose={() => setShowSymbolDraw(false)} onInsert={(name) => { insertCode(name + ' '); setShowSymbolDraw(false); }} />}
       {showRefManager && activeTab && <RefManager content={activeTab.content} onClose={() => setShowRefManager(false)} onJump={jumpToLine} onInsertRef={(name) => insertCode(`@${name}`)} />}
       {showBibManager && <BibManager onClose={() => setShowBibManager(false)} onCite={(key) => insertCode(`@${key}`)} onEnsureBib={ensureBibliography} onChanged={fetchTree} />}
