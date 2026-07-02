@@ -203,6 +203,27 @@ export default function App() {
     };
   }, [sidebarOpen, sidebarWidth]);
 
+  // When a folder is opened in the browser via the File System Access API, this
+  // holds a writable handle to the real folder on disk so edits are saved back
+  // to it (not just the app's working copy). Null in the desktop app (which
+  // already points the backend straight at the folder) and in fallback mode.
+  const dirHandleRef = useRef<any>(null);
+
+  // Write a file back to the opened on-disk folder (browser File System Access).
+  const syncToDisk = async (path: string, content: string) => {
+    const root = dirHandleRef.current;
+    if (!root) return;
+    try {
+      const parts = path.split('/');
+      let dir = root;
+      for (let i = 0; i < parts.length - 1; i++) dir = await dir.getDirectoryHandle(parts[i], { create: true });
+      const fh = await dir.getFileHandle(parts[parts.length - 1], { create: true });
+      const w = await fh.createWritable();
+      await w.write(content);
+      await w.close();
+    } catch { /* ignore (permission revoked / removed) */ }
+  };
+
   const fetchTree = async () => {
     try {
       const res = await fetch('http://localhost:3001/workspace');
@@ -219,6 +240,7 @@ export default function App() {
           await fetch(`http://localhost:3001/workspace/file?path=${encodeURIComponent(tab.path)}`, {
             method: 'POST', body: tab.content, headers: { 'Content-Type': 'text/plain' }
           });
+          if (tab.isDirty) syncToDisk(tab.path, tab.content);   // mirror edits to the opened folder on disk
         }
       }
       
@@ -274,6 +296,7 @@ export default function App() {
       await fetch(`http://localhost:3001/workspace/file?path=${encodeURIComponent(activeTab.path)}`, {
         method: 'POST', body: activeTab.content, headers: { 'Content-Type': 'text/plain' }
       });
+      syncToDisk(activeTab.path, activeTab.content);   // mirror to the opened folder on disk
       setTabs(prev => prev.map(t => t.path === activeTab.path ? { ...t, isDirty: false } : t));
       fetchTree();
       compileTypst(currentMain);
@@ -483,10 +506,31 @@ export default function App() {
     }
   };
 
+  const TEXT_EXT = ['typ', 'bib', 'txt', 'md', 'csv', 'json', 'yml', 'yaml', 'toml', 'xml', 'tex', 'html', 'css', 'js'];
+
+  // Recursively import an on-disk folder (File System Access handle) into the
+  // backend workspace so Typst can compile it. The handle is kept so edits are
+  // written straight back to the real files.
+  const importDirHandle = async (dirHandle: any, prefix: string) => {
+    for await (const entry of dirHandle.values()) {
+      if (entry.name.startsWith('.') || entry.name === 'node_modules') continue;
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.kind === 'directory') { await importDirHandle(entry, rel); continue; }
+      const file = await entry.getFile();
+      const ext = (entry.name.split('.').pop() || '').toLowerCase();
+      if (TEXT_EXT.includes(ext)) {
+        await fetch(`http://localhost:3001/workspace/file?path=${encodeURIComponent(rel)}`, { method: 'POST', body: await file.text(), headers: { 'Content-Type': 'text/plain' } });
+      } else {
+        await fetch(`http://localhost:3001/workspace/upload?path=${encodeURIComponent(rel)}`, { method: 'POST', body: await file.arrayBuffer(), headers: { 'Content-Type': 'application/octet-stream' } });
+      }
+    }
+  };
+
   // "Open Folder" (VS Code style): make the chosen folder the project.
-  // Desktop app → repoints the backend at that folder on disk (nothing copied).
-  // Browser → uses the native folder picker and imports the folder as the new
-  // workspace (browsers don't expose the real path), replacing the current files.
+  // - Desktop app → repoints the backend straight at the folder on disk.
+  // - Chrome/Edge → File System Access API: native picker + edits saved back to
+  //   the real folder.
+  // - Other browsers → folder picker that imports a working copy (no write-back).
   const openFolderAsRoot = async () => {
     const desktop = (window as any).desktop;
     if (desktop?.pickFolder) {
@@ -496,11 +540,31 @@ export default function App() {
         const res = await fetch('http://localhost:3001/workspace/root', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: folder }) });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) { alert(data.error || 'Could not open that folder.'); return; }
+        dirHandleRef.current = null;   // desktop backend edits the folder directly
         await loadWorkspace(folder.replace(/[/\\]+$/, '').split(/[/\\]/).pop() || 'Project');
       } catch { alert('Could not reach the local server.'); }
       return;
     }
-    // Browser: native folder picker.
+
+    // Chrome/Edge: writable directory handle → edits reflect on disk.
+    if ((window as any).showDirectoryPicker) {
+      let dir: any;
+      try { dir = await (window as any).showDirectoryPicker({ mode: 'readwrite' }); }
+      catch { return; } // cancelled
+      try {
+        if (dir.requestPermission && (await dir.requestPermission({ mode: 'readwrite' })) !== 'granted') {
+          alert('Write permission is needed so your edits save back to the folder.'); return;
+        }
+        if (!confirm(`Open “${dir.name}” as the workspace? Your edits will be saved back to this folder on disk.`)) return;
+        await fetch('http://localhost:3001/workspace/clear', { method: 'POST' });
+        dirHandleRef.current = dir;
+        await importDirHandle(dir, '');
+        await loadWorkspace(dir.name);
+      } catch { alert('Could not open that folder.'); }
+      return;
+    }
+
+    // Fallback (Safari/Firefox): folder picker that imports a working copy.
     const input = document.createElement('input');
     input.type = 'file';
     (input as any).webkitdirectory = true;
@@ -509,22 +573,19 @@ export default function App() {
       const files = Array.from(input.files || []);
       if (!files.length) return;
       const rootName = (((files[0] as any).webkitRelativePath || files[0].name).split('/')[0]) || 'Project';
-      if (!confirm(`Open “${rootName}” as the workspace? This replaces the current file list (${files.length} files). Folders elsewhere on your disk are not touched.`)) return;
-      const TEXT_EXT = ['typ', 'bib', 'txt', 'md', 'csv', 'json', 'yml', 'yaml', 'toml', 'xml', 'tex', 'html', 'css', 'js'];
+      if (!confirm(`Open “${rootName}” as the workspace? This browser can't save edits back to disk, so a working copy is imported (${files.length} files). Use the desktop app or Chrome to edit the folder in place.`)) return;
       try {
         await fetch('http://localhost:3001/workspace/clear', { method: 'POST' });
+        dirHandleRef.current = null;
         for (const f of files) {
           const rel = (f as any).webkitRelativePath || f.name;
           if (rel.includes('/.') || rel.includes('node_modules/')) continue;
-          // Drop the chosen folder's own name so its *contents* become the root.
-          const dest = rel.split('/').slice(1).join('/') || f.name;
+          const dest = rel.split('/').slice(1).join('/') || f.name;   // drop the folder's own name
           const ext = (f.name.split('.').pop() || '').toLowerCase();
           if (TEXT_EXT.includes(ext)) {
-            const text = await f.text();
-            await fetch(`http://localhost:3001/workspace/file?path=${encodeURIComponent(dest)}`, { method: 'POST', body: text, headers: { 'Content-Type': 'text/plain' } });
+            await fetch(`http://localhost:3001/workspace/file?path=${encodeURIComponent(dest)}`, { method: 'POST', body: await f.text(), headers: { 'Content-Type': 'text/plain' } });
           } else {
-            const buf = await f.arrayBuffer();
-            await fetch(`http://localhost:3001/workspace/upload?path=${encodeURIComponent(dest)}`, { method: 'POST', body: buf, headers: { 'Content-Type': 'application/octet-stream' } });
+            await fetch(`http://localhost:3001/workspace/upload?path=${encodeURIComponent(dest)}`, { method: 'POST', body: await f.arrayBuffer(), headers: { 'Content-Type': 'application/octet-stream' } });
           }
         }
         await loadWorkspace(rootName);
@@ -682,9 +743,9 @@ export default function App() {
     title: 'Insert Title Block',
     fields: [
       { key: 'title', label: 'Document title', default: 'Document Title' },
-      { key: 'author', label: 'Author(s)', default: 'Kazi Abu Rousan' },
-      { key: 'email', label: 'Email', default: 'kaziaburousan@gmail.com' },
-      { key: 'institute', label: 'Institute / Affiliation', default: 'University' },
+      { key: 'author', label: 'Author(s)', default: '', placeholder: 'Author name' },
+      { key: 'email', label: 'Email', default: '', placeholder: 'you@example.com' },
+      { key: 'institute', label: 'Institute / Affiliation', default: '', placeholder: 'Affiliation' },
     ],
     onSubmit: (v) => insertAtTop(
 `#align(center)[
@@ -701,8 +762,8 @@ export default function App() {
   const insertAuthor = () => setInputModal({
     title: 'Insert Author',
     fields: [
-      { key: 'author', label: 'Author name', default: 'Kazi Abu Rousan' },
-      { key: 'email', label: 'Email (optional)', default: 'kaziaburousan@gmail.com' },
+      { key: 'author', label: 'Author name', default: '', placeholder: 'Author name' },
+      { key: 'email', label: 'Email (optional)', default: '', placeholder: 'you@example.com' },
     ],
     onSubmit: (v) => insertAtTop(`#align(center)[${v.author}${v.email ? ` \\\n  #link("mailto:${v.email}")[${v.email.replace(/@/g, '\\@')}]` : ''}]\n`)
   });

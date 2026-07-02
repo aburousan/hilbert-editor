@@ -124,6 +124,32 @@ features) — those aren't bundled.
 > **macOS note:** the app is ad-hoc signed but not notarised, so the first launch
 > needs a right-click → **Open** (or `xattr -cr "/Applications/Typst Editor.app"`).
 
+### Windows
+
+Windows isn't in the prebuilt releases yet, but it runs fine — two ways:
+
+**1. Run from source** (quickest):
+
+```powershell
+winget install Typst.Typst        # or: scoop install typst / choco install typst
+git clone https://github.com/aburousan/typsteditor.git
+cd typsteditor
+npm install
+npm run dev                        # then open http://localhost:5173
+```
+
+Make sure `typst` is on your `PATH` (`typst --version` should work). For the
+optional code-execution features, install Python (with `numpy`, `matplotlib`,
+`sympy`) and/or Julia and put them on `PATH` too.
+
+**2. Build a desktop installer** — on a Windows machine, `npm run dist` produces
+an `.exe` (NSIS) installer in `release/`. (It has to be built on Windows;
+cross-building from macOS/Linux isn't reliable.)
+
+Tip: opening a folder to edit its files in place works best in the desktop app or
+in **Chrome/Edge** (which support writing changes back to the folder). Other
+browsers open a working copy instead.
+
 ### Docker (bundles Typst + Python)
 
 ```bash

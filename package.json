@@ -50,6 +50,11 @@
       ],
       "category": "Office",
       "maintainer": "Kazi Abu Rousan"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
     }
   },
   "dependencies": {
