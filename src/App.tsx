@@ -688,7 +688,7 @@ export default function App() {
   // Insert LaTeX (e.g. Wolfram TeXForm / sympy latex()) as rendered Typst math via
   // the mitex package, importing it once at the top of the document.
   const insertEquationFromLatex = (latex: string, codeBlock?: string) => {
-    ensureRule('@preview/mitex', '#import "@preview/mitex:0.2.5": mitex');
+    ensureRule('@preview/mitex', '#import "@preview/mitex:0.2.7": mitex');
     const lines = latex.split('\n').map(l => l.trim()).filter(Boolean);
     if (lines.length === 0) return;
     const body = lines.map(l => '#mitex(`' + l + '`)').join('\n\n');
@@ -1157,10 +1157,15 @@ export default function App() {
       if (!m) continue;
       const prob: Problem = { severity: m[1] as any, message: m[2].trim() };
       // The location line (┌─ file:line:col) usually follows within a few lines.
+      let fromPackage = false;
       for (let j = i + 1; j < Math.min(i + 4, lines.length); j++) {
+        if (lines[j].includes('@preview/')) fromPackage = true; // location points inside a package
         const loc = lines[j].match(/([\w./\-]+):(\d+):(\d+)/);
         if (loc) { prob.file = loc[1]; prob.line = Number(loc[2]); prob.col = Number(loc[3]); break; }
       }
+      // Skip warnings that originate inside an imported package (e.g. mitex's own
+      // deprecation notices) — the user can't act on them and they only add noise.
+      if (fromPackage && prob.severity === 'warning') continue;
       out.push(prob);
     }
     return out;

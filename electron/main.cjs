@@ -66,7 +66,15 @@ function createWindow(err) {
        </body>`));
     return;
   }
-  win.loadURL('http://127.0.0.1:3001');
+  const APP_URL = 'http://127.0.0.1:3001';
+  win.loadURL(APP_URL);
+  // If the page fails to load or the renderer dies (a transient race while the
+  // backend is warming up, etc.), retry rather than leaving a blank window.
+  let reloads = 0;
+  win.webContents.on('did-fail-load', (_e, code, _desc, _url, isMainFrame) => {
+    if (isMainFrame && code !== -3 && reloads++ < 10) setTimeout(() => { if (!win.isDestroyed()) win.loadURL(APP_URL); }, 700);
+  });
+  win.webContents.on('render-process-gone', () => { if (!win.isDestroyed()) win.loadURL(APP_URL); });
   // Open external links (mailto:, https:) in the real browser, not the app.
   win.webContents.setWindowOpenHandler(({ url }) => { shell.openExternal(url); return { action: 'deny' }; });
 }
