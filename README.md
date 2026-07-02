@@ -19,6 +19,14 @@ result straight into the document.
 
 ![Run code → equation](docs/gifs/run-code-equation.gif)
 
+**Sketch a symbol and get its Typst code (experimental):**
+
+![Draw a symbol](docs/gifs/draw-symbol.gif)
+
+**Look a paper up by DOI or arXiv id and cite it:**
+
+![Citations](docs/gifs/citations.gif)
+
 **Insert plots (cetz) without leaving the editor:**
 
 ![Insert a plot](docs/gifs/insert-plot.gif)
