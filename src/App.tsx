@@ -1102,9 +1102,13 @@ export default function App() {
           code = `#strike(${stroke ? `stroke: ${stroke}` : ''})[${v.body}]`;
         } else {
           const s = stroke || '1pt';
-          const diag = `#place(top + left, line(start: (0%, 100%), end: (100%, 0%), stroke: ${s}))`;
-          const anti = `#place(top + left, line(start: (0%, 0%), end: (100%, 100%), stroke: ${s}))`;
-          code = `#box(baseline: 0pt)[${v.body}${diag}${v.style === 'cross (X)' ? anti : ''}]`;
+          // Percentage line coords resolve against the *page*, not the box — so
+          // `line(end: (100%, ...))` drew the X across the whole page. Measure the
+          // body and draw the strokes to its actual size so they cover only the text.
+          const diag = `place(top + left, line(start: (0pt, sz.height), end: (sz.width, 0pt), stroke: ${s}))`;
+          const anti = `place(top + left, line(start: (0pt, 0pt), end: (sz.width, sz.height), stroke: ${s}))`;
+          const strokes = v.style === 'cross (X)' ? `${diag}\n  ${anti}` : diag;
+          code = `#box(baseline: 0pt, context {\n  let b = [${v.body}]\n  let sz = measure(b)\n  b\n  ${strokes}\n})`;
         }
         replaceOrInsert(sel, editor, model, code);
       }

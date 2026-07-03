@@ -343,7 +343,10 @@ body {
 .about-links a { color: var(--accent-hover); text-decoration: none; }
 .about-links a:hover { text-decoration: underline; }
 
-/* Toolbar */
+/* Toolbar. Must sit ABOVE the pane resizers (10) — at a tied z-index the
+   sidebar resizer (later in the DOM) paints a vertical streak across the
+   colour popover, which is trapped in this stacking context — but BELOW the
+   header (20), whose dropdown menus must cover the toolbar. */
 .toolbar {
   height: 44px;
   background-color: var(--panel-bg);
@@ -353,7 +356,7 @@ body {
   justify-content: space-between;
   padding: 0 16px;
   gap: 8px;
-  z-index: 10;
+  z-index: 15;
 }
 
 .toolbar-group {
