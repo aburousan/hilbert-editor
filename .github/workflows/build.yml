@@ -3,11 +3,13 @@ name: Build desktop bundles
 # Tauri compiles native code against each OS's system webview (WebKitGTK on
 # Linux, WebView2 on Windows, WKWebView on macOS), so — unlike Electron — it
 # cannot cross-compile. Each target is built on its own runner.
+#
+# Triggers use the `tauri-v*` tag prefix (NOT the Electron `v*` tags) so the two
+# release lines never collide: Electron keeps `v0.1.x`, Tauri uses `tauri-v0.1.x`.
 on:
-  workflow_dispatch:
+  workflow_dispatch:        # build on demand from the Actions tab
   push:
-    tags: ["v*"]
-    branches: ["tauri-port"]
+    tags: ["tauri-v*"]      # release build (creates a draft release)
 
 jobs:
   build:
@@ -43,10 +45,21 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # On a `tauri-v*` tag: create/attach to a separate, clearly-named GitHub
+      # Release (draft, so you publish it deliberately) — kept distinct from the
+      # Electron releases. On a branch push: tagName is empty, so it only builds
+      # and the artifacts are grabbed by upload-artifact below.
       - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: .
           args: ${{ matrix.args }}
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          releaseName: "Typst Editor (Tauri) v__VERSION__"
+          releaseBody: "Tauri desktop build. Native installers per platform, attached below."
+          releaseDraft: true
+          prerelease: false
 
       - uses: actions/upload-artifact@v4
         with:
