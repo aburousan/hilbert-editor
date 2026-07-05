@@ -402,7 +402,17 @@ async fn compile(State(st): St, Query(q): Q, body: Bytes) -> Response {
     if !body_str.trim().is_empty() {
         let _ = fs::write(&main_path, body_str.as_bytes());
     }
-    let out = match run_cmd("typst", &["compile", &main_path.to_string_lossy(), &output_path.to_string_lossy()], Some(&ws), None).await {
+    // Make any fonts the user imported into <workspace>/fonts discoverable by the
+    // compiler so `#set text(font: "…")` works with custom .ttf/.otf files.
+    let mut compile_args: Vec<String> = vec!["compile".into()];
+    if ws.join("fonts").is_dir() {
+        compile_args.push("--font-path".into());
+        compile_args.push("fonts".into());
+    }
+    compile_args.push(main_path.to_string_lossy().into_owned());
+    compile_args.push(output_path.to_string_lossy().into_owned());
+    let compile_argv: Vec<&str> = compile_args.iter().map(String::as_str).collect();
+    let out = match run_cmd("typst", &compile_argv, Some(&ws), None).await {
         Ok(o) => o,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return json_err(StatusCode::INTERNAL_SERVER_ERROR, TYPST_NOT_FOUND),
         Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not run typst: {e}")),
@@ -1672,6 +1682,297 @@ async fn local_guard(req: axum::extract::Request, next: axum::middleware::Next) 
     next.run(req).await
 }
 
+// ---------------------------------------------------------------------------
+// Tinymist LSP proxy for hover/docs & command completion
+// ---------------------------------------------------------------------------
+// A single long-lived `tinymist lsp` process on the backend, driven over its
+// stdio JSON-RPC channel. Two trivial REST endpoints (/lsp/hover,
+// /lsp/completion) let Monaco's providers query it without shipping the full
+// LSP protocol (WebSockets, monaco-languageclient) to the browser. This mirrors
+// the Express port's implementation in server.js.
+
+use tokio::io::AsyncWriteExt as _;
+use tokio::sync::oneshot;
+
+struct LspProxy {
+    stdin: tokio::process::ChildStdin,
+    pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
+    opened: HashMap<String, (i64, u64)>, // uri → (last version sent, content hash)
+    next_id: i64,
+}
+
+// Resolve the tinymist LSP binary: prefer a bundled copy (main.rs sets
+// TINYMIST_BIN to the app-resource path when present), else `tinymist` on PATH.
+fn tinymist_bin() -> String {
+    std::env::var("TINYMIST_BIN")
+        .ok()
+        .filter(|p| Path::new(p).exists())
+        .unwrap_or_else(|| "tinymist".into())
+}
+
+fn content_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+static LSP: LazyLock<tokio::sync::Mutex<Option<LspProxy>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(None));
+
+static LSP_CMD_LINK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[.*?\]\(command:[^)]+\)(?:\s*\|\s*)?").unwrap());
+static LSP_TRAILING_RULE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\n+---\n*$").unwrap());
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+async fn lsp_write(stdin: &mut tokio::process::ChildStdin, obj: &Value) {
+    let json = obj.to_string();
+    let header = format!("Content-Length: {}\r\n\r\n", json.as_bytes().len());
+    let _ = stdin.write_all(header.as_bytes()).await;
+    let _ = stdin.write_all(json.as_bytes()).await;
+    let _ = stdin.flush().await;
+}
+
+impl LspProxy {
+    // Write a request and hand back the receiver for its id-correlated response.
+    async fn begin_request(&mut self, method: &str, params: Value) -> oneshot::Receiver<Value> {
+        self.next_id += 1;
+        let id = self.next_id;
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(id, tx);
+        lsp_write(
+            &mut self.stdin,
+            &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
+        )
+        .await;
+        rx
+    }
+
+    async fn notify(&mut self, method: &str, params: Value) {
+        lsp_write(
+            &mut self.stdin,
+            &json!({ "jsonrpc": "2.0", "method": method, "params": params }),
+        )
+        .await;
+    }
+
+    // Keep tinymist's view of the file current: didOpen once, then didChange —
+    // but only push a didChange when the text actually differs from last time,
+    // so repeated hovers on an unchanged doc don't force a full re-parse.
+    async fn sync_file(&mut self, uri: &str, content: &str) {
+        let hash = content_hash(content);
+        match self.opened.get(uri).copied() {
+            None => {
+                self.opened.insert(uri.to_string(), (1, hash));
+                self.notify(
+                    "textDocument/didOpen",
+                    json!({ "textDocument": { "uri": uri, "languageId": "typst", "version": 1, "text": content } }),
+                )
+                .await;
+            }
+            Some((ver, prev_hash)) => {
+                if prev_hash == hash {
+                    return;
+                }
+                let nv = ver + 1;
+                self.opened.insert(uri.to_string(), (nv, hash));
+                self.notify(
+                    "textDocument/didChange",
+                    json!({
+                        "textDocument": { "uri": uri, "version": nv },
+                        "contentChanges": [{ "text": content }]
+                    }),
+                )
+                .await;
+            }
+        }
+    }
+}
+
+// Ensure a tinymist process is running and initialized. Returns false if it
+// could not be spawned (e.g. tinymist not installed) so callers degrade to null.
+async fn ensure_lsp(ws: &Path) -> bool {
+    let mut guard = LSP.lock().await;
+    if guard.is_some() {
+        return true;
+    }
+    let mut cmd = Command::new(tinymist_bin());
+    cmd.arg("lsp")
+        .current_dir(ws)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(false); // keep it alive after this fn drops the Child handle
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    // Reader task: parse Content-Length framed JSON-RPC and dispatch responses.
+    let pending_reader = pending.clone();
+    tokio::spawn(async move {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 16384];
+        loop {
+            let n = match stdout.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            buf.extend_from_slice(&chunk[..n]);
+            loop {
+                let Some(hdr_end) = find_subslice(&buf, b"\r\n\r\n") else { break };
+                let header = String::from_utf8_lossy(&buf[..hdr_end]).to_ascii_lowercase();
+                let len = header
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok());
+                let Some(len) = len else {
+                    buf.drain(..hdr_end + 4);
+                    continue;
+                };
+                let total = hdr_end + 4 + len;
+                if buf.len() < total {
+                    break;
+                }
+                let body = buf[hdr_end + 4..total].to_vec();
+                buf.drain(..total);
+                if let Ok(msg) = serde_json::from_slice::<Value>(&body) {
+                    if let Some(id) = msg.get("id").and_then(Value::as_i64) {
+                        if let Some(tx) = pending_reader.lock().unwrap().remove(&id) {
+                            let _ = tx.send(msg.get("result").cloned().unwrap_or(Value::Null));
+                        }
+                    }
+                }
+            }
+        }
+        // Process ended — drop the proxy so the next request respawns it.
+        *LSP.lock().await = None;
+    });
+
+    let mut proxy = LspProxy { stdin, pending, opened: HashMap::new(), next_id: 0 };
+
+    // initialize → (await result) → initialized
+    let root_uri = format!("file://{}", ws.to_string_lossy());
+    let rx = proxy
+        .begin_request(
+            "initialize",
+            json!({
+                "processId": std::process::id(),
+                "capabilities": {},
+                "rootUri": root_uri,
+                "workspaceFolders": [{ "uri": root_uri, "name": "workspace" }],
+            }),
+        )
+        .await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), rx).await;
+    proxy.notify("initialized", json!({})).await;
+
+    *guard = Some(proxy);
+    true
+}
+
+fn lsp_pos(v: &Value) -> Option<(String, i64, i64)> {
+    let file = jstr(v, "file")?.to_string();
+    let line = v.get("line")?.as_i64()?;
+    let character = v.get("character")?.as_i64()?;
+    Some((file, line, character))
+}
+
+// POST /lsp/hover { file, line, character, content } → { contents, range }
+async fn lsp_hover(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let Some((file, line, character)) = lsp_pos(&v) else {
+        return Json(json!({ "contents": Value::Null })).into_response();
+    };
+    let content = jstr(&v, "content").unwrap_or("").to_string();
+    let ws = st.ws();
+    if !ensure_lsp(&ws).await {
+        return Json(json!({ "contents": Value::Null })).into_response();
+    }
+    let uri = format!("file://{}", lexical_resolve(&ws, &file).to_string_lossy());
+    let rx = {
+        let mut guard = LSP.lock().await;
+        let Some(p) = guard.as_mut() else {
+            return Json(json!({ "contents": Value::Null })).into_response();
+        };
+        p.sync_file(&uri, &content).await;
+        p.begin_request(
+            "textDocument/hover",
+            json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": character } }),
+        )
+        .await
+    };
+    let result = match tokio::time::timeout(Duration::from_secs(3), rx).await {
+        Ok(Ok(v)) => v,
+        _ => Value::Null,
+    };
+    let md = match result.get("contents") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Object(o)) => o.get("value").and_then(Value::as_str).unwrap_or("").to_string(),
+        _ => String::new(),
+    };
+    if md.trim().is_empty() {
+        return Json(json!({ "contents": Value::Null })).into_response();
+    }
+    // Strip VSCode-specific command links; trim a trailing horizontal rule.
+    let md = LSP_CMD_LINK.replace_all(&md, "");
+    let md = LSP_TRAILING_RULE.replace(&md, "").trim().to_string();
+    Json(json!({ "contents": md, "range": result.get("range").cloned().unwrap_or(Value::Null) }))
+        .into_response()
+}
+
+// POST /lsp/completion { file, line, character, content } → { items: [...] }
+async fn lsp_completion(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let Some((file, line, character)) = lsp_pos(&v) else {
+        return Json(json!({ "items": [] })).into_response();
+    };
+    let content = jstr(&v, "content").unwrap_or("").to_string();
+    let ws = st.ws();
+    if !ensure_lsp(&ws).await {
+        return Json(json!({ "items": [] })).into_response();
+    }
+    let uri = format!("file://{}", lexical_resolve(&ws, &file).to_string_lossy());
+    let rx = {
+        let mut guard = LSP.lock().await;
+        let Some(p) = guard.as_mut() else {
+            return Json(json!({ "items": [] })).into_response();
+        };
+        p.sync_file(&uri, &content).await;
+        p.begin_request(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+                "context": { "triggerKind": 1 }
+            }),
+        )
+        .await
+    };
+    let result = match tokio::time::timeout(Duration::from_secs(3), rx).await {
+        Ok(Ok(v)) => v,
+        _ => Value::Null,
+    };
+    // tinymist may return an array or { isIncomplete, items: [...] }.
+    let items = if result.is_array() {
+        result
+    } else {
+        result.get("items").cloned().unwrap_or_else(|| json!([]))
+    };
+    Json(json!({ "items": items })).into_response()
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     use tower_http::cors::{AllowOrigin, Any, CorsLayer};
     let cors = CorsLayer::new()
@@ -1710,6 +2011,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/bib/fetch", post(bib_fetch))
         .route("/desktop/pick-folder", post(desktop_pick_folder))
         .route("/desktop/open", post(desktop_open))
+        .route("/lsp/hover", post(lsp_hover))
+        .route("/lsp/completion", post(lsp_completion))
         .fallback(static_fallback)
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .layer(cors)

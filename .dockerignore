@@ -1,0 +1,7 @@
+src-tauri/target
+src-tauri/target-linux
+src-tauri/target-win
+node_modules
+.git
+releases
+linux-build/release

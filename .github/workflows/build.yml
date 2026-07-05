@@ -4,9 +4,9 @@ name: Build desktop bundles
 # Linux, WKWebView on macOS), so — unlike Electron — it cannot cross-compile;
 # each target is built on its own runner.
 #
-# Windows is intentionally omitted: a native windows-latest runner can be added
-# back to the matrix when a Windows build is wanted (the cargo-xwin cross-build
-# is unreliable — see the README).
+# Windows builds on a native `windows-latest` runner — GitHub gives it away free,
+# and Tauri produces a proper `.msi` + `.exe` (NSIS) there. (Only *cross*-building
+# Windows from Linux with cargo-xwin was unreliable; a native runner is not.)
 #
 # Build-only: uploads per-platform artifacts you can download from the run.
 # Releases are cut manually (see README) so the Electron `v*` and Tauri
@@ -24,6 +24,8 @@ jobs:
             args: ""
           - os: macos-14            # macOS Apple Silicon: .app + .dmg
             args: "--target aarch64-apple-darwin"
+          - os: windows-latest      # Windows x64: .msi + .exe (NSIS)
+            args: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -58,3 +60,5 @@ jobs:
             src-tauri/target/**/release/bundle/**/*.AppImage
             src-tauri/target/**/release/bundle/**/*.deb
             src-tauri/target/**/release/bundle/**/*.dmg
+            src-tauri/target/**/release/bundle/**/*.msi
+            src-tauri/target/**/release/bundle/**/*.exe

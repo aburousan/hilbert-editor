@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Typst Editor",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "identifier": "com.kaziaburousan.typsteditor",
   "build": {
     "frontendDist": "ui-dummy"

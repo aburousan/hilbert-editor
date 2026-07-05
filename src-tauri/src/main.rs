@@ -80,6 +80,28 @@ fn seed_packages(bundled_preview: &Path, cache_root: &Path) {
     }
 }
 
+// Optional bundled tinymist for hover/completion: if a copy is present under the
+// app resource dir (bin/tinymist) or beside the crate, use it; otherwise the
+// backend falls back to `tinymist` on PATH. Not shipped by default (keeps the
+// app small) — drop a binary in bin/ and re-add the tauri.conf resource entry.
+fn find_bundled_tinymist(resource_dir: Option<&Path>) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(r) = resource_dir {
+        candidates.push(r.join("bin").join("tinymist"));
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin").join("tinymist"));
+    candidates.into_iter().find(|p| p.exists())
+}
+
+fn set_bundled_tinymist(resource_dir: Option<&Path>) {
+    if std::env::var_os("TINYMIST_BIN").is_some() {
+        return;
+    }
+    if let Some(tm) = find_bundled_tinymist(resource_dir) {
+        std::env::set_var("TINYMIST_BIN", tm);
+    }
+}
+
 fn workspace_dir(default_docs: Option<PathBuf>) -> PathBuf {
     if let Ok(ws) = std::env::var("TYPST_WORKSPACE") {
         return PathBuf::from(ws);
@@ -128,6 +150,7 @@ fn headless_main() {
             std::env::current_dir().unwrap_or_default().join("workspace")
         };
         let _ = fs::create_dir_all(&ws);
+        set_bundled_tinymist(None);
         let dist = std::env::var("TYPST_DIST").map(PathBuf::from).ok();
         let preferred: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(3001);
         let (listener, port) = bind_free_port(preferred);
@@ -150,6 +173,7 @@ fn main() {
         .setup(|app| {
             use tauri::Manager;
             let resource_dir = app.path().resource_dir().ok();
+            set_bundled_tinymist(resource_dir.as_deref());
 
             // Built UI: bundled resource, overridable for development.
             let dist = std::env::var("TYPST_DIST")

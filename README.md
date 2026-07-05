@@ -9,8 +9,19 @@ smaller and lighter.
 | --- | --- | --- |
 | macOS `.dmg` | 97–104 MB | **7.2 MB** |
 | Unpacked app | 248–255 MB | **18 MB** |
-| Runtime processes | Electron + Node utility process | one native process |
-| Memory | Chromium + Node | system WebView (WKWebView) |
+| Runtime processes | Electron + Node utility process | one native process + system WebView |
+| Idle RAM (macOS, same document) | ~320 MB (bundled Chromium + Node) | **~160 MB** (shared system WKWebView) |
+
+![Electron vs Tauri — RAM and disk](docs/ram-vs-electron.png)
+
+Measured at idle steady-state with the same document open (release builds, macOS
+Apple Silicon, summing every process: main, renderer, GPU, network and backend).
+The Tauri app uses about half the RAM because it renders through the OS's WebKit
+(shared with the system) instead of shipping its own copy of Chromium, and its
+backend is compiled into the same native process instead of a separate Node one.
+On disk it is about **39× smaller** (18 MB vs 711 MB unpacked). RAM figures
+fluctuate with page activity: the WebContent process spikes during heavy
+compiles, then the garbage collector reclaims it. Disk size is exact.
 
 ## How it works
 
@@ -95,7 +106,9 @@ A `cargo-xwin` cross-build from Linux exists (`linux-build/Dockerfile.win`) and
 produces an NSIS installer, but it is **experimental and unreliable** — the
 resulting app frequently fails to launch on real Windows (resource / WebView2
 embedding differs from a native MSVC build). Confirmed broken in testing, so do
-**not** ship the cross-built `.exe`. Use CI instead:
+**not** ship the cross-built `.exe`. **Build it in CI instead.** The workflow
+below now includes a native `windows-latest` runner, which produces a working
+`.msi` and `.exe` with no local Windows machine needed:
 
 ### GitHub Actions (`.github/workflows/build.yml`)
 
@@ -171,7 +184,12 @@ in the Rust backend:
   webview caches them across launches; `index.html` is `no-cache` so UI updates
   still land.
 - One native process using the OS webview instead of Electron + a bundled
-  Chromium + a Node backend process — much lower memory and faster cold start.
+  Chromium + a Node backend process — **~160 MB idle vs Electron's ~320 MB**
+  (see the chart above) and a faster cold start.
+- Shared runtime-memory hygiene (both builds): the PDF preview destroys each
+  pdf.js document on recompile, version history is capped per file, and the
+  in-editor blob URLs are revoked — so RAM stays flat over a long editing session
+  instead of climbing.
 
 ## Notes
 
