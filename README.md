@@ -202,3 +202,12 @@ in the Rust backend:
 - If the macOS dmg step fails with a Finder-automation error, approve the
   "control Finder" permission prompt, or build it manually with `hdiutil` (see
   the Build section).
+
+## Troubleshooting
+
+- **macOS says the app is "damaged" or won't open** — This is macOS Gatekeeper quarantining the app, or a broken signature from renaming the `.app` file. To fix it, run these two commands in your terminal:
+  ```bash
+  xattr -cr "/Applications/Hilbert.app"
+  codesign --force --deep --sign - "/Applications/Hilbert.app"
+  ```
+  *(If the app is in your Downloads folder, adjust the path accordingly).*
