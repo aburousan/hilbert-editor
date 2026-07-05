@@ -1,6 +1,10 @@
-# Typst Editor — Tauri port
+# Hilbert — Tauri port
 
-A Tauri-based build of [Typst Editor](https://github.com/aburousan/typsteditor).
+> **Unofficial.** Hilbert is an independent, community-built editor for
+> [Typst](https://typst.app). It is not the Typst web app, IDE, or compiler, and
+> is not affiliated with or endorsed by the Typst team.
+
+A Tauri-based build of [Hilbert](https://github.com/aburousan/hilbert-editor).
 Same UI, same features, same behaviour — but the Electron shell + Node/Express
 backend are replaced by **one small Rust binary**, so the app is dramatically
 smaller and lighter.
@@ -39,7 +43,7 @@ The original app is a React UI that talks to a local HTTP backend
 - **`src-tauri/src/main.rs`** — the shell (mirrors `electron/main.cjs`):
   free-port pick (3001 preferred), PATH augmentation for GUI launches,
   bundled Typst-package seeding into a writable cache
-  (`TYPST_PACKAGE_CACHE_PATH`), workspace at `~/Documents/TypstEditor`,
+  (`TYPST_PACKAGE_CACHE_PATH`), workspace at `~/Documents/Hilbert`,
   a native window pointing at the local server, external links opened in the
   real browser, and a `window.desktop.pickFolder()` bridge (native folder
   dialog) injected so **File → Open Folder** works exactly as in Electron.
@@ -65,8 +69,8 @@ If the Tauri dmg step fails (Finder scripting), make it manually:
 
 ```bash
 cd target/release/bundle
-mkdir dmg-staging && cp -R "macos/Typst Editor.app" dmg-staging/ && ln -s /Applications dmg-staging/Applications
-hdiutil create -volname "Typst Editor" -srcfolder dmg-staging -ov -format UDZO "dmg/Typst Editor.dmg"
+mkdir dmg-staging && cp -R "macos/Hilbert.app" dmg-staging/ && ln -s /Applications dmg-staging/Applications
+hdiutil create -volname "Hilbert" -srcfolder dmg-staging -ov -format UDZO "dmg/Hilbert.dmg"
 ```
 
 ### Refreshing the UI from the original project
@@ -119,13 +123,13 @@ native Windows build is wanted.
 
 ## Releases — Electron vs Tauri, kept separate
 
-Both live in the one `aburousan/typsteditor` repo but never collide, by
+Both live in the one `aburousan/hilbert-editor` repo but never collide, by
 convention:
 
 | | Branch | Tag | Release title | Bundle names |
 | --- | --- | --- | --- | --- |
-| **Electron** (original) | `main` | `v0.1.1` | *Typst Editor v0.1.1 (Electron)* | `TypstEditor-Electron-<ver>-<os>-<arch>.…` |
-| **Tauri** (this port) | `tauri-port` | `tauri-v0.1.1` | *Typst Editor (Tauri) v0.1.1* | `TypstEditor-Tauri-<ver>-<os>-<arch>.…` |
+| **Electron** (original) | `main` | `v0.1.1` | *Hilbert v0.1.1 (Electron)* | `TypstEditor-Electron-<ver>-<os>-<arch>.…` |
+| **Tauri** (this port) | `tauri-port` | `tauri-v0.1.1` | *Hilbert (Tauri) v0.1.1* | `TypstEditor-Tauri-<ver>-<os>-<arch>.…` |
 
 Releases are cut manually so the two lines stay clean. The bundles are built
 locally (macOS) and on the Linux server (`linux-build/` for Tauri,
@@ -134,12 +138,12 @@ locally (macOS) and on the Linux server (`linux-build/` for Tauri,
 ```bash
 # Electron
 gh release create v0.1.1 --target main \
-  --title "Typst Editor v0.1.1 (Electron)" --notes-file notes.md \
+  --title "Hilbert v0.1.1 (Electron)" --notes-file notes.md \
   TypstEditor-Electron-0.1.1-macOS-arm64.dmg TypstEditor-Electron-0.1.1-Linux-x86_64.AppImage
 
 # Tauri
 gh release create tauri-v0.1.1 --target tauri-port \
-  --title "Typst Editor (Tauri) v0.1.1" --notes-file notes.md \
+  --title "Hilbert (Tauri) v0.1.1" --notes-file notes.md \
   TypstEditor-Tauri-0.1.1-macOS-arm64.dmg TypstEditor-Tauri-0.1.1-Linux-x86_64.deb \
   TypstEditor-Tauri-0.1.1-Linux-x86_64.AppImage
 ```

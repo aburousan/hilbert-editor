@@ -153,6 +153,10 @@ async fn run_cmd(
     timeout_ms: Option<u64>,
 ) -> std::io::Result<CmdOut> {
     let mut cmd = Command::new(program);
+    // Windows: don't flash a console window for each spawned tool (typst, git,
+    // python, julia…). CREATE_NO_WINDOW = 0x08000000. No-op on other platforms.
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
     cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     if let Some(d) = cwd {
         cmd.current_dir(d);
@@ -1020,15 +1024,30 @@ async fn webdav_sync(State(st): St, body: Bytes) -> Response {
 
 const IMAGE_EXT: [&str; 5] = [".png", ".jpg", ".jpeg", ".svg", ".gif"];
 
+// Cross-platform `which`: walk PATH ourselves. On Windows the entries are
+// separated by ';' and we try each PATHEXT extension so `which("python")`
+// matches `python.exe`; on Unix it's ':' and a bare name.
 fn which(name: &str) -> Option<String> {
     let path = std::env::var("PATH").unwrap_or_default();
-    for dir in path.split(':') {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let exts: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".into())
+            .split(';')
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+    for dir in path.split(sep) {
         if dir.is_empty() {
             continue;
         }
-        let cand = Path::new(dir).join(name);
-        if cand.is_file() {
-            return Some(cand.to_string_lossy().into_owned());
+        for ext in &exts {
+            let cand = Path::new(dir).join(format!("{name}{ext}"));
+            if cand.is_file() {
+                return Some(cand.to_string_lossy().into_owned());
+            }
         }
     }
     None
@@ -1039,55 +1058,96 @@ fn detect_interpreters() -> Interpreters {
     let home = dirs::home_dir().unwrap_or_default();
     let mut out = Interpreters::default();
 
-    let base_py = which("python3").or_else(|| which("python")).or_else(|| {
-        [home.join("miniconda3/bin/python3"), PathBuf::from("/opt/homebrew/bin/python3"), PathBuf::from("/usr/bin/python3")]
-            .iter()
-            .find(|p| p.exists())
-            .map(|p| p.to_string_lossy().into_owned())
-    });
+    // Interpreter binary layout differs by OS: bin/python (Unix) vs python.exe
+    // (Windows). Returns whichever exists under an env dir.
+    let py_in = |dir: &Path| -> Option<String> {
+        let p = if cfg!(windows) { dir.join("python.exe") } else { dir.join("bin/python") };
+        if p.is_file() { Some(p.to_string_lossy().into_owned()) } else { None }
+    };
+    let first_file = |cands: &[PathBuf]| cands.iter().find(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned());
+
+    let base_py = which("python3")
+        .or_else(|| which("python"))
+        .or_else(|| if cfg!(windows) { which("py") } else { None })
+        .or_else(|| {
+            let mut cands: Vec<PathBuf> = if cfg!(windows) {
+                vec![
+                    PathBuf::from(r"C:\Python313\python.exe"),
+                    PathBuf::from(r"C:\Python312\python.exe"),
+                    PathBuf::from(r"C:\Python311\python.exe"),
+                ]
+            } else {
+                vec![
+                    home.join("miniconda3/bin/python3"),
+                    PathBuf::from("/opt/homebrew/bin/python3"),
+                    PathBuf::from("/usr/local/bin/python3"),
+                    PathBuf::from("/usr/bin/python3"),
+                ]
+            };
+            // Windows per-user installs: %LOCALAPPDATA%\Programs\Python\Python3xx\python.exe
+            if cfg!(windows) {
+                if let Ok(rd) = fs::read_dir(home.join("AppData/Local/Programs/Python")) {
+                    for e in rd.flatten() {
+                        cands.push(e.path().join("python.exe"));
+                    }
+                }
+            }
+            first_file(&cands)
+        });
     if let Some(p) = base_py {
-        out.python.push(Interp { label: "Default (python3)".into(), path: p });
+        out.python.push(Interp { label: "Default (python)".into(), path: p });
     }
-    for root in ["miniconda3", "anaconda3", "mambaforge", "miniforge3"] {
-        let envs_dir = home.join(root).join("envs");
+
+    // conda / mamba environments — root locations differ per platform.
+    let conda_roots: Vec<PathBuf> = if cfg!(windows) {
+        ["miniconda3", "anaconda3", "mambaforge", "miniforge3"]
+            .iter()
+            .flat_map(|r| vec![home.join(r), PathBuf::from(format!(r"C:\{r}")), PathBuf::from(format!(r"C:\ProgramData\{r}"))])
+            .collect()
+    } else {
+        ["miniconda3", "anaconda3", "mambaforge", "miniforge3"].iter().map(|r| home.join(r)).collect()
+    };
+    for root in &conda_roots {
+        let envs_dir = root.join("envs");
         if let Ok(rd) = fs::read_dir(&envs_dir) {
             let mut envs: Vec<_> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
             envs.sort();
             for env in envs {
-                let p = envs_dir.join(&env).join("bin/python");
-                if p.exists() {
-                    out.python.push(Interp { label: format!("conda: {env}"), path: p.to_string_lossy().into_owned() });
+                if let Some(p) = py_in(&envs_dir.join(&env)) {
+                    out.python.push(Interp { label: format!("conda: {env}"), path: p });
                 }
             }
         }
     }
+
     let venv_dir = home.join(".virtualenvs");
     if let Ok(rd) = fs::read_dir(&venv_dir) {
         let mut envs: Vec<_> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         envs.sort();
         for env in envs {
-            let p = venv_dir.join(&env).join("bin/python");
-            if p.exists() {
-                out.python.push(Interp { label: format!("venv: {env}"), path: p.to_string_lossy().into_owned() });
+            if let Some(p) = py_in(&venv_dir.join(&env)) {
+                out.python.push(Interp { label: format!("venv: {env}"), path: p });
             }
         }
     }
 
     let jl = which("julia").or_else(|| {
-        [home.join(".juliaup/bin/julia"), PathBuf::from("/opt/homebrew/bin/julia"), PathBuf::from("/usr/local/bin/julia")]
-            .iter()
-            .find(|p| p.exists())
-            .map(|p| p.to_string_lossy().into_owned())
+        first_file(&if cfg!(windows) {
+            vec![home.join(".juliaup/bin/julia.exe"), home.join("AppData/Local/Programs/Julia/bin/julia.exe")]
+        } else {
+            vec![home.join(".juliaup/bin/julia"), PathBuf::from("/opt/homebrew/bin/julia"), PathBuf::from("/usr/local/bin/julia")]
+        })
     });
     if let Some(p) = jl {
         out.julia.push(Interp { label: "Default (julia)".into(), path: p });
     }
 
     let wl = which("wolframscript").or_else(|| {
-        [PathBuf::from("/usr/local/bin/wolframscript"), PathBuf::from("/opt/homebrew/bin/wolframscript")]
-            .iter()
-            .find(|p| p.exists())
-            .map(|p| p.to_string_lossy().into_owned())
+        first_file(&if cfg!(windows) {
+            vec![PathBuf::from(r"C:\Program Files\Wolfram Research\WolframScript\wolframscript.exe")]
+        } else {
+            vec![PathBuf::from("/usr/local/bin/wolframscript"), PathBuf::from("/opt/homebrew/bin/wolframscript")]
+        })
     });
     if let Some(p) = wl {
         out.wolfram.push(Interp { label: "WolframScript".into(), path: p });
@@ -1804,6 +1864,8 @@ async fn ensure_lsp(ws: &Path) -> bool {
         return true;
     }
     let mut cmd = Command::new(tinymist_bin());
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — no console popup
     cmd.arg("lsp")
         .current_dir(ws)
         .stdin(Stdio::piped())

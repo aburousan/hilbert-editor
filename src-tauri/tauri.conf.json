@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Typst Editor",
+  "productName": "Hilbert",
   "version": "0.1.2",
-  "identifier": "com.kaziaburousan.typsteditor",
+  "identifier": "com.kaziaburousan.hilbert",
   "build": {
     "frontendDist": "ui-dummy"
   },

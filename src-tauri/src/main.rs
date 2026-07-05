@@ -109,7 +109,14 @@ fn workspace_dir(default_docs: Option<PathBuf>) -> PathBuf {
     let docs = default_docs
         .or_else(dirs::document_dir)
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join("Documents"));
-    docs.join("TypstEditor")
+    // Renamed from "Typst Editor"; migrate the old Documents/TypstEditor folder to
+    // Documents/Hilbert on first launch so existing users don't lose their files.
+    let ws = docs.join("Hilbert");
+    let legacy = docs.join("TypstEditor");
+    if !ws.exists() && legacy.exists() {
+        let _ = fs::rename(&legacy, &ws);
+    }
+    ws
 }
 
 // Bridge injected into the page: replaces the Electron preload (`window.desktop`)
@@ -188,7 +195,7 @@ fn main() {
                 let cache_root = app
                     .path()
                     .app_data_dir()
-                    .unwrap_or_else(|_| dirs::data_dir().unwrap_or_default().join("com.kaziaburousan.typsteditor"))
+                    .unwrap_or_else(|_| dirs::data_dir().unwrap_or_default().join("com.kaziaburousan.hilbert"))
                     .join("typst-cache");
                 if let Some(res) = resource_dir.as_ref() {
                     seed_packages(&res.join("typst-packages").join("preview"), &cache_root);
@@ -208,7 +215,7 @@ fn main() {
 
             let url: tauri::Url = format!("http://127.0.0.1:{port}").parse().unwrap();
             tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::External(url))
-                .title("Typst Editor")
+                .title("Hilbert")
                 .inner_size(1440.0, 920.0)
                 .min_inner_size(900.0, 600.0)
                 .initialization_script(INIT_SCRIPT)
