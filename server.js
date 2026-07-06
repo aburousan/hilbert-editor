@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import { spawn as _spawn, execFile as _execFile, execFileSync as _execFileSync } from 'child_process';
-import { writeFileSync, readFileSync, rmSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync, cpSync, mkdtempSync } from 'fs';
+import { writeFileSync, readFileSync, rmSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync, cpSync, renameSync, mkdtempSync } from 'fs';
 import { join, relative, dirname, resolve, sep, delimiter } from 'path';
 import { tmpdir, homedir } from 'os';
 
@@ -174,8 +174,38 @@ app.post('/workspace/copy', (req, res) => {
   try {
     if (!existsSync(src)) return res.status(404).json({ error: 'Source not found.' });
     mkdirSync(dirname(dst), { recursive: true });
-    cpSync(src, dst);
+    cpSync(src, dst, { recursive: true });
     res.json({ ok: true, path: to });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Rename a file or folder within the workspace.
+app.post('/workspace/rename', (req, res) => {
+  const { from, to } = req.body || {};
+  const src = safeWorkspacePath(from), dst = safeWorkspacePath(to);
+  if (!src || !dst) return res.status(400).json({ error: 'Invalid path' });
+  try {
+    if (!existsSync(src)) return res.status(404).json({ error: 'Source not found.' });
+    if (existsSync(dst)) return res.status(409).json({ error: 'Destination already exists.' });
+    mkdirSync(dirname(dst), { recursive: true });
+    renameSync(src, dst);
+    res.json({ ok: true, path: to });
+  } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// Reveal a file or folder in the native OS file manager.
+app.post('/workspace/reveal', (req, res) => {
+  const path = req.body?.path ? safeWorkspacePath(req.body.path) : WORKSPACE;
+  if (!path || !existsSync(path)) return res.status(404).json({ error: 'Path not found' });
+  try {
+    if (IS_WIN) {
+      execFile('explorer', [statSync(path).isDirectory() ? path : `/select,"${path}"`]);
+    } else if (process.platform === 'darwin') {
+      execFile('open', ['-R', path]);
+    } else {
+      execFile('xdg-open', [statSync(path).isDirectory() ? path : dirname(path)]);
+    }
+    res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 

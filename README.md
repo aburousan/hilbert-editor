@@ -92,7 +92,7 @@ view:
   hover any function for its signature and docs, and get completions for every
   builtin, package export and label. On top of that: `@`-reference autocomplete,
   **image-path autocomplete** inside `image("…")` (Overleaf-style, offered from
-  your workspace), a file tree (files **and** folders, image upload), an outline,
+  your workspace), a file tree (files **and** folders, image upload, **full right-click context menu** with rename/duplicate/copy/paste), an outline,
   a clickable **Problems** panel, and resizable panes.
 - **Open Folder** works like VS Code — pick any folder as the workspace (edits
   save back to disk in the desktop app and Chrome/Edge) — with **File → Open

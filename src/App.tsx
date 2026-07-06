@@ -291,6 +291,8 @@ export default function App() {
   const [showHistoryModal, setShowHistoryModal] = useState(false);
   const [showAppSettings, setShowAppSettings] = useState(false);
   const [activeMenu, setActiveMenu] = useState<string | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number, y: number, node?: FileNode, type: 'file' | 'folder' | 'empty' } | null>(null);
+  const [fileClipboard, setFileClipboard] = useState<{ path: string, type: 'copy' | 'cut' } | null>(null);
   const [projectName, setProjectName] = useState('Project Report');
   const [editingTitle, setEditingTitle] = useState(false);
   const [inputModal, setInputModal] = useState<InputModalConfig | null>(null);
@@ -585,19 +587,88 @@ export default function App() {
     fetchTree();
   };
 
-  const createNewFile = async () => {
-    const name = prompt('File name (use a slash for a subfolder, e.g. chapters/intro.typ):', 'new.typ');
+  const createNewFile = async (basePath?: string | React.MouseEvent) => {
+    const dir = typeof basePath === 'string' ? basePath : undefined;
+    const defaultName = dir ? `${dir}/new.typ` : 'new.typ';
+    const name = prompt('File name (use a slash for a subfolder, e.g. chapters/intro.typ):', defaultName);
     if (!name) return;
     await fetch(`${API}/workspace/file?path=${encodeURIComponent(name)}`, { method: 'POST', body: '' });
     fetchTree();
     openFile(name);
   };
 
-  const createNewFolder = async () => {
-    const name = prompt('Folder name (e.g. images):', 'images');
+  const createNewFolder = async (basePath?: string | React.MouseEvent) => {
+    const dir = typeof basePath === 'string' ? basePath : undefined;
+    const defaultName = dir ? `${dir}/new_folder` : 'images';
+    const name = prompt('Folder name (e.g. images):', defaultName);
     if (!name) return;
     await fetch(`${API}/workspace/mkdir?path=${encodeURIComponent(name)}`, { method: 'POST' });
     fetchTree();
+  };
+
+  const handleRename = async (node: FileNode) => {
+    const newName = prompt(`Rename ${node.name} to:`, node.name);
+    if (!newName || newName === node.name) return;
+    const parentPath = node.path.includes('/') ? node.path.substring(0, node.path.lastIndexOf('/')) : '';
+    const newPath = parentPath ? `${parentPath}/${newName}` : newName;
+    try {
+      await fetch(`${API}/workspace/rename`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from: node.path, to: newPath })
+      });
+      if (node.type === 'file') {
+        setTabs(prev => prev.map(t => t.path === node.path ? { ...t, path: newPath } : t));
+        if (activeTabPath === node.path) setActiveTabPath(newPath);
+      } else {
+        setTabs(prev => prev.map(t => t.path.startsWith(node.path + '/') ? { ...t, path: newPath + t.path.substring(node.path.length) } : t));
+        if (activeTabPath.startsWith(node.path + '/')) setActiveTabPath(newPath + activeTabPath.substring(node.path.length));
+      }
+      fetchTree();
+    } catch {}
+  };
+
+  const handleDuplicate = async (node: FileNode) => {
+    let newPath = node.path;
+    if (node.type === 'file') {
+      const match = node.path.match(/^(.*?)(\.[^.]+)?$/);
+      newPath = `${match?.[1]}_copy${match?.[2] || ''}`;
+    } else {
+      newPath = `${node.path}_copy`;
+    }
+    const newName = prompt(`Duplicate ${node.name} as:`, newPath);
+    if (!newName || newName === node.path) return;
+    try {
+      await fetch(`${API}/workspace/copy`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from: node.path, to: newName })
+      });
+      fetchTree();
+    } catch {}
+  };
+
+  const handlePaste = async (targetNode?: FileNode) => {
+    if (!fileClipboard) return;
+    const targetDir = targetNode && targetNode.type === 'directory' ? targetNode.path :
+                      targetNode ? (targetNode.path.includes('/') ? targetNode.path.substring(0, targetNode.path.lastIndexOf('/')) : '') : '';
+    const fileName = fileClipboard.path.split('/').pop()!;
+    const newPath = targetDir ? `${targetDir}/${fileName}` : fileName;
+    try {
+      if (fileClipboard.type === 'cut') {
+        await fetch(`${API}/workspace/rename`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ from: fileClipboard.path, to: newPath })
+        });
+        setTabs(prev => prev.map(t => t.path === fileClipboard.path ? { ...t, path: newPath } : t));
+        if (activeTabPath === fileClipboard.path) setActiveTabPath(newPath);
+        setFileClipboard(null);
+      } else {
+        await fetch(`${API}/workspace/copy`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ from: fileClipboard.path, to: newPath })
+        });
+      }
+      fetchTree();
+    } catch {}
   };
 
   // Upload any file (images included) into the workspace, optionally into a folder.
@@ -2099,7 +2170,7 @@ export default function App() {
       <div key={node.path} className="tree-node">
         {node.type === 'directory' ? (
           <details open>
-            <summary className="tree-dir">
+            <summary className="tree-dir" onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setContextMenu({ x: e.clientX, y: e.clientY, node, type: 'folder' }); }}>
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
               <span className="tree-name">{node.name}</span>
               <button className="tree-del" title="Delete folder" onClick={(e) => deleteEntry(e, node.path, true)}>×</button>
@@ -2107,7 +2178,7 @@ export default function App() {
             <div className="tree-children">{node.children && renderTree(node.children)}</div>
           </details>
         ) : (
-          <div className={`tree-file ${activeTabPath === node.path ? 'active' : ''}`} onClick={() => openFile(node.path)}>
+          <div className={`tree-file ${activeTabPath === node.path ? 'active' : ''}`} onClick={() => openFile(node.path)} onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setContextMenu({ x: e.clientX, y: e.clientY, node, type: 'file' }); }}>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path><polyline points="13 2 13 9 20 9"></polyline></svg>
             <span className="tree-name">{node.name}</span>
             <button className="tree-del" title="Delete file" onClick={(e) => deleteEntry(e, node.path, false)}>×</button>
@@ -2133,8 +2204,22 @@ export default function App() {
     onMouseEnter: () => { if (activeMenu && activeMenu !== name) setActiveMenu(name); },
   });
 
+  const revealInFileManager = async (path?: string) => {
+    try { await fetch(`${API}/workspace/reveal`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: path || '' }) }); } catch {}
+  };
+  const copyToClipboard = (text: string) => navigator.clipboard.writeText(text);
+  const collapseTree = () => document.querySelectorAll('.file-tree details').forEach(d => (d as HTMLDetailsElement).open = false);
+  const expandTree = () => document.querySelectorAll('.file-tree details').forEach(d => (d as HTMLDetailsElement).open = true);
+  const copyAbsolutePath = async (path: string) => {
+    try {
+      const res = await fetch(`${API}/workspace/root`);
+      const { root } = await res.json();
+      navigator.clipboard.writeText(`${root}/${path}`);
+    } catch {}
+  };
+
   return (
-    <div className="app-container" onClick={() => { setActiveMenu(null); setColorPopAt(null); setHighlightPopAt(null); setFontSizePopAt(null); }}>
+    <div className="app-container" onClick={() => { setActiveMenu(null); setColorPopAt(null); setHighlightPopAt(null); setFontSizePopAt(null); setContextMenu(null); }} onContextMenu={() => setContextMenu(null)}>
       <header className="header">
         <div className="header-left">
           <div className="logo logo-btn" style={{ fontSize: '0.9rem', gap: '4px' }} title="About Hilbert" onClick={() => setShowAbout(true)}>
@@ -2532,7 +2617,7 @@ export default function App() {
                     <svg className="tree-action" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ cursor: 'pointer' }} onClick={uploadAsset}><title>Upload file / image</title><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
                   </span>
                 </div>
-                <div className="file-tree" style={{ flex: 1, overflowY: 'auto' }}>
+                <div className="file-tree" style={{ flex: 1, overflowY: 'auto' }} onContextMenu={(e) => { e.preventDefault(); setContextMenu({ x: e.clientX, y: e.clientY, type: 'empty' }); }}>
                   {treeJsx}
                 </div>
               </div>
@@ -2808,6 +2893,60 @@ export default function App() {
       )}
 
       {showSymbolPicker && <SymbolPicker onClose={() => setShowSymbolPicker(false)} onInsert={(code) => { insertCode(code + ' '); setShowSymbolPicker(false); }} />}
+
+      {contextMenu && (
+        <div className="context-menu dropdown" style={{ position: 'fixed', top: contextMenu.y, left: contextMenu.x, zIndex: 9999, display: 'block' }} onClick={e => e.stopPropagation()}>
+          {contextMenu.type === 'file' && contextMenu.node && (
+            <>
+              <div className="dropdown-item" onClick={() => { openFile(contextMenu.node!.path); setContextMenu(null); }}>Open</div>
+              <div className="dropdown-divider"></div>
+              <div className="dropdown-item" onClick={() => { const dir = contextMenu.node!.path.includes('/') ? contextMenu.node!.path.substring(0, contextMenu.node!.path.lastIndexOf('/')) : ''; createNewFile(dir); setContextMenu(null); }}>New File...</div>
+              <div className="dropdown-item" onClick={() => { const dir = contextMenu.node!.path.includes('/') ? contextMenu.node!.path.substring(0, contextMenu.node!.path.lastIndexOf('/')) : ''; createNewFolder(dir); setContextMenu(null); }}>New Folder...</div>
+              <div className="dropdown-divider"></div>
+              <div className="dropdown-item" onClick={() => { handleRename(contextMenu.node!); setContextMenu(null); }}>Rename</div>
+              <div className="dropdown-item" onClick={() => { handleDuplicate(contextMenu.node!); setContextMenu(null); }}>Duplicate</div>
+              <div className="dropdown-divider"></div>
+              <div className="dropdown-item" onClick={() => { setFileClipboard({ path: contextMenu.node!.path, type: 'copy' }); setContextMenu(null); }}>Copy</div>
+              <div className="dropdown-item" onClick={() => { setFileClipboard({ path: contextMenu.node!.path, type: 'cut' }); setContextMenu(null); }}>Cut</div>
+              <div className="dropdown-item" style={{ opacity: fileClipboard ? 1 : 0.5, pointerEvents: fileClipboard ? 'auto' : 'none' }} onClick={() => { handlePaste(contextMenu.node!); setContextMenu(null); }}>Paste</div>
+              <div className="dropdown-divider"></div>
+              <div className="dropdown-item" style={{ color: '#ef4444' }} onClick={(e) => { deleteEntry(e, contextMenu.node!.path, false); setContextMenu(null); }}>Delete</div>
+              <div className="dropdown-divider"></div>
+              <div className="dropdown-item" onClick={() => { revealInFileManager(contextMenu.node!.path); setContextMenu(null); }}>Reveal in File Manager</div>
+              <div className="dropdown-item" onClick={() => { copyToClipboard(contextMenu.node!.path); setContextMenu(null); }}>Copy Relative Path</div>
+              <div className="dropdown-item" onClick={() => { copyAbsolutePath(contextMenu.node!.path); setContextMenu(null); }}>Copy Absolute Path</div>
+            </>
+          )}
+          {contextMenu.type === 'folder' && contextMenu.node && (
+            <>
+              <div className="dropdown-item" onClick={() => { createNewFile(contextMenu.node!.path); setContextMenu(null); }}>New File...</div>
+              <div className="dropdown-item" onClick={() => { createNewFolder(contextMenu.node!.path); setContextMenu(null); }}>New Folder...</div>
+              <div className="dropdown-divider"></div>
+              <div className="dropdown-item" style={{ opacity: fileClipboard ? 1 : 0.5, pointerEvents: fileClipboard ? 'auto' : 'none' }} onClick={() => { handlePaste(contextMenu.node!); setContextMenu(null); }}>Paste</div>
+              <div className="dropdown-divider"></div>
+              <div className="dropdown-item" onClick={() => { handleRename(contextMenu.node!); setContextMenu(null); }}>Rename</div>
+              <div className="dropdown-item" style={{ color: '#ef4444' }} onClick={(e) => { deleteEntry(e, contextMenu.node!.path, true); setContextMenu(null); }}>Delete</div>
+              <div className="dropdown-divider"></div>
+              <div className="dropdown-item" onClick={() => { copyToClipboard(contextMenu.node!.path); setContextMenu(null); }}>Copy Path</div>
+              <div className="dropdown-item" onClick={() => { revealInFileManager(contextMenu.node!.path); setContextMenu(null); }}>Reveal in File Manager</div>
+              <div className="dropdown-divider"></div>
+              <div className="dropdown-item" onClick={() => { collapseTree(); setContextMenu(null); }}>Collapse</div>
+              <div className="dropdown-item" onClick={() => { expandTree(); setContextMenu(null); }}>Expand All</div>
+            </>
+          )}
+          {contextMenu.type === 'empty' && (
+            <>
+              <div className="dropdown-item" onClick={() => { createNewFile(''); setContextMenu(null); }}>New File...</div>
+              <div className="dropdown-item" onClick={() => { createNewFolder(''); setContextMenu(null); }}>New Folder...</div>
+              <div className="dropdown-divider"></div>
+              <div className="dropdown-item" style={{ opacity: fileClipboard ? 1 : 0.5, pointerEvents: fileClipboard ? 'auto' : 'none' }} onClick={() => { handlePaste(); setContextMenu(null); }}>Paste</div>
+              <div className="dropdown-divider"></div>
+              <div className="dropdown-item" onClick={() => { fetchTree(); setContextMenu(null); }}>Refresh</div>
+              <div className="dropdown-item" onClick={() => { revealInFileManager(''); setContextMenu(null); }}>Reveal Workspace</div>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }
