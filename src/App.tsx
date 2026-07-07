@@ -529,7 +529,37 @@ export default function App() {
   useEffect(() => {
     if (activeTabPath && activeTabPath.endsWith('.typ')) setLastTypPath(activeTabPath);
   }, [activeTabPath]);
-  const currentMain = activeTabPath && activeTabPath.endsWith('.typ') ? activeTabPath : (lastTypPath || 'main.typ');
+
+  // The project's root/entry file — what the preview compiles. Multi-file
+  // projects (templates, theses) have chapters that are `#include`d into a root
+  // file and can't compile on their own (they reference a bibliography/labels
+  // defined in the root). So instead of compiling whatever tab is active, we
+  // compile the root, so editing any chapter updates the whole-document preview.
+  const [mainOverride, setMainOverride] = useState<string | null>(null); // explicit "Set as main file"
+  const [detectedEntry, setDetectedEntry] = useState<string | null>(null); // from typst.toml
+  const treeHasPath = useCallback((target: string): boolean => {
+    const walk = (nodes: FileNode[]): boolean => nodes.some(n => n.path === target || (n.children ? walk(n.children) : false));
+    return walk(fileTree);
+  }, [fileTree]);
+  // Read the entrypoint from a root typst.toml if the project has one.
+  useEffect(() => {
+    if (!fileTree.some(n => n.type === 'file' && n.name === 'typst.toml')) { setDetectedEntry(null); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch(`${API}/workspace/file?path=typst.toml`);
+        if (!r.ok || cancelled) return;
+        const m = (await r.text()).match(/entrypoint\s*=\s*"([^"]+\.typ)"/);
+        if (m && !cancelled && treeHasPath(m[1])) setDetectedEntry(m[1]);
+      } catch { /* ignore */ }
+    })();
+    return () => { cancelled = true; };
+  }, [fileTree, treeHasPath]);
+  const currentMain =
+    (mainOverride && treeHasPath(mainOverride)) ? mainOverride :
+    (detectedEntry && treeHasPath(detectedEntry)) ? detectedEntry :
+    treeHasPath('main.typ') ? 'main.typ' :
+    (activeTabPath && activeTabPath.endsWith('.typ') ? activeTabPath : (lastTypPath || 'main.typ'));
   const [lastCompiledPath, setLastCompiledPath] = useState<string>('');
 
   const saveActiveFile = useCallback(async () => {
@@ -1250,12 +1280,15 @@ export default function App() {
     input.click();
   };
   
-  const handleInitTemplate = async (templateCode: string) => {
+  const handleInitTemplate = async (result: string | { code: string; entrypoint?: string }) => {
     setShowTemplateInstaller(false);
-    await fetchTree();
-    setTabs([{ path: 'main.typ', content: templateCode, isDirty: false }]);
-    setActiveTabPath('main.typ');
-    compileTypst('main.typ');
+    await fetchTree();   // show every file the template created, not just the entry
+    const entry = typeof result === 'string' ? 'main.typ' : (result.entrypoint || 'main.typ');
+    const code = typeof result === 'string' ? result : result.code;
+    setMainOverride(entry);   // preview compiles the template's root, not its chapters
+    setTabs([{ path: entry, content: code, isDirty: false }]);
+    setActiveTabPath(entry);
+    compileTypst(entry);
   };
 
   const insertCode = (text: string) => {
@@ -2554,11 +2587,14 @@ export default function App() {
               ) : (
                 <>
                   <span className="tree-name">{node.name}</span>
+                  {node.path === currentMain && (
+                    <span title="Main file — the preview compiles this" style={{ marginLeft: 'auto', marginRight: '4px', fontSize: '0.58rem', letterSpacing: '0.03em', fontWeight: 700, color: 'var(--accent)', border: '1px solid var(--accent)', borderRadius: '4px', padding: '0 4px', opacity: 0.85 }}>MAIN</span>
+                  )}
                   {(() => {
                     const stat = getGitStatusForPath(node.path, false);
                     if (!stat) return null;
                     const color = '#f59e0b'; // Yellow for 'M'
-                    return <span style={{ marginLeft: 'auto', marginRight: '4px', fontSize: '0.65rem', color, fontWeight: 'bold' }}>{stat}</span>;
+                    return <span style={{ marginLeft: node.path === currentMain ? '0' : 'auto', marginRight: '4px', fontSize: '0.65rem', color, fontWeight: 'bold' }}>{stat}</span>;
                   })()}
                   <button className="tree-del" title="Delete file" onClick={(e) => deleteEntry(e, node.path, false)}>×</button>
                 </>
@@ -2635,7 +2671,7 @@ export default function App() {
 
   // Memoize derived views so typing doesn't re-walk the tree / re-scan headings
   // on every keystroke (they only depend on the tree and the active file).
-  const treeJsx = useMemo(() => renderTree(filterTree(fileTree, treeSearch, searchContentResults)), [fileTree, activeTabPath, renamingPath, renameValue, selectedPaths, collapsedDirs, tabs, treeSearch, searchContentResults]);
+  const treeJsx = useMemo(() => renderTree(filterTree(fileTree, treeSearch, searchContentResults)), [fileTree, activeTabPath, renamingPath, renameValue, selectedPaths, collapsedDirs, currentMain, tabs, treeSearch, searchContentResults]);
   const outline = useMemo(() => getOutline(), [activeTab?.content]);
 
   const toggleMenu = (e: React.MouseEvent, menuName: string) => {
@@ -3462,6 +3498,11 @@ export default function App() {
                 return null;
               })()}
               {selectedPaths.length === 1 && <div className="dropdown-item" onClick={() => { if (contextMenu.node!.type === 'file') openFile(contextMenu.node!.path); setContextMenu(null); }}>Open</div>}
+              {selectedPaths.length === 1 && contextMenu.node!.type === 'file' && contextMenu.node!.path.endsWith('.typ') && (
+                <div className="dropdown-item" onClick={() => { setMainOverride(contextMenu.node!.path); compileTypst(contextMenu.node!.path); setContextMenu(null); }}>
+                  {currentMain === contextMenu.node!.path ? '✓ Main file (compiled in preview)' : 'Set as main file'}
+                </div>
+              )}
               {selectedPaths.length === 1 && <div className="dropdown-divider"></div>}
               {selectedPaths.length === 1 && <div className="dropdown-item" onClick={() => { const dir = contextMenu.node!.type === 'directory' ? contextMenu.node!.path : (contextMenu.node!.path.includes('/') ? contextMenu.node!.path.substring(0, contextMenu.node!.path.lastIndexOf('/')) : ''); createNewFile(dir); setContextMenu(null); }}>New File...</div>}
               {selectedPaths.length === 1 && <div className="dropdown-item" onClick={() => { const dir = contextMenu.node!.type === 'directory' ? contextMenu.node!.path : (contextMenu.node!.path.includes('/') ? contextMenu.node!.path.substring(0, contextMenu.node!.path.lastIndexOf('/')) : ''); createNewFolder(dir); setContextMenu(null); }}>New Folder...</div>}

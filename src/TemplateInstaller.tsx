@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import './PackageInstaller.css';
 
 interface Template { name: string; version: string; description: string; authors: string[]; }
-interface TemplateInstallerProps { onInsert: (code: string) => void; onClose: () => void; }
+interface TemplateInstallerProps { onInsert: (result: { code: string; entrypoint?: string }) => void; onClose: () => void; }
 
 import { API } from './api';
 
@@ -60,7 +60,7 @@ export function TemplateInstaller({ onInsert, onClose }: TemplateInstallerProps)
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ template: `@preview/${pkg.name}:${pkg.version}` })
       });
-      if (res.ok) onInsert((await res.json()).code);
+      if (res.ok) onInsert(await res.json());
       else alert('Failed to initialize template. It may contain complex multi-file dependencies.');
     } catch { alert('Network error initializing template'); } finally { setLoading(false); }
   };

@@ -337,18 +337,27 @@ app.post('/init-template', (req, res) => {
 
   rmSync(WORKSPACE_DIR, { recursive: true, force: true });
   const initProcess = spawn('typst', ['init', template, WORKSPACE_DIR]);
-  
-  let stderr = '';
+
+  let stderr = '', stdout = '';
+  initProcess.stdout.on('data', data => { stdout += data.toString(); });
   initProcess.stderr.on('data', data => { stderr += data.toString(); });
-  
+  initProcess.on('error', e => { if (!res.headersSent) res.status(500).json({ error: e.code === 'ENOENT' ? 'Typst CLI not found — install it so `typst --version` works.' : String(e.message) }); });
+
   initProcess.on('close', code => {
-    if (code !== 0) return res.status(400).json({ error: stderr });
-    
+    if (code !== 0) return res.status(400).json({ error: stderr || 'typst init failed' });
+
     try {
       const files = readdirSync(WORKSPACE_DIR);
-      const typFile = files.find(f => f.endsWith('.typ')) || 'main.typ';
-      const content = readFileSync(join(WORKSPACE_DIR, typFile), 'utf-8');
-      res.json({ code: content });
+      // `typst init` prints the real entrypoint, e.g. `> typst watch main.typ`.
+      // Trust that over "first .typ alphabetically" so multi-file templates open
+      // the correct entry (a chapter file could otherwise sort ahead of it).
+      const m = (stdout + '\n' + stderr).match(/(?:watch|compile)\s+"?([^\s"]+\.typ)/);
+      let entry = m && m[1];
+      if (!entry || !existsSync(join(WORKSPACE_DIR, entry))) {
+        entry = files.includes('main.typ') ? 'main.typ' : (files.find(f => f.endsWith('.typ')) || 'main.typ');
+      }
+      const content = existsSync(join(WORKSPACE_DIR, entry)) ? readFileSync(join(WORKSPACE_DIR, entry), 'utf-8') : '';
+      res.json({ code: content, entrypoint: entry });
     } catch (e) {
       res.status(500).json({ error: 'Failed to read template files' });
     }

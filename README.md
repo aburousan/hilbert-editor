@@ -14,6 +14,24 @@ result straight into the document.
 
 ![Hilbert](docs/screenshot.png)
 
+## Why you'll like it
+
+- **It feels instant.** The PDF re-renders as you type, the editor is Monaco (the
+  same one that powers VS Code) with real Typst hover-docs and autocomplete, and the
+  whole app is ready in well under a second.
+- **The fiddly stuff is one click.** Equations, matrices, tables, figures, theorem
+  boxes, citations by DOI/arXiv, commutative and Feynman diagrams, 3D plots — all
+  visual, all producing clean, editable Typst you own.
+- **It does the maths for you.** Run Python / Julia / Wolfram and drop the result
+  straight in as a typeset equation, or select an expression and simplify, solve,
+  differentiate or integrate it in place.
+- **It's genuinely light.** The Tauri build starts at around **12 MB of memory** and
+  installs in under **9 MB** — a fraction of a typical Electron editor. There's a
+  full head-to-head in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+- **It stays out of your way.** Offline by default, opens any folder like VS Code,
+  shows a clickable error panel instead of crashing, keeps your last good preview,
+  and never flashes a console window on Windows.
+
 ## Demo
 
 **Live editing with an instant PDF preview:**
@@ -341,6 +359,16 @@ OS-level isolation (a container or VM).
 Cloud credentials (Google Drive OAuth, WebDAV) live only in your browser's local
 storage — they're never committed or sent anywhere but the service you're syncing
 to. For Google Drive you supply your own OAuth Client ID in App Settings.
+
+## What's next
+
+Honestly, Hilbert already does most of what I set out to build — the writing and live
+preview, the visual builders, the maths tooling, references, export, all of it. So
+rather than keep piling on new features, I want the next few releases to be about
+making what's already here rock-solid: smoothing out the rough edges you actually hit,
+squashing bugs, and making it faster and lighter (the [benchmarks](docs/PERFORMANCE.md)
+are where I'm tracking that). If something breaks or feels slow, that's exactly the
+kind of thing I want to hear about.
 
 ## Feedback & updates
 
