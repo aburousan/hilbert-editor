@@ -22,10 +22,16 @@ jobs:
         include:
           - os: ubuntu-22.04        # Linux: AppImage + .deb
             args: ""
+            rust_target: ""
           - os: macos-14            # macOS Apple Silicon: .app + .dmg
             args: "--target aarch64-apple-darwin"
+            rust_target: "aarch64-apple-darwin"
+          - os: macos-13            # macOS Intel: .app + .dmg
+            args: "--target x86_64-apple-darwin"
+            rust_target: "x86_64-apple-darwin"
           - os: windows-latest      # Windows x64: .msi + .exe (NSIS)
             args: ""
+            rust_target: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -43,7 +49,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.os == 'macos-14' && 'aarch64-apple-darwin' || '' }}
+          targets: ${{ matrix.rust_target }}
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
