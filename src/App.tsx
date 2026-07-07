@@ -3301,6 +3301,11 @@ export default function App() {
           {compileError ? (
             (() => {
               const errs = problems.filter(p => p.severity === 'error');
+              // Errors coming from inside an installed package (a template's
+              // dependency) usually mean the package isn't compatible with the
+              // installed Typst version — reassure the user it isn't their file.
+              const pkgRe = /@preview\/|\/preview\/|\b\d+\.\d+\.\d+\/src\//;
+              const pkgIssue = pkgRe.test(compileError || '') || errs.some(p => pkgRe.test(p.file || ''));
               return (
                 <div className="preview-error">
                   <div className="preview-error-card">
@@ -3314,6 +3319,11 @@ export default function App() {
                         ? ` Fix the ${errs.length} error${errs.length > 1 ? 's' : ''} below — click one to jump to it.`
                         : ''}
                     </div>
+                    {pkgIssue && (
+                      <div style={{ margin: '2px 0 4px', padding: '9px 12px', borderRadius: '8px', background: 'rgba(245, 158, 11, 0.12)', border: '1px solid rgba(245, 158, 11, 0.35)', color: 'var(--text-color)', fontSize: '0.82rem', lineHeight: 1.45 }}>
+                        This error is inside a Typst <b>package</b> (a template's dependency), not your document. It usually means that package isn't compatible with your installed Typst version — try a different template, or update the Typst CLI. Nothing is broken on your end.
+                      </div>
+                    )}
                     {errs.length > 0 ? (
                       <ul className="preview-error-list">
                         {errs.map((p, i) => (

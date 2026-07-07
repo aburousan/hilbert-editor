@@ -81,6 +81,12 @@ view:
 > compiler and (optional) code execution — nothing leaves the machine unless you
 > deliberately turn on Google Drive or WebDAV sync.
 
+> **Built to stay out of your way.** A failed compile shows a clickable error
+> panel and keeps your last good preview — it doesn't crash or lose your work. On
+> Windows, the tools it runs in the background (Typst, git, Python, …) never flash
+> a console window. The backend also survives a misbehaving tool instead of taking
+> the whole app down with it.
+
 ## What's in the box
 
 **Writing & preview**
@@ -195,13 +201,22 @@ starts the Vite dev server and the local backend; open the printed URL (default
 
 ### Prefer a desktop app?
 
-There are prebuilt installers on the [Releases](https://github.com/aburousan/hilbert-editor/releases)
-page — a **`.dmg`** for macOS (Apple Silicon and Intel) and an **`.AppImage`**
-for Linux — or build them yourself:
+Prebuilt installers are on the [Releases](https://github.com/aburousan/hilbert-editor/releases)
+page — pick the one for your machine:
+
+| Platform | Download |
+| --- | --- |
+| **Windows** | `.exe` installer |
+| **macOS — Apple Silicon** (M1 / M2 / M3 …) | `Hilbert_<ver>_aarch64.dmg` |
+| **macOS — Intel** | `Hilbert_<ver>_x64.dmg` |
+| **Linux** | `.AppImage` |
+
+On a Mac, choose **Apple Silicon** for M-series chips and **Intel** for older
+Macs — *About This Mac* tells you which you have. Or build from source:
 
 ```bash
 npm run app     # build the UI and launch the desktop window
-npm run dist    # build installers into release/ (.dmg on macOS, .AppImage on Linux)
+npm run dist    # build an installer into release/ for your current platform
 ```
 
 Your documents live in `~/Documents/Hilbert`. The desktop app still needs the
@@ -223,7 +238,12 @@ features) — those aren't bundled.
 
 ### Windows
 
-Windows isn't in the prebuilt releases yet, but it runs fine — two ways:
+There's a prebuilt **`.exe` installer** on the [Releases](https://github.com/aburousan/hilbert-editor/releases)
+page — download and run it. It behaves like a normal Windows app: launching tools
+(Typst, git, Python, …) never flashes a console window, and a failed compile shows
+an error panel instead of closing. You still need the **Typst CLI** on your `PATH`.
+
+Prefer to run it yourself? Two ways:
 
 **1. Run from source** (quickest):
 
@@ -283,6 +303,13 @@ documents persist in the mounted `workspace/`. Keep the port on `127.0.0.1` only
   found. Install it (`brew install typst`, `winget install Typst.Typst`, or a
   release binary) and make sure `typst --version` works. The desktop app looks in
   the usual install locations (Homebrew, cargo, `~/.local/bin`, …).
+- **A template fails with an error inside `@preview/…`** — that's a package
+  compatibility problem, not the editor. Some Typst Universe templates pull in
+  helper packages that were written for an older Typst and don't build on newer
+  releases (e.g. *"cannot add string and type"*). The editor shows the error in a
+  panel — it doesn't crash — but the fix is out of its hands: pick a different
+  template, or match the Typst version the template expects. Your own document is
+  fine.
 - **`npm run dev` only prints `concurrently "node server.js" "vite"` and stops** —
   the dev dependencies aren't installed. Run a full `npm install` (not
   `--production`), then `npm run dev` again.
