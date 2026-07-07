@@ -9,24 +9,38 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-// A GUI-launched app inherits a bare PATH (roughly /usr/bin:/bin), so it can't
-// find typst/python/julia installed via Homebrew, cargo, etc. Prepend the usual
-// install locations so spawned tools are found.
+// A GUI-launched app inherits a bare PATH (roughly /usr/bin:/bin on macOS/Linux),
+// so it can't find typst/python/julia installed via Homebrew, cargo, etc. Prepend
+// the usual install locations so spawned tools are found.
 fn augment_path() {
     let home = dirs::home_dir().unwrap_or_default();
-    let extra = [
-        PathBuf::from("/opt/homebrew/bin"),
-        PathBuf::from("/opt/homebrew/sbin"),
-        PathBuf::from("/usr/local/bin"),
-        PathBuf::from("/usr/local/sbin"),
-        home.join(".cargo/bin"),
-        home.join(".juliaup/bin"),
-        home.join(".local/bin"),
-        PathBuf::from("/opt/local/bin"),
-    ];
+    // Platform-appropriate extra locations. CRITICAL: join with the OS path
+    // separator — using ':' on Windows (where it must be ';') corrupts the whole
+    // PATH, breaking `which()` for typst AND python (template installer + code
+    // runner both stop working).
+    let extra: Vec<PathBuf> = if cfg!(windows) {
+        let local = std::env::var("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|_| home.join("AppData/Local"));
+        vec![
+            home.join(".cargo/bin"),
+            home.join(".juliaup/bin"),
+            local.join("Programs/Python/Launcher"), // the `py` launcher
+        ]
+    } else {
+        vec![
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/opt/homebrew/sbin"),
+            PathBuf::from("/usr/local/bin"),
+            PathBuf::from("/usr/local/sbin"),
+            home.join(".cargo/bin"),
+            home.join(".juliaup/bin"),
+            home.join(".local/bin"),
+            PathBuf::from("/opt/local/bin"),
+        ]
+    };
+    let sep = if cfg!(windows) { ";" } else { ":" };
     let mut parts: Vec<String> = extra.iter().filter(|p| p.exists()).map(|p| p.to_string_lossy().into_owned()).collect();
     parts.push(std::env::var("PATH").unwrap_or_default());
-    std::env::set_var("PATH", parts.join(":"));
+    std::env::set_var("PATH", parts.join(sep));
 }
 
 // Prefer the standard port, but fall back to an ephemeral one when it's taken.
