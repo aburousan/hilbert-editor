@@ -383,10 +383,8 @@ These are guardrails, **not** a hardened sandbox — code runs with your user pr
 **Don't expose port 3001 to a network or run untrusted documents.** For untrusted use
 you'd want real OS-level isolation (a container or VM).
 
-The **auto-updater** verifies every update against a signing key: the repo holds only
-the **public** key, so nothing in it can forge an update; the private key never leaves
-the maintainer's machine. Cloud credentials (Google Drive OAuth, WebDAV) live only in
-your browser's local storage.
+Cloud credentials (Google Drive OAuth, WebDAV) live only in your browser's local
+storage.
 
 ---
 
