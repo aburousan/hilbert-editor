@@ -120,16 +120,3 @@ workspace root at that path (`POST /workspace/root`) and reads/writes files ther
 directly. Recent folders are remembered. In the browser build, the File System
 Access API writes edits straight back to the chosen folder. No copy, no import step
 for the desktop app — exactly like opening a folder in VS Code.
-
----
-
-## 6. Not yet measured (needs GUI instrumentation)
-
-The backend numbers above are headless. These require the running window and are
-tracked separately via the app's own `logTiming()`:
-
-- Startup waterfall (window → React → Monaco → backend → first compile).
-- Per-keystroke editor latency, idle CPU/energy, preview FPS.
-- Full-process memory (renderer/WebView + GPU), not just the backend.
-
-Re-run `bench.cjs` before every release and append results here.
