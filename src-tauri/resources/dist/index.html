@@ -5,12 +5,21 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Hilbert — Typst editor (Unofficial)</title>
-    <script type="module" crossorigin src="/assets/index-CXibsycl.js"></script>
-    <link rel="modulepreload" crossorigin href="/assets/rolldown-runtime-QTnfLwEv.js">
-    <link rel="modulepreload" crossorigin href="/assets/monaco-DRTKqFf8.js">
+    <script>
+      window.appStartTime = performance.now();
+      window.logTiming = function(label) {
+        const elapsed = performance.now() - window.appStartTime;
+        let timeStr = elapsed < 1000 ? Math.round(elapsed) + ' ms' : (elapsed / 1000).toFixed(1) + ' s';
+        console.log((label + ' ').padEnd(27, '.') + ' ' + timeStr);
+      };
+      window.logTiming('Window created');
+    </script>
+    <script type="module" crossorigin src="/assets/index-CRLPDC5U.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/rolldown-runtime-aKtaBQYM.js">
+    <link rel="modulepreload" crossorigin href="/assets/monaco-B9g3NQO_.js">
     <link rel="modulepreload" crossorigin href="/assets/pdfjs-C58hELUo.js">
     <link rel="stylesheet" crossorigin href="/assets/monaco-v5rfKcVs.css">
-    <link rel="stylesheet" crossorigin href="/assets/index-C6x0yqFx.css">
+    <link rel="stylesheet" crossorigin href="/assets/index-5ly16FBs.css">
   </head>
   <body>
     <div id="root"></div>

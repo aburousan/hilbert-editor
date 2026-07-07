@@ -214,7 +214,8 @@ fn get_tree(dir: &Path, ws: &Path) -> Vec<Value> {
         if st.is_dir() {
             out.push(json!({ "type": "directory", "name": item, "path": rel, "children": get_tree(&full, ws) }));
         } else {
-            out.push(json!({ "type": "file", "name": item, "path": rel }));
+            let mtime = st.modified().map(epoch_ms).unwrap_or(0.0);
+            out.push(json!({ "type": "file", "name": item, "path": rel, "size": st.len(), "mtime": mtime }));
         }
     }
     out
@@ -391,6 +392,145 @@ async fn workspace_copy(State(st): St, body: Bytes) -> Response {
     }
 }
 
+// Rename / move a file or folder within the workspace.
+async fn workspace_rename(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let ws = st.ws();
+    let (Some(src), Some(dst)) = (
+        jstr(&v, "from").and_then(|p| safe_workspace_path(&ws, p)),
+        jstr(&v, "to").and_then(|p| safe_workspace_path(&ws, p)),
+    ) else {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid path");
+    };
+    if !src.exists() {
+        return json_err(StatusCode::NOT_FOUND, "Source not found.");
+    }
+    if dst.exists() {
+        return json_err(StatusCode::CONFLICT, "Destination already exists.");
+    }
+    if let Some(parent) = dst.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match fs::rename(&src, &dst) {
+        Ok(_) => Json(json!({ "ok": true, "path": jstr(&v, "to").unwrap_or("") })).into_response(),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// Reveal a file or folder in the native OS file manager.
+async fn workspace_reveal(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let ws = st.ws();
+    let target = jstr(&v, "path").and_then(|p| safe_workspace_path(&ws, p)).unwrap_or_else(|| ws.clone());
+    if !target.exists() {
+        return json_err(StatusCode::NOT_FOUND, "Path not found");
+    }
+    #[cfg(target_os = "macos")]
+    { let _ = std::process::Command::new("open").arg("-R").arg(&target).spawn(); }
+    #[cfg(target_os = "windows")]
+    { let _ = std::process::Command::new("explorer").arg(format!("/select,{}", target.display())).spawn(); }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    { let dir = if target.is_dir() { target.clone() } else { target.parent().map(Path::to_path_buf).unwrap_or_else(|| target.clone()) }; let _ = open::that_detached(dir); }
+    Json(json!({ "ok": true })).into_response()
+}
+
+// Full-text search across the workspace (skips dotfiles, binaries, build output).
+async fn workspace_search(State(st): St, Query(q): Q) -> Response {
+    let query = q.get("q").map(|s| s.to_lowercase()).unwrap_or_default();
+    if query.is_empty() {
+        return Json(json!([])).into_response();
+    }
+    let ws = st.ws();
+    let mut results: Vec<Value> = Vec::new();
+    search_walk(&ws, &ws, &query, &mut results);
+    Json(results).into_response()
+}
+
+fn search_walk(dir: &Path, ws: &Path, q: &str, out: &mut Vec<Value>) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || name == "node_modules" || name == "sandbox" || name.ends_with(".pdf") {
+            continue;
+        }
+        let full = entry.path();
+        let Ok(meta) = fs::metadata(&full) else { continue };
+        if meta.is_dir() {
+            search_walk(&full, ws, q, out);
+            continue;
+        }
+        let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+        if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "bmp" | "zip" | "tar" | "gz") {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&full) else { continue };
+        let Ok(content) = String::from_utf8(bytes) else { continue };
+        if !content.to_lowercase().contains(q) {
+            continue;
+        }
+        let matches: Vec<Value> = content
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.to_lowercase().contains(q))
+            .map(|(i, line)| json!({ "lineNum": i + 1, "text": line.trim() }))
+            .collect();
+        if !matches.is_empty() {
+            let rel = full.strip_prefix(ws).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+            out.push(json!({ "path": rel, "matches": matches }));
+        }
+    }
+}
+
+// Serve a raw workspace file (e.g. image / file preview) with a guessed MIME type.
+async fn workspace_raw(State(st): St, Query(q): Q) -> Response {
+    let Some(full) = q.get("path").and_then(|p| safe_workspace_path(&st.ws(), p)) else {
+        return text_err(StatusCode::BAD_REQUEST, "Invalid path");
+    };
+    match fs::read(&full) {
+        Ok(bytes) => {
+            let mime = mime_guess::from_path(&full).first_or_octet_stream();
+            ([(header::CONTENT_TYPE, mime.as_ref())], bytes).into_response()
+        }
+        Err(_) => text_err(StatusCode::NOT_FOUND, "Not found"),
+    }
+}
+
+// Compress selected files/folders into a zip archive inside the workspace.
+async fn workspace_compress(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let ws = st.ws();
+    let Some(paths) = v.get("paths").and_then(|p| p.as_array()).filter(|a| !a.is_empty()) else {
+        return json_err(StatusCode::BAD_REQUEST, "Paths required");
+    };
+    let archive_name = jstr(&v, "archiveName").filter(|s| !s.is_empty()).unwrap_or("archive.zip");
+    let Some(out_path) = safe_workspace_path(&ws, archive_name) else {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid archive name");
+    };
+    let mut rel_paths: Vec<String> = Vec::new();
+    for p in paths {
+        if let Some(full) = p.as_str().and_then(|s| safe_workspace_path(&ws, s)) {
+            if let Ok(rel) = full.strip_prefix(&ws) {
+                rel_paths.push(rel.to_string_lossy().into_owned());
+            }
+        }
+    }
+    if rel_paths.is_empty() {
+        return json_err(StatusCode::BAD_REQUEST, "No valid paths");
+    }
+    let mut args: Vec<String> = vec!["-r".into(), out_path.to_string_lossy().into_owned()];
+    args.extend(rel_paths);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    match run_cmd("zip", &argv, Some(&ws), None).await {
+        Ok(o) if o.code == Some(0) => Json(json!({ "ok": true })).into_response(),
+        Ok(o) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            if o.stderr.is_empty() { format!("Compression failed with code {}", o.code.map(|c| c.to_string()).unwrap_or_else(|| "null".into())) } else { o.stderr },
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json_err(StatusCode::INTERNAL_SERVER_ERROR, "The `zip` command was not found on this system."),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Compile
 // ---------------------------------------------------------------------------
@@ -408,7 +548,9 @@ async fn compile(State(st): St, Query(q): Q, body: Bytes) -> Response {
     }
     // Make any fonts the user imported into <workspace>/fonts discoverable by the
     // compiler so `#set text(font: "…")` works with custom .ttf/.otf files.
-    let mut compile_args: Vec<String> = vec!["compile".into()];
+    // `--root <ws>` lets `#include`/`#import` reach any file in the workspace
+    // (multi-file projects), matching the Electron backend.
+    let mut compile_args: Vec<String> = vec!["compile".into(), "--root".into(), ws.to_string_lossy().into_owned()];
     if ws.join("fonts").is_dir() {
         compile_args.push("--font-path".into());
         compile_args.push("fonts".into());
@@ -468,9 +610,10 @@ async fn compile_html(State(st): St, Query(q): Q) -> Response {
         return json_err(StatusCode::BAD_REQUEST, "Invalid main path");
     };
     let out_file = ws.join(".out.html");
+    let ws_s = ws.to_string_lossy();
     let out = match run_cmd(
         "typst",
-        &["compile", "--format", "html", "--features", "html", &main_path.to_string_lossy(), &out_file.to_string_lossy()],
+        &["compile", "--root", &ws_s, "--format", "html", "--features", "html", &main_path.to_string_lossy(), &out_file.to_string_lossy()],
         Some(&ws),
         None,
     )
@@ -513,7 +656,8 @@ async fn export(State(st): St, body: Bytes) -> Response {
         let ext = if format == "html" { "html" } else { "pdf" };
         let target = Path::new(folder).join(format!("{name}.{ext}"));
         let main_abs = ws.join(main_file);
-        let mut args: Vec<&str> = vec!["compile", "--format", ext];
+        let ws_s = ws.to_string_lossy().into_owned();
+        let mut args: Vec<&str> = vec!["compile", "--root", &ws_s, "--format", ext];
         if format == "html" {
             args.extend(["--features", "html"]);
         }
@@ -685,9 +829,9 @@ async fn git_status(State(st): St) -> Response {
         return Json(json!({ "initialized": false })).into_response();
     }
     let branch = git(&ws, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
-    let status = git(&ws, &["status", "--short"]).await;
+    let status = git(&ws, &["status", "--porcelain"]).await;
     let remote = git(&ws, &["remote", "get-url", "origin"]).await;
-    let files: Vec<String> = status.stdout.split('\n').filter(|l| !l.is_empty()).map(|l| l.trim().to_string()).collect();
+    let files: Vec<String> = status.stdout.split('\n').filter(|l| !l.is_empty()).map(|l| l.to_string()).collect();
     Json(json!({
         "initialized": true,
         "branch": if branch.code == Some(0) { branch.stdout.trim().to_string() } else { "main".to_string() },
@@ -922,7 +1066,7 @@ fn collect_workspace(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>)
 }
 
 async fn compile_to_pdf(ws: &Path, main: &Path, out: &Path) -> bool {
-    match run_cmd("typst", &["compile", &main.to_string_lossy(), &out.to_string_lossy()], Some(ws), Some(30000)).await {
+    match run_cmd("typst", &["compile", "--root", &ws.to_string_lossy(), &main.to_string_lossy(), &out.to_string_lossy()], Some(ws), Some(30000)).await {
         Ok(o) => o.code == Some(0) && out.exists(),
         Err(_) => false,
     }
@@ -2051,6 +2195,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/workspace/upload", post(workspace_upload))
         .route("/workspace/save-image", post(workspace_save_image))
         .route("/workspace/copy", post(workspace_copy))
+        .route("/workspace/rename", post(workspace_rename))
+        .route("/workspace/reveal", post(workspace_reveal))
+        .route("/workspace/search", get(workspace_search))
+        .route("/workspace/raw", get(workspace_raw))
+        .route("/workspace/compress", post(workspace_compress))
         .route("/compile", post(compile))
         .route("/compile/html", get(compile_html))
         .route("/init-template", post(init_template))
