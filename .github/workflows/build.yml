@@ -1,21 +1,25 @@
-name: Build desktop bundles
+name: Release desktop bundles
 
+# Builds, signs, and publishes a cross-platform release with the auto-updater
+# artifacts + latest.json, so installed apps can update themselves.
+#
 # Tauri compiles native code against each OS's system webview (WebKitGTK on
-# Linux, WKWebView on macOS), so — unlike Electron — it cannot cross-compile;
-# each target is built on its own runner.
+# Linux, WebView2 on Windows, WKWebView on macOS), so — unlike Electron — it
+# cannot cross-compile; each target builds on its own runner.
 #
-# Windows builds on a native `windows-latest` runner — GitHub gives it away free,
-# and Tauri produces a proper `.msi` + `.exe` (NSIS) there. (Only *cross*-building
-# Windows from Linux with cargo-xwin was unreliable; a native runner is not.)
-#
-# Build-only: uploads per-platform artifacts you can download from the run.
-# Releases are cut manually (see README) so the Electron `v*` and Tauri
-# `tauri-v*` release lines stay cleanly separated.
+# Manual trigger. It creates a DRAFT release: every platform job uploads its
+# bundles and merges its signature into a single latest.json on that draft.
+# Publish the draft afterwards (and mark it Latest) so the updater endpoint
+# — github…/releases/latest/download/latest.json — resolves to it.
+
 on:
-  workflow_dispatch:        # build on demand from the Actions tab
+  workflow_dispatch:
+
+permissions:
+  contents: write        # tauri-action needs this to create the release
 
 jobs:
-  build:
+  release:
     strategy:
       fail-fast: false
       matrix:
@@ -54,25 +58,20 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - uses: tauri-apps/tauri-action@v0
+      # Pinned to a commit SHA (not the mutable @v0 tag) so a compromise of the
+      # action's tag can't run with the signing key. SHA is action-v1.0.0.
+      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
         env:
-          # Signs the auto-updater artifacts. Add the private key (contents of
-          # ~/Desktop/hilbert-updater-private.key) as a repo secret to enable updates.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Signs the auto-updater artifacts. Repo secret = the full contents of
+          # ~/Desktop/hilbert-updater-private.key. The key's password is empty.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         with:
           projectPath: .
           args: ${{ matrix.args }}
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: bundles-${{ matrix.os }}
-          path: |
-            src-tauri/target/**/release/bundle/**/*.AppImage
-            src-tauri/target/**/release/bundle/**/*.deb
-            src-tauri/target/**/release/bundle/**/*.dmg
-            src-tauri/target/**/release/bundle/**/*.msi
-            src-tauri/target/**/release/bundle/**/*.exe
-            src-tauri/target/**/release/bundle/**/*.sig
-            src-tauri/target/**/release/bundle/**/*.tar.gz
-            src-tauri/target/**/release/bundle/**/*.zip
+          tagName: tauri-v__VERSION__
+          releaseName: "Hilbert (Tauri) v__VERSION__"
+          releaseBody: "Fixes the a4/us-letter page size in the preview and improves the bidirectional source/PDF link."
+          releaseDraft: true
+          prerelease: false
