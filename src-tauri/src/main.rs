@@ -2,6 +2,7 @@
 // the built UI in a native window — the Electron main.cjs, replicated.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod proofread;
 mod server;
 
 use std::fs;
@@ -176,6 +177,7 @@ fn headless_main() {
         let preferred: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(3001);
         let (listener, port) = bind_free_port(preferred);
         let state = Arc::new(server::AppState::new(ws, dist));
+        std::thread::spawn(proofread::warm); // pre-load spell/grammar dictionaries
         println!("Typst compiler server running on http://127.0.0.1:{port}");
         println!("  code execution: {}", if state.allow_exec { "ENABLED (sandbox/)" } else { "disabled" });
         server::serve(listener, state).await;
@@ -256,20 +258,27 @@ fn main() {
                 std::env::set_var("TYPST_PACKAGE_CACHE_PATH", &cache_root);
             }
 
-            // Keep user documents in a writable location outside the app bundle.
-            let ws = workspace_dir(app.path().document_dir().ok());
+            // Reopen the last project if its folder still exists (session restore),
+            // otherwise fall back to the default documents workspace.
+            let ws = server::saved_workspace()
+                .unwrap_or_else(|| workspace_dir(app.path().document_dir().ok()));
             let _ = fs::create_dir_all(&ws);
 
             let (listener, port) = bind_free_port(3001);
             let state = Arc::new(server::AppState::new(ws, dist));
             *state.app.lock().unwrap() = Some(app.handle().clone());
             tauri::async_runtime::spawn(server::serve(listener, state));
+            std::thread::spawn(proofread::warm); // pre-load spell/grammar dictionaries
 
             let url: tauri::Url = format!("http://127.0.0.1:{port}").parse().unwrap();
             tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::External(url))
                 .title("Hilbert")
                 .inner_size(1440.0, 920.0)
                 .min_inner_size(900.0, 600.0)
+                // Let OS file drops reach the webview instead of being swallowed
+                // by Tauri's native handler, so dragging files onto the file tree
+                // fires the app's own drop upload.
+                .disable_drag_drop_handler()
                 .initialization_script(INIT_SCRIPT)
                 // Open external links (mailto:, https:) in the real browser, not the app.
                 .on_navigation(|url| {

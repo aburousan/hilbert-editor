@@ -18,7 +18,7 @@ use std::{
     fs,
     path::{Component, Path, PathBuf},
     process::Stdio,
-    sync::{Arc, LazyLock, Mutex, RwLock},
+    sync::{atomic::{AtomicU64, Ordering}, Arc, LazyLock, Mutex, RwLock},
     time::{Duration, Instant, SystemTime},
 };
 use tokio::io::AsyncReadExt;
@@ -78,7 +78,9 @@ impl AppState {
     }
 
     fn ws(&self) -> PathBuf {
-        self.workspace.read().unwrap().clone()
+        // Recover from a poisoned lock instead of panicking: a workspace path is
+        // always readable, and one panicked handler shouldn't wedge every request.
+        self.workspace.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -204,8 +206,10 @@ fn get_tree(dir: &Path, ws: &Path) -> Vec<Value> {
     let mut items: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
     items.sort();
     for item in items {
-        // Hide dotfiles, node_modules, the sandbox scratch dir and build output.
-        if item.starts_with('.') || item == "node_modules" || item == "sandbox" || item.ends_with(".pdf") {
+        // Hide dotfiles, node_modules and the sandbox scratch dir. PDFs (both the
+        // compiled out.pdf and any the user adds) stay visible so they can be
+        // opened and downloaded from the tree.
+        if item.starts_with('.') || item == "node_modules" || item == "sandbox" {
             continue;
         }
         let full = dir.join(&item);
@@ -250,7 +254,7 @@ async fn workspace_root_post(State(st): St, body: Bytes) -> Response {
         Ok(_) => return json_err(StatusCode::BAD_REQUEST, format!("Not a folder: {}", resolved.display())),
         Err(_) => return json_err(StatusCode::BAD_REQUEST, format!("Not a folder: {}", resolved.display())),
     }
-    *st.workspace.write().unwrap() = resolved.clone();
+    *st.workspace.write().unwrap_or_else(|e| e.into_inner()) = resolved.clone();
     Json(json!({ "ok": true, "root": resolved.to_string_lossy() })).into_response()
 }
 
@@ -2195,6 +2199,100 @@ async fn lsp_completion(State(st): St, body: Bytes) -> Response {
     Json(json!({ "items": items })).into_response()
 }
 
+// Proofreading: spelling (spellbook / Nuspell-compatible) + grammar & style
+// (harper-core with a Typst-aware parser). Runs on a blocking thread so the
+// dictionary work never stalls the async runtime.
+async fn lint_text(body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let text = jstr(&v, "text").unwrap_or("").to_string();
+    if text.trim().is_empty() {
+        return Json(json!({ "issues": [] })).into_response();
+    }
+    let issues = tokio::task::spawn_blocking(move || crate::proofread::lint(&text)).await.unwrap_or_default();
+    Json(json!({ "issues": issues })).into_response()
+}
+
+// Lazy spelling suggestions for the words the client actually displays. Kept
+// off the lint hot path because each suggestion is a dictionary-wide search.
+async fn lint_suggest(body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let words: Vec<String> = v
+        .get("words")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    if words.is_empty() {
+        return Json(json!({ "suggestions": {} })).into_response();
+    }
+    let pairs = tokio::task::spawn_blocking(move || crate::proofread::suggest_words(&words)).await.unwrap_or_default();
+    let map: serde_json::Map<String, Value> = pairs.into_iter().map(|(w, s)| (w, json!(s))).collect();
+    Json(json!({ "suggestions": map })).into_response()
+}
+
+async fn lint_ignore(body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let word = jstr(&v, "word").unwrap_or("").to_string();
+    if !word.trim().is_empty() {
+        let _ = tokio::task::spawn_blocking(move || crate::proofread::add_ignored_word(&word)).await;
+    }
+    Json(json!({ "ok": true })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Session persistence — remember the last project, open files, and cursor so the
+// app reopens exactly where the user left off, even across reboots. Stored on
+// disk, not the webview's localStorage (which is tied to the port and can vanish).
+// ---------------------------------------------------------------------------
+
+fn session_file() -> PathBuf {
+    // Overridable so headless/test runs don't touch the real user session file.
+    if let Ok(p) = std::env::var("HILBERT_SESSION_FILE") {
+        return PathBuf::from(p);
+    }
+    dirs::config_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"))
+        .join("hilbert")
+        .join("session.json")
+}
+
+// The workspace folder from the last session, if it still exists. Lets the GUI
+// reopen the previous project immediately at startup, before the UI even loads.
+pub fn saved_workspace() -> Option<PathBuf> {
+    let raw = fs::read_to_string(session_file()).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    let p = v.get("workspacePath").and_then(|x| x.as_str())?;
+    let path = PathBuf::from(p);
+    path.is_dir().then_some(path)
+}
+
+async fn session_get() -> Response {
+    match fs::read_to_string(session_file()) {
+        Ok(s) if !s.trim().is_empty() => ([(header::CONTENT_TYPE, "application/json")], s).into_response(),
+        _ => Json(json!({})).into_response(),
+    }
+}
+
+async fn session_post(body: Bytes) -> Response {
+    // Only persist well-formed JSON, and write atomically (temp + rename) so a
+    // crash mid-write can't leave a corrupt file that breaks the next launch.
+    if serde_json::from_slice::<Value>(&body).is_err() {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid session JSON");
+    }
+    let path = session_file();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    // Unique temp name per write so overlapping writes never race on the same file
+    // (the rename onto the target stays atomic; last writer wins).
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!("json.tmp.{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+    if fs::write(&tmp, &body).and_then(|_| fs::rename(&tmp, &path)).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, "Could not save session");
+    }
+    Json(json!({ "ok": true })).into_response()
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     use tower_http::cors::{AllowOrigin, Any, CorsLayer};
     let cors = CorsLayer::new()
@@ -2240,6 +2338,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/desktop/open", post(desktop_open))
         .route("/lsp/hover", post(lsp_hover))
         .route("/lsp/completion", post(lsp_completion))
+        .route("/lint", post(lint_text))
+        .route("/lint/suggest", post(lint_suggest))
+        .route("/lint/ignore", post(lint_ignore))
+        .route("/session", get(session_get).post(session_post))
         .fallback(static_fallback)
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .layer(cors)

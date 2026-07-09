@@ -205,7 +205,7 @@ in the Rust backend:
 
 ## Troubleshooting
 
-- **macOS says the app is "damaged" or won't open** — This is macOS Gatekeeper quarantining the app, or a broken signature from renaming the `.app` file. To fix it, run these two commands in your terminal:
+- **macOS says the app is "damaged" or won't open** — This is macOS Gatekeeper quarantining the app, or a broken signature from renaming the `.app` file. To fix it, run these as **two separate commands, one per line** — if you paste them joined onto a single line the shell reads `--force` as an option to `xattr` and reports it as unrecognised:
   ```bash
   xattr -cr "/Applications/Hilbert.app"
   codesign --force --deep --sign - "/Applications/Hilbert.app"
