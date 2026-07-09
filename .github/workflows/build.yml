@@ -72,6 +72,73 @@ jobs:
           args: ${{ matrix.args }}
           tagName: tauri-v__VERSION__
           releaseName: "Hilbert (Tauri) v__VERSION__"
-          releaseBody: "Fixes the a4/us-letter page size in the preview and improves the bidirectional source/PDF link."
+          releaseBody: |
+            Fixes the a4/us-letter page size in the preview and improves the bidirectional source/PDF link.
+
+            This release is a bit larger than usual because it lays the groundwork for spelling and grammar checking, which is coming in the next update.
           releaseDraft: true
           prerelease: false
+
+  # The GTK AppImage bundle pulls libwayland-*.so* into the image; on Wayland/KDE
+  # those clash with the host's mesa/EGL and the app fails to start. Strip them,
+  # repack, then re-sign the fixed AppImage and patch its signature back into
+  # latest.json. Runs after every build job so latest.json is already settled.
+  fix-appimage-wayland:
+    needs: release
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get AppImage tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y jq python3
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
+          chmod +x appimagetool
+      - name: Download the built AppImage + latest.json from the draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION=$(jq -r .version src-tauri/tauri.conf.json)
+          echo "TAG=tauri-v$VERSION" >> "$GITHUB_ENV"
+          gh release download "tauri-v$VERSION" -R "$GITHUB_REPOSITORY" \
+            -p '*_amd64.AppImage' -p '*_amd64.AppImage.sig' -p 'latest.json' --clobber
+      - name: Strip bundled Wayland libs and repack
+        run: |
+          set -euo pipefail
+          APP=$(ls *_amd64.AppImage)
+          chmod +x "$APP"
+          APPIMAGE_EXTRACT_AND_RUN=1 ./"$APP" --appimage-extract >/dev/null
+          rm -fv squashfs-root/usr/lib/libwayland-*.so*
+          find squashfs-root -iname 'im-wayland.so' -delete
+          if find squashfs-root -iname 'libwayland-*.so*' | grep -q .; then
+            echo "::error::libwayland still bundled after strip"; exit 1
+          fi
+          rm -f "$APP"
+          APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 ./appimagetool squashfs-root "$APP"
+          test -f "$APP"
+          echo "APP=$APP" >> "$GITHUB_ENV"
+      - name: Re-sign and patch latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: |
+          set -euo pipefail
+          npx --yes @tauri-apps/cli@2 signer sign -k "$TAURI_SIGNING_PRIVATE_KEY" -p "" "$APP"
+          test -f "$APP.sig"
+          python3 - "$APP" <<'PY'
+          import json, sys
+          app = sys.argv[1]
+          sig = open(app + ".sig").read().strip()
+          d = json.load(open("latest.json"))
+          n = 0
+          for k in d["platforms"]:
+              if k.startswith("linux-x86_64"):
+                  d["platforms"][k]["signature"] = sig
+                  n += 1
+          assert n > 0, "no linux-x86_64 platform found in latest.json"
+          json.dump(d, open("latest.json", "w"), indent=2)
+          print(f"patched {n} linux entries")
+          PY
+          gh release upload "$TAG" "$APP" "$APP.sig" latest.json --clobber -R "$GITHUB_REPOSITORY"
