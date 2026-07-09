@@ -132,13 +132,15 @@ jobs:
           app = sys.argv[1]
           sig = open(app + ".sig").read().strip()
           d = json.load(open("latest.json"))
+          # Only the AppImage-backed keys — the .deb/.rpm entries point to other
+          # files and must keep their own signatures.
           n = 0
-          for k in d["platforms"]:
-              if k.startswith("linux-x86_64"):
+          for k in ("linux-x86_64", "linux-x86_64-appimage"):
+              if k in d["platforms"]:
                   d["platforms"][k]["signature"] = sig
                   n += 1
-          assert n > 0, "no linux-x86_64 platform found in latest.json"
+          assert n > 0, "no AppImage platform key found in latest.json"
           json.dump(d, open("latest.json", "w"), indent=2)
-          print(f"patched {n} linux entries")
+          print(f"patched {n} AppImage entries (deb/rpm untouched)")
           PY
           gh release upload "$TAG" "$APP" "$APP.sig" latest.json --clobber -R "$GITHUB_REPOSITORY"
