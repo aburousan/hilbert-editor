@@ -29,6 +29,9 @@ workspace/sandbox/
 /test.pdf
 /screenshot.png
 *.run.*
+/test-*.cjs
+/*benchmark*.cjs
+/*stress*.cjs
 workspace/.previews/
 release/
 

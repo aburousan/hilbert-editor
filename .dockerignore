@@ -1,9 +1,0 @@
-node_modules
-dist
-release
-docs/gifs
-.git
-*.log
-workspace/out.pdf
-workspace/sandbox
-workspace/.previews

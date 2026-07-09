@@ -985,6 +985,17 @@ iframe.pdf-viewer {
   justify-content: center;
   transition: background 0.13s ease, color 0.13s ease, border-color 0.13s ease;
 }
+.pdf-pagesize {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-muted);
+  padding: 3px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 7px;
+  white-space: nowrap;
+  user-select: none;
+}
 .pdf-btn:hover { background: var(--panel-elevated); border-color: var(--accent-line); color: var(--text-main); }
 .pdf-btn.active { background: var(--accent-soft); border-color: var(--accent-line); color: var(--accent-hover); }
 .pdf-btn-icon { padding: 0 6px; }
@@ -994,6 +1005,14 @@ iframe.pdf-viewer {
   width: 100%;
   min-width: 0;
   overflow: auto;
+  /* Reserve the vertical scrollbar's width permanently. Without this, on
+     platforms with classic (space-consuming) scrollbars — Windows especially —
+     a page sized to sit right at the overflow threshold makes the scrollbar
+     flip on and off, and each flip changes the content width, which re-fits the
+     page, which flips the scrollbar again: the preview oscillates a few times a
+     second. A stable gutter keeps the content width constant so the loop can't
+     start. */
+  scrollbar-gutter: stable;
   background: #525659;
   padding: 16px 0;
 }
@@ -1089,6 +1108,18 @@ iframe.pdf-viewer {
 
 /* brief flash when jumping to a synced word */
 .sync-flash { background: rgba(139, 92, 246, 0.35); border-radius: 2px; }
+
+/* forward-sync landing flash over a word in the PDF text layer */
+.textLayer span.sync-flash-pdf {
+  background: rgba(139, 92, 246, 0.45);
+  outline: 2px solid rgba(139, 92, 246, 0.75);
+  border-radius: 2px;
+  animation: syncPulse 1.4s ease-out;
+}
+@keyframes syncPulse {
+  0% { background: rgba(139, 92, 246, 0.75); }
+  100% { background: rgba(139, 92, 246, 0.25); }
+}
 
 /* Sidebar & File Tree */
 .sidebar {

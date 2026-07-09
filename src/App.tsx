@@ -4,6 +4,10 @@ import Editor, { useMonaco } from '@monaco-editor/react';
 import ImageEditor from './ImageEditor';
 import ExcalidrawEditor from './ExcalidrawEditor';
 import { setupTypstLanguage, setWorkspaceImages } from './typstMonaco';
+import { useProofread } from './proofread';
+import ProofreadPanel from './components/ProofreadPanel';
+import { tokenizeLine, bestMatch, type SyncPayload } from './syncMatch';
+import type { PdfHandle } from './components/PdfPreview';
 import { PackageInstaller } from './PackageInstaller';
 import { TemplateInstaller } from './TemplateInstaller';
 import DiagramBuilder from './components/DiagramBuilder';
@@ -108,6 +112,15 @@ const DEFAULT_CODE = `#set page(paper: "a4")
 
 This is a local, offline editor for *Typst*. It comes pre-configured with packages!
 `;
+
+// Stable no-op so the read-only PDF viewer (opened .pdf tabs) keeps PdfPreview's
+// memo intact instead of re-rendering on every parent render.
+const NOOP_REVERSE_SYNC = () => {};
+
+// Proofreading (spelling + grammar) is finished but held back for a later
+// release. The code stays wired up; this flag keeps it dormant and out of the UI
+// so it can't be turned on. Flip to true to ship it.
+const PROOFREAD_FEATURE_ENABLED = false;
 
 interface HistoryEntry {
   id: string;
@@ -225,6 +238,8 @@ type SearchResult = { path: string; matches: SearchSnippet[] };
 
 export default function App() {
   const editorRef = useRef<any>(null);
+  const pdfRef = useRef<PdfHandle | null>(null);
+  const forwardSyncRef = useRef<() => void>(() => {});
   const [tabs, setTabs] = useState<Tab[]>([{ path: 'main.typ', content: DEFAULT_CODE, isDirty: true }]);
   const [activeTabPath, setActiveTabPath] = useState<string>('main.typ');
   const [fileTree, setFileTree] = useState<FileNode[]>([]);
@@ -283,6 +298,41 @@ export default function App() {
   useEffect(() => { localStorage.setItem('compile_delay', String(compileDelay)); }, [compileDelay]);
 
   const activeTab = tabs.find(t => t.path === activeTabPath);
+
+  // Session restore: reopen the last project (workspace folder), its open tabs, and
+  // the cursor position on the next launch, the way VS Code reopens where you left
+  // off. Persisted to localStorage like the other saved settings above; no backend
+  // state, so nothing to load or migrate.
+  const workspacePathRef = useRef<string | null>(null);
+  const sessionRef = useRef<{ workspacePath?: string; openPaths?: string[]; activePath?: string; cursor?: { line: number; column: number }; scrollTop?: number }>({});
+  const sessionSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingCursorRef = useRef<{ path: string; line: number; column: number; scrollTop?: number } | null>(null);
+  const restoredRef = useRef(false);
+  const scheduleSaveSession = () => {
+    if (sessionSaveTimer.current) clearTimeout(sessionSaveTimer.current);
+    sessionSaveTimer.current = setTimeout(() => {
+      // Persist to the backend's on-disk session store (survives reboots and port
+      // changes, unlike localStorage which is keyed to the webview origin).
+      fetch(`${API}/session`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(sessionRef.current) }).catch(() => {});
+    }, 500);
+  };
+  // Track the open tabs / active tab / workspace so the next launch can restore them.
+  useEffect(() => {
+    sessionRef.current.workspacePath = workspacePathRef.current || undefined;
+    sessionRef.current.openPaths = tabs.map(t => t.path);
+    sessionRef.current.activePath = activeTabPath;
+    scheduleSaveSession();
+  }, [tabs, activeTabPath]);
+  // Once a restored tab's content is in the editor, put the cursor back where it was.
+  useEffect(() => {
+    const cur = pendingCursorRef.current, ed = editorRef.current;
+    if (!cur || !ed || activeTab?.path !== cur.path || activeTab?.content === undefined) return;
+    ed.setPosition({ lineNumber: cur.line, column: cur.column });
+    ed.revealLineInCenter(cur.line);
+    if (cur.scrollTop != null && ed.setScrollTop) ed.setScrollTop(cur.scrollTop);
+    ed.focus();
+    pendingCursorRef.current = null;
+  }, [activeTabPath, activeTab?.content]);
   
   const getStats = () => {
     if (!activeTab) return { words: 0, chars: 0 };
@@ -348,7 +398,9 @@ export default function App() {
   const [showRefManager, setShowRefManager] = useState(false);
   const [showBibManager, setShowBibManager] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  
+  const [proofreadEnabled, setProofreadEnabled] = useState<boolean>(() => localStorage.getItem('proofread_enabled') === '1');
+  useEffect(() => { localStorage.setItem('proofread_enabled', proofreadEnabled ? '1' : '0'); }, [proofreadEnabled]);
+
   const [sidebarWidth, setSidebarWidth] = useState(250);
   const [editorWidth, setEditorWidth] = useState(500);
   const [treeHeight, setTreeHeight] = useState(220);
@@ -360,12 +412,16 @@ export default function App() {
 
   const monaco = useMonaco();
 
+  const proof = useProofread(monaco, editorRef, activeTab?.path, activeTab?.content, PROOFREAD_FEATURE_ENABLED && proofreadEnabled);
+
   useEffect(() => { if (monaco) setupTypstLanguage(monaco); }, [monaco]);
   // Keep the editor's image-path autocomplete (inside image("…")) in sync with
   // the workspace's image files.
   useEffect(() => { setWorkspaceImages(workspaceImages); }, [workspaceImages]);
   useEffect(() => { 
-    fetchTree(); 
+    // Restore the last project (folder + tabs + cursor) if one was saved, else load
+    // the default workspace. Runs once.
+    if (!restoredRef.current) { restoredRef.current = true; restoreSessionOrDefault(); }
     fetch(`${API}/lsp/hover`, { method: 'POST', body: JSON.stringify({ file: 'main.typ', line: 0, character: 0, content: '' }), headers: {'Content-Type': 'application/json'} })
       .then(() => {
         const w = (window as any);
@@ -650,13 +706,10 @@ export default function App() {
   const IMG_EXT = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp'];
   
   const openFile = async (path: string) => {
-    if (!tabs.find(t => t.path === path)) {
-    }
-    
-    // Check if it's an image
     const ext = (path.split('.').pop() || '').toLowerCase();
-    if (IMG_EXT.includes(ext)) {
-      // Don't try to fetch text content for images
+    // Images and PDFs are binary: open them as a preview tab rather than reading
+    // their bytes as text, which would fill the editor with garbage.
+    if (IMG_EXT.includes(ext) || ext === 'pdf') {
       if (!tabs.find(t => t.path === path)) {
         setTabs(prev => [...prev, { path, content: '', isDirty: false }]);
       }
@@ -814,25 +867,42 @@ export default function App() {
     }
   };
 
+  // Dragging OS files in reads as a "copy"; dragging tree nodes around is a "move".
+  const dropEffectFor = (e: React.DragEvent) =>
+    Array.from(e.dataTransfer.types).includes('Files') ? 'copy' : 'move';
+
   const handleDragEnter = (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    e.dataTransfer.dropEffect = 'move';
+    e.dataTransfer.dropEffect = dropEffectFor(e);
   };
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    e.dataTransfer.dropEffect = 'move';
+    e.dataTransfer.dropEffect = dropEffectFor(e);
   };
 
   const handleDrop = async (e: React.DragEvent, targetDir: string) => {
     e.preventDefault();
     e.stopPropagation();
     try {
-      // 1. Handle OS file drops (uploads)
+      // 1. Handle OS file drops (uploads). Some webviews (notably macOS WKWebView)
+      // populate dataTransfer.items but leave dataTransfer.files empty for
+      // non-image files, so gather from both and de-dupe by name+size.
+      const dropped: File[] = [];
+      if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
+        for (const it of Array.from(e.dataTransfer.items)) {
+          if (it.kind === 'file') { const f = it.getAsFile(); if (f) dropped.push(f); }
+        }
+      }
       if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-        const files = Array.from(e.dataTransfer.files);
+        for (const f of Array.from(e.dataTransfer.files)) {
+          if (!dropped.some(d => d.name === f.name && d.size === f.size)) dropped.push(f);
+        }
+      }
+      if (dropped.length > 0) {
+        const files = dropped;
         for (const file of files) {
           const newPath = targetDir ? `${targetDir}/${file.name}` : file.name;
           const arrayBuffer = await file.arrayBuffer();
@@ -991,21 +1061,32 @@ export default function App() {
   const uploadAsset = () => {
     const input = document.createElement('input');
     input.type = 'file';
+    input.multiple = true;
     input.onchange = () => {
-      const file = input.files?.[0];
-      if (!file) return;
+      const files = Array.from(input.files || []);
+      if (!files.length) return;
+      // Images belong with the other assets by default; source files, data and
+      // everything else go to the project root unless the user says otherwise.
+      const allImages = files.every(f => IMG_EXT.includes((f.name.split('.').pop() || '').toLowerCase()));
+      const label = files.length === 1 ? `Upload ${files[0].name}` : `Upload ${files.length} files`;
       setInputModal({
-        title: `Upload ${file.name}`,
+        title: label,
         submitLabel: 'Upload',
-        fields: [{ key: 'folder', label: 'Destination folder', default: 'images', placeholder: '(project root)', hint: 'Leave blank to upload into the project root' }],
+        fields: [{ key: 'folder', label: 'Destination folder', default: allImages ? 'images' : '', placeholder: '(project root)', hint: 'Leave blank to upload into the project root' }],
         onSubmit: async (v) => {
           const folder = (v.folder || '').trim().replace(/^\/+|\/+$/g, '');
-          const path = folder ? `${folder}/${file.name}` : file.name;
-          const buf = await file.arrayBuffer();
-          await fetch(`${API}/workspace/upload?path=${encodeURIComponent(path)}`, { method: 'POST', body: buf, headers: { 'Content-Type': 'application/octet-stream' } });
+          for (const file of files) {
+            const path = folder ? `${folder}/${file.name}` : file.name;
+            const buf = await file.arrayBuffer();
+            await fetch(`${API}/workspace/upload?path=${encodeURIComponent(path)}`, { method: 'POST', body: buf, headers: { 'Content-Type': 'application/octet-stream' } });
+          }
           await fetchTree();
-          const ext = (file.name.split('.').pop() || '').toLowerCase();
-          if (IMG_EXT.includes(ext)) insertCode(`\n#figure(\n  image("${path}", width: 80%),\n  caption: [],\n)\n`);
+          if (files.length === 1) {
+            const file = files[0];
+            const path = folder ? `${folder}/${file.name}` : file.name;
+            const ext = (file.name.split('.').pop() || '').toLowerCase();
+            if (IMG_EXT.includes(ext)) insertCode(`\n#figure(\n  image("${path}", width: 80%),\n  caption: [],\n)\n`);
+          }
         },
       });
     };
@@ -1165,6 +1246,50 @@ export default function App() {
     }
   };
 
+  // Reopen the tabs saved in the last session, restoring the active tab and cursor.
+  // Returns false if nothing could be reopened (e.g. the files were deleted), so the
+  // caller can fall back to the default startup.
+  const restoreTabsFromSession = async (sess: any): Promise<boolean> => {
+    const paths: string[] = Array.isArray(sess.openPaths) ? sess.openPaths : [];
+    const loaded: Tab[] = [];
+    for (const p of paths) {
+      const ext = (p.split('.').pop() || '').toLowerCase();
+      if (IMG_EXT.includes(ext) || ext === 'pdf') { loaded.push({ path: p, content: '', isDirty: false }); continue; }
+      try {
+        const r = await fetch(`${API}/workspace/file?path=${encodeURIComponent(p)}`);
+        if (r.ok) loaded.push({ path: p, content: await r.text(), isDirty: false });
+      } catch {}
+    }
+    if (!loaded.length) return false;
+    setTabs(loaded);
+    const active = loaded.find(t => t.path === sess.activePath) ? sess.activePath : loaded[loaded.length - 1].path;
+    setActiveTabPath(active);
+    if (sess.cursor) pendingCursorRef.current = { path: active, line: sess.cursor.line, column: sess.cursor.column, scrollTop: sess.scrollTop };
+    return true;
+  };
+
+  // On launch: if a previous session exists, switch to its folder (desktop only —
+  // it needs a native path) and reopen its tabs; otherwise load the default workspace.
+  const restoreSessionOrDefault = async () => {
+    let sess: any = null;
+    try { sess = await (await fetch(`${API}/session`)).json(); } catch {}
+    const desktop = (window as any).desktop;
+    if (sess && Array.isArray(sess.openPaths) && sess.openPaths.length) {
+      try {
+        if (sess.workspacePath && desktop?.pickFolder) {
+          const res = await fetch(`${API}/workspace/root`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: sess.workspacePath }) });
+          if (res.ok) {
+            workspacePathRef.current = sess.workspacePath;
+            setProjectName(sess.workspacePath.replace(/[/\\]+$/, '').split(/[/\\]/).pop() || 'Project');
+          }
+        }
+        setFileTree(await (await fetch(`${API}/workspace`)).json());
+        if (await restoreTabsFromSession(sess)) return;
+      } catch {}
+    }
+    fetchTree();
+  };
+
   const TEXT_EXT = ['typ', 'bib', 'txt', 'md', 'csv', 'json', 'yml', 'yaml', 'toml', 'xml', 'tex', 'html', 'css', 'js'];
 
   // Recursively import an on-disk folder (File System Access handle) into the
@@ -1197,6 +1322,7 @@ export default function App() {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) { alert(data.error || 'Could not open that folder.'); return; }
       dirHandleRef.current = null;   // desktop backend edits the folder directly
+      workspacePathRef.current = folder;   // remember this project for session restore
       const name = folder.replace(/[/\\]+$/, '').split(/[/\\]/).pop() || 'Project';
       await loadWorkspace(name);
       addRecentFolder({ name, path: folder });
@@ -1212,6 +1338,7 @@ export default function App() {
       }
       if (ask && !confirm(`Open “${dir.name}” as the workspace? Your edits will be saved back to this folder on disk.`)) return;
       await fetch(`${API}/workspace/clear`, { method: 'POST' });
+      workspacePathRef.current = null;   // web-imported working copy: no native path to reopen
       dirHandleRef.current = dir;
       await importDirHandle(dir, '');
       await loadWorkspace(dir.name);
@@ -2491,87 +2618,99 @@ export default function App() {
     ed.focus();
   };
 
-  // Reverse "SyncTeX"-style search: a word double-clicked in the PDF preview is
-  // matched in the source and the editor jumps to it (best effort — works for
-  // prose/headings; rendered math may not match the source token).
+  // Bidirectional PDF ↔ source sync. Both directions match a multi-word phrase
+  // (not a lone word), so a word that repeats can't send you to the wrong line,
+  // and both refuse to jump when the phrase can't be confidently pinned down.
   const syncDecorations = useRef<string[]>([]);
-  const jumpToWord = useCallback(async (raw: string, context?: string) => {
-    const editor = editorRef.current;
-    const model = editor?.getModel();
-    if (!editor || !model) return;
-    const word = raw.replace(/[^\p{L}\p{N}_]/gu, ' ').trim().split(/\s+/).filter(w => w.length > 1).pop();
-    if (!word) return;
-    // Whole-word matches only (avoids partial hits inside longer words).
-    const all = model.findMatches(word, true, false, true, ' \t\n.,;:!?()[]{}*_$#=+-/\\"\'<>', false);
-    // Drop matches that fall inside line comments (// ...) — they aren't real text.
-    const real = all.filter((m: any) => {
-      const lineText = model.getLineContent(m.range.startLineNumber);
-      const c = lineText.indexOf('//');
-      return c === -1 || m.range.startColumn - 1 < c;
-    });
-    const matches = real.length ? real : all;
-    
-    const ctxWords = (context || '').toLowerCase().split(/[^\p{L}\p{N}_]+/u).filter(w => w.length > 2 && w !== word.toLowerCase());
-    
-    if (!matches.length) { 
-      try {
-        const res = await fetch(`${API}/workspace/search?q=${encodeURIComponent(word)}`);
-        const hits = await res.json();
-        if (Array.isArray(hits) && hits.length > 0) {
-          let bestHit = hits[0];
-          let bestLineNum = hits[0].matches[0].lineNum;
-          if (ctxWords.length > 0) {
-            let bestScore = -1;
-            for (const hit of hits) {
-              for (const m of hit.matches) {
-                const text = m.text.toLowerCase();
-                const score = ctxWords.reduce((n, w) => n + (text.includes(w) ? 1 : 0), 0);
-                if (score > bestScore) { bestScore = score; bestHit = hit; bestLineNum = m.lineNum; }
-              }
-            }
-          }
-          // Jump to the found file and line
-          handleNodeClick({} as any, bestHit.path, false);
-          setTimeout(() => {
-            if (editorRef.current) {
-              editorRef.current.revealLineInCenter(bestLineNum);
-              editorRef.current.setPosition({ lineNumber: bestLineNum, column: 1 });
-              editorRef.current.focus();
-            }
-          }, 100);
-          return;
-        }
-      } catch (e) {}
-      
-      setErrorLogs(`"${word}" not found in source (rendered math/symbols may differ).`); 
-      return; 
-    }
-    // Use the surrounding words from the PDF (context) to pick the right instance
-    // when the word occurs more than once: score each match by how many of the
-    // neighbouring words appear on the same or an adjacent source line.
-    const cur = editor.getPosition();
-    let next: any;
 
-    if (matches.length > 1 && ctxWords.length) {
-      const scoreAt = (m: any) => {
-        const from = Math.max(1, m.range.startLineNumber - 1), to = Math.min(model.getLineCount(), m.range.startLineNumber + 1);
-        let text = '';
-        for (let ln = from; ln <= to; ln++) text += ' ' + model.getLineContent(ln).toLowerCase();
-        return ctxWords.reduce((n, w) => n + (text.includes(w) ? 1 : 0), 0);
-      };
-      let best = -1;
-      for (const m of matches) { const s = scoreAt(m); if (s > best) { best = s; next = m; } }
-      if (best <= 0) next = undefined; // no context hit — fall back to cursor cycling
-    }
-    // Otherwise prefer the next match strictly after the cursor, so repeated clicks cycle.
-    if (!next) next = matches.find((m: any) => !cur || m.range.startLineNumber > cur.lineNumber ||
-      (m.range.startLineNumber === cur.lineNumber && m.range.startColumn > cur.column)) || matches[0];
-    editor.revealLineInCenter(next.range.startLineNumber);
-    editor.setPosition({ lineNumber: next.range.startLineNumber, column: next.range.startColumn });
-    editor.focus();
-    syncDecorations.current = editor.deltaDecorations(syncDecorations.current, [{ range: next.range, options: { inlineClassName: 'sync-flash' } }]);
+  const flashSourceRange = (line: number, col: number, len: number) => {
+    const ed = editorRef.current; if (!ed) return;
+    ed.revealLineInCenter(line);
+    ed.setPosition({ lineNumber: line, column: col });
+    ed.focus();
+    const range = { startLineNumber: line, startColumn: col, endLineNumber: line, endColumn: col + Math.max(1, len) };
+    syncDecorations.current = ed.deltaDecorations(syncDecorations.current, [{ range, options: { inlineClassName: 'sync-flash' } }]);
     setTimeout(() => { if (editorRef.current) syncDecorations.current = editorRef.current.deltaDecorations(syncDecorations.current, []); }, 1300);
+  };
+
+  // Flatten the active model into positioned word tokens, skipping line comments
+  // so `// note` text can't be matched. Markup punctuation (#, =, *, _, $ …) is
+  // dropped naturally since only word characters form tokens.
+  const tokenizeSourceModel = (model: any): { w: string; line: number; col: number }[] => {
+    const out: { w: string; line: number; col: number }[] = [];
+    const lc = model.getLineCount();
+    for (let ln = 1; ln <= lc; ln++) {
+      const text = model.getLineContent(ln);
+      const ci = text.indexOf('//');
+      for (const t of tokenizeLine(text)) {
+        if (ci !== -1 && t.offset >= ci) break;
+        out.push({ w: t.w, line: ln, col: t.offset + 1 });
+      }
+    }
+    return out;
+  };
+
+  // Reverse: a PDF word (with its neighbours) → the exact source location.
+  const reverseSync = useCallback(async (p: SyncPayload) => {
+    const editor = editorRef.current; const model = editor?.getModel();
+    if (!editor || !model) return;
+    const focusWord = p.words[p.focus];
+    if (!focusWord) return;
+
+    const src = tokenizeSourceModel(model);
+    const res = bestMatch(src.map(s => s.w), p.words, p.focus, Math.round(p.docFraction * src.length));
+    if (res) {
+      const tok = src[res.index];
+      flashSourceRange(tok.line, tok.col, tok.w.length);
+      return;
+    }
+
+    // Not in the active file — search the workspace, disambiguating by the
+    // surrounding PDF words, and open the best-scoring file/line.
+    try {
+      const ctx = p.words.filter((_, i) => i !== p.focus);
+      const resp = await fetch(`${API}/workspace/search?q=${encodeURIComponent(focusWord)}`);
+      const hits = await resp.json();
+      if (Array.isArray(hits) && hits.length) {
+        let bestHit = hits[0], bestLine = hits[0].matches[0].lineNum, bestScore = -1;
+        for (const hit of hits) for (const m of hit.matches) {
+          const text = (m.text || '').toLowerCase();
+          const score = ctx.reduce((n, w) => n + (text.includes(w) ? 1 : 0), 0);
+          if (score > bestScore) { bestScore = score; bestHit = hit; bestLine = m.lineNum; }
+        }
+        handleNodeClick({} as any, bestHit.path, false);
+        setTimeout(() => flashSourceRange(bestLine, 1, 0), 120);
+        return;
+      }
+    } catch {}
+    // Genuinely couldn't locate it (e.g. rendered math) — say so, don't guess.
+    setErrorLogs(`Couldn't locate “${focusWord}” in the source (rendered math or symbols may differ from the markup).`);
   }, []);
+
+  // Forward: the editor cursor → reveal & flash the matching word in the PDF.
+  const forwardSync = useCallback(() => {
+    const ed = editorRef.current; const model = ed?.getModel();
+    if (!ed || !model || !pdfRef.current) return;
+    const pos = ed.getPosition(); if (!pos) return;
+    const total = model.getLineCount();
+
+    // Find prose at/near the cursor (math and blank lines carry no words).
+    let line = pos.lineNumber;
+    let toks = tokenizeLine(model.getLineContent(line));
+    for (let d = 1; !toks.length && d <= 6; d++) {
+      if (pos.lineNumber - d >= 1 && (toks = tokenizeLine(model.getLineContent(pos.lineNumber - d))).length) { line = pos.lineNumber - d; break; }
+      if (pos.lineNumber + d <= total && (toks = tokenizeLine(model.getLineContent(pos.lineNumber + d))).length) { line = pos.lineNumber + d; break; }
+    }
+    if (!toks.length) { setErrorLogs('Nothing to sync — place the cursor on a line with text.'); return; }
+
+    let focus = 0, bestD = Infinity;
+    const anchorCol = line === pos.lineNumber ? pos.column : 1;
+    toks.forEach((t, i) => { const d = Math.abs(t.offset + 1 - anchorCol); if (d < bestD) { bestD = d; focus = i; } });
+    const ok = pdfRef.current.revealSource({ words: toks.map(t => t.w), focus, docFraction: (line - 0.5) / total });
+    if (!ok) setErrorLogs('Couldn’t find this line in the PDF (recompile if the preview is stale, or the text may be inside math).');
+  }, []);
+
+  useEffect(() => { forwardSyncRef.current = forwardSync; }, [forwardSync]);
 
   const formatBytes = (bytes: number, decimals = 1) => {
     if (bytes === 0) return '0 Bytes';
@@ -2998,6 +3137,24 @@ export default function App() {
         )}
 
         <div className="header-right">
+          {PROOFREAD_FEATURE_ENABLED && proof.available && (
+            <button
+              className="theme-toggle"
+              onClick={() => { setProofreadEnabled(v => !v); if (!proofreadEnabled && !sidebarOpen) setSidebarOpen(true); }}
+              style={proofreadEnabled ? { color: '#34d399', borderColor: '#34d399' } : undefined}
+              title={proofreadEnabled
+                ? `Proofreading on — spelling (Nuspell) + grammar/style (Harper)${proof.issues.length ? ` · ${proof.issues.length} issue(s)` : ''}. Click to turn off.`
+                : 'Proofreading off — click to check spelling & grammar as you type'}
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M4 7V5a1 1 0 0 1 1-1h14a1 1 0 0 1 1 1v2" /><path d="M9 20h6" /><path d="M12 4v16" />
+                <path d="M16 15l2 2 4-4" />
+              </svg>
+              {proofreadEnabled && proof.issues.length > 0 && (
+                <span style={{ marginLeft: 4, fontSize: '0.7rem', fontWeight: 700 }}>{proof.issues.length}</span>
+              )}
+            </button>
+          )}
           <button className="theme-toggle" onClick={() => setTheme(t => t === 'typst-dark' ? 'typst-light' : 'typst-dark')}
             title={theme === 'typst-dark' ? 'Editor theme: dark — click for light (the PDF preview has its own toggle)' : 'Editor theme: light — click for dark (the PDF preview has its own toggle)'}>
             {theme === 'typst-dark'
@@ -3239,6 +3396,16 @@ export default function App() {
                 </div>
               </div>
 
+              {PROOFREAD_FEATURE_ENABLED && proof.available && proofreadEnabled && (
+                <ProofreadPanel
+                  issues={proof.issues}
+                  busy={proof.busy}
+                  onJump={proof.jumpTo}
+                  onApply={proof.applySuggestion}
+                  onIgnore={proof.ignoreWord}
+                />
+              )}
+
               <div style={{ padding: '9px 14px', borderTop: '1px solid var(--border-color)', display: 'flex', alignItems: 'center', gap: '7px', cursor: 'pointer', color: 'var(--text-muted)', fontSize: '0.78rem' }} onClick={() => setShowAppSettings(true)}>
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
                 App Settings
@@ -3260,6 +3427,19 @@ export default function App() {
                 <button className="tab-close" onClick={(e) => closeTab(e, tab.path)}>×</button>
               </div>
             ))}
+            {pdfUrl && activeTabPath.endsWith('.typ') && (
+              <button
+                className="tab-sync-btn"
+                style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5, padding: '0 10px', background: 'transparent', border: 'none', borderLeft: '1px solid var(--border-color)', color: 'var(--text-muted)', cursor: 'pointer', fontSize: '0.72rem', whiteSpace: 'nowrap' }}
+                onClick={() => forwardSync()}
+                title="Reveal the cursor's line in the PDF preview (Ctrl/Cmd+Alt+J). Double-click a word in the PDF to jump back to the source."
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M5 12h14" /><path d="M13 6l6 6-6 6" />
+                </svg>
+                Find in PDF
+              </button>
+            )}
           </div>
           <div className="editor-container" style={{ flex: 1, position: 'relative', display: 'flex', flexDirection: 'column' }}>
             {activeTab ? (
@@ -3301,6 +3481,15 @@ export default function App() {
                     </div>
                   );
                 }
+                if (ext === 'pdf') {
+                  // View an ordinary PDF (dropped/uploaded, not the compile output)
+                  // with the same zoom/fit/page-size viewer used for the preview.
+                  return (
+                    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', height: '100%', minWidth: 0 }}>
+                      <PdfPreview url={rawSrc} onReverseSync={NOOP_REVERSE_SYNC} downloadName={activeTabPath.split('/').pop()} />
+                    </div>
+                  );
+                }
                 if (ext === 'excalidraw') {
                   return (
                     <Boundary name="Whiteboard" onClose={() => { const rem = tabs.filter(t => t.path !== activeTabPath); setTabs(rem); setActiveTabPath(rem.length ? rem[rem.length - 1].path : ''); }}>
@@ -3333,6 +3522,11 @@ export default function App() {
                     onMount={(e, monacoInstance) => {
                       (window as any).logTiming('Monaco ready');
                       editorRef.current = e;
+                      // Remember cursor position for session restore (debounced write).
+                      e.onDidChangeCursorPosition(() => {
+                        const p = e.getPosition();
+                        if (p) { sessionRef.current.cursor = { line: p.lineNumber, column: p.column }; sessionRef.current.scrollTop = e.getScrollTop?.(); scheduleSaveSession(); }
+                      });
                       (e as any).onDidType(() => {
                         const pos = e.getPosition(); const model = e.getModel();
                         if (!pos || !model) return;
@@ -3342,6 +3536,15 @@ export default function App() {
                       monacoInstance.editor.setTheme(theme);
                       e.updateOptions({ hover: { enabled: true, delay: 300 } });
                       e.addCommand(monacoInstance.KeyMod.CtrlCmd | monacoInstance.KeyCode.KeyY, () => e.trigger('keyboard', 'redo', null));
+                      // Forward sync: reveal the cursor's line in the PDF preview.
+                      e.addAction({
+                        id: 'hilbert.syncToPdf',
+                        label: 'Sync: reveal cursor position in the PDF',
+                        keybindings: [monacoInstance.KeyMod.CtrlCmd | monacoInstance.KeyMod.Alt | monacoInstance.KeyCode.KeyJ],
+                        contextMenuGroupId: 'navigation',
+                        contextMenuOrder: 1.5,
+                        run: () => forwardSyncRef.current(),
+                      });
                       const m = e.getModel();
                       if (m) { const last = m.getLineCount(); e.setPosition({ lineNumber: last, column: m.getLineMaxColumn(last) }); }
                     }}
@@ -3437,7 +3640,7 @@ export default function App() {
           ) : isCompiling && !pdfUrl ? (
             <div className="empty-preview">Generating PDF…</div>
           ) : pdfUrl ? (
-            <PdfPreview url={pdfUrl} onWordClick={jumpToWord} onWordCount={handlePdfWordCount} />
+            <PdfPreview ref={pdfRef} url={pdfUrl} onReverseSync={reverseSync} onWordCount={handlePdfWordCount} downloadName={`${(projectName || 'document').replace(/\s+/g, '_')}.pdf`} />
           ) : (
             <div className="empty-preview">Nothing to preview yet — write some Typst and it renders here.</div>
           )}
