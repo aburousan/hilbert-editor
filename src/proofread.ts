@@ -13,7 +13,7 @@ import { API } from './api';
 
 export type ProofKind = 'spelling' | 'grammar' | 'style';
 
-export interface ProofIssue {
+interface ProofIssue {
   start: number;          // char offset (Unicode scalar index) into the source
   end: number;
   text: string;
@@ -181,7 +181,7 @@ function withSuggestions(placed: PlacedIssue[]): PlacedIssue[] {
   );
 }
 
-export interface UseProofread {
+interface UseProofread {
   available: boolean;   // backend supports /lint (Tauri edition)
   issues: PlacedIssue[];
   busy: boolean;

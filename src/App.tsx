@@ -180,7 +180,7 @@ const LATEX_SYM: Record<string, string> = {
   varepsilon: 'epsilon.alt', varphi: 'phi.alt', vartheta: 'theta.alt', varrho: 'rho.alt',
   Box: 'square.stroked', perp: 'perp', parallel: 'parallel',
 };
-export const latexMathToTypst = (s: string): string => {
+const latexMathToTypst = (s: string): string => {
   let out = s;
   for (let i = 0; i < 8 && /\\frac\s*\{[^{}]*\}\s*\{[^{}]*\}/.test(out); i++)
     out = out.replace(/\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, '($1)/($2)');
@@ -256,8 +256,13 @@ export default function App() {
   const editorRef = useRef<any>(null);
   const pdfRef = useRef<PdfHandle | null>(null);
   const forwardSyncRef = useRef<() => void>(() => {});
-  const [tabs, setTabs] = useState<Tab[]>([{ path: 'main.typ', content: DEFAULT_CODE, isDirty: true }]);
-  const [activeTabPath, setActiveTabPath] = useState<string>('main.typ');
+  // Start with no tabs. Seeding main.typ with DEFAULT_CODE here would build a
+  // Monaco model holding the starter template, and a restored session then lands
+  // its real content on that same model as an *edit* — leaving the template one
+  // undo away. The opening tab is chosen once we know whether we're restoring.
+  const [tabs, setTabs] = useState<Tab[]>([]);
+  const [activeTabPath, setActiveTabPath] = useState<string>('');
+  const [booted, setBooted] = useState(false);
   const [fileTree, setFileTree] = useState<FileNode[]>([]);
   const [treeSearch, setTreeSearch] = useState<string>('');
   const [isSearchVisible, setIsSearchVisible] = useState<boolean>(false);
@@ -1340,6 +1345,11 @@ export default function App() {
     if (projectDisplayName) setProjectName(projectDisplayName);
     const tree: FileNode[] = await (await fetch(`${API}/workspace`)).json();
     setFileTree(tree);
+    // Monaco keeps one model per path. A new project whose filenames match the old
+    // one's (main.typ, nearly always) would otherwise land on the previous
+    // document's model — carrying its undo history across projects. The tabs were
+    // cleared above, so the editor is detached and these are safe to drop.
+    monaco?.editor.getModels().forEach(m => m.dispose());
     // Open a starter file directly (don't route through openFile, whose closure
     // still holds the pre-switch tab list).
     const first = findFirstTyp(tree);
@@ -1371,6 +1381,13 @@ export default function App() {
     return true;
   };
 
+  // The fresh-start document: an unsaved main.typ holding the starter template.
+  // Set as the *initial* content of its model, so undo has nothing behind it.
+  const seedDefaultTab = () => {
+    setTabs([{ path: 'main.typ', content: DEFAULT_CODE, isDirty: true }]);
+    setActiveTabPath('main.typ');
+  };
+
   // On launch: if a previous session exists, switch to its folder (desktop only —
   // it needs a native path) and reopen its tabs; otherwise load the default workspace.
   const restoreSessionOrDefault = async () => {
@@ -1387,9 +1404,11 @@ export default function App() {
           }
         }
         setFileTree(await (await fetch(`${API}/workspace`)).json());
-        if (await restoreTabsFromSession(sess)) return;
+        if (await restoreTabsFromSession(sess)) { setBooted(true); return; }
       } catch {}
     }
+    seedDefaultTab();
+    setBooted(true);
     fetchTree();
   };
 
@@ -3909,7 +3928,7 @@ export default function App() {
                 );
               })()
             ) : (
-              <div className="empty-state">No file selected</div>
+              <div className="empty-state">{booted ? 'No file selected' : ''}</div>
             )}
           </div>
         </div>
@@ -3920,21 +3939,6 @@ export default function App() {
           document.body.classList.add('is-resizing');
         }} />
         <div className="preview-pane" style={{ flex: 1, minWidth: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column', position: 'relative', backgroundColor: '#ffffff' }}>
-          {/* Non-intrusive status bar on a failed compile: the preview below stays
-              on the last good render instead of being taken over. */}
-          {compileError && (
-            <div className="preview-status">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" /></svg>
-              <span className="preview-status-msg">
-                {(() => { const n = problems.filter(p => p.severity === 'error').length; return n > 0 ? `${n} error${n > 1 ? 's' : ''}` : 'Compilation failed'; })()}
-                {pdfUrl ? ' · showing last successful preview' : ''}
-                {isCompiling ? ' · recompiling…' : ''}
-              </span>
-              <button className="preview-status-btn" onClick={() => setPreviewTab(previewTab === 'problems' ? 'preview' : 'problems')}>
-                {previewTab === 'problems' ? 'Back to preview' : (pdfUrl ? 'View errors' : 'Details')}
-              </button>
-            </div>
-          )}
           <div style={{ flex: 1, minWidth: 0, position: 'relative', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
             {/* PDF stays mounted whenever it exists, so its scroll/zoom survive
                 switching to the Problems view and back. */}
@@ -3986,9 +3990,25 @@ export default function App() {
               );
             })()}
           </div>
+          {/* Non-intrusive status strip on a failed compile. It floats over the
+              bottom edge of the preview so the PDF above never shifts or flickers
+              when errors come and go — the last good render stays put underneath. */}
+          {compileError && (
+            <div className="preview-status">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" /></svg>
+              <span className="preview-status-msg">
+                {(() => { const n = problems.filter(p => p.severity === 'error').length; return n > 0 ? `${n} error${n > 1 ? 's' : ''}` : 'Compilation failed'; })()}
+                {pdfUrl ? ' · showing last successful preview' : ''}
+                {isCompiling ? ' · recompiling…' : ''}
+              </span>
+              <button className="preview-status-btn" onClick={() => setPreviewTab(previewTab === 'problems' ? 'preview' : 'problems')}>
+                {previewTab === 'problems' ? 'Back to preview' : (pdfUrl ? 'View errors' : 'Details')}
+              </button>
+            </div>
+          )}
         </div>
       </div>
-      
+
       {showPackageInstaller && <PackageInstaller onClose={() => setShowPackageInstaller(false)} onInsert={(pkg) => {
         if (!editorRef.current) return;
         editorRef.current.executeEdits('packages', [{ range: new monaco!.Range(1, 1, 1, 1), text: `#import "@preview/${pkg.name}:${pkg.version}": *\n`, forceMoveMarkers: true }]);

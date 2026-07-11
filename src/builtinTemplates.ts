@@ -4,7 +4,7 @@
 // offline. The one exception is the Touying slides deck, whose theme package
 // downloads once on first compile and is then cached forever.
 
-export interface BuiltinFile {
+interface BuiltinFile {
   // Path relative to the workspace root. The first file is the entrypoint.
   path: string;
   content: string;

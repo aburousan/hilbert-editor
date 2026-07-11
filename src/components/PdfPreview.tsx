@@ -163,11 +163,31 @@ function PdfPreview(
 
   const setZoom = (z: number) => { setZoomFactor(z); zoomFactorRef.current = z; applyWidths(liveWRef.current, z); scheduleRaster(); };
 
-  // Build the page structure for a document. Full teardown (replaceChildren) only
-  // happens here — i.e. on an actual content change (a recompile gives a new blob
-  // url) — never on resize/zoom, so the preview doesn't blank while you drag.
-  // Virtualised: each page gets a sized placeholder immediately, but its bitmap is
-  // only drawn when it scrolls near the viewport.
+  // Only pages within ~one screen of the viewport hold a bitmap; the rest stay as
+  // placeholders. This observer draws them as they scroll near. Reused across both
+  // the in-place refresh and the full rebuild, keyed on the current render token.
+  const attachObserver = (tok: number, scrollEl: HTMLDivElement) => {
+    ioRef.current?.disconnect();
+    const io = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        if (e.isIntersecting) {
+          const idx = slotsRef.current.findIndex(s => s.div === e.target);
+          if (idx >= 0) drawPage(idx + 1, tok);
+        }
+      }
+    }, { root: scrollEl, rootMargin: '800px 0px' });
+    ioRef.current = io;
+    for (const s of slotsRef.current) io.observe(s.div);
+  };
+
+  // Load a compiled document into the preview. While you type, each recompile
+  // hands us a new blob url — but almost always with the SAME page count. In that
+  // case we keep the existing page divs and just swap each page's bitmap in place
+  // as the fresh one finishes painting (drawPage removes the old canvas only after
+  // the new one is ready), so nothing ever blanks: the preview updates without the
+  // flash you'd get from rebuilding the DOM. A full teardown (replaceChildren)
+  // happens only when the structure really changes — first load, a different page
+  // count, or a new page size. Resize/zoom never comes through here at all.
   useEffect(() => {
     const pagesEl = pagesRef.current, scrollEl = scrollRef.current;
     if (!url || !pagesEl || !scrollEl) return;
@@ -175,6 +195,9 @@ function PdfPreview(
     const prevScroll = scrollEl.scrollTop;
 
     (async () => {
+      const prevSlots = slotsRef.current;
+      const prevNaturalW = docCache.current.naturalW;
+
       let cache = docCache.current;
       if (cache.url !== url || !cache.doc) {
         let loaded;
@@ -204,6 +227,30 @@ function PdfPreview(
       const aspect = aspVp.height / aspVp.width;
       aspectRef.current = aspect;
 
+      // Refresh in place when the shape is unchanged (same page count and page
+      // width) — the common case as you type. The old bitmaps stay on screen while
+      // each new one rasterises, so there's no blank frame and scroll doesn't move.
+      const reusable =
+        prevSlots.length === doc.numPages &&
+        pagesEl.children.length === doc.numPages &&
+        Math.abs(prevNaturalW - cache.naturalW) < 1;
+
+      if (reusable) {
+        for (const slot of prevSlots) {
+          slot.div.style.width = `${displayW}px`;
+          if (!slot.rendered) slot.div.style.height = `${displayW * aspect}px`;
+        }
+        attachObserver(token, scrollEl);
+        // Redraw the pages that already hold a bitmap; the rest refresh lazily
+        // through the observer as they scroll into view.
+        for (let i = 0; i < prevSlots.length; i++) {
+          if (prevSlots[i].rendered) drawPage(i + 1, token, true);
+        }
+        await renderTextLayers(token);
+        return;
+      }
+
+      // Structural change: rebuild the page column, preserving scroll position.
       const slots: Slot[] = [];
       const frag = document.createDocumentFragment();
       for (let i = 1; i <= doc.numPages; i++) {
@@ -222,20 +269,7 @@ function PdfPreview(
       slotsRef.current = slots;
       scrollEl.scrollTop = prevScroll;
 
-      // Only pages within ~one screen of the viewport hold a bitmap; the rest stay
-      // as placeholders. This is the CPU + memory win on long documents.
-      ioRef.current?.disconnect();
-      const io = new IntersectionObserver((entries) => {
-        for (const e of entries) {
-          if (e.isIntersecting) {
-            const idx = slots.findIndex(s => s.div === e.target);
-            if (idx >= 0) drawPage(idx + 1, token);
-          }
-        }
-      }, { root: scrollEl, rootMargin: '800px 0px' });
-      ioRef.current = io;
-      for (const s of slots) io.observe(s.div);
-
+      attachObserver(token, scrollEl);
       await renderTextLayers(token);
     })();
 

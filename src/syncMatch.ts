@@ -32,7 +32,7 @@ export function tokenizeLine(text: string): { w: string; offset: number }[] {
   return out;
 }
 
-export interface MatchResult {
+interface MatchResult {
   index: number;   // haystack index aligned to phrase[focus]
   score: number;   // matched neighbours (0 = only the focus word lined up)
   ambiguous: boolean; // true when several equally-good candidates remain

@@ -107,7 +107,7 @@ function ColorField({ value, onChange }: { value: string; onChange: (v: string) 
   );
 }
 
-export type Field = {
+type Field = {
   key: string;
   label: string;
   placeholder?: string;
