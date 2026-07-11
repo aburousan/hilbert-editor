@@ -265,7 +265,10 @@ async fn run_cmd_inner(
         let cpu_secs = timeout_ms.map(|ms| ms / 1000 + 30).unwrap_or(180);
         unsafe {
             cmd.pre_exec(move || {
-                let set = |res: libc::c_int, cur: u64, max: u64| {
+                // The resource argument is c_int on macOS/BSD but __rlimit_resource_t
+                // (u32) on Linux, so let the compiler infer it from the constant
+                // rather than naming a type that is only right on one platform.
+                let set = |res, cur: u64, max: u64| {
                     let lim = libc::rlimit { rlim_cur: cur as libc::rlim_t, rlim_max: max as libc::rlim_t };
                     libc::setrlimit(res, &lim);
                 };

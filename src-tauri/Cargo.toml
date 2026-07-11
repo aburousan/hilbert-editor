@@ -29,16 +29,19 @@ open = "5"
 # to CSV offline, with no runtime dependency on Excel or Python.
 calamine = "0.26"
 
-[target.'cfg(unix)'.dependencies]
-# Per-process resource limits (CPU time, max file size) applied to spawned
-# Python/Julia code so a runaway cell can't fill the disk or peg a core.
-libc = "0.2"
 # Proofreading: spellbook is a pure-Rust, Nuspell/Hunspell-compatible spell
 # checker; harper-core + harper-typst provide native grammar/style linting that
 # understands Typst syntax (prose only, skipping code/math).
 spellbook = "0.4"
 harper-core = "2.5"
 harper-typst = "2.5"
+
+# Keep this LAST: a [target.…] header ends [dependencies], so anything written
+# below it would silently become unix-only.
+[target.'cfg(unix)'.dependencies]
+# Per-process resource limits (CPU time, max file size) applied to spawned
+# Python/Julia code so a runaway cell can't fill the disk or peg a core.
+libc = "0.2"
 
 [profile.release]
 codegen-units = 1
