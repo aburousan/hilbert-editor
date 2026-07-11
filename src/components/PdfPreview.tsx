@@ -5,6 +5,8 @@ import { normalizeWord, bestMatch, type SyncPayload } from '../syncMatch';
 
 export type PdfHandle = { revealSource(p: SyncPayload): boolean };
 
+type Slot = { div: HTMLDivElement; textDiv: HTMLDivElement; rendered: boolean };
+
 // Walk a text-layer subtree (a page, or the whole document) into a flat list of
 // normalized words in reading order, each paired with the span that holds it.
 function collectSpanWords(root: ParentNode): { words: string[]; spans: HTMLElement[] } {
@@ -70,9 +72,16 @@ function PdfPreview(
   const docCache = useRef<{ url: string | null; doc: any; naturalW: number }>({ url: null, doc: null, naturalW: 595 });
   const liveWRef = useRef(0);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const ioRef = useRef<IntersectionObserver | null>(null);
+  const slotsRef = useRef<Slot[]>([]);
+  const scaleRef = useRef({ dScale: 1, renderScale: DPR });
+  const aspectRef = useRef(1.414);
 
-  // zoomFactor is relative to fit-width: 1 = fit, 1.2 = 120% of fit.
+  // zoomFactor is relative to fit-width: 1 = fit, 1.2 = 120% of fit. Mirrored in a
+  // ref so the (once-created) ResizeObserver reads the live value, not the zoom
+  // captured when the effect first ran.
   const [zoomFactor, setZoomFactor] = useState(1);
+  const zoomFactorRef = useRef(1);
   const [rasterTick, setRasterTick] = useState(0);
   const [dark, setDark] = useState(false);
   const [pageInfo, setPageInfo] = useState<{ w: number; h: number } | null>(null);
@@ -93,6 +102,49 @@ function PdfPreview(
     debounceRef.current = setTimeout(() => setRasterTick(t => t + 1), 160);
   };
 
+  // Draw (or redraw) one page's bitmap. The new canvas is rendered off-screen and
+  // only swapped in once it's ready, so a resize/zoom re-raster never blanks the
+  // page — this is what removes the flicker. `force` re-rasterises a page that's
+  // already drawn so it stays crisp at the new scale.
+  const drawPage = async (i: number, token: number, force = false) => {
+    const slot = slotsRef.current[i - 1];
+    const doc = docCache.current.doc;
+    if (!slot || !doc || token !== renderTokenRef.current) return;
+    if (slot.rendered && !force) return;
+    slot.rendered = true;
+    let page;
+    try { page = await doc.getPage(i); } catch { slot.rendered = false; return; }
+    if (token !== renderTokenRef.current) return;
+    const rvp = page.getViewport({ scale: scaleRef.current.renderScale });
+    const canvas = document.createElement('canvas');
+    canvas.width = rvp.width; canvas.height = rvp.height;
+    canvas.style.width = '100%'; canvas.style.height = 'auto';
+    try { await page.render({ canvasContext: canvas.getContext('2d')!, viewport: rvp }).promise; }
+    catch { slot.rendered = false; return; }
+    if (token !== renderTokenRef.current) return;
+    const old = slot.div.querySelector('canvas');
+    slot.div.insertBefore(canvas, slot.div.firstChild);   // add new first…
+    if (old) old.remove();                                 // …then drop the old one
+    slot.div.style.height = '';   // real bitmap now dictates the height
+  };
+
+  // (Re)build the transparent text layers at the current scale so cursor↔PDF sync
+  // can locate words even on pages whose bitmap isn't drawn yet.
+  const renderTextLayers = async (token: number) => {
+    const doc = docCache.current.doc, slots = slotsRef.current;
+    if (!doc) return;
+    const dScale = scaleRef.current.dScale;
+    for (let i = 1; i <= slots.length; i++) {
+      const page = await doc.getPage(i);
+      if (token !== renderTokenRef.current) return;
+      const td = slots[i - 1].textDiv;
+      td.replaceChildren();
+      td.style.setProperty('--scale-factor', String(dScale));
+      const tl = new TextLayer({ textContentSource: page.streamTextContent(), container: td, viewport: page.getViewport({ scale: dScale }) });
+      await tl.render();
+    }
+  };
+
   // Track pane width: apply instant CSS width, debounce the crisp re-render.
   useEffect(() => {
     const el = scrollRef.current;
@@ -101,23 +153,24 @@ function PdfPreview(
       const w = entries[0].contentRect.width;
       if (Math.abs(w - liveWRef.current) < 1) return;
       liveWRef.current = w;
-      applyWidths(w, zoomFactor);
+      applyWidths(w, zoomFactorRef.current);
       scheduleRaster();
     });
     ro.observe(el);
     liveWRef.current = el.clientWidth;
-    setRasterTick(t => t + 1);
     return () => { clearTimeout(debounceRef.current); ro.disconnect(); };
   }, []);
 
-  const setZoom = (z: number) => { setZoomFactor(z); applyWidths(liveWRef.current, z); scheduleRaster(); };
+  const setZoom = (z: number) => { setZoomFactor(z); zoomFactorRef.current = z; applyWidths(liveWRef.current, z); scheduleRaster(); };
 
-  // Rasterise (crisp) at the current width/zoom. Runs on load, resize-settle, zoom.
+  // Build the page structure for a document. Full teardown (replaceChildren) only
+  // happens here — i.e. on an actual content change (a recompile gives a new blob
+  // url) — never on resize/zoom, so the preview doesn't blank while you drag.
+  // Virtualised: each page gets a sized placeholder immediately, but its bitmap is
+  // only drawn when it scrolls near the viewport.
   useEffect(() => {
-    const pagesEl = pagesRef.current;
-    const scrollEl = scrollRef.current;
-    const w = liveWRef.current;
-    if (!url || !pagesEl || !scrollEl || !w) return;
+    const pagesEl = pagesRef.current, scrollEl = scrollRef.current;
+    if (!url || !pagesEl || !scrollEl) return;
     const token = ++renderTokenRef.current;
     const prevScroll = scrollEl.scrollTop;
 
@@ -138,41 +191,74 @@ function PdfPreview(
         if (prevDoc && prevDoc !== loaded) { try { prevDoc.destroy(); } catch {} }
         cache = docCache.current;
       }
-      const dScale = displayScale(w, zoomFactor);
-      const renderScale = Math.min(dScale * DPR, 5); // crisp bitmap, capped
+      const doc = cache.doc;
+      const w = liveWRef.current || scrollEl.clientWidth || cache.naturalW;
+      const dScale = displayScale(w, zoomFactorRef.current);
+      scaleRef.current = { dScale, renderScale: Math.min(dScale * DPR, 5) };
+      const displayW = cache.naturalW * dScale;
 
+      // Page-1 aspect sizes the placeholders (Typst pages are usually uniform; a
+      // page's true height replaces the estimate once it actually rasterises).
+      const aspVp = (await doc.getPage(1)).getViewport({ scale: 1 });
+      if (token !== renderTokenRef.current) return;
+      const aspect = aspVp.height / aspVp.width;
+      aspectRef.current = aspect;
+
+      const slots: Slot[] = [];
       const frag = document.createDocumentFragment();
-      for (let i = 1; i <= cache.doc.numPages; i++) {
-        const page = await cache.doc.getPage(i);
-        if (token !== renderTokenRef.current) return;
-        const rvp = page.getViewport({ scale: renderScale });
-
+      for (let i = 1; i <= doc.numPages; i++) {
         const pageDiv = document.createElement('div');
         pageDiv.className = 'pdf-page';
-        pageDiv.style.width = `${cache.naturalW * dScale}px`;   // display (CSS) width
-
-        const canvas = document.createElement('canvas');
-        canvas.width = rvp.width; canvas.height = rvp.height;    // high-res bitmap
-        canvas.style.width = '100%'; canvas.style.height = 'auto';
-        pageDiv.appendChild(canvas);
-
+        pageDiv.style.width = `${displayW}px`;
+        pageDiv.style.height = `${displayW * aspect}px`;   // placeholder until drawn
         const textDiv = document.createElement('div');
         textDiv.className = 'textLayer';
         textDiv.style.setProperty('--scale-factor', String(dScale));
         pageDiv.appendChild(textDiv);
-
         frag.appendChild(pageDiv);
-        await page.render({ canvasContext: canvas.getContext('2d')!, viewport: rvp }).promise;
-        if (token !== renderTokenRef.current) return;
-        // Text layer at DISPLAY scale so its spans line up with the CSS-sized canvas.
-        const tl = new TextLayer({ textContentSource: page.streamTextContent(), container: textDiv, viewport: page.getViewport({ scale: dScale }) });
-        await tl.render();
+        slots.push({ div: pageDiv, textDiv, rendered: false });
       }
-      if (token !== renderTokenRef.current) return;
       pagesEl.replaceChildren(frag);
+      slotsRef.current = slots;
       scrollEl.scrollTop = prevScroll;
+
+      // Only pages within ~one screen of the viewport hold a bitmap; the rest stay
+      // as placeholders. This is the CPU + memory win on long documents.
+      ioRef.current?.disconnect();
+      const io = new IntersectionObserver((entries) => {
+        for (const e of entries) {
+          if (e.isIntersecting) {
+            const idx = slots.findIndex(s => s.div === e.target);
+            if (idx >= 0) drawPage(idx + 1, token);
+          }
+        }
+      }, { root: scrollEl, rootMargin: '800px 0px' });
+      ioRef.current = io;
+      for (const s of slots) io.observe(s.div);
+
+      await renderTextLayers(token);
     })();
-  }, [url, rasterTick, zoomFactor]);
+
+    return () => { ioRef.current?.disconnect(); };
+  }, [url]);
+
+  // Re-rasterise in place on resize-settle / zoom: no teardown. Update every
+  // page's width and text-layer scale, then redraw the already-drawn bitmaps
+  // crisply — each new canvas swaps in only when ready, so nothing blanks.
+  useEffect(() => {
+    const slots = slotsRef.current, w = liveWRef.current;
+    if (!slots.length || !docCache.current.doc || !w) return;
+    const token = renderTokenRef.current;
+    const dScale = displayScale(w, zoomFactorRef.current);
+    scaleRef.current = { dScale, renderScale: Math.min(dScale * DPR, 5) };
+    const displayW = docCache.current.naturalW * dScale;
+    for (const slot of slots) {
+      slot.div.style.width = `${displayW}px`;
+      if (!slot.rendered) slot.div.style.height = `${displayW * aspectRef.current}px`;
+    }
+    for (let i = 0; i < slots.length; i++) if (slots[i].rendered) drawPage(i + 1, token, true);
+    renderTextLayers(token);
+  }, [rasterTick, zoomFactor]);
 
   // Word count from the RENDERED document (the PDF's text), not the Typst source —
   // so `#set`, `#import`, function names and markup syntax don't inflate it. Runs
@@ -280,13 +366,22 @@ function PdfPreview(
   // (a blob: URL) and an opened workspace PDF (an http: URL).
   const downloadPdf = async () => {
     try {
-      const blob = await (await fetch(url)).blob();
-      const objUrl = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = objUrl;
       a.download = downloadName || 'document.pdf';
-      document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(() => URL.revokeObjectURL(objUrl), 1000);
+      if (url.startsWith('blob:')) {
+        // Compile preview: already an in-memory object URL — download it as-is
+        // rather than fetching it back into a second blob.
+        a.href = url;
+        document.body.appendChild(a); a.click(); a.remove();
+      } else {
+        // Opened workspace PDF (http): copy into a blob first — WKWebView won't
+        // honour the download attribute on a plain same-origin link.
+        const blob = await (await fetch(url)).blob();
+        const objUrl = URL.createObjectURL(blob);
+        a.href = objUrl;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(objUrl), 1000);
+      }
     } catch { /* ignore — nothing to download if the compile hasn't produced a PDF */ }
   };
 

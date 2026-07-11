@@ -1,14 +1,23 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
+import { API } from '../api';
+import { notify } from '../notify';
+import { parseDelimited, sniffDelim, sanitizeName, looksLikeHeader } from '../csvUtil';
 
 // Visual cetz canvas builder with a LIVE preview. Click shape icons to add
 // primitives; set each one's X/Y (position), Size (radius / length / grid range),
-// Rotation and Colour, and see it rendered live before inserting.
+// Rotation and Colour, and see it rendered live before inserting. The "Data"
+// tool imports a CSV/Excel file and plots two chosen columns as a real curve.
 
 type PrimType =
   | 'circle' | 'ellipse' | 'rect' | 'triangle' | 'hexagon' | 'line'
-  | 'arrow' | 'arc' | 'bezier' | 'grid' | 'dot' | 'axes' | 'text';
+  | 'arrow' | 'arc' | 'bezier' | 'grid' | 'dot' | 'axes' | 'text' | 'datacurve';
 
-type Item = { uid: number; type: PrimType; color: string; x: number; y: number; size: number; rot: number; text?: string };
+type Item = {
+  uid: number; type: PrimType; color: string; x: number; y: number; size: number; rot: number; text?: string;
+  // Populated only for 'datacurve': the file to save + parsed columns.
+  dataFile?: string; dataContent?: string; dataHeaders?: string[]; dataRows?: string[][];
+  dataHasHeader?: boolean; xcol?: number; ycol?: number;
+};
 
 const COLORS = ['blue', 'red', 'green', 'orange', 'purple', 'teal', 'gray', 'black'];
 const HEX: Record<string, string> = {
@@ -17,8 +26,11 @@ const HEX: Record<string, string> = {
 };
 const DEF_SIZE: Record<PrimType, number> = {
   circle: 1.5, ellipse: 2, rect: 1.6, triangle: 1.5, hexagon: 1.6, line: 1.8,
-  arrow: 1.8, arc: 1.5, bezier: 2, grid: 2, dot: 1.5, axes: 2, text: 1,
+  arrow: 1.8, arc: 1.5, bezier: 2, grid: 2, dot: 1.5, axes: 2, text: 1, datacurve: 3,
 };
+
+const EXCEL_EXT = ['xlsx', 'xls', 'xlsb', 'ods'];
+const csvField = (v: string) => /[",\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
 
 const PRIMS: { type: PrimType; name: string; icon: React.ReactNode }[] = [
   { type: 'circle',   name: 'Circle',    icon: <circle cx="20" cy="20" r="12" /> },
@@ -34,19 +46,65 @@ const PRIMS: { type: PrimType; name: string; icon: React.ReactNode }[] = [
   { type: 'dot',      name: 'Point',     icon: <circle cx="20" cy="20" r="4" stroke="none" /> },
   { type: 'axes',     name: 'Axes',      icon: <><line x1="8" y1="32" x2="34" y2="32"/><polygon points="34,29 38,32 34,35" stroke="none"/><line x1="8" y1="32" x2="8" y2="6"/><polygon points="5,6 8,2 11,6" stroke="none"/></> },
   { type: 'text',     name: 'Label',     icon: <text x="20" y="26" fontSize="18" textAnchor="middle" stroke="none" fill="currentColor">T</text> },
+  { type: 'datacurve', name: 'Data',      icon: <><line x1="7" y1="33" x2="7" y2="7"/><line x1="7" y1="33" x2="34" y2="33"/><path d="M9 28 L16 18 L23 22 L32 10" fill="none" strokeWidth="2.4" /></> },
 ];
 
 let counter = 0;
 
-export default function DiagramBuilder({ onClose, onInsert }: { onClose: () => void, onInsert: (code: string) => void }) {
+export default function DiagramBuilder({ onClose, onInsert, onSaveFile }: { onClose: () => void, onInsert: (code: string) => void, onSaveFile?: (filename: string, content: string) => Promise<void> }) {
   const [scene, setScene] = useState<Item[]>([{ uid: ++counter, type: 'circle', color: 'blue', x: 0, y: 0, size: 1.5, rot: 0 }]);
   const [asFigure, setAsFigure] = useState(true);
   const [caption, setCaption] = useState('Diagram');
   const [label, setLabel] = useState('');
+  const dataInput = useRef<HTMLInputElement>(null);
 
   const add = (type: PrimType) => setScene(s => [...s, { uid: ++counter, type, color: 'blue', x: 0, y: 0, size: DEF_SIZE[type], rot: 0, ...(type === 'text' ? { text: 'Label' } : {}) }]);
   const remove = (uid: number) => setScene(s => s.filter(i => i.uid !== uid));
   const patch = (uid: number, p: Partial<Item>) => setScene(s => s.map(i => i.uid === uid ? { ...i, ...p } : i));
+
+  // Parse a data cell of a chosen column into numbers, skipping unparseable rows.
+  const dataPoints = (it: Item): [number, number][] => {
+    if (!it.dataRows || it.xcol == null || it.ycol == null) return [];
+    const rows = it.dataHasHeader ? it.dataRows.slice(1) : it.dataRows;
+    const out: [number, number][] = [];
+    for (const r of rows) {
+      const x = parseFloat(r[it.xcol]), y = parseFloat(r[it.ycol]);
+      if (Number.isFinite(x) && Number.isFinite(y)) out.push([x, y]);
+    }
+    return out;
+  };
+
+  // Import a CSV/TSV/Excel file, sniff columns, and drop a data-curve into the scene.
+  const importData = async (file: File) => {
+    const e = (file.name.split('.').pop() || '').toLowerCase();
+    let content = '', rows: string[][] = [];
+    if (EXCEL_EXT.includes(e)) {
+      try {
+        const res = await fetch(`${API}/data/xlsx`, { method: 'POST', body: await file.arrayBuffer() });
+        const j = await res.json().catch(() => ({}));
+        if (!res.ok) { notify(j.error || 'Could not read that spreadsheet.'); return; }
+        const sheet = j.sheets?.[0];
+        if (!sheet) { notify('No readable sheets in that file.'); return; }
+        content = sheet.csv; rows = parseDelimited(content, ',');
+        if (j.sheets.length > 1) notify(`Using sheet "${sheet.name}" (first of ${j.sheets.length}).`, 'info');
+      } catch { notify('Could not reach the local server.'); return; }
+    } else {
+      content = await file.text();
+      const delim = e === 'tsv' ? '\t' : sniffDelim(content.split('\n')[0] || '');
+      rows = parseDelimited(content, delim);
+      // Save everything as comma CSV so Typst's csv() reads it with defaults.
+      if (delim !== ',') content = rows.map(r => r.map(csvField).join(',')).join('\n') + '\n';
+    }
+    if (rows.length < 2 || (rows[0]?.length || 0) < 2) { notify('Need at least two columns and two rows of data.', 'info'); return; }
+    const hasHeader = looksLikeHeader(rows[0]);
+    const headers = hasHeader ? rows[0] : rows[0].map((_, i) => `col ${i + 1}`);
+    const dataFile = sanitizeName(file.name.replace(/\.[^.]+$/, '') + '.csv');
+    setScene(s => [...s, {
+      uid: ++counter, type: 'datacurve', color: 'blue', x: 0, y: 0, size: 3, rot: 0,
+      dataFile, dataContent: content, dataHeaders: headers, dataRows: rows, dataHasHeader: hasHeader,
+      xcol: 0, ycol: Math.min(1, rows[0].length - 1),
+    }]);
+  };
 
   const hexPts = (cx: number, cy: number, r: number) => Array.from({ length: 6 }, (_, k) => { const a = Math.PI / 3 * k - Math.PI / 2; return [cx + r * Math.cos(a), cy + r * Math.sin(a)] as [number, number]; });
 
@@ -62,13 +120,32 @@ export default function DiagramBuilder({ onClose, onInsert }: { onClose: () => v
       case 'triangle': body = `line((${cx}, ${(cy + s).toFixed(2)}), (${(cx + s * 0.87).toFixed(2)}, ${(cy - s * 0.5).toFixed(2)}), (${(cx - s * 0.87).toFixed(2)}, ${(cy - s * 0.5).toFixed(2)}), close: true, fill: ${fill}, ${st})`; break;
       case 'hexagon':  body = `line(${hexPts(cx, cy, s).map(([a, b]) => `(${a.toFixed(2)}, ${b.toFixed(2)})`).join(', ')}, close: true, fill: ${fill}, ${st})`; break;
       case 'line':     body = `line((${cx - s}, ${(cy - s * 0.67).toFixed(2)}), (${cx + s}, ${(cy + s * 0.67).toFixed(2)}), ${st})`; break;
-      case 'arrow':    body = `line((${cx - s}, ${cy}), (${cx + s}, ${cy}), mark: (end: ">"), ${st})`; break;
+      case 'arrow':    body = `line((${cx - s}, ${cy}), (${cx + s}, ${cy}), mark: (end: ">", scale: ${s}), stroke: (paint: ${c}, thickness: ${(s * 0.9).toFixed(2)}pt))`; break;
       case 'arc':      body = `arc((${cx}, ${cy}), start: 0deg, stop: 260deg, radius: ${s}, ${st})`; break;
       case 'bezier':   body = `bezier((${cx - s}, ${cy}), (${cx + s}, ${cy}), (${(cx - s / 2).toFixed(2)}, ${cy + s}), (${(cx + s / 2).toFixed(2)}, ${cy - s}), ${st})`; break;
       case 'grid':     body = `grid((${cx - s}, ${cy - s}), (${cx + s}, ${cy + s}), step: 1, stroke: gray.lighten(50%))`; break;
       case 'dot':      body = `circle((${cx}, ${cy}), radius: ${Math.max(0.08, s * 0.1).toFixed(2)}, fill: ${c}, stroke: none)`; break;
       case 'axes':     body = `line((${cx - s}, ${cy}), (${cx + s}, ${cy}), mark: (end: ">"), ${st})\n    line((${cx}, ${cy - s}), (${cx}, ${cy + s}), mark: (end: ">"), ${st})`; break;
       case 'text':     body = `content((${cx}, ${cy}), text(size: ${Math.max(6, Math.round(s * 9))}pt, fill: ${c})[${(it.text || 'Label').replace(/([\[\]#])/g, '\\$1')}])`; break;
+      case 'datacurve': {
+        const hdr = it.dataHasHeader ? 1 : 0, xi = it.xcol ?? 0, yi = it.ycol ?? 1;
+        // Reads the saved CSV at compile time and normalises the two chosen
+        // columns into a (2·size) box centred at (x, y) so it sits in the canvas.
+        body = `{
+    let _num = regex("^[-+]?(\\d+\\.?\\d*|\\.\\d+)([eE][-+]?\\d+)?$")
+    let _raw = csv("${it.dataFile}")
+    let _pts = _raw.slice(${hdr}).filter(r => r.len() > ${Math.max(xi, yi)} and r.at(${xi}).trim().match(_num) != none and r.at(${yi}).trim().match(_num) != none).map(r => (float(r.at(${xi})), float(r.at(${yi}))))
+    if _pts.len() >= 2 {
+      let _xs = _pts.map(p => p.at(0)); let _ys = _pts.map(p => p.at(1))
+      let _x0 = calc.min(.._xs); let _x1 = calc.max(.._xs)
+      let _y0 = calc.min(.._ys); let _y1 = calc.max(.._ys)
+      let _nx(v) = if _x1 == _x0 { ${cx} } else { ${cx} - ${s} + 2 * ${s} * (v - _x0) / (_x1 - _x0) }
+      let _ny(v) = if _y1 == _y0 { ${cy} } else { ${cy} - ${s} + 2 * ${s} * (v - _y0) / (_y1 - _y0) }
+      line(.._pts.map(p => (_nx(p.at(0)), _ny(p.at(1)))), stroke: ${c})
+    }
+  }`;
+        break;
+      }
     }
     if (it.rot) return `  group({\n    rotate(${it.rot}deg, origin: (${cx}, ${cy}))\n    ${body}\n  })`;
     return `  ${body}`;
@@ -101,18 +178,38 @@ export default function DiagramBuilder({ onClose, onInsert }: { onClose: () => v
       case 'triangle': el = <polygon points={[[it.x, it.y + s], [it.x + s * 0.87, it.y - s * 0.5], [it.x - s * 0.87, it.y - s * 0.5]].map(([a, b]) => `${px(a)},${py(b)}`).join(' ')} {...filled} />; break;
       case 'hexagon':  el = <polygon points={hexPts(it.x, it.y, s).map(([a, b]) => `${px(a)},${py(b)}`).join(' ')} {...filled} />; break;
       case 'line':     el = <line x1={px(it.x - s)} y1={py(it.y - s * 0.67)} x2={px(it.x + s)} y2={py(it.y + s * 0.67)} {...line} />; break;
-      case 'arrow':    el = <line x1={px(it.x - s)} y1={py(it.y)} x2={px(it.x + s)} y2={py(it.y)} markerEnd="url(#pv-arrow)" {...line} />; break;
+      case 'arrow':    { const sw = Math.max(1, s * 1.1); el = <line x1={px(it.x - s)} y1={py(it.y)} x2={px(it.x + s)} y2={py(it.y)} markerEnd="url(#pv-arrow)" stroke={c} strokeWidth={sw} fill="none" />; break; }
       case 'arc':      { const r = s * scale, a1 = 260 * Math.PI / 180; const x0 = px(it.x) + r, y0 = py(it.y); const x1 = px(it.x) + r * Math.cos(a1), y1 = py(it.y) - r * Math.sin(a1); el = <path d={`M ${x0} ${y0} A ${r} ${r} 0 1 0 ${x1} ${y1}`} {...line} />; break; }
       case 'bezier':   el = <path d={`M ${px(it.x - s)} ${py(it.y)} C ${px(it.x - s / 2)} ${py(it.y + s)}, ${px(it.x + s / 2)} ${py(it.y - s)}, ${px(it.x + s)} ${py(it.y)}`} {...line} />; break;
       case 'grid':     { const els = []; for (let i = -s; i <= s + 1e-6; i++) { els.push(<line key={`h${i}`} x1={px(it.x - s)} y1={py(it.y + i)} x2={px(it.x + s)} y2={py(it.y + i)} stroke="#c9ced6" strokeWidth={1} />); els.push(<line key={`v${i}`} x1={px(it.x + i)} y1={py(it.y - s)} x2={px(it.x + i)} y2={py(it.y + s)} stroke="#c9ced6" strokeWidth={1} />); } el = <g>{els}</g>; break; }
       case 'dot':      el = <circle cx={px(it.x)} cy={py(it.y)} r={Math.max(2.5, s * 0.1 * scale)} fill={c} />; break;
       case 'axes':     el = <g><line x1={px(it.x - s)} y1={py(it.y)} x2={px(it.x + s)} y2={py(it.y)} markerEnd="url(#pv-arrow)" {...line} /><line x1={px(it.x)} y1={py(it.y - s)} x2={px(it.x)} y2={py(it.y + s)} markerEnd="url(#pv-arrow)" {...line} /></g>; break;
       case 'text':     el = <text x={px(it.x)} y={py(it.y)} fill={c} fontSize={Math.max(9, s * 11)} textAnchor="middle" dominantBaseline="middle">{it.text || 'Label'}</text>; break;
+      case 'datacurve': {
+        const pts = dataPoints(it);
+        if (pts.length < 2) { el = <text x={px(it.x)} y={py(it.y)} fill={c} fontSize={11} textAnchor="middle">no data</text>; break; }
+        const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+        const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+        const nx = (v: number) => x1 === x0 ? it.x : it.x - s + 2 * s * (v - x0) / (x1 - x0);
+        const ny = (v: number) => y1 === y0 ? it.y : it.y - s + 2 * s * (v - y0) / (y1 - y0);
+        const d = pts.map((p, i) => `${i ? 'L' : 'M'} ${px(nx(p[0]))} ${py(ny(p[1]))}`).join(' ');
+        el = <path d={d} {...line} />; break;
+      }
     }
     return <g key={it.uid} transform={rot}>{el}</g>;
   };
 
-  const handleInsert = () => {
+  const handleInsert = async () => {
+    // Persist each referenced data file into the workspace (shown in the tree).
+    if (onSaveFile) {
+      const seen = new Set<string>();
+      for (const it of scene) {
+        if (it.type === 'datacurve' && it.dataFile && it.dataContent && !seen.has(it.dataFile)) {
+          seen.add(it.dataFile);
+          await onSaveFile(it.dataFile, it.dataContent);
+        }
+      }
+    }
     const inner = scene.map(genLine).join('\n');
     const imports = `#import "@preview/cetz:0.3.4": canvas, draw\n`;
     const canvas = `canvas({\n  import draw: *\n${inner}\n})`;
@@ -137,12 +234,14 @@ export default function DiagramBuilder({ onClose, onInsert }: { onClose: () => v
         </div>
 
         <div className="modal-body">
+          <input ref={dataInput} type="file" accept=".csv,.tsv,.txt,.xlsx,.xls,.xlsb,.ods" style={{ display: 'none' }}
+            onChange={e => { const f = e.target.files?.[0]; if (f) importData(f); e.currentTarget.value = ''; }} />
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 372px', gap: 16 }}>
             <div style={{ minWidth: 0 }}>
               <div style={{ fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--text-muted)', marginBottom: 6 }}>Click to add</div>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 6, marginBottom: 14 }}>
                 {PRIMS.map(p => (
-                  <button key={p.type} title={`Add ${p.name}`} onClick={() => add(p.type)}
+                  <button key={p.type} title={p.type === 'datacurve' ? 'Plot a curve from a data file' : `Add ${p.name}`} onClick={() => p.type === 'datacurve' ? dataInput.current?.click() : add(p.type)}
                     style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2, padding: '6px 2px', background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.09)', borderRadius: 7, cursor: 'pointer', color: 'var(--text-color)' }}
                     onMouseEnter={e => (e.currentTarget.style.background = 'rgba(139,92,246,0.22)')}
                     onMouseLeave={e => (e.currentTarget.style.background = 'rgba(255,255,255,0.05)')}>
@@ -161,7 +260,17 @@ export default function DiagramBuilder({ onClose, onInsert }: { onClose: () => v
                       <svg width="18" height="18" viewBox="0 0 40 40" fill="currentColor" stroke="currentColor" strokeWidth="2.5" style={{ flexShrink: 0, opacity: 0.85 }}>{prim.icon}</svg>
                       {it.type === 'text'
                         ? <input value={it.text || ''} onChange={e => patch(it.uid, { text: e.target.value })} placeholder="text" style={{ width: 58, background: 'var(--bg-color)', color: 'var(--text-color)', border: '1px solid var(--border-color)', borderRadius: 4, padding: '2px 5px', fontSize: '0.76rem' }} />
-                        : <span style={{ width: 50, fontSize: '0.76rem' }}>{prim.name}</span>}
+                        : it.type === 'datacurve'
+                          ? <span title={it.dataFile} style={{ width: 78, fontSize: '0.7rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{it.dataFile}</span>
+                          : <span style={{ width: 50, fontSize: '0.76rem' }}>{prim.name}</span>}
+                      {it.type === 'datacurve' && (<>
+                        {lbl('X')}<select value={it.xcol} onChange={e => patch(it.uid, { xcol: Number(e.target.value) })} style={{ maxWidth: 84, background: 'var(--bg-color)', color: 'var(--text-color)', border: '1px solid var(--border-color)', borderRadius: 4, padding: '2px 2px', fontSize: '0.72rem' }}>
+                          {it.dataHeaders?.map((h, i) => <option key={i} value={i}>{h}</option>)}
+                        </select>
+                        {lbl('Y')}<select value={it.ycol} onChange={e => patch(it.uid, { ycol: Number(e.target.value) })} style={{ maxWidth: 84, background: 'var(--bg-color)', color: 'var(--text-color)', border: '1px solid var(--border-color)', borderRadius: 4, padding: '2px 2px', fontSize: '0.72rem' }}>
+                          {it.dataHeaders?.map((h, i) => <option key={i} value={i}>{h}</option>)}
+                        </select>
+                      </>)}
                       {lbl('x')}{numIn(it.x, n => patch(it.uid, { x: n }))}
                       {lbl('y')}{numIn(it.y, n => patch(it.uid, { y: n }))}
                       {lbl(it.type === 'grid' ? 'range' : 'size')}{numIn(it.size, n => patch(it.uid, { size: Math.max(0.1, n) }))}

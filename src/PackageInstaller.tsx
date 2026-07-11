@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import './PackageInstaller.css';
 
 import { API } from './api';
+import { notify } from './notify';
 
 interface Package { name: string; version: string; description: string; authors: string[]; }
 interface PackageInstallerProps { onInsert: (pkg: Package) => void; onClose: () => void; }
@@ -45,8 +46,8 @@ export function PackageInstaller({ onInsert, onClose }: PackageInstallerProps) {
     try {
       const res = await fetch(`${API}/packages/download`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: pkg.name, version: pkg.version }) });
       if (res.ok) await loadInstalled();
-      else alert((await res.json().catch(() => ({}))).error || 'Download failed.');
-    } catch { alert('Could not reach the local server.'); } finally { setBusy(null); }
+      else notify((await res.json().catch(() => ({}))).error || 'Download failed.');
+    } catch { notify('Could not reach the local server.'); } finally { setBusy(null); }
   };
 
   const remove = async (pkg: Package) => {
@@ -55,8 +56,8 @@ export function PackageInstaller({ onInsert, onClose }: PackageInstallerProps) {
     try {
       const res = await fetch(`${API}/packages/remove`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: pkg.name, version: pkg.version }) });
       if (res.ok) await loadInstalled();
-      else alert((await res.json().catch(() => ({}))).error || 'Remove failed.');
-    } catch { alert('Could not reach the local server.'); } finally { setBusy(null); }
+      else notify((await res.json().catch(() => ({}))).error || 'Remove failed.');
+    } catch { notify('Could not reach the local server.'); } finally { setBusy(null); }
   };
 
   const shownInstalled = filter.trim()

@@ -13,7 +13,7 @@ type LoopKind = 'plain' | 'photon' | 'gluon';
 type LoopFill = 'none' | 'hatched' | 'shaded';
 
 type Edge = { id: number, type: 'edge', kind: EdgeKind, from: Pt, to: Pt, bend: number, thickness: number, amplitude: number, endArrow: boolean, label: string, side: 1 | -1, color?: string };
-type Loop = { id: number, type: 'loop', kind: LoopKind, fill: LoopFill, center: Pt, radius: number, thickness: number, amplitude: number, label: string, color?: string };
+type Loop = { id: number, type: 'loop', kind: LoopKind, fill: LoopFill, center: Pt, radius: number, thickness: number, amplitude: number, label: string, color?: string, arrow?: 0 | 1 | -1 };
 type Vertex = { id: number, type: 'vertex', at: Pt, size: number, color?: string };
 type TextEl = { id: number, type: 'text', at: Pt, text: string, color?: string };
 type El = Edge | Loop | Vertex | TextEl;
@@ -189,6 +189,16 @@ function loopCode(l: Loop): string[] {
       out.push(`  line(${cx(p1)}, ${cx(p2)}, stroke: ${strokeOf(Math.max(0.4, l.thickness * 0.45), l.color)})`);
     }
   }
+  // Fermion-flow arrows tangent to the circle, one at the top and one at the
+  // bottom so the rotation reads at a glance. arrow: 1 = clockwise, -1 = ccw.
+  if (l.arrow) {
+    const ex = 3.2, sc = num(Math.max(0.8, l.thickness * 0.8));
+    for (const [py, dir] of [[l.center.y - l.radius, l.arrow], [l.center.y + l.radius, -l.arrow]] as const) {
+      const p1 = { x: l.center.x - dir * ex, y: py };
+      const p2 = { x: l.center.x + dir * ex, y: py };
+      out.push(`  mark(${cx(p1)}, ${cx(p2)}, symbol: ">", fill: ${paintOf(l.color)}, stroke: ${paintOf(l.color)}, scale: ${sc})`);
+    }
+  }
   return out;
 }
 
@@ -225,7 +235,7 @@ const TEMPLATES: { name: string, make: () => El[] }[] = [
     name: 'Vacuum polarisation (photon–loop–photon)',
     make: () => [
       { id: tid++, type: 'edge', kind: 'photon', from: T(100, 240), to: T(230, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'gamma', side: 1 },
-      { id: tid++, type: 'loop', kind: 'plain', fill: 'none', center: T(290, 240), radius: 60, thickness: 1.2, amplitude: 5, label: '' },
+      { id: tid++, type: 'loop', kind: 'plain', fill: 'none', center: T(290, 240), radius: 60, thickness: 1.2, amplitude: 5, label: '', arrow: 1 },
       { id: tid++, type: 'edge', kind: 'photon', from: T(350, 240), to: T(480, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'gamma', side: 1 },
       { id: tid++, type: 'vertex', at: T(230, 240), size: 3 },
       { id: tid++, type: 'vertex', at: T(350, 240), size: 3 },
@@ -509,6 +519,11 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
       }
       parts.push(<g key="h">{hs}</g>);
     }
+    if (l.arrow) {
+      const size = 4 + l.thickness * 2;
+      parts.push(<polygon key="a1" points={arrowPts({ x: l.center.x, y: l.center.y - l.radius }, { x: l.arrow, y: 0 }, size, false)} fill={col} />);
+      parts.push(<polygon key="a2" points={arrowPts({ x: l.center.x, y: l.center.y + l.radius }, { x: -l.arrow, y: 0 }, size, false)} fill={col} />);
+    }
     if (l.label.trim())
       parts.push(<text key="l" x={l.center.x} y={l.center.y - l.radius - 14} fontSize="13" fontStyle="italic" fontFamily="Georgia, serif" textAnchor="middle" dominantBaseline="middle" fill={col}>{l.label}</text>);
     return <g key={l.id}>{parts}</g>;
@@ -639,6 +654,13 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
                     <option value="none">None (open loop)</option>
                     <option value="hatched">Hatched (blob)</option>
                     <option value="shaded">Shaded grey</option>
+                  </select>
+                ))}
+                {field('Fermion flow (arrows)', (
+                  <select value={sel.arrow ?? 0} onChange={e => update({ arrow: Number(e.target.value) as 0 | 1 | -1 })}>
+                    <option value={0}>None</option>
+                    <option value={1}>Clockwise ↻</option>
+                    <option value={-1}>Counter-clockwise ↺</option>
                   </select>
                 ))}
                 {field(`Radius — ${num(sel.radius / UNIT)}`, <input type="range" min="12" max="120" step="2" value={sel.radius} onChange={e => update({ radius: Number(e.target.value) })} />)}

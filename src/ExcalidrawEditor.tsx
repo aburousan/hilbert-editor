@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { Excalidraw, exportToSvg, convertToExcalidrawElements } from '@excalidraw/excalidraw';
 import '@excalidraw/excalidraw/index.css';
+import { notify } from './notify';
 
 interface ExcalidrawEditorProps {
   path: string;
@@ -41,7 +42,7 @@ function plotFn(cx: number, cy: number, o: MakeOpts): Skel[] {
     // eslint-disable-next-line no-new-func
     const f = new Function('x', 'sin', 'cos', 'tan', 'exp', 'log', 'ln', 'sqrt', 'abs', 'pow', 'pi', 'e', `return (${js});`);
     fn = (x) => f(x, Math.sin, Math.cos, Math.tan, Math.exp, Math.log, Math.log, Math.sqrt, Math.abs, Math.pow, Math.PI, Math.E);
-  } catch { if (typeof window !== 'undefined') window.alert('Could not parse that expression.'); return []; }
+  } catch { if (typeof window !== 'undefined') notify('Could not parse that expression.'); return []; }
   const xMin = -6, xMax = 6, px = 18;
   const samples: { x: number; y: number }[] = [];
   let ymax = 1e-6;
@@ -51,7 +52,7 @@ function plotFn(cx: number, cy: number, o: MakeOpts): Skel[] {
     if (!isFinite(y)) continue;
     samples.push({ x, y }); ymax = Math.max(ymax, Math.abs(y));
   }
-  if (samples.length < 2) { if (typeof window !== 'undefined') window.alert('That expression produced no plottable values.'); return []; }
+  if (samples.length < 2) { if (typeof window !== 'undefined') notify('That expression produced no plottable values.'); return []; }
   const yscale = Math.min(70 / ymax, 60);
   const pts: number[][] = samples.map(s => [s.x * px, -Math.max(Math.min(s.y, ymax), -ymax) * yscale]);
   const halfW = ((xMax - xMin) / 2) * px;

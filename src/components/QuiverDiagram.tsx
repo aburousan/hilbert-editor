@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import { notify } from '../notify';
 
 // Draw a commutative diagram with quiver (bundled, offline) and drop the
 // generated fletcher/Typst code straight into the document. quiver is embedded
@@ -12,7 +13,7 @@ export default function QuiverDiagram({ onClose, onInsert }: { onClose: () => vo
       if (e.data && typeof e.data.quiverExport === 'string') {
         onInsert(e.data.quiverExport);
       } else if (e.data && e.data.quiverExportError) {
-        alert('Could not export the diagram: ' + e.data.quiverExportError);
+        notify('Could not export the diagram: ' + e.data.quiverExportError);
       }
     };
     window.addEventListener('message', handler);

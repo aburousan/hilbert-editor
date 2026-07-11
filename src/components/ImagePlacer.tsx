@@ -118,14 +118,29 @@ export default function ImagePlacer({
   // Build the simulated text lines, shortened where they meet the image.
   const lines = Array.from({ length: nLines }, (_, i) => {
     const y = pad + 5 + i * lineGap;
-    const within = y >= img.y - 2 && y <= img.y + img.h + 2;
+    // A line overlaps the image if its bottom is below the image's top AND its top is above the image's bottom
+    const within = (y + lineH) > img.y && y < (img.y + img.h);
     // Block modes (below/float/full): skip lines that fall inside the image band.
     if (within && (flow === 'below' || flow === 'float-top' || flow === 'float-bottom' || flow === 'full')) return null;
+    
     let x = pad, w = areaW;
-    if (within && flow === 'wrap-left')  { x = img.x + img.w + 6; w = PW - pad - x; }
-    if (within && flow === 'wrap-right') { w = img.x - 6 - pad; }
-    // Free mode uses #place with an opaque backing: the image floats at an exact
-    // point and covers the text beneath, so lines keep their full width.
+    if (within) {
+      if (flow === 'wrap-left') {
+        x = img.x + img.w + 6;
+        w = PW - pad - x;
+      } else if (flow === 'wrap-right') {
+        w = img.x - 6 - pad;
+      } else if (flow === 'free') {
+        // Free mode wraps on whichever side has more space
+        if (img.x > areaW / 2) {
+          w = img.x - 6 - pad; // wrap left
+        } else {
+          x = img.x + img.w + 6; // wrap right
+          w = PW - pad - x;
+        }
+      }
+    }
+    
     // last line of a paragraph is a touch shorter, for realism
     if (i % 5 === 4) w *= 0.72;
     return { y, x, w: Math.max(w, 6) };
@@ -148,16 +163,18 @@ export default function ImagePlacer({
       ? bodyText.replace(/\n/g, '\n    ')
       : '// Replace this with the text that should wrap around the figure.\n    #lorem(60)';
     let code: string;
-    if (flow === 'wrap-left' || flow === 'wrap-right') {
-      // Text flows around the image with no overlap, anchored to the margin.
+    if (flow === 'wrap-left' || flow === 'wrap-right' || flow === 'free') {
       onEnsureImport(WRAP_IMPORT);
-      const al = flow === 'wrap-left' ? 'top + left' : 'top + right';
+      let al: string;
+      if (flow === 'free') {
+        const hAlign = pos.x > 0.5 ? 'right' : 'left';
+        const vAlign = pos.y > 0.5 ? 'bottom' : 'top';
+        al = `${vAlign} + ${hAlign}`;
+      } else {
+        al = flow === 'wrap-left' ? 'top + left' : 'top + right';
+      }
+      // Text flows around the image with no overlap.
       code = `#wrap-content(\n  ${fig},\n  [\n    ${wrapBody}\n  ],\n  align: ${al},\n)\n`;
-    } else if (flow === 'free') {
-      // Pin the image to the exact dropped point. #place floats it above the flow;
-      // the opaque backing box keeps body text from showing through.
-      const dx = Math.round(pos.x * 100), dy = Math.round(pos.y * 100);
-      code = `#place(\n  top + left,\n  dx: ${dx}%,\n  dy: ${dy}%,\n  block(\n    fill: white,\n    inset: 4pt,\n    figure(\n      ${image},\n      caption: [${caption}],\n    ),\n  ),\n)\n`;
     } else if (flow === 'float-top' || flow === 'float-bottom') {
       const p = flow === 'float-top' ? 'top' : 'bottom';
       code = `#figure(\n  ${image},\n  caption: [${caption}],\n  placement: ${p},\n)\n`;
@@ -185,7 +202,7 @@ export default function ImagePlacer({
     'float-top': <>The figure <b>floats to the top</b> of whatever page it lands on; body text fills the rest. No fixed position.</>,
     'float-bottom': <>The figure <b>floats to the bottom</b> of its page; body text fills the space above.</>,
     'full': <>The image spans the <b>full text width</b> on its own line — good for wide plots and diagrams.</>,
-    'free': <><b>Drag the image anywhere</b> — it's pinned to that exact point with <code>#place</code> and sits on an opaque backing that covers the text beneath (nothing bleeds through). Text does <b>not</b> reflow around it — Typst can't wrap around a free-floating box — so drop it where you have room. For readable text-flow, use the <b>Wrap</b> modes instead.</>,
+    'free': <><b>Drag the image anywhere</b> — text wraps around it using <code>wrap-it</code>, automatically aligning based on where you drag it.</>,
   };
 
   return (
@@ -221,10 +238,7 @@ export default function ImagePlacer({
                 <div style={{
                   position: 'absolute', left: img.x, top: img.y, width: img.w, height: img.h,
                   border: '1.5px solid var(--accent)', borderRadius: 4,
-                  // Free mode covers the text (opaque); other modes tint through.
-                  background: flow === 'free'
-                    ? 'color-mix(in srgb, var(--accent) 14%, var(--bg-color))'
-                    : 'color-mix(in srgb, var(--accent) 18%, transparent)',
+                  background: 'color-mix(in srgb, var(--accent) 18%, transparent)',
                   display: 'flex', alignItems: 'center', justifyContent: 'center',
                 }}>
                   <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" strokeWidth="1.8">

@@ -2,16 +2,23 @@ import React, { useState, useEffect } from 'react';
 import './PackageInstaller.css';
 
 interface Template { name: string; version: string; description: string; authors: string[]; }
-interface TemplateInstallerProps { onInsert: (result: { code: string; entrypoint?: string }) => void; onClose: () => void; }
+interface TemplateInstallerProps {
+  onInsert: (result: { code: string; entrypoint?: string }) => void;
+  onUseBuiltin: (tpl: BuiltinTemplate) => void;
+  onClose: () => void;
+}
 
 import { API } from './api';
+import { notify } from './notify';
+import { BUILTIN_TEMPLATES, type BuiltinTemplate } from './builtinTemplates';
 
-export function TemplateInstaller({ onInsert, onClose }: TemplateInstallerProps) {
+export function TemplateInstaller({ onInsert, onUseBuiltin, onClose }: TemplateInstallerProps) {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<Template[]>([]);
   const [loading, setLoading] = useState(false);
   const [initialLoading, setInitialLoading] = useState(true);
   const [selected, setSelected] = useState<Template | null>(null);
+  const [selBuiltin, setSelBuiltin] = useState<BuiltinTemplate | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [previewState, setPreviewState] = useState<'idle' | 'loading' | 'error'>('idle');
 
@@ -46,6 +53,28 @@ export function TemplateInstaller({ onInsert, onClose }: TemplateInstallerProps)
     return () => { cancelled = true; };
   }, [selected]);
 
+  // Same one-page preview for a built-in, rendered from the files we ship.
+  useEffect(() => {
+    if (!selBuiltin) return;
+    let cancelled = false;
+    setPreviewState('loading'); setPreviewUrl(null);
+    (async () => {
+      try {
+        const res = await fetch(`${API}/template/render-preview`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ entry: selBuiltin.entry, files: selBuiltin.files.map(f => ({ path: f.path, content: f.content })) }),
+        });
+        if (cancelled) return;
+        if (!res.ok) { setPreviewState('error'); return; }
+        const blob = await res.blob();
+        if (cancelled) return;
+        setPreviewUrl(URL.createObjectURL(blob));
+        setPreviewState('idle');
+      } catch { if (!cancelled) setPreviewState('error'); }
+    })();
+    return () => { cancelled = true; };
+  }, [selBuiltin]);
+
   // Revoke the previous preview blob URL when it changes or the modal closes —
   // the cleanup captures the prior value, so browsing templates doesn't pile up
   // orphaned object URLs (each holds its PNG in memory).
@@ -61,8 +90,8 @@ export function TemplateInstaller({ onInsert, onClose }: TemplateInstallerProps)
         body: JSON.stringify({ template: `@preview/${pkg.name}:${pkg.version}` })
       });
       if (res.ok) onInsert(await res.json());
-      else alert('Failed to initialize template. It may contain complex multi-file dependencies.');
-    } catch { alert('Network error initializing template'); } finally { setLoading(false); }
+      else notify('Failed to initialize template. It may contain complex multi-file dependencies.');
+    } catch { notify('Network error initializing template'); } finally { setLoading(false); }
   };
 
   return (
@@ -81,12 +110,27 @@ export function TemplateInstaller({ onInsert, onClose }: TemplateInstallerProps)
 
         <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
           <div className="results-list" style={{ flex: '0 0 48%', borderRight: '1px solid var(--border-color)' }}>
+            <div className="dropdown-header" style={{ padding: '8px 14px 4px', fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.04em', opacity: 0.6 }}>Built-in · works offline</div>
+            {BUILTIN_TEMPLATES.map((tpl) => (
+              <div key={tpl.id} className={`package-card ${selBuiltin?.id === tpl.id ? 'selected' : ''}`} onClick={() => { setSelBuiltin(tpl); setSelected(null); }} style={{ cursor: 'pointer' }}>
+                <div className="pkg-header">
+                  <h3>{tpl.name}</h3>
+                  {tpl.downloadsOnce && <span className="pkg-version" title="Its theme package downloads once, then works offline">downloads once</span>}
+                </div>
+                <p className="pkg-desc">{tpl.description}</p>
+                <div className="pkg-footer">
+                  <span className="pkg-authors">Ships with the app</span>
+                  <button className="insert-btn" onClick={(e) => { e.stopPropagation(); onUseBuiltin(tpl); }}>Use</button>
+                </div>
+              </div>
+            ))}
+            <div className="dropdown-header" style={{ padding: '12px 14px 4px', fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.04em', opacity: 0.6 }}>From Typst Universe</div>
             {initialLoading ? (
               <div className="empty-state">Loading popular templates...</div>
             ) : results.length === 0 ? (
               <div className="empty-state">No templates found.</div>
             ) : results.map((pkg, i) => (
-              <div key={i} className={`package-card ${selected?.name === pkg.name ? 'selected' : ''}`} onClick={() => setSelected(pkg)} style={{ cursor: 'pointer' }}>
+              <div key={i} className={`package-card ${selected?.name === pkg.name ? 'selected' : ''}`} onClick={() => { setSelected(pkg); setSelBuiltin(null); }} style={{ cursor: 'pointer' }}>
                 <div className="pkg-header">
                   <h3>{pkg.name}</h3>
                   <span className="pkg-version">v{pkg.version}</span>
@@ -101,24 +145,28 @@ export function TemplateInstaller({ onInsert, onClose }: TemplateInstallerProps)
           </div>
 
           <div className="template-preview">
-            {!selected ? (
+            {!selected && !selBuiltin ? (
               <div className="empty-state" style={{ margin: 'auto' }}>Select a template to preview it.</div>
             ) : previewState === 'loading' ? (
               <div className="empty-state" style={{ margin: 'auto' }}>
                 <div className="spinner" /> Rendering preview…
-                <div style={{ fontSize: 11, marginTop: 6, opacity: 0.7 }}>(first time downloads the template)</div>
+                {(selected || selBuiltin?.downloadsOnce) && <div style={{ fontSize: 11, marginTop: 6, opacity: 0.7 }}>(first time downloads the template)</div>}
               </div>
             ) : previewState === 'error' ? (
               <div className="empty-state" style={{ margin: 'auto', textAlign: 'center' }}>
-                No preview (this template needs extra files or fonts).
+                {selBuiltin ? 'Could not render this preview.' : 'No preview (this template needs extra files or fonts).'}
                 <div style={{ marginTop: 12 }}>
-                  <button className="btn-primary" onClick={() => handleInitTemplate(selected)} disabled={loading}>Use “{selected.name}” anyway</button>
+                  {selBuiltin
+                    ? <button className="btn-primary" onClick={() => onUseBuiltin(selBuiltin)}>Use “{selBuiltin.name}” anyway</button>
+                    : <button className="btn-primary" onClick={() => handleInitTemplate(selected!)} disabled={loading}>Use “{selected!.name}” anyway</button>}
                 </div>
               </div>
             ) : previewUrl ? (
               <>
-                <img src={previewUrl} alt={`${selected.name} preview`} className="template-thumb" />
-                <button className="btn-primary" style={{ margin: '12px auto 0' }} onClick={() => handleInitTemplate(selected)} disabled={loading}>Use “{selected.name}”</button>
+                <img src={previewUrl} alt={`${(selBuiltin || selected)!.name} preview`} className="template-thumb" />
+                {selBuiltin
+                  ? <button className="btn-primary" style={{ margin: '12px auto 0' }} onClick={() => onUseBuiltin(selBuiltin)}>Use “{selBuiltin.name}”</button>
+                  : <button className="btn-primary" style={{ margin: '12px auto 0' }} onClick={() => handleInitTemplate(selected!)} disabled={loading}>Use “{selected!.name}”</button>}
               </>
             ) : null}
           </div>

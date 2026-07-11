@@ -10,6 +10,7 @@ import { tokenizeLine, bestMatch, type SyncPayload } from './syncMatch';
 import type { PdfHandle } from './components/PdfPreview';
 import { PackageInstaller } from './PackageInstaller';
 import { TemplateInstaller } from './TemplateInstaller';
+import type { BuiltinTemplate } from './builtinTemplates';
 import DiagramBuilder from './components/DiagramBuilder';
 import FigureBuilder from './components/FigureBuilder';
 import QuiverDiagram from './components/QuiverDiagram';
@@ -19,6 +20,7 @@ import DriveSyncModal from './components/DriveSyncModal';
 import AppSettingsModal from './components/AppSettingsModal';
 import InputModal, { type InputModalConfig } from './components/InputModal';
 import CodeRunnerModal from './components/CodeRunnerModal';
+import CommandPalette, { type PaletteCommand } from './components/CommandPalette';
 import SaveAsModal from './components/SaveAsModal';
 import PdfPreview from './components/PdfPreview';
 // Loaded on demand: pulls in all of three.js, which nothing else needs.
@@ -26,12 +28,17 @@ const Plot3DStudio = lazy(() => import('./components/Plot3DStudio'));
 const PlotStudio = lazy(() => import('./components/PlotStudio'));
 const FeynmanBuilder = lazy(() => import('./components/FeynmanBuilder'));
 const EquationGallery = lazy(() => import('./components/EquationGallery'));
+const PhysicsGallery = lazy(() => import('./components/PhysicsGallery'));
+const HelpModal = lazy(() => import('./components/HelpModal'));
 import type { EqTemplate } from './components/EquationGallery';
 const FlowchartCoder = lazy(() => import('./components/FlowchartCoder'));
 const MatrixStudio = lazy(() => import('./components/MatrixStudio'));
 const ImagePlacer = lazy(() => import('./components/ImagePlacer'));
 import SymbolDraw from './components/SymbolDraw';
 import Boundary from './components/Boundary';
+import Toaster from './components/Toaster';
+import DataImportModal from './components/DataImportModal';
+import { notify } from './notify';
 import RefManager from './components/RefManager';
 import BibManager from './components/BibManager';
 import './index.css';
@@ -98,7 +105,17 @@ interface FileNode {
 }
 type Tab = { path: string; content: string; isDirty: boolean };
 
-const DEFAULT_CODE = `#set page(paper: "a4")
+// Show rule injected once when a notebook runs: badges each python/julia code
+// block in the compiled PDF with its language logo (files under .hilbert/logos/,
+// created by the backend on compile).
+const NB_LOGO_MARKER = '#show raw.where(block: true, lang: "python")';
+const NB_LOGO_SHOW_RULE = `// Language logo beside python/julia code blocks (Hilbert)
+#show raw.where(block: true, lang: "python"): it => block(width: 100%, breakable: false, { place(top + right, dy: -3pt, box(height: 1.15em, image(".hilbert/logos/python.svg"))); it })
+#show raw.where(block: true, lang: "julia"): it => block(width: 100%, breakable: false, { place(top + right, dy: -3pt, box(height: 1.15em, image(".hilbert/logos/julia.svg"))); it })
+
+`;
+
+const DEFAULT_CODE = `#set page(paper: "a4", numbering: "1")
 #set text(font: "New Computer Modern", size: 11pt)
 
 // Sections and equations are numbered by default:
@@ -117,10 +134,9 @@ This is a local, offline editor for *Typst*. It comes pre-configured with packag
 // memo intact instead of re-rendering on every parent render.
 const NOOP_REVERSE_SYNC = () => {};
 
-// Proofreading (spelling + grammar) is finished but held back for a later
-// release. The code stays wired up; this flag keeps it dormant and out of the UI
-// so it can't be turned on. Flip to true to ship it.
-const PROOFREAD_FEATURE_ENABLED = false;
+// Proofreading (spelling + grammar) is finished. This flag exposes it in the UI;
+// it remains off per-user until toggled on (persisted in localStorage).
+const PROOFREAD_FEATURE_ENABLED = true;
 
 interface HistoryEntry {
   id: string;
@@ -270,6 +286,11 @@ export default function App() {
   // Set only when a real compile fails (kept separate from errorLogs, which is
   // also reused for transient UI hints). Drives the clear preview error panel.
   const [compileError, setCompileError] = useState<string | null>(null);
+  // Which view the preview pane shows. On a failed compile we keep the last good
+  // PDF up (VSCode/tinymist style) rather than taking over the pane; errors live
+  // in a "Problems" tab you can switch to. Reset to the preview once it's clean.
+  const [previewTab, setPreviewTab] = useState<'preview' | 'problems'>('preview');
+  useEffect(() => { if (!compileError) setPreviewTab('preview'); }, [compileError]);
   const [theme, setTheme] = useState<'typst-dark' | 'typst-light'>(() =>
     localStorage.getItem('editor_theme') === 'typst-light' ? 'typst-light' : 'typst-dark');
   const [editorFontSize, setEditorFontSize] = useState<number>(() => Number(localStorage.getItem('editor_font_size')) || 14);
@@ -308,6 +329,10 @@ export default function App() {
   const sessionSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingCursorRef = useRef<{ path: string; line: number; column: number; scrollTop?: number } | null>(null);
   const restoredRef = useRef(false);
+  // In the browser dev flow vite is up long before the Rust backend, so the
+  // first compile would hit a dead port and the error would stick until a
+  // manual refresh. Compiles hold until the backend answers once.
+  const [backendReady, setBackendReady] = useState(false);
   const scheduleSaveSession = () => {
     if (sessionSaveTimer.current) clearTimeout(sessionSaveTimer.current);
     sessionSaveTimer.current = setTimeout(() => {
@@ -334,20 +359,20 @@ export default function App() {
     pendingCursorRef.current = null;
   }, [activeTabPath, activeTab?.content]);
   
-  const getStats = () => {
+  // Only a fallback for the header word count (until the PDF's own count lands),
+  // so memoise it — no need to re-split the whole document on every render.
+  const stats = useMemo(() => {
     if (!activeTab) return { words: 0, chars: 0 };
     const text = activeTab.content;
-    const chars = text.length;
-    const words = text.trim().split(/\s+/).filter(w => w.length > 0).length;
-    return { words, chars };
-  };
-  const stats = getStats();
+    return { words: text.trim().split(/\s+/).filter(w => w.length > 0).length, chars: text.length };
+  }, [activeTab?.content]);
   const [showPackageInstaller, setShowPackageInstaller] = useState(false);
   const [showTemplateInstaller, setShowTemplateInstaller] = useState(false);
   const [showSymbolPicker, setShowSymbolPicker] = useState(false);
   const [showDiagramBuilder, setShowDiagramBuilder] = useState(false);
   const [showFeynman, setShowFeynman] = useState(false);
   const [showEqGallery, setShowEqGallery] = useState(false);
+  const [showPhysics, setShowPhysics] = useState(false);
   const [showMatrixStudio, setShowMatrixStudio] = useState(false);
   const [showImagePlacer, setShowImagePlacer] = useState<string | boolean>(false);
 
@@ -389,8 +414,43 @@ export default function App() {
   const [projectName, setProjectName] = useState('Project Report');
   const [editingTitle, setEditingTitle] = useState(false);
   const [inputModal, setInputModal] = useState<InputModalConfig | null>(null);
+  const [confirmModal, setConfirmModal] = useState<null | { message: string; danger?: boolean; confirmLabel?: string; resolve: (ok: boolean) => void }>(null);
+  const confirmDialog = useCallback((message: string, opts?: { danger?: boolean; confirmLabel?: string }) =>
+    new Promise<boolean>(resolve => setConfirmModal({ message, danger: opts?.danger, confirmLabel: opts?.confirmLabel, resolve })), []);
+  const [showDataImport, setShowDataImport] = useState(false);
+
+  // Stable options object: @monaco-editor/react calls editor.updateOptions() every
+  // time this prop's identity changes, and reconfiguring mid-search makes the
+  // find-match highlights flicker. Only rebuild it when the font size changes.
+  const editorOptions = useMemo(() => ({
+    automaticLayout: true,
+    minimap: { enabled: false },
+    wordWrap: 'on' as const,
+    wordBasedSuggestions: 'off' as const,
+    quickSuggestions: { other: true, comments: false, strings: false },
+    quickSuggestionsDelay: 10,
+    suggestOnTriggerCharacters: true,
+    acceptSuggestionOnEnter: 'on' as const,
+    tabCompletion: 'on' as const,
+    snippetSuggestions: 'top' as const,
+    suggest: { showSnippets: true, snippetsPreventQuickSuggestions: false },
+    fontSize: editorFontSize,
+    lineNumbers: 'on' as const,
+    tabSize: 2,
+    insertSpaces: true,
+    detectIndentation: false,
+    scrollBeyondLastLine: false,
+    smoothScrolling: true,
+    padding: { top: 16, bottom: 16 },
+    autoClosingBrackets: 'always' as const,
+    autoClosingQuotes: 'always' as const,
+    bracketPairColorization: { enabled: true },
+    hover: { enabled: true, delay: 300 },
+  }), [editorFontSize]);
   const [codeRunner, setCodeRunner] = useState<null | { initialLang?: 'python' | 'julia' | 'wolfram'; initialCode?: string; initialMode?: 'text' | 'equation' }>(null);
   const [showSaveAs, setShowSaveAs] = useState(false);
+  const [showPalette, setShowPalette] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
   const [showPlot3D, setShowPlot3D] = useState(false);
   const [showPlotStudio, setShowPlotStudio] = useState(false);
   const [showSymbolDraw, setShowSymbolDraw] = useState(false);
@@ -404,9 +464,12 @@ export default function App() {
   const [sidebarWidth, setSidebarWidth] = useState(250);
   const [editorWidth, setEditorWidth] = useState(500);
   const [treeHeight, setTreeHeight] = useState(220);
+  const [problemsHeight, setProblemsHeight] = useState(160);
   const isResizingSidebar = useRef(false);
   const isResizingEditor = useRef(false);
   const isResizingTree = useRef(false);
+  const isResizingProblems = useRef(false);
+  const problemsResizeStart = useRef({ y: 0, height: 0 });
   const sidebarRef = useRef<HTMLDivElement | null>(null);
   const toggleNumberingRef = useRef<() => void>(() => {});
 
@@ -421,7 +484,20 @@ export default function App() {
   useEffect(() => { 
     // Restore the last project (folder + tabs + cursor) if one was saved, else load
     // the default workspace. Runs once.
-    if (!restoredRef.current) { restoredRef.current = true; restoreSessionOrDefault(); }
+    if (!restoredRef.current) {
+      restoredRef.current = true;
+      (async () => {
+        // In the desktop app the page is served by the backend itself, so the
+        // first probe succeeds immediately. Give a slow dev boot up to 30s,
+        // then proceed anyway so a genuinely dead backend still surfaces.
+        for (let i = 0; i < 60; i++) {
+          try { await fetch(`${API}/workspace/root`); break; }
+          catch { await new Promise(r => setTimeout(r, 500)); }
+        }
+        setBackendReady(true);
+        restoreSessionOrDefault();
+      })();
+    }
     fetch(`${API}/lsp/hover`, { method: 'POST', body: JSON.stringify({ file: 'main.typ', line: 0, character: 0, content: '' }), headers: {'Content-Type': 'application/json'} })
       .then(() => {
         const w = (window as any);
@@ -447,12 +523,19 @@ export default function App() {
         const top = sidebarRef.current?.getBoundingClientRect().top ?? 0;
         const total = sidebarRef.current?.clientHeight ?? 600;
         setTreeHeight(Math.max(80, Math.min(e.clientY - top, total - 140)));
+      } else if (isResizingProblems.current) {
+        // Drag the handle up → the Problems panel grows (it's anchored to the
+        // bottom); delta-based so it works regardless of the panels below it.
+        const dy = problemsResizeStart.current.y - e.clientY;
+        const total = sidebarRef.current?.clientHeight ?? 600;
+        setProblemsHeight(Math.max(60, Math.min(problemsResizeStart.current.height + dy, total - 200)));
       }
     };
     const handleMouseUp = () => {
       isResizingSidebar.current = false;
       isResizingEditor.current = false;
       isResizingTree.current = false;
+      isResizingProblems.current = false;
       document.body.style.cursor = 'default';
       document.body.classList.remove('is-resizing');
     };
@@ -501,7 +584,16 @@ export default function App() {
   };
 
 
+  // Single-flight compile: a newer compile aborts the one still running. Axum
+  // drops the handler future when the client disconnects, and run_cmd kills the
+  // child on drop, so aborting the fetch also kills the superseded `typst`
+  // process — no orphaned compiles racing to write out.pdf.
+  const compileAbortRef = useRef<AbortController | null>(null);
+
   const compileTypst = useCallback(async (mainFile: string = 'main.typ') => {
+    compileAbortRef.current?.abort();
+    const ac = new AbortController();
+    compileAbortRef.current = ac;
     setIsCompiling(true);
     try {
       for (const tab of tabs) {
@@ -512,9 +604,8 @@ export default function App() {
           if (tab.isDirty) syncToDisk(tab.path, tab.content);   // mirror edits to the opened folder on disk
         }
       }
-      fetchTree();
-      
-      const res = await fetch(`${API}/compile?main=${encodeURIComponent(mainFile)}`, { method: 'POST' });
+
+      const res = await fetch(`${API}/compile?main=${encodeURIComponent(mainFile)}`, { method: 'POST', signal: ac.signal });
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         const msg = errData.error || 'Compilation failed.';
@@ -528,50 +619,30 @@ export default function App() {
       setPdfUrl(prev => { if (prev) URL.revokeObjectURL(prev); return url; });
       setErrorLogs(null);
       setCompileError(null);
-      
+
       const w = (window as any);
       if (!w._hasLoggedCompile) {
         w._hasLoggedCompile = true;
         w.logTiming('First compile');
       }
 
-      setHistory(prev => {
-        let newHistory = [...prev];
-        for (const tab of tabs) {
-          const last = prev.filter(h => h.path === tab.path).pop();
-          if (!last || last.content !== tab.content) {
-            newHistory.push({ id: Math.random().toString(), timestamp: Date.now(), path: tab.path, content: tab.content });
-          }
-        }
-        // Cap per-file history — each entry holds a FULL document snapshot, and
-        // compile-on-type pushes one per change, so an unbounded array would grow
-        // to hundreds of copies of the doc over a long session. Keep the newest N.
-        const PER_FILE_CAP = 50;
-        const seen: Record<string, number> = {};
-        const kept: typeof newHistory = [];
-        for (let i = newHistory.length - 1; i >= 0; i--) {
-          const h = newHistory[i];
-          seen[h.path] = (seen[h.path] || 0) + 1;
-          if (seen[h.path] <= PER_FILE_CAP) kept.push(h);
-        }
-        return kept.reverse();
-      });
-
       setTabs(prev => prev.map(t => ({ ...t, isDirty: false })));
       fetchTree();
     } catch (error) {
+      if (ac.signal.aborted) return;   // superseded by a newer compile — stay quiet
       const msg = error instanceof Error && /fetch/i.test(error.message)
         ? "Couldn't reach the local Typst engine. Make sure the app's backend is running, then recompile."
         : String(error);
       setErrorLogs(msg);
       setCompileError(msg);
     } finally {
-      setIsCompiling(false);
+      // Only the latest compile owns the spinner; a superseded one bows out.
+      if (compileAbortRef.current === ac) setIsCompiling(false);
     }
   }, [tabs]);
 
-  const restoreHistory = (h: HistoryEntry) => {
-    if (confirm(`Restore version from ${new Date(h.timestamp).toLocaleTimeString()}?`)) {
+  const restoreHistory = async (h: HistoryEntry) => {
+    if (await confirmDialog(`Restore version from ${new Date(h.timestamp).toLocaleTimeString()}?`, { confirmLabel: 'Restore' })) {
       setTabs(prev => {
         if (!prev.find(t => t.path === h.path)) {
           return [...prev, { path: h.path, content: h.content, isDirty: true }];
@@ -614,12 +685,38 @@ export default function App() {
     })();
     return () => { cancelled = true; };
   }, [fileTree, treeHasPath]);
-  const currentMain =
+  const currentMain = useMemo(() =>
     (mainOverride && treeHasPath(mainOverride)) ? mainOverride :
     (detectedEntry && treeHasPath(detectedEntry)) ? detectedEntry :
     treeHasPath('main.typ') ? 'main.typ' :
-    (activeTabPath && activeTabPath.endsWith('.typ') ? activeTabPath : (lastTypPath || 'main.typ'));
+    (activeTabPath && activeTabPath.endsWith('.typ') ? activeTabPath : (lastTypPath || 'main.typ')),
+    [mainOverride, detectedEntry, activeTabPath, lastTypPath, treeHasPath]);
   const [lastCompiledPath, setLastCompiledPath] = useState<string>('');
+
+  // Record a version-history snapshot for one file. Called only on an explicit
+  // save, so each entry is an intentional version the user chose to keep — not
+  // one snapshot per second of compile-on-type. Skips a no-op save (unchanged
+  // since the last snapshot) and keeps only the newest few per file, since each
+  // entry holds a full copy of the document.
+  const HISTORY_PER_FILE = 40;
+  const snapshotHistory = useCallback((path: string, content: string) => {
+    setHistory(prev => {
+      const last = prev.filter(h => h.path === path).pop();
+      if (last && last.content === content) return prev;
+      const next = [...prev, { id: Math.random().toString(), timestamp: Date.now(), path, content }];
+      const seen: Record<string, number> = {};
+      const kept: typeof next = [];
+      for (let i = next.length - 1; i >= 0; i--) {
+        const h = next[i];
+        seen[h.path] = (seen[h.path] || 0) + 1;
+        if (seen[h.path] <= HISTORY_PER_FILE) kept.push(h);
+      }
+      return kept.reverse();
+    });
+  }, []);
+
+  // Points at the latest runNotebook (defined further down). Held in a ref so an
+  // intentional save can trigger it without pulling it into save's dependencies.
 
   const saveActiveFile = useCallback(async () => {
     if (!activeTab) return;
@@ -627,13 +724,14 @@ export default function App() {
       await fetch(`${API}/workspace/file?path=${encodeURIComponent(activeTab.path)}`, {
         method: 'POST', body: activeTab.content, headers: { 'Content-Type': 'text/plain' }
       });
+      snapshotHistory(activeTab.path, activeTab.content);   // keep a version, this save only
       syncToDisk(activeTab.path, activeTab.content);   // mirror to the opened folder on disk
       setTabs(prev => prev.map(t => t.path === activeTab.path ? { ...t, isDirty: false } : t));
       fetchTree();
       compileTypst(currentMain);
       webdavAutoSync();
     } catch (e) {}
-  }, [activeTab, currentMain, compileTypst]);
+  }, [activeTab, currentMain, compileTypst, snapshotHistory]);
 
   // If the user enabled WebDAV auto-sync, push the project on every save.
   const webdavAutoSync = () => {
@@ -662,6 +760,7 @@ export default function App() {
     'S-u': () => computeSelection(),
     'S-y': () => setShowSymbolDraw(true),
     'S-b': () => insertCodeBlock(),
+    'S-h': () => insertHRule(),
     'b': () => wrapSelection('*', '*'),
     'i': () => wrapSelection('_', '_'),
     'e': () => wrapSelection('$', '$'),
@@ -671,6 +770,7 @@ export default function App() {
       if (!(e.metaKey || e.ctrlKey)) return;
       const key = e.key.toLowerCase();
       if (key === 's' && !e.shiftKey) { e.preventDefault(); saveActiveFile(); return; }
+      if (key === 'k' && !e.shiftKey) { e.preventDefault(); setShowPalette(v => !v); return; }
       if (key === 'n' && e.shiftKey) { e.preventDefault(); toggleNumberingRef.current(); return; }
       const action = shortcutRef.current[`${e.shiftKey ? 'S-' : ''}${key}`];
       if (!action) return;
@@ -687,21 +787,24 @@ export default function App() {
   }, [saveActiveFile]);
 
   useEffect(() => {
+    if (!backendReady) return;
     const hasDirty = tabs.some(t => t.isDirty);
     if (hasDirty || currentMain !== lastCompiledPath) {
-      const timeoutId = setTimeout(() => { 
-        compileTypst(currentMain); 
+      const timeoutId = setTimeout(() => {
+        compileTypst(currentMain);
         setLastCompiledPath(currentMain);
       }, hasDirty ? compileDelay : 50);
       return () => clearTimeout(timeoutId);
     }
-  }, [tabs, compileTypst, currentMain, lastCompiledPath, compileDelay]);
+  }, [backendReady, tabs, compileTypst, currentMain, lastCompiledPath, compileDelay]);
 
-  const handleEditorChange = (value: string | undefined) => {
+  // Stable so @monaco-editor/react doesn't dispose+resubscribe the content
+  // listener on every render; identity only changes when the active tab does.
+  const handleEditorChange = useCallback((value: string | undefined) => {
     if (value !== undefined && activeTabPath) {
       setTabs(prev => prev.map(t => t.path === activeTabPath ? { ...t, content: value, isDirty: true } : t));
     }
-  };
+  }, [activeTabPath]);
 
   const IMG_EXT = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp'];
   
@@ -826,7 +929,7 @@ export default function App() {
 
     if (e.key === 'Backspace' || e.key === 'Delete') {
       e.preventDefault();
-      if (!confirm(`Delete ${selectedPaths.length} items?`)) return;
+      if (!await confirmDialog(`Delete ${selectedPaths.length} items?`, { danger: true, confirmLabel: 'Delete' })) return;
       for (const p of selectedPaths) await fetch(`${API}/workspace/file?path=${encodeURIComponent(p)}`, { method: 'DELETE' });
       setSelectedPaths([]); fetchTree();
     } else if (e.key === 'Enter') {
@@ -941,14 +1044,14 @@ export default function App() {
             else if (activeTabPath.startsWith(p + '/')) setActiveTabPath(newPath + activeTabPath.substring(p.length));
           } else {
             const err = await res.json();
-            alert(`Failed to move ${p}: ${err.error || 'Unknown error'}`);
+            notify(`Failed to move ${p}: ${err.error || 'Unknown error'}`);
           }
         }
       }
       if (successCount > 0) setSelectedPaths([]);
       fetchTree();
     } catch (err: any) {
-      alert(`Drag and drop failed: ${err.message || err}`);
+      notify(`Drag and drop failed: ${err.message || err}`);
     }
   };
 
@@ -1011,7 +1114,7 @@ export default function App() {
   const deleteEntry = async (e: React.MouseEvent, path: string, isDir: boolean) => {
     e.preventDefault();
     e.stopPropagation();
-    if (!confirm(`Delete ${isDir ? 'folder' : 'file'} "${path}"?${isDir ? '\\nAll of its contents will be removed.' : ''}`)) return;
+    if (!await confirmDialog(`Delete ${isDir ? 'folder' : 'file'} "${path}"?${isDir ? '\nAll of its contents will be removed.' : ''}`, { danger: true, confirmLabel: 'Delete' })) return;
     try {
       await fetch(`${API}/workspace/file?path=${encodeURIComponent(path)}`, { method: 'DELETE' });
     } catch {}
@@ -1196,7 +1299,7 @@ export default function App() {
     input.onchange = async () => {
       const files = Array.from(input.files || []);
       if (!files.length) return;
-      if (files.length > 400 && !confirm(`Import ${files.length} files? This may take a moment.`)) return;
+      if (files.length > 400 && !await confirmDialog(`Import ${files.length} files? This may take a moment.`, { confirmLabel: 'Import' })) return;
       const TEXT_EXT = ['typ', 'bib', 'txt', 'md', 'csv', 'json', 'yml', 'yaml', 'toml', 'xml', 'tex', 'html', 'css', 'js'];
       for (const f of files) {
         const rel = (f as any).webkitRelativePath || f.name;
@@ -1320,13 +1423,13 @@ export default function App() {
     try {
       const res = await fetch(`${API}/workspace/root`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: folder }) });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) { alert(data.error || 'Could not open that folder.'); return; }
+      if (!res.ok) { notify(data.error || 'Could not open that folder.'); return; }
       dirHandleRef.current = null;   // desktop backend edits the folder directly
       workspacePathRef.current = folder;   // remember this project for session restore
       const name = folder.replace(/[/\\]+$/, '').split(/[/\\]/).pop() || 'Project';
       await loadWorkspace(name);
       addRecentFolder({ name, path: folder });
-    } catch { alert('Could not reach the local server.'); }
+    } catch { notify('Could not reach the local server.'); }
   };
 
   // Chrome/Edge: writable directory handle → edits reflect on disk (also used by
@@ -1334,9 +1437,9 @@ export default function App() {
   const openDirHandleAsRoot = async (dir: any, ask = true) => {
     try {
       if (dir.requestPermission && (await dir.requestPermission({ mode: 'readwrite' })) !== 'granted') {
-        alert('Write permission is needed so your edits save back to the folder.'); return;
+        notify('Write permission is needed so your edits save back to the folder.', 'info'); return;
       }
-      if (ask && !confirm(`Open “${dir.name}” as the workspace? Your edits will be saved back to this folder on disk.`)) return;
+      if (ask && !await confirmDialog(`Open “${dir.name}” as the workspace? Your edits will be saved back to this folder on disk.`, { confirmLabel: 'Open' })) return;
       await fetch(`${API}/workspace/clear`, { method: 'POST' });
       workspacePathRef.current = null;   // web-imported working copy: no native path to reopen
       dirHandleRef.current = dir;
@@ -1344,7 +1447,7 @@ export default function App() {
       await loadWorkspace(dir.name);
       const key = `dir:${dir.name}`;
       try { await idbPut(key, dir); addRecentFolder({ name: dir.name, idb: key }); } catch { /* recents are best-effort */ }
-    } catch { alert('Could not open that folder.'); }
+    } catch { notify('Could not open that folder.'); }
   };
 
   const openRecentFolder = async (r: RecentFolder) => {
@@ -1354,7 +1457,7 @@ export default function App() {
         const h = await idbGet(r.idb);
         if (!h) throw new Error('gone');
         await openDirHandleAsRoot(h, false);
-      } catch { alert('Could not reopen this folder — open it once via File → Open Folder…'); }
+      } catch { notify('Could not reopen this folder — open it once via File → Open Folder…'); }
     }
   };
 
@@ -1384,7 +1487,7 @@ export default function App() {
       const files = Array.from(input.files || []);
       if (!files.length) return;
       const rootName = (((files[0] as any).webkitRelativePath || files[0].name).split('/')[0]) || 'Project';
-      if (!confirm(`Open “${rootName}” as the workspace? This browser can't save edits back to disk, so a working copy is imported (${files.length} files). Use the desktop app or Chrome to edit the folder in place.`)) return;
+      if (!await confirmDialog(`Open “${rootName}” as the workspace? This browser can't save edits back to disk, so a working copy is imported (${files.length} files). Use the desktop app or Chrome to edit the folder in place.`, { confirmLabel: 'Open' })) return;
       try {
         await fetch(`${API}/workspace/clear`, { method: 'POST' });
         dirHandleRef.current = null;
@@ -1400,49 +1503,23 @@ export default function App() {
           }
         }
         await loadWorkspace(rootName);
-      } catch { alert('Could not import that folder.'); }
+      } catch { notify('Could not import that folder.'); }
     };
     input.click();
   };
 
-  // Import a data file (CSV/JSON/…) into the workspace and insert the matching
-  // Typst read function so it can be used in the document.
-  const insertDataFile = () => {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = '.csv,.json,.yaml,.yml,.toml,.xml,.txt';
-    input.onchange = async () => {
-      const file = input.files?.[0];
-      if (!file) return;
-      const text = await file.text();
-      const name = file.name;
-      await fetch(`${API}/workspace/file?path=${encodeURIComponent(name)}`, { method: 'POST', body: text, headers: { 'Content-Type': 'text/plain' } });
-      await fetchTree();
-      const ext = (name.split('.').pop() || '').toLowerCase();
-      let snippet: string;
-      if (ext === 'csv') snippet =
-`#let data = csv("${name}")
-// Preview: header + first 10 rows, auto-scaled to fit the page. \`data\` holds every row.
-#let _rows = data.slice(0, calc.min(11, data.len()))
-#let _tbl = text(size: 8pt, table(
-  columns: data.first().len(),
-  align: left,
-  table.header(.._rows.first()),
-  .._rows.slice(1).flatten(),
-))
-#layout(size => scale(
-  calc.min(1, size.width / measure(_tbl).width) * 100%,
-  reflow: true,
-  _tbl,
-))`;
-      else if (ext === 'json') snippet = `#let data = json("${name}")\n// e.g. #data.at("key")`;
-      else if (ext === 'yaml' || ext === 'yml') snippet = `#let data = yaml("${name}")`;
-      else if (ext === 'toml') snippet = `#let data = toml("${name}")`;
-      else if (ext === 'xml') snippet = `#let data = xml("${name}")`;
-      else snippet = `#let text-data = read("${name}")`;
-      insertCode('\n' + snippet + '\n\n');
-    };
-    input.click();
+  // Open the data-import dialog (CSV/Excel/JSON/…) with preview + options.
+  const insertDataFile = () => setShowDataImport(true);
+
+  // Called by DataImportModal once the user has chosen a file, sheet and options:
+  // write the (possibly Excel-converted) data into the workspace and drop the
+  // matching Typst read snippet at the cursor.
+  const handleDataImport = async ({ filename, content, snippet }: { filename: string; content: string; snippet: string }) => {
+    await fetch(`${API}/workspace/file?path=${encodeURIComponent(filename)}`, { method: 'POST', body: content, headers: { 'Content-Type': 'text/plain' } });
+    await fetchTree();
+    insertCode('\n' + snippet + '\n\n');
+    setShowDataImport(false);
+    notify(`Imported ${filename}`, 'success');
   };
   
   const handleInitTemplate = async (result: string | { code: string; entrypoint?: string }) => {
@@ -1452,6 +1529,43 @@ export default function App() {
     const code = typeof result === 'string' ? result : result.code;
     setMainOverride(entry);   // preview compiles the template's root, not its chapters
     setTabs([{ path: entry, content: code, isDirty: false }]);
+    setActiveTabPath(entry);
+    compileTypst(entry);
+  };
+
+  // Write a built-in (offline) starter into the open folder. Unlike the Universe
+  // templates above, these ship in the app; they land in the current workspace
+  // as real files and open as a new tab, without discarding what's already open.
+  const handleUseBuiltin = async (tpl: BuiltinTemplate) => {
+    setShowTemplateInstaller(false);
+    let existing: string[] = [];
+    try {
+      const res = await fetch(`${API}/workspace`);
+      if (res.ok) {
+        const tree = await res.json();
+        if (Array.isArray(tree)) existing = tree.map((n: any) => n.path);
+      }
+    } catch { /* offline read of our own workspace — ignore */ }
+
+    // Don't clobber an existing file of the same name: bump slides.typ → slides-1.typ.
+    const dot = tpl.entry.lastIndexOf('.');
+    const base = dot > 0 ? tpl.entry.slice(0, dot) : tpl.entry;
+    const ext = dot > 0 ? tpl.entry.slice(dot) : '';
+    let entry = tpl.entry;
+    for (let i = 1; existing.includes(entry); i++) entry = `${base}-${i}${ext}`;
+
+    for (const f of tpl.files) {
+      const target = f.path === tpl.entry ? entry : f.path;
+      if (f.keepExisting && existing.includes(target)) continue;
+      await fetch(`${API}/workspace/file?path=${encodeURIComponent(target)}`, {
+        method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: f.content,
+      });
+    }
+
+    await fetchTree();
+    const content = tpl.files.find(f => f.path === tpl.entry)!.content;
+    setMainOverride(entry);
+    setTabs(prev => prev.some(t => t.path === entry) ? prev : [...prev, { path: entry, content, isDirty: false }]);
     setActiveTabPath(entry);
     compileTypst(entry);
   };
@@ -1475,6 +1589,82 @@ export default function App() {
     }
     editor.executeEdits('insert', [{ range, text, forceMoveMarkers: true }]);
     editor.focus();
+  };
+
+  // Run every ```python / ```julia code block in the active file as ONE
+  // persistent session per language, so variables carry across blocks like a
+  // Jupyter notebook, then write each block's output back into the document just
+  // below it. A previous auto-generated output block is replaced, not stacked.
+  const [notebookRunning, setNotebookRunning] = useState(false);
+  const runNotebook = async () => {
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    if (!editor || !model || !activeTab) return;
+    const content = model.getValue();
+
+    // Line-anchored so a fence printed *inside* a cell's output can't be mistaken
+    // for a real cell on a later run.
+    const CELL_RE = /^```(python|julia)[^\n]*\n([\s\S]*?)^```/gm;
+    type Cell = { lang: 'python' | 'julia'; code: string; end: number; result?: any };
+    const cells: Cell[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = CELL_RE.exec(content))) {
+      cells.push({ lang: m[1] as 'python' | 'julia', code: m[2].replace(/\n$/, ''), end: CELL_RE.lastIndex });
+    }
+    if (!cells.length) { notify('No ```python or ```julia code blocks found in this file.', 'info'); return; }
+
+    setNotebookRunning(true);
+    try {
+      for (const lang of ['python', 'julia'] as const) {
+        const group = cells.filter(c => c.lang === lang);
+        if (!group.length) continue;
+        // Use the interpreter the user picked in the code runner (e.g. a conda
+        // env with numpy), not just the default one the backend detected first.
+        const bin = localStorage.getItem(`interp_${lang}`) || '';
+        const res = await fetch(`${API}/notebook/run`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ lang, cells: group.map(c => c.code), bin }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.results) {
+          notify(`Notebook run failed (${lang}): ${data.error || data.stderr || res.statusText}`);
+          return;
+        }
+        group.forEach((c, i) => { c.result = data.results[i]; });
+      }
+
+      const esc = (s: string) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r/g, '').replace(/\n/g, '\\n').replace(/\t/g, '\\t');
+      const outputBlock = (r: any) => {
+        const parts: string[] = [];
+        const so = (r?.stdout || '').replace(/\n+$/, '');
+        const er = (r?.error || '').replace(/\n+$/, '');
+        if (so) parts.push(`  #raw(block: true, "${esc(so)}")`);
+        if (er) parts.push(`  #text(fill: red, raw(block: true, "${esc(er)}"))`);
+        for (const img of (r?.images || [])) parts.push(`  #image("${img}", width: 70%)`);
+        const inner = parts.length ? parts.join('\n') : '  #text(fill: gray)[(no output)]';
+        return `// >>> nb-output — auto-generated; re-run replaces this\n#block(fill: luma(245), inset: 6pt, radius: 3pt, width: 100%)[\n${inner}\n]\n// <<< nb-output`;
+      };
+
+      // Splice outputs in back-to-front so earlier offsets stay valid.
+      let next = content;
+      for (let i = cells.length - 1; i >= 0; i--) {
+        const c = cells[i];
+        const after = next.slice(c.end);
+        const existing = after.match(/^\s*\/\/ >>> nb-output[\s\S]*?\n\/\/ <<< nb-output[^\n]*/);
+        const removeLen = existing ? existing[0].length : 0;
+        next = next.slice(0, c.end) + '\n' + outputBlock(c.result) + next.slice(c.end + removeLen);
+      }
+      // Once, add the show rule that badges python/julia code blocks with their
+      // language logo in the compiled PDF (logos live in .hilbert/logos/).
+      if (!next.includes(NB_LOGO_MARKER)) next = NB_LOGO_SHOW_RULE + next;
+
+      editor.executeEdits('notebook', [{ range: model.getFullModelRange(), text: next, forceMoveMarkers: true }]);
+      editor.pushUndoStop();
+    } catch (e: any) {
+      notify('Notebook run error: ' + (e?.message || e));
+    } finally {
+      setNotebookRunning(false);
+    }
   };
 
   // Replace the current selection with `text` (wrapping it), or insert at the
@@ -1657,7 +1847,7 @@ export default function App() {
       { key: 'mright', label: 'Right margin', placeholder: 'e.g. 2cm' },
       { key: 'header', label: 'Header text', placeholder: 'optional' },
       { key: 'footer', label: 'Footer text', placeholder: 'optional' },
-      { key: 'pagenum', label: 'Page numbers', type: 'select', default: 'none', options: ['none', 'bottom center', 'bottom right', 'bottom left', 'top center', 'top right'] },
+      { key: 'pagenum', label: 'Page numbers', type: 'select', default: 'bottom center', options: ['none', 'bottom center', 'bottom right', 'bottom left', 'top center', 'top right'] },
     ],
     onSubmit: (v) => {
       const esc = (s: string) => s.replace(/([\[\]#])/g, '\\$1');
@@ -2198,6 +2388,12 @@ export default function App() {
     setShowEqGallery(false);
   };
 
+  const insertPhysicsTemplate = (t: EqTemplate, display: boolean) => {
+    if (t.physica) ensureRule('@preview/physica', '#import "@preview/physica:0.9.8": *');
+    insertSnippet(display ? `\n$ ${t.snippet} $\n\n` : `$ ${t.snippet} $`);
+    setShowPhysics(false);
+  };
+
   // Ensure a multi-line preamble block exists once, at the top of the document.
   // A multi-line setup block (e.g. #let theorem = …) is just a rule with an
   // extra trailing blank line — delegate to ensureRule to avoid duplicating the
@@ -2470,6 +2666,37 @@ export default function App() {
   const insertNestedList = () => insertCode('\n- First point\n  - Sub-point\n  - Sub-point\n    + Numbered sub-sub-point\n- Second point\n\n');
   const insertTermList = () => insertCode('\n/ Term: its definition or explanation.\n/ Second term: another definition.\n\n');
 
+  // Slide building blocks. The floating box is plain built-in Typst; the
+  // subfigure grid and the fletcher diagram each pull a small package, imported
+  // once at the top of the document (skipped if it's already there).
+  const insertFloatingBox = () => insertCode(
+    '\n// Floating text box — move it by changing dx/dy (0% = top-left, 100% = bottom-right).\n' +
+    '#place(top + left, dx: 55%, dy: 25%, block(\n' +
+    '  fill: yellow.lighten(60%), inset: 8pt, radius: 4pt, stroke: 0.5pt,\n' +
+    ')[\n  Floating callout \\\n  placed anywhere\n])\n');
+
+  const insertSubfigures = () => {
+    ensureSetup('@preview/subpar', '#import "@preview/subpar:0.2.2"');
+    // Unique suffix per insert so two subfigure blocks never clash on labels.
+    const id = Math.random().toString(36).slice(2, 7);
+    insertCode(
+      '\n#subpar.grid(\n' +
+      `  figure(rect(width: 100%, height: 3cm, fill: luma(230)), caption: [left]), <${id}-a>,\n` +
+      `  figure(rect(width: 100%, height: 3cm, fill: luma(200)), caption: [right]), <${id}-b>,\n` +
+      '  columns: (1fr, 1fr),\n' +
+      `  caption: [Two panels, @${id}-a and @${id}-b.],\n` +
+      `  label: <fig-${id}>,\n)\n\n`);
+  };
+
+  const insertFletcher = () => {
+    ensureSetup('@preview/fletcher', '#import "@preview/fletcher:0.5.8" as fletcher: node, edge');
+    insertCode(
+      '\n#fletcher.diagram(\n  node-stroke: 0.5pt,\n' +
+      '  node((0,0), [Input]), edge("->"),\n' +
+      '  node((1,0), [Process]), edge("->"),\n' +
+      '  node((2,0), [Output]),\n)\n\n');
+  };
+
   // --- Text features: callouts, notes, quotes, typographic emphasis ----------
   // Self-contained callout (no external package): a coloured, left-ruled block
   // whose colour, icon and title follow the chosen kind.
@@ -2504,6 +2731,8 @@ export default function App() {
     if (sel && model && !sel.isEmpty()) replaceOrInsert(sel, editor, model, `#footnote[${inner}]`);
     else insertCode('#footnote[note text]');
   };
+
+  const insertHRule = () => insertCode('\n#line(length: 100%, stroke: 0.5pt)\n');
 
   const insertSideNote = () => setInputModal({
     title: 'Insert Margin / Side Note',
@@ -2867,8 +3096,11 @@ export default function App() {
 
   // Memoize derived views so typing doesn't re-walk the tree / re-scan headings
   // on every keystroke (they only depend on the tree and the active file).
-  const treeJsx = useMemo(() => renderTree(filterTree(fileTree, treeSearch, searchContentResults)), [fileTree, activeTabPath, renamingPath, renameValue, selectedPaths, collapsedDirs, currentMain, tabs, treeSearch, searchContentResults]);
-  const outline = useMemo(() => getOutline(), [activeTab?.content]);
+  // The tree reads tabs only for the dirty markers, so key it on the set of
+  // dirty paths — not the tabs array, whose identity changes on every keystroke.
+  const dirtyPathsKey = useMemo(() => tabs.filter(t => t.isDirty).map(t => t.path).sort().join('\u0001'), [tabs]);
+  const treeJsx = useMemo(() => renderTree(filterTree(fileTree, treeSearch, searchContentResults)), [fileTree, activeTabPath, renamingPath, renameValue, selectedPaths, collapsedDirs, currentMain, dirtyPathsKey, treeSearch, searchContentResults]);
+  const outline = useMemo(() => (sidebarOpen ? getOutline() : []), [activeTab?.content, sidebarOpen]);
 
   const toggleMenu = (e: React.MouseEvent, menuName: string) => {
     e.stopPropagation();
@@ -2901,8 +3133,104 @@ export default function App() {
     } catch {}
   };
 
+  // Everything reachable from the menus, exposed to the ⌘K palette. Built on
+  // open (not memoised) so each command closes over current state.
+  const paletteCommands = (): PaletteCommand[] => [
+    { category: 'File', title: 'New File...', run: createNewFile },
+    { category: 'File', title: 'Open File...', run: openFromDisk },
+    { category: 'File', title: 'Open Folder as Workspace...', run: openFolderAsRoot },
+    { category: 'File', title: 'Import Folder into Project...', run: openFolderFromDisk },
+    { category: 'File', title: 'Import Font (.ttf / .otf)...', run: importFont },
+    { category: 'File', title: 'New from Template...', run: () => setShowTemplateInstaller(true) },
+    { category: 'File', title: 'Save', hint: '⌘S', run: saveActiveFile },
+    { category: 'File', title: 'Save As / Export...', run: () => setShowSaveAs(true) },
+    { category: 'File', title: 'Sync / Share (Drive, WebDAV)...', run: () => setShowDriveSync(true) },
+    { category: 'Edit', title: 'Undo', run: () => editorRef.current?.trigger('palette', 'undo', null) },
+    { category: 'Edit', title: 'Redo', run: () => editorRef.current?.trigger('palette', 'redo', null) },
+    { category: 'Edit', title: 'Find...', run: () => editorRef.current?.getAction('actions.find')?.run() },
+    { category: 'Edit', title: 'Find & Replace...', run: () => editorRef.current?.getAction('editor.action.startFindReplaceAction')?.run() },
+    { category: 'Edit', title: 'Toggle Numbering (at cursor)', hint: '⌘⇧N', run: toggleNumbering },
+    { category: 'Edit', title: 'Toggle Equation Numbering (all)', run: toggleEquationNumbering },
+    { category: 'Edit', title: 'Document Settings...', run: () => setShowEditSettings(true) },
+    { category: 'View', title: 'Toggle Sidebar', run: () => setSidebarOpen(v => !v) },
+    { category: 'View', title: 'Toggle Editor Theme (dark / light)', run: () => setTheme(t => t === 'typst-dark' ? 'typst-light' : 'typst-dark') },
+    { category: 'View', title: 'Version History...', run: () => setShowHistoryModal(true) },
+    { category: 'View', title: 'Recompile Document', run: () => compileTypst(currentMain) },
+    { category: 'View', title: 'App Settings (interpreters, git, cloud)...', run: () => setShowAppSettings(true) },
+    { category: 'Insert', title: 'Title Block...', run: insertTitleBlock },
+    { category: 'Insert', title: 'Author...', run: insertAuthor },
+    { category: 'Insert', title: 'Institute...', run: insertInstitute },
+    { category: 'Insert', title: 'Abstract', run: insertAbstract },
+    { category: 'Insert', title: 'Heading...', run: insertHeading },
+    { category: 'Insert', title: 'Theorem / Proof / Lemma...', run: insertTheorem },
+    { category: 'Math', title: 'Inline Equation', hint: '⌘E', run: () => wrapSelection('$', '$') },
+    { category: 'Math', title: 'Block Equation', run: () => insertCode('\n$ E = m c^2 $\n\n') },
+    { category: 'Math', title: 'Multiline / Aligned Equation', run: insertMultilineEquation },
+    { category: 'Math', title: 'Numbered Equation...', hint: '⌘⇧E', run: insertNumberedEquation },
+    { category: 'Math', title: 'Equation Templates...', hint: '⌘⇧G', run: () => setShowEqGallery(true) },
+    { category: 'Math', title: 'Insert Physics (physica)...', run: () => setShowPhysics(true) },
+    { category: 'Math', title: 'Matrix Studio...', hint: '⌘⇧M', run: () => setShowMatrixStudio(true) },
+    { category: 'Math', title: 'Matrix (augmentation lines)...', run: insertMatrix },
+    { category: 'Math', title: 'Conditional / Piecewise (cases)...', run: insertCases },
+    { category: 'Math', title: 'Over / Under Brace...', run: insertBrace },
+    { category: 'Math', title: 'Cancel / Strike Term...', run: insertCancel },
+    { category: 'Math', title: 'Math & Physics Symbols...', hint: '⌘⇧P', run: () => setShowSymbolPicker(true) },
+    { category: 'Math', title: 'Draw a Symbol → Typst...', hint: '⌘⇧Y', run: () => setShowSymbolDraw(true) },
+    { category: 'Math', title: 'Compute Selection (simplify / solve)...', hint: '⌘⇧U', run: computeSelection },
+    { category: 'Lists', title: 'Bullet List', run: () => makeList('-') },
+    { category: 'Lists', title: 'Numbered List', run: () => makeList('+') },
+    { category: 'Lists', title: 'Nested List', run: insertNestedList },
+    { category: 'Lists', title: 'Term / Definition List', run: insertTermList },
+    { category: 'Text', title: 'Callout / Admonition box...', run: insertCallout },
+    { category: 'Text', title: 'Block Quote...', run: insertBlockQuote },
+    { category: 'Text', title: 'Footnote', run: insertFootnote },
+    { category: 'Text', title: 'Margin / Side Note...', run: insertSideNote },
+    { category: 'Text', title: 'Horizontal Line (full width)', hint: '⌘⇧H', run: insertHRule },
+    { category: 'Figures', title: 'Figure...', run: () => setShowFigureBuilder(true) },
+    { category: 'Figures', title: 'Image...', run: insertImage },
+    { category: 'Figures', title: 'Whiteboard / Sketch (Excalidraw)...', run: insertWhiteboard },
+    { category: 'Figures', title: 'Table...', run: insertTable },
+    { category: 'Figures', title: 'Import Data (CSV/Excel/JSON)...', run: insertDataFile },
+    { category: 'Figures', title: 'Code Block', hint: '⌘⇧B', run: insertCodeBlock },
+    { category: 'Figures', title: 'Subfigures (side-by-side)...', run: insertSubfigures },
+    { category: 'Plots', title: 'Plot Studio (2D · data · 3D · Python)...', run: () => setShowPlotStudio(true) },
+    { category: 'Plots', title: 'cetz Canvas (shapes & grid)...', run: () => setShowDiagramBuilder(true) },
+    { category: 'Plots', title: 'Commutative Diagram (quiver)...', run: () => setShowQuiver(true) },
+    { category: 'Plots', title: 'Feynman Diagram...', hint: '⌘⇧F', run: () => setShowFeynman(true) },
+    { category: 'Plots', title: 'Flow diagram (fletcher)...', run: insertFletcher },
+    { category: 'Compute', title: 'Flowchart → Code...', hint: '⌘⇧L', run: () => setShowFlowchart(true) },
+    { category: 'Compute', title: 'Run Notebook (all code cells)', run: () => runNotebook() },
+    { category: 'Compute', title: 'Run Python...', hint: '⌘⇧K', run: () => setCodeRunner({ initialLang: 'python' }) },
+    { category: 'Compute', title: 'Run Julia...', run: () => setCodeRunner({ initialLang: 'julia' }) },
+    { category: 'Compute', title: 'Run Wolfram...', run: () => setCodeRunner({ initialLang: 'wolfram' }) },
+    { category: 'References', title: 'Link (Web)...', run: insertWebLink },
+    { category: 'References', title: 'Cross-reference (Internal)...', run: insertCrossRef },
+    { category: 'References', title: 'Label...', run: insertLabel },
+    { category: 'References', title: 'Reference & Label Manager...', run: () => setShowRefManager(true) },
+    { category: 'References', title: 'Citations & Bibliography (DOI/arXiv)...', run: () => setShowBibManager(true) },
+    { category: 'Format', title: 'Bold', hint: '⌘B', run: () => wrapSelection('*', '*') },
+    { category: 'Format', title: 'Italic', hint: '⌘I', run: () => wrapSelection('_', '_') },
+    { category: 'Format', title: 'Underline', run: () => wrapSelection('#underline[', ']') },
+    { category: 'Format', title: 'Superscript', run: () => wrapSelection('#super[', ']') },
+    { category: 'Format', title: 'Subscript', run: () => wrapSelection('#sub[', ']') },
+    { category: 'Format', title: 'Text Colour...', run: insertTextColor },
+    { category: 'Format', title: 'Highlight / Background Colour...', run: insertHighlight },
+    { category: 'Format', title: 'Page Setup (size, margins)...', run: insertPageSetup },
+    { category: 'Format', title: 'Box Selection (fill, border)...', run: insertBox },
+    { category: 'Format', title: 'Font Size...', run: setSelectionFontSizePrompt },
+    { category: 'Format', title: 'Align Content...', run: insertAlign },
+    { category: 'Format', title: 'Rotate (content or equation)...', run: insertRotate },
+    { category: 'Format', title: 'Small Caps', run: () => wrapSelection('#smallcaps[', ']') },
+    { category: 'Format', title: 'Strikethrough', run: () => wrapSelection('#strike[', ']') },
+    { category: 'Format', title: 'Letter Spacing...', run: insertTracking },
+    { category: 'Packages', title: 'Install Typst Package...', run: () => setShowPackageInstaller(true) },
+    { category: 'Help', title: 'Features & Help...', run: () => setShowHelp(true) },
+  ];
+
   return (
     <div className="app-container" onClick={() => { setActiveMenu(null); setColorPopAt(null); setHighlightPopAt(null); setFontSizePopAt(null); setContextMenu(null); }} onContextMenu={() => setContextMenu(null)}>
+      <Toaster />
+      {showPalette && <CommandPalette commands={paletteCommands()} onClose={() => setShowPalette(false)} />}
       <header className="header">
         <div className="header-left">
           <div className="logo logo-btn" style={{ fontSize: '0.9rem', gap: '4px' }} title="About Hilbert" onClick={() => setShowAbout(true)}>
@@ -2947,6 +3275,8 @@ export default function App() {
               Edit
               {activeMenu === 'edit' && (
                 <div className="dropdown">
+                  <div className="dropdown-item" onClick={() => { setShowPalette(true); setActiveMenu(null); }}>Command Palette... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘K</span></div>
+                  <div className="dropdown-divider"></div>
                   <div className="dropdown-item" onClick={() => { editorRef.current?.trigger('menu', 'undo', null); setActiveMenu(null); }}>Undo</div>
                   <div className="dropdown-item" onClick={() => { editorRef.current?.trigger('menu', 'redo', null); setActiveMenu(null); }}>Redo</div>
                   <div className="dropdown-divider"></div>
@@ -2985,6 +3315,7 @@ export default function App() {
                       <div className="dropdown-item" onClick={() => { insertNumberedEquation(); setActiveMenu(null); }}>Numbered Equation... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧E</span></div>
                       <div className="dropdown-header">Templates &amp; Structures</div>
                       <div className="dropdown-item" onClick={() => { setShowEqGallery(true); setActiveMenu(null); }}>Equation Templates... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧G</span></div>
+                      <div className="dropdown-item" onClick={() => { setShowPhysics(true); setActiveMenu(null); }}>Insert Physics... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>physica</span></div>
                       <div className="dropdown-item" onClick={() => { setShowMatrixStudio(true); setActiveMenu(null); }}>Matrix Studio (fill, borders, code array)... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧M</span></div>
                       <div className="dropdown-item" onClick={() => { insertMatrix(); setActiveMenu(null); }}>Matrix (augmentation lines)...</div>
                       <div className="dropdown-item" onClick={() => { insertCases(); setActiveMenu(null); }}>Conditional / Piecewise (cases)...</div>
@@ -3028,6 +3359,7 @@ export default function App() {
                       <div className="dropdown-item" onClick={() => { insertBlockQuote(); setActiveMenu(null); }}>Block Quote...</div>
                       <div className="dropdown-item" onClick={() => { insertFootnote(); setActiveMenu(null); }}>Footnote</div>
                       <div className="dropdown-item" onClick={() => { insertSideNote(); setActiveMenu(null); }}>Margin / Side Note...</div>
+                      <div className="dropdown-item" onClick={() => { insertHRule(); setActiveMenu(null); }}>Horizontal Line (full width) <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧H</span></div>
                     </div>
                   </div>
                   <div className="dropdown-header">Figures &amp; Data</div>
@@ -3038,7 +3370,7 @@ export default function App() {
                       <div className="dropdown-item" onClick={() => { insertImage(); setActiveMenu(null); }}>Image...</div>
                       <div className="dropdown-item" onClick={() => { insertWhiteboard(); setActiveMenu(null); }}>Whiteboard / Sketch (Excalidraw)...</div>
                       <div className="dropdown-item" onClick={() => { insertTable(); setActiveMenu(null); }}>Table...</div>
-                      <div className="dropdown-item" onClick={() => { insertDataFile(); setActiveMenu(null); }}>Import Data (CSV/JSON)...</div>
+                      <div className="dropdown-item" onClick={() => { insertDataFile(); setActiveMenu(null); }}>Import Data (CSV/Excel/JSON)...</div>
                       <div className="dropdown-item" onClick={() => { insertCodeBlock(); setActiveMenu(null); }}>Code Block <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧B</span></div>
                     </div>
                   </div>
@@ -3052,14 +3384,19 @@ export default function App() {
                       <div className="dropdown-header">Diagrams</div>
                       <div className="dropdown-item" onClick={() => { setShowQuiver(true); setActiveMenu(null); }}>Commutative Diagram (quiver)...</div>
                       <div className="dropdown-item" onClick={() => { setShowFeynman(true); setActiveMenu(null); }}>Feynman Diagram (visual)... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧F</span></div>
+                      <div className="dropdown-header">Slides</div>
+                      <div className="dropdown-item" onClick={() => { insertFloatingBox(); setActiveMenu(null); }}>Floating text box (place anywhere)...</div>
+                      <div className="dropdown-item" onClick={() => { insertFletcher(); setActiveMenu(null); }}>Flow diagram (fletcher)...</div>
                     </div>
                   </div>
+                  <div className="dropdown-item" onClick={() => { insertSubfigures(); setActiveMenu(null); }}>Subfigures (side-by-side, labelled a/b)...</div>
                   <div className="dropdown-header">Compute &amp; References</div>
                   <div className="dropdown-item has-submenu">
                     <span>Compute</span><span className="submenu-arrow">›</span>
                     <div className="submenu">
                       <div className="dropdown-item" onClick={() => { setShowFlowchart(true); setActiveMenu(null); }}>Flowchart → Code (build logic visually)... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧L</span></div>
                       <div className="dropdown-divider"></div>
+                      <div className="dropdown-item" onClick={() => { runNotebook(); setActiveMenu(null); }}>Run Notebook (all ```python / ```julia cells, variables persist)</div>
                       <div className="dropdown-item" onClick={() => { setCodeRunner({ initialLang: 'python' }); setActiveMenu(null); }}>Run Python... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧K</span></div>
                       <div className="dropdown-item" onClick={() => { setCodeRunner({ initialLang: 'julia' }); setActiveMenu(null); }}>Run Julia...</div>
                       <div className="dropdown-item" onClick={() => { setCodeRunner({ initialLang: 'wolfram' }); setActiveMenu(null); }}>Run Wolfram...</div>
@@ -3086,6 +3423,7 @@ export default function App() {
                   <div className="dropdown-header">Text</div>
                   <div className="dropdown-item" onClick={() => { wrapSelection('*', '*'); setActiveMenu(null); }}>Bold <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘B</span></div>
                   <div className="dropdown-item" onClick={() => { wrapSelection('_', '_'); setActiveMenu(null); }}>Italic <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘I</span></div>
+                  <div className="dropdown-item" onClick={() => { wrapSelection('#underline[', ']'); setActiveMenu(null); }}>Underline</div>
                   <div className="dropdown-item" onClick={() => { wrapSelection('#super[', ']'); setActiveMenu(null); }}>Superscript</div>
                   <div className="dropdown-item" onClick={() => { wrapSelection('#sub[', ']'); setActiveMenu(null); }}>Subscript</div>
                   <div className="dropdown-header">Colour &amp; Emphasis</div>
@@ -3112,6 +3450,15 @@ export default function App() {
               {activeMenu === 'packages' && (
                 <div className="dropdown">
                   <div className="dropdown-item" onClick={() => setShowPackageInstaller(true)}>Install Typst Package...</div>
+                </div>
+              )}
+            </div>
+            <div {...menuProps('help')}>
+              Help
+              {activeMenu === 'help' && (
+                <div className="dropdown">
+                  <div className="dropdown-item" onClick={() => { setShowHelp(true); setActiveMenu(null); }}>Features &amp; Help...</div>
+                  <div className="dropdown-item" onClick={() => { setShowPalette(true); setActiveMenu(null); }}>Command Palette... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘K</span></div>
                 </div>
               )}
             </div>
@@ -3189,6 +3536,7 @@ export default function App() {
           <div className="toolbar-divider"></div>
           <button className="tool-btn" onClick={() => wrapSelection('*', '*')} title="Bold  (⌘B)"><b>B</b></button>
           <button className="tool-btn" onClick={() => wrapSelection('_', '_')} title="Italic  (⌘I)"><i>I</i></button>
+          <button className="tool-btn" onClick={() => wrapSelection('#underline[', ']')} title="Underline — for a coloured/offset underline use Formatting ▸ Underline…"><span style={{ textDecoration: 'underline' }}>U</span></button>
           <button className="tool-btn" title="Text size — resize the selected text"
             onClick={(e) => {
               e.stopPropagation();
@@ -3289,7 +3637,7 @@ export default function App() {
           <button className="tool-btn" onClick={insertCrossRef} title="Cross-reference a labelled equation / figure / section  (@)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg></button>
           <div className="toolbar-divider"></div>
           <button className="tool-btn" onClick={insertCodeBlock} title="Code block — insert a fenced ``` code block"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg></button>
-          <button className="tool-btn" onClick={() => setCodeRunner({})} title="Run code — Python / Julia / Wolfram → live output"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="6 4 20 12 6 20 6 4"></polygon></svg></button>
+          <button className="tool-btn" onClick={() => runNotebook()} disabled={notebookRunning} title="Run Notebook — execute every ```python / ```julia block in this file as one session (variables persist), output written below each block"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="8 6 3 12 8 18"></polyline><polyline points="16 6 21 12 16 18"></polyline><line x1="13" y1="4" x2="11" y2="20"></line></svg>{notebookRunning && <span className="spinner" style={{ marginLeft: 4 }} />}</button>
         </div>
 
         <div className="toolbar-group">
@@ -3373,12 +3721,20 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="sidebar-section problems-section" style={{ flex: 'none', maxHeight: '38%', display: 'flex', flexDirection: 'column', borderTop: '1px solid var(--border-color)' }}>
+              <div className="resizer-h" onMouseDown={(e) => {
+                e.preventDefault();
+                isResizingProblems.current = true;
+                problemsResizeStart.current = { y: e.clientY, height: problemsHeight };
+                document.body.style.cursor = 'row-resize';
+                document.body.classList.add('is-resizing');
+              }} />
+
+              <div className="sidebar-section problems-section" style={{ flex: 'none', height: problemsHeight, display: 'flex', flexDirection: 'column', borderTop: '1px solid var(--border-color)' }}>
                 <div className="sidebar-header" style={{ padding: '6px 14px', background: 'var(--panel-bg)', fontSize: '0.68rem', fontWeight: 600, letterSpacing: '0.07em', textTransform: 'uppercase', opacity: 0.85, color: problems.some(p => p.severity === 'error') ? '#f87171' : 'var(--text-muted)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <span>Problems</span>
                   {problems.length > 0 && <span className="problem-badge">{problems.length}</span>}
                 </div>
-                <div className="problems-list" style={{ overflowY: 'auto', padding: '6px' }}>
+                <div className="problems-list" style={{ flex: 1, overflowY: 'auto', padding: '6px' }}>
                   {problems.length === 0 ? (
                     <div style={{ color: '#4ade80', fontSize: '12px', padding: '6px 10px', display: 'flex', alignItems: 'center', gap: 6 }}>
                       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="20 6 9 17 4 12"></polyline></svg>
@@ -3548,42 +3904,12 @@ export default function App() {
                       const m = e.getModel();
                       if (m) { const last = m.getLineCount(); e.setPosition({ lineNumber: last, column: m.getLineMaxColumn(last) }); }
                     }}
-                    options={{
-                      automaticLayout: true,
-                      minimap: { enabled: false },
-                      wordWrap: 'on',
-                      wordBasedSuggestions: 'off',
-                      quickSuggestions: { other: true, comments: false, strings: false },
-                      quickSuggestionsDelay: 10,
-                      suggestOnTriggerCharacters: true,
-                      acceptSuggestionOnEnter: 'on',
-                      tabCompletion: 'on',
-                      snippetSuggestions: 'top',
-                      suggest: { showSnippets: true, snippetsPreventQuickSuggestions: false },
-                      fontSize: editorFontSize,
-                      lineNumbers: 'on',
-                      tabSize: 2,
-                      insertSpaces: true,
-                      detectIndentation: false,
-                      scrollBeyondLastLine: false,
-                      smoothScrolling: true,
-                      padding: { top: 16, bottom: 16 },
-                      autoClosingBrackets: 'always',
-                      autoClosingQuotes: 'always',
-                      bracketPairColorization: { enabled: true },
-                      hover: { enabled: true, delay: 300 },
-                    }}
+                    options={editorOptions}
                   />
                 );
               })()
             ) : (
               <div className="empty-state">No file selected</div>
-            )}
-            {problems.some(p => p.severity === 'error') && (
-              <div className="error-banner" onClick={() => { if (!sidebarOpen) setSidebarOpen(true); }} title="See the PROBLEMS panel">
-                <b>{problems.filter(p => p.severity === 'error').length} error(s)</b> — {problems.find(p => p.severity === 'error')?.message}
-                {problems[0]?.line ? ` (line ${problems.find(p => p.severity === 'error')?.line})` : ''}
-              </div>
             )}
           </div>
         </div>
@@ -3594,8 +3920,31 @@ export default function App() {
           document.body.classList.add('is-resizing');
         }} />
         <div className="preview-pane" style={{ flex: 1, minWidth: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column', position: 'relative', backgroundColor: '#ffffff' }}>
-          {compileError ? (
-            (() => {
+          {/* Non-intrusive status bar on a failed compile: the preview below stays
+              on the last good render instead of being taken over. */}
+          {compileError && (
+            <div className="preview-status">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" /></svg>
+              <span className="preview-status-msg">
+                {(() => { const n = problems.filter(p => p.severity === 'error').length; return n > 0 ? `${n} error${n > 1 ? 's' : ''}` : 'Compilation failed'; })()}
+                {pdfUrl ? ' · showing last successful preview' : ''}
+                {isCompiling ? ' · recompiling…' : ''}
+              </span>
+              <button className="preview-status-btn" onClick={() => setPreviewTab(previewTab === 'problems' ? 'preview' : 'problems')}>
+                {previewTab === 'problems' ? 'Back to preview' : (pdfUrl ? 'View errors' : 'Details')}
+              </button>
+            </div>
+          )}
+          <div style={{ flex: 1, minWidth: 0, position: 'relative', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+            {/* PDF stays mounted whenever it exists, so its scroll/zoom survive
+                switching to the Problems view and back. */}
+            {pdfUrl && (
+              <PdfPreview ref={pdfRef} url={pdfUrl} onReverseSync={reverseSync} onWordCount={handlePdfWordCount} downloadName={`${(projectName || 'document').replace(/\s+/g, '_')}.pdf`} />
+            )}
+            {!pdfUrl && !compileError && (
+              <div className="empty-preview">{isCompiling ? 'Generating PDF…' : 'Nothing to preview yet — write some Typst and it renders here.'}</div>
+            )}
+            {compileError && (previewTab === 'problems' || !pdfUrl) && (() => {
               const errs = problems.filter(p => p.severity === 'error');
               // Errors coming from inside an installed package (a template's
               // dependency) usually mean the package isn't compatible with the
@@ -3603,17 +3952,16 @@ export default function App() {
               const pkgRe = /@preview\/|\/preview\/|\b\d+\.\d+\.\d+\/src\//;
               const pkgIssue = pkgRe.test(compileError || '') || errs.some(p => pkgRe.test(p.file || ''));
               return (
-                <div className="preview-error">
+                <div className="preview-error preview-problems-overlay">
                   <div className="preview-error-card">
                     <div className="preview-error-title">
                       <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" /></svg>
-                      Compilation failed
+                      Problems
                     </div>
                     <div className="preview-error-sub">
-                      Typst couldn't build this document, so the preview isn't updated.
                       {errs.length > 0
-                        ? ` Fix the ${errs.length} error${errs.length > 1 ? 's' : ''} below — click one to jump to it.`
-                        : ''}
+                        ? `${errs.length} error${errs.length > 1 ? 's' : ''} — click one to jump to it.`
+                        : "Typst couldn't build this document."}
                     </div>
                     {pkgIssue && (
                       <div style={{ margin: '2px 0 4px', padding: '9px 12px', borderRadius: '8px', background: 'rgba(245, 158, 11, 0.12)', border: '1px solid rgba(245, 158, 11, 0.35)', color: 'var(--text-color)', fontSize: '0.82rem', lineHeight: 1.45 }}>
@@ -3632,18 +3980,12 @@ export default function App() {
                     ) : (
                       <pre className="preview-error-raw">{compileError}</pre>
                     )}
-                    <div className="preview-error-foot">{isCompiling ? 'Recompiling…' : 'The preview returns automatically as soon as it compiles cleanly.'}</div>
+                    <div className="preview-error-foot">{isCompiling ? 'Recompiling…' : 'The preview updates automatically as soon as it compiles cleanly.'}</div>
                   </div>
                 </div>
               );
-            })()
-          ) : isCompiling && !pdfUrl ? (
-            <div className="empty-preview">Generating PDF…</div>
-          ) : pdfUrl ? (
-            <PdfPreview ref={pdfRef} url={pdfUrl} onReverseSync={reverseSync} onWordCount={handlePdfWordCount} downloadName={`${(projectName || 'document').replace(/\s+/g, '_')}.pdf`} />
-          ) : (
-            <div className="empty-preview">Nothing to preview yet — write some Typst and it renders here.</div>
-          )}
+            })()}
+          </div>
         </div>
       </div>
       
@@ -3652,10 +3994,13 @@ export default function App() {
         editorRef.current.executeEdits('packages', [{ range: new monaco!.Range(1, 1, 1, 1), text: `#import "@preview/${pkg.name}:${pkg.version}": *\n`, forceMoveMarkers: true }]);
         setShowPackageInstaller(false);
       }} />}
-      {showTemplateInstaller && <TemplateInstaller onClose={() => setShowTemplateInstaller(false)} onInsert={handleInitTemplate} />}
-      {showDiagramBuilder && <DiagramBuilder onClose={() => setShowDiagramBuilder(false)} onInsert={(code) => { insertCode(code); setShowDiagramBuilder(false); }} />}
+      {showTemplateInstaller && <TemplateInstaller onClose={() => setShowTemplateInstaller(false)} onInsert={handleInitTemplate} onUseBuiltin={handleUseBuiltin} />}
+      {showDiagramBuilder && <DiagramBuilder onClose={() => setShowDiagramBuilder(false)} onInsert={(code) => { insertCode(code); setShowDiagramBuilder(false); }}
+        onSaveFile={async (filename, content) => { await fetch(`${API}/workspace/file?path=${encodeURIComponent(filename)}`, { method: 'POST', body: content, headers: { 'Content-Type': 'text/plain' } }); await fetchTree(); }} />}
       {showFeynman && <Suspense fallback={null}><FeynmanBuilder onClose={() => setShowFeynman(false)} onInsert={(code) => { insertCode(code); setShowFeynman(false); }} /></Suspense>}
       {showEqGallery && <Suspense fallback={null}><EquationGallery onClose={() => setShowEqGallery(false)} onInsert={insertEqTemplate} /></Suspense>}
+      {showPhysics && <Suspense fallback={null}><PhysicsGallery onClose={() => setShowPhysics(false)} onInsert={insertPhysicsTemplate} /></Suspense>}
+      {showHelp && <Suspense fallback={null}><HelpModal onClose={() => setShowHelp(false)} /></Suspense>}
       {showMatrixStudio && <Suspense fallback={null}><MatrixStudio onClose={() => setShowMatrixStudio(false)} onInsert={insertMatrixBody} /></Suspense>}
       {showImagePlacer && <Suspense fallback={null}><ImagePlacer onClose={() => setShowImagePlacer(false)} onEnsureImport={(imp) => { const m = editorRef.current?.getModel(); if (m && !m.getValue().includes(imp.trim())) insertAtTop(imp); }} onInsert={(code) => { if (typeof showImagePlacer === 'string') { const { editor, model, sel } = getSelectionCtx(''); if (sel && editor && model && !sel.isEmpty()) { editor.executeEdits('re-place', [{ range: sel, text: code, forceMoveMarkers: true }]); editor.focus(); } else insertCode(code); } else insertCode(code); fetchTree(); }} workspaceImages={workspaceImages} selectedCode={typeof showImagePlacer === 'string' ? showImagePlacer : undefined} /></Suspense>}
       {showFlowchart && <Suspense fallback={null}><FlowchartCoder onClose={() => setShowFlowchart(false)} onInsert={(code) => { if (code.includes('fc-result(')) ensureSetup('#let fc-result', '#let fc-result(v) = box(inset: (x: 9pt, y: 6pt), radius: 6pt, fill: rgb(238, 242, 255), stroke: 0.6pt + rgb(165, 180, 252))[*Result:* #v]'); insertCode(`\n${code}\n`); setShowFlowchart(false); }} /></Suspense>}
@@ -3667,9 +4012,9 @@ export default function App() {
             <div className="about-version">An offline editor for Typst · Unofficial</div>
             <div className="about-version">Version {__APP_VERSION__}</div>
             <div className="about-author">Created by <a href="https://rousan.netlify.app/" target="_blank" rel="noreferrer" style={{ color: 'inherit', fontWeight: 600, textDecoration: 'underline', textDecorationColor: 'var(--accent)' }}>Kazi Abu Rousan</a></div>
-            <a className="about-coffee" href="https://buymeacoffee.com/rousan" target="_blank" rel="noreferrer" title="Support the project — buy me a coffee">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 8h1a4 4 0 0 1 0 8h-1"></path><path d="M2 8h16v9a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4V8z"></path><line x1="6" y1="1" x2="6" y2="4"></line><line x1="10" y1="1" x2="10" y2="4"></line><line x1="14" y1="1" x2="14" y2="4"></line></svg>
-              Buy me a coffee
+            <a className="about-sponsor" href="https://github.com/sponsors/aburousan" target="_blank" rel="noreferrer" title="Support Hilbert's development through GitHub Sponsors">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"></path></svg>
+              Sponsor
             </a>
             <div className="about-links">
               <a href="https://github.com/aburousan/hilbert-editor" target="_blank" rel="noreferrer">GitHub</a>
@@ -3691,10 +4036,31 @@ export default function App() {
         compileDelay={compileDelay} onCompileDelay={setCompileDelay} />}
       {showQuiver && <QuiverDiagram onClose={() => setShowQuiver(false)} onInsert={insertQuiverDiagram} />}
       {inputModal && <InputModal {...inputModal} onClose={() => setInputModal(null)} />}
+      {showDataImport && <DataImportModal onClose={() => setShowDataImport(false)} onImport={handleDataImport} />}
+      {confirmModal && (
+        <div className="modal-overlay" onClick={() => { confirmModal.resolve(false); setConfirmModal(null); }}>
+          <div className="modal-content" style={{ width: '420px' }} onClick={e => e.stopPropagation()}
+            onKeyDown={e => {
+              if (e.key === 'Escape') { confirmModal.resolve(false); setConfirmModal(null); }
+              if (e.key === 'Enter') { confirmModal.resolve(true); setConfirmModal(null); }
+            }}>
+            <div className="modal-header">
+              <h2>Confirm</h2>
+              <button className="close-btn" onClick={() => { confirmModal.resolve(false); setConfirmModal(null); }}>×</button>
+            </div>
+            <div className="modal-body" style={{ whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>{confirmModal.message}</div>
+            <div className="modal-footer">
+              <button className="btn-ghost" onClick={() => { confirmModal.resolve(false); setConfirmModal(null); }}>Cancel</button>
+              <button className={confirmModal.danger ? 'btn-danger' : 'btn-primary'} autoFocus
+                onClick={() => { confirmModal.resolve(true); setConfirmModal(null); }}>{confirmModal.confirmLabel || 'OK'}</button>
+            </div>
+          </div>
+        </div>
+      )}
       {codeRunner && <Boundary name="Code Runner" onClose={() => setCodeRunner(null)}><CodeRunnerModal {...codeRunner} onClose={() => setCodeRunner(null)} onInsert={(code) => { insertCode(code); setCodeRunner(null); }} onInsertEquation={(latex, codeBlock) => { insertEquationFromLatex(latex, codeBlock); setCodeRunner(null); }} onChanged={fetchTree} /></Boundary>}
       {showSaveAs && activeTab && <SaveAsModal onClose={() => setShowSaveAs(false)} fileName={activeTabPath} content={activeTab.content} pdfUrl={pdfUrl} projectName={projectName} mainFile={currentMain} />}
       {showPlot3D && <Boundary name="3D Plot Studio" onClose={() => setShowPlot3D(false)}><Suspense fallback={null}><Plot3DStudio onClose={() => setShowPlot3D(false)} onInsert={(code) => { insertCode(code); setShowPlot3D(false); fetchTree(); }} /></Suspense></Boundary>}
-      {showPlotStudio && <Boundary name="Plot Studio" onClose={() => setShowPlotStudio(false)}><Suspense fallback={null}><PlotStudio onClose={() => setShowPlotStudio(false)} onInsert={(code) => insertCode(code)} onOpenInteractive={() => setShowPlot3D(true)} onOpenPython={() => setCodeRunner({ initialLang: 'python', initialCode: SURFACE_3D_TEMPLATE })} /></Suspense></Boundary>}
+      {showPlotStudio && <Boundary name="Plot Studio" onClose={() => setShowPlotStudio(false)}><Suspense fallback={null}><PlotStudio onClose={() => setShowPlotStudio(false)} onInsert={(code) => insertCode(code)} onEnsureSetup={ensureSetup} onOpenInteractive={() => setShowPlot3D(true)} onOpenPython={() => setCodeRunner({ initialLang: 'python', initialCode: SURFACE_3D_TEMPLATE })} /></Suspense></Boundary>}
       {showSymbolDraw && <SymbolDraw onClose={() => setShowSymbolDraw(false)} onInsert={(name) => { insertCode(name + ' '); setShowSymbolDraw(false); }} />}
       {showRefManager && activeTab && <RefManager content={activeTab.content} onClose={() => setShowRefManager(false)} onJump={jumpToLine} onInsertRef={(name) => insertCode(`@${name}`)} />}
       {showBibManager && <BibManager onClose={() => setShowBibManager(false)} onCite={(key) => { insertCode(`@${key}`); ensureBibliography(); }} onEnsureBib={ensureBibliography} onChanged={fetchTree} />}
@@ -3710,7 +4076,7 @@ export default function App() {
               <div style={{ color: 'var(--text-muted)', marginBottom: '15px' }}>History for {activeTabPath}</div>
               <div className="history-list" style={{ maxHeight: '400px', overflowY: 'auto' }}>
                 {history.filter(h => h.path === activeTabPath).length === 0 && (
-                  <div style={{ color: '#94a3b8', fontSize: '13px', textAlign: 'center', marginTop: '20px' }}>No history for this file yet.<br/>Compile to save history.</div>
+                  <div style={{ color: '#94a3b8', fontSize: '13px', textAlign: 'center', marginTop: '20px' }}>No history for this file yet.<br/>Save the file (⌘S) to keep a version.</div>
                 )}
                 {history.filter(h => h.path === activeTabPath).reverse().map((h, i) => (
                   <div key={h.id} className="history-item" onClick={() => { restoreHistory(h); setShowHistoryModal(false); }} style={{ padding: '12px', borderBottom: '1px solid var(--border-color)', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -3798,7 +4164,7 @@ export default function App() {
               }}>Compress {selectedPaths.length > 1 ? `(${selectedPaths.length})` : ''}</div>
               <div className="dropdown-divider"></div>
               <div className="dropdown-item" style={{ color: '#ef4444' }} onClick={async () => {
-                if (!confirm(`Delete ${selectedPaths.length} items?`)) return;
+                if (!await confirmDialog(`Delete ${selectedPaths.length} items?`, { danger: true, confirmLabel: 'Delete' })) return;
                 for (const p of selectedPaths) await fetch(`${API}/workspace/file?path=${encodeURIComponent(p)}`, { method: 'DELETE' });
                 setSelectedPaths([]); fetchTree(); setContextMenu(null);
               }}>Delete {selectedPaths.length > 1 ? `(${selectedPaths.length})` : ''}</div>

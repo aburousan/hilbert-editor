@@ -250,7 +250,7 @@ body {
 }
 .toolbar-group:first-child::-webkit-scrollbar { display: none; }
 .toolbar-group:last-child { flex: 0 0 auto; }
-.tool-btn, .toolbar-divider, .fontsize-select { flex: 0 0 auto; }
+.tool-btn, .toolbar-divider { flex: 0 0 auto; }
 
 /* Editor theme toggle (header) */
 .theme-toggle,
@@ -273,26 +273,28 @@ body {
   border-color: var(--accent-line);
   background: var(--hover-color);
 }
-/* Buy-me-a-coffee: a warm pill in the About card, beside the author name. */
-.about-coffee {
+
+/* GitHub Sponsors link in the About card, under the author name. */
+.about-sponsor {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
+  align-self: center;   /* the card stretches its children; hug the label instead */
   gap: 7px;
   margin: 12px 0 2px;
-  padding: 7px 14px;
+  padding: 6px 14px;
   border-radius: 999px;
   font-size: 0.82rem;
   font-weight: 600;
   text-decoration: none;
-  color: #7c4a03;
-  background: linear-gradient(180deg, #ffdd66, #ffc933);
-  border: 1px solid #e6a700;
-  transition: transform 0.12s ease, box-shadow 0.12s ease, filter 0.12s ease;
+  color: #db61a2;
+  background: rgba(219, 97, 162, 0.1);
+  border: 1px solid rgba(219, 97, 162, 0.45);
+  transition: background-color 0.12s ease, border-color 0.12s ease;
 }
-.about-coffee:hover {
-  transform: translateY(-1px);
-  filter: brightness(1.04);
-  box-shadow: 0 6px 16px -6px #eab30880;
+.about-sponsor:hover {
+  background: rgba(219, 97, 162, 0.18);
+  border-color: #db61a2;
 }
 
 /* Font-size quick dropdown — a compact list of sizes, click to apply. */
@@ -580,27 +582,7 @@ body {
   margin: 0 6px;
 }
 
-.fontsize-select {
-  background: transparent;
-  color: var(--text-muted);
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  height: 30px;
-  padding: 0 4px;
-  font-size: 12px;
-  cursor: pointer;
-}
-.fontsize-select:hover { color: var(--accent-hover); border-color: var(--accent); }
-
 /* Status indicator */
-.header-status {
-  font-size: 0.8rem;
-  color: var(--text-muted);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
 .status-dot {
   width: 8px;
   height: 8px;
@@ -651,23 +633,6 @@ body {
 body.is-resizing iframe,
 body.is-resizing .editor-container {
   pointer-events: none;
-}
-
-.error-banner {
-  position: absolute;
-  bottom: 0;
-  left: 0;
-  right: 0;
-  background-color: var(--error-bg);
-  color: var(--error-text);
-  padding: 8px 14px;
-  font-size: 0.8rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  border-top: 1px solid #7f1d1d;
-  z-index: 20;
-  cursor: pointer;
 }
 
 /* Problems panel */
@@ -800,6 +765,37 @@ body.is-resizing .editor-container {
 }
 
 /* Clear compile-failure panel shown in the (white) preview pane. */
+/* Soft amber status strip shown when a compile fails — deliberately calmer than
+   a red takeover; the last good preview stays visible underneath. */
+.preview-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 0 0 auto;
+  padding: 2px 10px;
+  background: #fffbeb;
+  border-bottom: 1px solid #fde68a;
+  color: #92400e;
+  font-size: 0.72rem;
+  line-height: 1.5;
+}
+.preview-status > svg { color: #d97706; flex: 0 0 auto; width: 12px; height: 12px; }
+.preview-status-msg { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.preview-status-btn {
+  flex: 0 0 auto;
+  background: #d97706;
+  color: #fff;
+  border: none;
+  padding: 1px 9px;
+  border-radius: 5px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.preview-status-btn:hover { background: #b45309; }
+/* Problems view sits over the (still-mounted) PDF when you switch to it. */
+.preview-problems-overlay { position: absolute; inset: 0; z-index: 5; }
+
 .preview-error {
   flex: 1;
   display: flex;
@@ -923,11 +919,6 @@ body.is-resizing .editor-container {
   border-radius: 4px;
 }
 
-.filename-input {
-  font-size: 24px;
-  font-weight: bold;
-}
-
 .symbol-btn:hover {
   background: var(--hover-color);
   border-color: var(--accent-color);
@@ -942,13 +933,6 @@ body.is-resizing .editor-container {
   font-size: 11px;
   color: #94a3b8;
   font-family: monospace;
-}
-
-iframe.pdf-viewer {
-  flex: 1;
-  width: 100%;
-  border: none;
-  min-height: 100%;
 }
 
 /* PDF.js-based preview with a selectable text layer for click-to-source */
@@ -999,7 +983,6 @@ iframe.pdf-viewer {
 .pdf-btn:hover { background: var(--panel-elevated); border-color: var(--accent-line); color: var(--text-main); }
 .pdf-btn.active { background: var(--accent-soft); border-color: var(--accent-line); color: var(--accent-hover); }
 .pdf-btn-icon { padding: 0 6px; }
-.pdf-zoom { font-size: 12px; color: var(--text-muted); min-width: 42px; text-align: center; }
 .pdf-scroll {
   flex: 1;
   width: 100%;
@@ -1060,7 +1043,6 @@ iframe.pdf-viewer {
 .ms-stepper button:hover { background: var(--panel-elevated); color: var(--accent-hover); }
 .ms-stepper span { min-width: 26px; text-align: center; font-size: 0.85rem; font-variant-numeric: tabular-nums; }
 .ms-grid-wrap { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 12px; background: var(--bg-color); border: 1px solid var(--border-soft); border-radius: 10px; }
-.ms-grid { display: grid; gap: 6px; }
 .ms-cell {
   width: 46px; height: 40px; border: 1px solid var(--border-color); border-radius: 6px;
   background: var(--panel-lighter); color: var(--text-main); cursor: pointer;
@@ -1284,15 +1266,6 @@ details > summary::-webkit-details-marker {
   overflow: hidden;
 }
 
-.empty-editor {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  height: 100%;
-  color: var(--text-muted);
-  font-style: italic;
-}
-
 .tree-file.selected, .tree-dir.selected {
   background: rgba(167, 139, 250, 0.15);
   color: var(--accent);
@@ -1321,3 +1294,80 @@ details > summary::-webkit-details-marker {
   transform: rotate(90deg);
 }
 
+
+
+/* ---------------------------------------------------------------------------
+   Fix: the "(Escape)" tooltip on Monaco's find-widget close button flashed
+   continuously and made the × unclickable. Cause is a tooltip-covers-trigger
+   loop: in a narrow editor the hover pops up under the cursor, so the button
+   loses hover → tooltip hides → button regains hover → tooltip shows → repeat.
+   Making the hover overlay non-interactive breaks the loop (the button keeps
+   hover and stays clickable). Scoped with :has() to hover overlays only, so
+   context menus and the suggestion widget keep their pointer events.
+--------------------------------------------------------------------------- */
+.context-view:has(.monaco-hover),
+.context-view:has(.workbench-hover-container) {
+  pointer-events: none;
+}
+
+
+/* Command palette (⌘K) */
+.palette-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 400;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 12vh;
+}
+.palette {
+  width: 560px;
+  max-width: 92vw;
+  background: var(--panel-lighter);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+.palette-input {
+  width: 100%;
+  padding: 12px 14px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border-soft);
+  color: var(--text-color);
+  font-size: 0.95rem;
+  outline: none;
+}
+.palette-list {
+  max-height: 46vh;
+  overflow-y: auto;
+  padding: 4px;
+}
+.palette-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--text-color);
+}
+.palette-item.selected { background: var(--accent-soft); }
+.palette-cat {
+  flex: 0 0 auto;
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  background: var(--bg-color);
+  border: 1px solid var(--border-soft);
+  border-radius: 4px;
+  padding: 1px 6px;
+  min-width: 64px;
+  text-align: center;
+}
+.palette-title { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.palette-hint { flex: 0 0 auto; font-size: 0.72rem; color: var(--text-muted); }
+.palette-empty { padding: 16px; text-align: center; color: var(--text-muted); font-size: 0.85rem; }

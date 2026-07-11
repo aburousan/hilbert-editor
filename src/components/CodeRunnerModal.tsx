@@ -185,7 +185,7 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
 
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-content" style={{ width: '660px', maxHeight: '90vh' }} onClick={e => e.stopPropagation()}>
+      <div className="modal-content" style={{ width: '960px', maxWidth: '96vw', maxHeight: '90vh' }} onClick={e => e.stopPropagation()}>
         <div className="modal-header">
           <h2>Run Code &amp; Insert</h2>
           <button className="close-btn" onClick={onClose}>×</button>
@@ -232,39 +232,56 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
             <div className="form-hint" style={{ marginTop: -6 }}>Just write the maths (e.g. <code>{lang === 'wolfram' ? 'D[Sin[x^2], x]' : 'diff(sin(x**2), x)'}</code>) — the result is converted to a typeset equation automatically.</div>
           )}
 
-          <label className="form-field">
-            <span>Code</span>
-            <textarea value={code} onChange={e => setCode(e.target.value)} style={{ minHeight: 160, fontSize: '0.85rem' }} spellCheck={false} />
-          </label>
-
-          <div style={{ display: 'flex', gap: 14, alignItems: 'center' }}>
+          <div style={{ display: 'flex', gap: 14, alignItems: 'center', margin: '2px 0' }}>
             <button className="btn-primary" onClick={run} disabled={running || (tools ? !tools.execEnabled : false)}>{running ? 'Running…' : `▶ Run`}</button>
             <label className="form-check"><input type="checkbox" checked={includeCode} onChange={e => setIncludeCode(e.target.checked)} /> Include source code in document</label>
             {savedPath && <span className="form-hint" style={{ margin: 0, opacity: 0.7 }} title="Every run is kept in the project">💾 saved to <code>{savedPath}</code></span>}
           </div>
 
-          {result && (
-            <div className="form-field">
-              <span>Output {result.interpreter ? `· ${result.interpreter}` : ''} {result.timedOut ? '(timed out)' : ''}</span>
-              {result.stdout && <pre style={{ background: 'var(--bg-color)', padding: 10, borderRadius: 6, fontSize: '0.8rem', maxHeight: 130, overflow: 'auto', margin: 0, whiteSpace: 'pre-wrap' }}>{result.stdout}</pre>}
-              {result.stderr && <pre style={{ background: 'rgba(127,29,29,0.4)', color: '#fecaca', padding: 10, borderRadius: 6, fontSize: '0.8rem', maxHeight: 130, overflow: 'auto', margin: '6px 0 0', whiteSpace: 'pre-wrap' }}>{result.stderr}</pre>}
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 10 }}>
-                {outputMode === 'equation' && onInsertEquation && result.stdout.trim() ? (
-                  <button className="btn-primary" onClick={() => { onInsertEquation(result.stdout, includeCode ? codeBlock() : undefined); onClose(); }} title="Render the output as a typeset Typst equation (with the source code if checked)">
-                    Insert {includeCode ? 'code + equation' : 'equation'}
-                  </button>
-                ) : (
+          {/* Code on the left, output on the right — run and read them together. */}
+          <div style={{ display: 'flex', gap: 14, alignItems: 'stretch' }}>
+            <label className="form-field" style={{ flex: 1, minWidth: 0, marginBottom: 0 }}>
+              <span>Code</span>
+              <textarea value={code} onChange={e => setCode(e.target.value)} style={{ minHeight: 260, height: '100%', fontSize: '0.85rem', resize: 'vertical' }} spellCheck={false} />
+            </label>
+            <div className="form-field" style={{ flex: 1, minWidth: 0, marginBottom: 0, display: 'flex', flexDirection: 'column' }}>
+              <span>Output {result?.interpreter ? `· ${result.interpreter}` : ''} {result?.timedOut ? '(timed out)' : ''}</span>
+              <div style={{ flex: 1, minHeight: 260, background: 'var(--bg-color)', borderRadius: 6, padding: 10, overflow: 'auto' }}>
+                {running ? (
+                  <span className="form-hint" style={{ margin: 0 }}>Running…</span>
+                ) : result ? (
                   <>
-                    {(result.stdout.trim() || includeCode) && <button className="btn-ghost" onClick={insertText}>Insert {includeCode ? 'code + output' : 'output'}</button>}
-                    {onInsertEquation && result.stdout.trim() && (
-                      <button className="btn-primary" onClick={() => { onInsertEquation(result.stdout, includeCode ? codeBlock() : undefined); onClose(); }} title="Render the output (LaTeX) as a typeset equation via mitex">
-                        Insert as equation
-                      </button>
-                    )}
+                    {result.stdout && <pre style={{ fontSize: '0.8rem', margin: 0, whiteSpace: 'pre-wrap' }}>{result.stdout}</pre>}
+                    {result.stderr && <pre style={{ color: '#fecaca', fontSize: '0.8rem', margin: result.stdout ? '6px 0 0' : 0, whiteSpace: 'pre-wrap' }}>{result.stderr}</pre>}
+                    {result.images.map(img => (
+                      <img key={img} src={`${API}/workspace/raw?path=${encodeURIComponent(img)}`} alt={img} style={{ maxWidth: '100%', marginTop: 8, borderRadius: 4, display: 'block' }} />
+                    ))}
+                    {!result.stdout && !result.stderr && !result.images.length && <span className="form-hint" style={{ margin: 0 }}>(no output)</span>}
                   </>
+                ) : (
+                  <span className="form-hint" style={{ margin: 0, opacity: 0.6 }}>Press ▶ Run to see the output here.</span>
                 )}
-                {result.images.map(img => <button key={img} className="btn-primary" onClick={() => insertFigure(img)}>Insert figure: {img.replace('sandbox/', '')}</button>)}
               </div>
+            </div>
+          </div>
+
+          {result && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 4 }}>
+              {outputMode === 'equation' && onInsertEquation && result.stdout.trim() ? (
+                <button className="btn-primary" onClick={() => { onInsertEquation(result.stdout, includeCode ? codeBlock() : undefined); onClose(); }} title="Render the output as a typeset Typst equation (with the source code if checked)">
+                  Insert {includeCode ? 'code + equation' : 'equation'}
+                </button>
+              ) : (
+                <>
+                  {(result.stdout.trim() || includeCode) && <button className="btn-ghost" onClick={insertText}>Insert {includeCode ? 'code + output' : 'output'}</button>}
+                  {onInsertEquation && result.stdout.trim() && (
+                    <button className="btn-primary" onClick={() => { onInsertEquation(result.stdout, includeCode ? codeBlock() : undefined); onClose(); }} title="Render the output (LaTeX) as a typeset equation via mitex">
+                      Insert as equation
+                    </button>
+                  )}
+                </>
+              )}
+              {result.images.map(img => <button key={img} className="btn-primary" onClick={() => insertFigure(img)}>Insert figure: {img.replace('sandbox/', '')}</button>)}
             </div>
           )}
 

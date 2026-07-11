@@ -1,122 +1,148 @@
-# Hilbert — Performance Report
+# Hilbert: performance report
 
-Benchmarks and optimization notes for both editions of Hilbert:
+Measured numbers for the shipping app: a Rust/axum backend
+(`src-tauri/src/server.rs`) behind the system WebView, driving the Typst CLI.
 
-- **Electron** edition — Node/Express backend (`server.js`), Chromium renderer.
-- **Tauri** edition — Rust/axum backend (`src-tauri/src/server.rs`), system WebView.
+Everything here is reproducible. `scripts/bench.mjs` generates the workspaces and runs
+the backend against each one; `scripts/bench_plot.py` draws the chart from the JSON it
+writes.
 
-Both editions share the exact same React UI; only the shell and backend differ.
+```bash
+node scripts/bench.mjs        # writes bench-results.json
+python scripts/bench_plot.py  # writes docs/performance.png
+```
 
----
-
-## 1. Method
-
-A reproducible backend benchmark (`bench.cjs`) generates four workspaces and runs
-**both backends** (`node server.js` and `typst-editor --headless`) through the
-same HTTP calls. Each backend is restarted per workspace for a clean memory
-baseline. Compile uses the same `typst` CLI in both, so it isolates backend cost.
-
-| Workspace | `.typ` | images | bib refs | total files |
-|-----------|-------:|-------:|---------:|------------:|
-| Tiny      | 3      | 1      | 5        | 7 |
-| Medium    | 30     | 20     | 100      | 53 |
-| Thesis    | 200    | 100    | 500      | 303 |
-| Huge      | 1000   | 500    | 2000     | 1503 |
-
-`main.typ` `#include`s every chapter, so "full compile" scales with the project.
-
-Test machine: Apple Silicon (arm64), macOS 15; Node 26, Typst 0.14.2.
-Numbers are averages over 10–20 iterations; re-run before each release.
+Test machine: Apple Silicon (arm64), macOS 15, release build, Typst 0.15.0. Averages
+over 5 to 20 iterations per figure. Re-run before each release.
 
 ---
 
-## 2. Results — Electron (Node) vs Tauri (Rust)
+## 1. Backend
 
-| Metric | Tiny (N/R) | Medium (N/R) | Thesis (N/R) | Huge (N/R) |
-|---|---|---|---|---|
-| Index tree, avg (ms)      | 1.4 / **0.7** | 1.8 / **0.9** | 3.6 / **2.1** | 11.2 / **6.4** |
-| Search, avg (ms)          | 0.9 / **0.6** | 1.7 / **1.2** | 4.5 / **3.9** | 22.1 / **15.8** |
-| Search, worst (ms)        | 1.6 / **0.7** | 3.0 / **1.4** | 5.9 / **4.9** | 44.0 / **17.9** |
-| File-op cycle¹ (ms)       | 3.3 / **1.9** | 2.5 / **1.5** | 2.1 / **1.1** | 2.0 / **1.0** |
-| Full compile² (ms)        | 253 / 79 | 83 / 80 | 112 / 107 | 273 / 247 |
-| **RSS at start (MB)**     | 67 / **12** | 67 / **12** | 70 / **12** | 74 / **14** |
-| RSS after 100× load³ (MB) | 71 / **13** | 72 / **13** | 82 / **14** | 144 / **21** |
-| RSS growth under load (MB)| +4.3 / **+1.0** | +4.7 / **+1.2** | +12.1 / **+1.7** | +69.9 / **+7.5** |
+Four workspaces of increasing size. `main.typ` `#include`s every chapter, so a full
+compile scales with the project.
 
-¹ create → rename → copy → delete, one round-trip each.
-² `main.typ` including every chapter; both shell out to the same `typst` binary.
-³ RSS after hammering 100 tree+search requests, to surface leaks.
+| Workspace | chapters | bib refs | files |
+|---|---:|---:|---:|
+| Tiny   | 3    | 5    | 5 |
+| Medium | 30   | 100  | 32 |
+| Thesis | 200  | 500  | 202 |
+| Huge   | 1000 | 2000 | 1002 |
 
-### Reading the data
+![Backend benchmarks](performance.png)
 
-- **Memory is the headline.** The Tauri/Rust backend starts at **~12 MB vs ~70 MB**
-  — 5–6× lighter — and stays nearly flat under load. On the Huge project, Node grew
-  **+70 MB** after 100 hammered search calls (V8 holding large result-set JSON with
-  delayed GC — a high ceiling, not a hard leak); Rust grew **+7.5 MB**.
-- **Search & indexing** favour Rust at every size and scale better: worst-case search
-  on 1,500 files is **18 ms (Rust) vs 44 ms (Node)**.
-- **File ops** are ~1–3 ms either way; the tree stays instant.
-- **Compile is effectively equal** — both invoke the same `typst` CLI, so backend
-  choice barely matters. The Tiny 253 ms was cold-start warmup (drops to ~80 ms warm).
+| Metric | Tiny | Medium | Thesis | Huge |
+|---|---:|---:|---:|---:|
+| Index the file tree, avg (ms) | 0.9 | 0.6 | 1.6 | 4.4 |
+| Full-text search, avg (ms)    | 0.4 | 1.1 | 3.9 | 17.3 |
+| Full-text search, worst (ms)  | 0.6 | 1.9 | 5.7 | 18.4 |
+| File-op cycle, avg (ms)¹      | 1.7 | 0.8 | 0.8 | 0.7 |
+| Full compile, avg (ms)²       | 212 | 134 | 204 | 536 |
+| RSS at start (MB)             | 12  | 12  | 12  | 12 |
+| RSS after 100x load (MB)³     | 14  | 14  | 15  | 18 |
 
-**Takeaway:** Electron is the capable baseline; Tauri is the optimized build —
-same features, a fraction of the memory, and lower latency on large projects.
+¹ create, rename, then delete: one HTTP round trip each.
+² `main.typ` including every chapter, through the Typst CLI.
+³ After 100 hammered tree and search requests, to surface leaks.
 
----
-
-## 3. Improvements shipped this cycle
-
-**Both editions (shared UI):**
-- File tree rewritten: multi-select, drag-and-drop move, rename/duplicate/delete,
-  cut/copy/paste, right-click context menu, content search with jump-to-line.
-- Folder collapse state moved into React state (survives re-renders); collapse/
-  expand hide children via CSS rather than destroying nodes.
-- Non-`.typ` tabs (`.bib`, `.toml`, …) no longer hijack the preview — the last
-  `.typ` file stays compiled.
-- Whiteboard (Excalidraw) gained a scientific-shape palette (axes, vectors, circuits,
-  optics, waves), shading controls, and an **Experimental** group (function plotter,
-  vector field, Bohr atom, free-body diagram).
-- Image editor is raster-only (PNG/JPG/…); SVGs open as a safe preview instead of
-  being rasterised and corrupted.
-- **Memory leak fixed:** Monaco models are now disposed on tab close (previously each
-  opened-then-closed file leaked a full-document model).
-- UI density pass on the sidebar labels and toolbar buttons.
-
-**Electron backend (`server.js`):** `--root` on all compile paths (multi-file
-projects), `/workspace/search`, `/workspace/raw`, file `size`/`mtime` in the tree,
-`/workspace/compress`, Windows console-popup suppression, cross-platform interpreter
-detection.
-
-**Tauri backend (`server.rs`):** ported the above endpoint-for-endpoint — `--root`
-compiles, `/workspace/{rename,reveal,search,raw,compress}`, tree `size`/`mtime`,
-`git status --porcelain` — keeping the Rust backend a 1:1 match of the Node one.
+Reading the data. The backend starts at **12 MB** and stays there: a thousand-file
+project costs about 6 MB more, and hammering it adds a few MB that get reclaimed.
+Search is the only thing that scales visibly with project size, and even across 1000
+files the worst case is 18 ms, comfortably inside a keystroke. File operations stay
+under 2 ms at every size. Compile is dominated by the Typst CLI rather than by the
+backend, which is why the Huge figure (0.54 s for 1000 chapters) sits close to what
+`typst compile` costs on its own.
 
 ---
 
-## 4. Component-lifecycle scorecard
+## 2. Startup, and the app as a whole
 
-The hot paths use keep-alive / model-swap; occasional tools mount on demand.
+| Metric | Value |
+|---|---|
+| Backend process to first HTTP response | 32 ms warm, roughly 650 ms on a cold first run |
+| App launch to embedded server ready | 231 ms |
+| Page load to editor interactive | about 300 ms |
+| Page load to a rendered 300-page PDF | about 1.5 s |
+| Installed size (`Hilbert.app`) | 37 MB (16 MB binary, 18 MB UI, 2 MB Typst packages) |
+| Frontend JS heap | about 31 MB |
 
-| Component | Pattern | Status |
-|---|---|---|
-| **Monaco editor** | one instance, swap models per file | ✅ keep-alive |
-| **PDF preview** | viewer stays mounted, replaces the pdf.js document | ✅ keep-alive |
-| **File explorer** | collapse hides children (CSS), nodes reused | ✅ hide-not-destroy |
-| **Tabs** | file contents kept in state; editor state preserved | ✅ keep-alive |
-| **Package list** | Typst-universe index cached on disk (TTL) | ✅ cached |
-| **Settings / Excalidraw / Plot Studio / builders** | lazy-mounted, freed on close | ⚠️ on-demand |
+A 300-page stress document (7000 lines, 300 tables, 100 code blocks, heavy maths)
+compiles in about **1.0 s** and first-renders in about **1.5 s**. Twenty consecutive
+compiles of it leave resident memory flat.
 
-The on-demand tools trade a ~100 ms reopen cost for **zero idle memory** — a
-deliberate choice that keeps the resting footprint low (see §2). Converting the
-most-reopened ones (Plot Studio's WebGL, Excalidraw's canvas) to "init once, then
-hide/show" is a viable future optimization if reopen latency becomes noticeable.
+Every compile spawns a fresh `typst` process, so an edit recompiles the whole
+document. A second per 300 pages is comfortable, but this is the one number that would
+need attention for a very large book. A `typst watch` sidecar, or the compiler used as
+a library, would make edits incremental.
 
 ---
 
-## 5. Workspace model (VS Code–style)
+## 3. The optimizations behind these numbers
 
-"Open Folder" makes any folder on disk the live project — the backend repoints its
-workspace root at that path (`POST /workspace/root`) and reads/writes files there
-directly. Recent folders are remembered. In the browser build, the File System
-Access API writes edits straight back to the chosen folder. No copy, no import step
-for the desktop app — exactly like opening a folder in VS Code.
+**Dictionaries load on demand, cutting idle memory by 14x.** The spelling and grammar
+dictionaries (spellbook and Harper) cost about 150 MB resident. They used to be
+preloaded on a background thread at launch, but proofreading is off by default, so
+most people carried that memory forever without ever using it. They now load the first
+time `/lint` is called, which only happens once proofreading is switched on, and the
+load runs in the background so the first sentence is still checked promptly. Idle RSS
+fell from **173 MB to 12 MB**.
+
+**Monaco is created once** and swaps models between tabs rather than being torn down
+and rebuilt. Models are disposed on tab close, which fixed a leak where every
+opened-then-closed file kept a full document in memory.
+
+**The editor's options object is memoised.** `@monaco-editor/react` calls
+`updateOptions()` whenever the options prop changes identity, and reconfiguring the
+editor mid-search resets its find-match highlights, which showed up as flicker while
+typing in the find box.
+
+**The PDF preview re-rasterises pages in place.** Resizing or zooming used to replace
+the whole page area, blanking the document for a frame. Each page now renders
+off-screen and is swapped in when ready, and pages outside the viewport are skipped
+with an IntersectionObserver.
+
+**Compile output lives in a hidden `.hilbert/` folder** per workspace, next to the
+scratch directory used for code execution. Plots produced by a notebook run are moved
+out into a visible `assets/` folder, because the document embeds them and they have to
+survive a cleanup.
+
+**Code execution is capped by the kernel**, not only by a timer. File-size and CPU
+limits are set on the child process and captured output is truncated at 8 MB, so a
+runaway cell cannot fill the disk or exhaust memory.
+
+---
+
+## 4. Where the memory actually goes
+
+| Process | RSS |
+|---|---|
+| Backend, idle | 12 MB |
+| Backend, once proofreading is enabled | about 174 MB (dictionaries) |
+| WebKit content process | about 200 MB |
+| tinymist language server (child) | about 33 MB |
+
+The WebView dominates, which is the expected shape for a Tauri app: the system WebKit
+is shared rather than bundled, so the binary stays at 16 MB where an Electron build
+ships a whole copy of Chromium. The earlier Electron edition of this app idled around
+320 MB across five processes and unpacked to 711 MB on disk.
+
+Switching proofreading on is now the largest single memory decision in the app, and it
+belongs to the user.
+
+---
+
+## 5. Component lifecycle
+
+| Component | Pattern |
+|---|---|
+| Monaco editor | one instance, models swapped per file |
+| PDF preview | stays mounted, re-rasterises in place |
+| File tree | collapse hides children, nodes reused |
+| Tabs | contents kept in state, editor state preserved |
+| Package index | cached on disk with a TTL |
+| Plot Studio, 3D studio, whiteboard, builders | lazy-mounted, freed on close |
+
+The heavy tools are loaded on demand and freed when closed. That costs roughly 100 ms
+to reopen one and keeps the resting footprint near zero, which is the right trade for
+tools opened a few times per session. If reopening ever starts to feel slow, the WebGL
+and canvas tools are the ones to convert to init-once-then-hide.

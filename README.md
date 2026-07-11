@@ -15,10 +15,10 @@
 
 It started as "an offline, Overleaf-feeling place to write physics and maths," and
 grew into a full scientific-writing IDE: a real code editor on the left, a live PDF
-on the right, and everything in between. Equations, matrices, plots, diagrams,
-theorems, citations, and running code are one click away instead of something you
-memorise. It runs entirely on your machine, works offline, and can execute your
-Python, Julia, or Wolfram snippets and drop the result straight into the document.
+on the right. Equations, matrices, plots, diagrams, theorems, citations, and running
+code are a click away instead of something you memorise. It runs entirely on your
+machine, works offline, and can execute your Python, Julia, or Wolfram snippets and
+drop the result straight into the document.
 
 ![Hilbert](docs/screenshot.png)
 
@@ -26,7 +26,7 @@ Python, Julia, or Wolfram snippets and drop the result straight into the documen
 
 ## Contents
 
-- [Why you'll like it](#why-youll-like-it)
+- [What it's like to use](#what-its-like-to-use)
 - [Feature tour (with demos)](#feature-tour)
 - [Everything in the box](#everything-in-the-box): the full list
 - [What you need](#what-you-need)
@@ -37,27 +37,28 @@ Python, Julia, or Wolfram snippets and drop the result straight into the documen
 
 ---
 
-## Why you'll like it
+## What it's like to use
 
-The PDF re-renders as you type, and the editor is Monaco, the same one VS Code runs
-on, with real Typst hover-docs and autocomplete. The whole thing is up and usable in
-well under a second.
+The PDF re-renders as you type. The editor is Monaco, the same one VS Code runs on,
+with Typst hover-docs and autocomplete. It opens and is usable in well under a second.
 
-Most of the things you'd normally have to memorise are a click away instead:
-equations, matrices, tables, figures, theorem boxes, citations by DOI or arXiv, 2D
-and 3D plots, commutative and Feynman diagrams. Each drops in as clean, editable
-Typst that stays yours. And it'll do the actual maths: run a Python, Julia, or
-Wolfram snippet and get the result back as a typeset equation, or highlight an
-expression and simplify, solve, or integrate it where it sits.
+Most of the syntax you'd otherwise have to memorise is a click away: equations,
+matrices, tables, figures, theorem boxes, citations by DOI or arXiv, 2D and 3D plots,
+commutative and Feynman diagrams. Each drops in as clean, editable Typst that stays
+yours. Press ⌘K and you can search every one of them by name.
+
+It will also do the actual maths. Run a Python, Julia, or Wolfram snippet and get the
+result back as a typeset equation, or highlight an expression and simplify, solve, or
+integrate it where it sits.
 
 Underneath it behaves like a real workspace. Open any folder the way you would in VS
-Code, split a document across `#include`d chapters, drag files around the tree,
-search the whole project at once.
+Code, split a document across `#include`d chapters, drag files around the tree, search
+the whole project at once.
 
-It's also genuinely light: the Tauri build idles around 12 MB of memory and installs
-in under 9 MB, a fraction of what a typical Electron editor costs
+It is also small. The backend idles at 12 MB and installs in 37 MB, a fraction of what
+a comparable Electron editor costs, and a thousand-file project only takes it to 18 MB
 ([benchmarks](docs/PERFORMANCE.md)). It works offline, updates itself, and keeps
-crashes contained (a broken tool shows an error instead of blanking the editor). On
+crashes contained: a broken tool shows an error rather than blanking the editor. On
 Windows it never flashes a console window at you.
 
 ---
@@ -69,15 +70,15 @@ Double-click any word in the PDF to jump to it in the source.
 
 ![Live preview](docs/gifs/live-preview.gif)
 
-Plot Studio is one tool for every plot: 2D functions (`y=f(x)`, implicit,
-parametric), 2D data (line, scatter, bar), and 3D surfaces, plus a one-click launch
-into the interactive 3D studio and the Python/matplotlib runner. It emits `cetz` and
+Plot Studio is one tool for every plot: 2D functions (`y=f(x)`, implicit, parametric),
+2D data (line, scatter, bar), and 3D surfaces, plus a one-click launch into the
+interactive 3D studio and the Python/matplotlib runner. It emits `cetz` and
 `cetz-plot`.
 
 ![Plot Studio](docs/plot-studio.png)
 
 cetz Canvas lets you draw diagrams visually. Click shapes from a palette onto a live
-preview, then set each one's position, size, rotation, and colour. No blind
+preview, then set each one's position, size, rotation, and colour, without guessing at
 coordinates.
 
 ![cetz Canvas](docs/gifs/cetz-canvas.gif)
@@ -87,8 +88,15 @@ Commutative diagrams are drawn in a bundled, offline copy of
 
 ![Commutative diagram with quiver](docs/gifs/quiver-diagram.gif)
 
-Run Python, Julia, or Wolfram and insert the result as text, a figure, or a typeset
-equation.
+Write Python and Julia straight into the document and press Run Notebook. Every code
+block in the file runs as one session, so variables carry from cell to cell, and the
+output is written back underneath each block. The compiled PDF marks each block with
+its language logo.
+
+![Python and Julia notebook cells](docs/notebook-python-julia.png)
+
+Run Python, Julia, or Wolfram in a scratchpad instead, and insert the result as text, a
+figure, or a typeset equation.
 
 ![Run code to equation](docs/gifs/run-code-equation.gif)
 
@@ -96,12 +104,12 @@ Colour anything with a draggable colour-grid picker.
 
 ![Text colour picker](docs/gifs/text-colour.gif)
 
-Sketch a symbol and get its Typst code (experimental).
+Sketch a symbol and get its Typst code.
 
 ![Draw a symbol](docs/gifs/draw-symbol.gif)
 
-Cite by DOI or arXiv id: Hilbert looks the paper up, saves it to `refs.bib`, and
-cites it.
+Cite by DOI or arXiv id: Hilbert looks the paper up, saves it to `refs.bib`, and cites
+it.
 
 ![Citations](docs/gifs/citations.gif)
 
@@ -115,8 +123,9 @@ Toggle a dark PDF preview, like Overleaf.
 
 ### More visual builders
 
-Feynman diagrams support fermion, photon, gluon, scalar, and ghost propagators,
-loops, hatched or shaded blobs, vertices, and labels, all producing editable `cetz`.
+Feynman diagrams support fermion, photon, gluon, scalar, and ghost propagators, loops
+with fermion-flow arrows, hatched or shaded blobs, vertices, and labels, all producing
+editable `cetz`.
 
 ![Feynman diagram builder](docs/feynman-builder.png)
 
@@ -124,8 +133,8 @@ Matrix Studio is a visual grid with fills, borders, brackets, and a code-array m
 
 ![Matrix Studio](docs/matrix-studio.png)
 
-3D Plot Studio lets you rotate a surface to the exact angle you want, then insert
-that view.
+3D Plot Studio lets you rotate a surface to the exact angle you want, then insert that
+view.
 
 ![3D Plot Studio](docs/plot3d-studio.png)
 
@@ -133,7 +142,7 @@ Flowchart to Code: draw the logic, and it writes the `while`, `if`, and `for`.
 
 ![Flowchart to code](docs/flowchart-code.png)
 
-> Everything happens on your computer. A tiny local server drives the Typst compiler
+> Everything happens on your computer. A small local server drives the Typst compiler
 > and (optional) code execution. Nothing leaves the machine unless you deliberately
 > turn on Google Drive or WebDAV sync.
 
@@ -143,110 +152,134 @@ Flowchart to Code: draw the logic, and it writes the `while`, `if`, and `for`.
 
 The full list, grouped by what you're doing.
 
-### Editing & preview
-- **Monaco editor** with Typst highlighting, plus hover documentation and smart
-  autocomplete powered by [tinymist](https://github.com/Myriad-Dreamin/tinymist):
-  hover any function for its signature and docs, and get completions for every
-  builtin, package export, and label. There's also `@`-reference autocomplete and
-  image-path autocomplete inside `image("…")`.
-- **Live PDF preview** that recompiles as you type, with zoom, fit-to-width, a dark
-  PDF mode, and double-click-to-source (it uses the surrounding words to land on the
-  right occurrence).
-- **Multi-file projects.** The preview compiles the project root (`main.typ` or the
-  `typst.toml` entrypoint), so `#include`d chapters that share a bibliography or
-  labels render as a whole. The root shows a MAIN badge; right-click any `.typ` and
-  choose **Set as main file** to change it.
-- A clickable **Problems** panel, a **File Outline**, resizable panes, and a live
-  word count of the rendered document (read from the PDF, so `#set`/`#import`/markup
-  don't inflate it).
-- Control-flow completions that offer both `{ }` code and `[ ]` content bodies for
-  `if`, `for`, and `while`.
+### Editing and preview
 
-### Project & file management (VS Code-style)
-- **Open Folder** makes any folder on disk the workspace (edits save straight back on
-  the desktop app and in Chrome/Edge), with **File → Open Recent**.
-- **File tree**: multi-select, drag-and-drop move, rename, duplicate, delete, cut,
-  copy, paste, a right-click context menu, new file and folder (styled in-app
-  dialogs), image/asset upload, compress to `.zip`, and reveal-in-file-manager.
-- **Full-text search** across the workspace with jump-to-line.
+The Monaco editor handles Typst highlighting, and
+[tinymist](https://github.com/Myriad-Dreamin/tinymist) supplies hover documentation
+and autocomplete: hover any function for its signature and docs, and get completions
+for every builtin, package export, and label. There's `@`-reference autocomplete, and
+image-path autocomplete inside `image("…")`. Control-flow completions offer both the
+`{ }` code body and the `[ ]` content body for `if`, `for`, and `while`.
+
+The PDF preview recompiles as you type, with zoom, fit-to-width, a dark PDF mode, and
+double-click-to-source (it reads the surrounding words to land on the right
+occurrence). When a compile fails you keep the last good preview and the errors move
+to their own Problems tab, so a typo mid-sentence doesn't blank the page.
+
+Multi-file projects compile from the project root (`main.typ`, or the `typst.toml`
+entrypoint), so `#include`d chapters that share a bibliography or labels render as a
+whole. The root file shows a MAIN badge; right-click any `.typ` and choose
+**Set as main file** to change it.
+
+There's also a clickable Problems panel, a File Outline, resizable panes, a ⌘K command
+palette covering every menu action, a Help window listing the features, and a live
+word count of the rendered document (read from the PDF, so `#set` and `#import` lines
+don't inflate it).
+
+### Projects and files (VS Code style)
+
+**Open Folder** makes any folder on disk the workspace, with edits saved straight back
+on the desktop app and in Chrome/Edge, plus **File → Open Recent**. The file tree does
+multi-select, drag-and-drop moves, rename, duplicate, delete, cut, copy, paste, a
+right-click menu, new file and folder, asset upload, compress to `.zip`, and
+reveal-in-file-manager. Full-text search across the workspace jumps you to the line.
 
 ### Inserting the annoying stuff
-- Title blocks, headings, abstracts, authors, institutes.
-- Inline, block, aligned, and numbered equations (numbering on by default; toggle it
-  under the cursor with **⌘⇧N**).
-- **Matrices** (visual Matrix Studio), tables, figures, images, and lists, most with
-  a *center on page* toggle.
-- **Page Setup builder** (Formatting → Page Setup): paper size, per-side margins,
-  header/footer, and page numbers, which writes the `#set page(...)` rule.
-- **Text formatting**: bold, italic, super- and subscript, a draggable colour picker,
-  underline, highlight, strike-through, boxed selections (fill, border, texture),
-  font-size dropdown, alignment, rotation, and small caps.
-- **Cross-references**: add a label (`= Intro <sec:intro>`), type `@`, and pick it.
-- **Image editor**: crop and rotate raster images (PNG/JPG) before inserting; SVGs
-  open as a safe preview.
 
-### Maths & physics
-- A **maths and physics symbol picker** (`physica`), and, experimentally, a
-  draw-a-symbol pad.
-- **Theorems, proofs, and lemmas**, plain or in coloured boxes, each kind numbered.
-- A **Physics & Cosmology menu** of ready-made, compile-checked equations: bra-kets,
-  commutators, the Dirac and Klein-Gordon equations, the QED Lagrangian, Einstein's
-  field equations, Christoffel symbols, the FRW metric, the Friedmann equations, and
-  more.
-- An **equation gallery** of fill-in templates.
+Title blocks, headings, abstracts, authors, and institutes. Inline, block, aligned,
+and numbered equations, with numbering on by default (toggle it under the cursor with
+⌘⇧N). Matrices through the visual Matrix Studio, plus tables, figures, images, and
+lists, most with a *center on page* toggle.
 
-### Plots & diagrams
-- **Plot Studio**, the unified plotting tool: 2D functions (explicit, implicit,
-  parametric), 2D data (line, scatter, bar), 3D `cetz` surfaces, plus launchers for
-  the interactive 3D studio and the Python/matplotlib runner.
-- **cetz Canvas**, a visual shape builder: 13 primitives (circle, ellipse, rectangle,
-  triangle, hexagon, line, arrow, arc, curve, grid, point, axes, label) with a live
-  preview and per-shape position, size (grid range / radius / length), rotation, and
-  colour.
-- **3D Plot Studio**, an interactive surface you rotate, then insert exactly that
-  view.
-- **Commutative diagrams** via bundled offline [quiver](https://github.com/varkor/quiver),
-  producing editable `fletcher`.
-- **Feynman diagrams** drawn visually, producing editable `cetz`.
-- **Flowchart to Code**: draw logic, get `while`, `if`, and `for`.
-- 2D plotting via `cetz` and `cetz-plot`.
+The Page Setup builder (Formatting → Page Setup) writes the `#set page(...)` rule for
+paper size, per-side margins, header and footer, and page numbers. Text formatting
+covers bold, italic, super- and subscript, a draggable colour picker, underline,
+highlight, strike-through, boxed selections with fill and border and texture, a
+font-size dropdown, alignment, rotation, small caps, and a full-width horizontal rule
+(⌘⇧H).
+
+Cross-references work by adding a label (`= Intro <sec:intro>`), typing `@`, and
+picking it. The image editor crops and rotates PNGs and JPGs before inserting; SVGs
+open as a safe preview.
+
+### Maths and physics
+
+A maths and physics symbol picker backed by `physica`, and a draw-a-symbol pad that
+matches your sketch against the glyph shapes offline.
+
+Theorems, proofs, and lemmas, plain or in coloured boxes, each kind numbered
+separately. A Physics & Cosmology menu of ready-made, compile-checked equations:
+bra-kets, commutators, the Dirac and Klein-Gordon equations, the QED Lagrangian,
+Einstein's field equations, Christoffel symbols, the FRW metric, and the Friedmann
+equations. An equation gallery of fill-in templates sits alongside it.
+
+### Plots and diagrams
+
+Plot Studio is the unified plotting tool: 2D functions (explicit, implicit,
+parametric), 2D data (line, scatter, bar), 3D `cetz` surfaces, and launchers for the
+interactive 3D studio and the Python/matplotlib runner.
+
+cetz Canvas is a visual shape builder with 13 primitives (circle, ellipse, rectangle,
+triangle, hexagon, line, arrow, arc, curve, grid, point, axes, label), a live preview,
+and per-shape position, size, rotation, and colour. It can also plot a curve straight
+from a data file once you pick the X and Y columns.
+
+3D Plot Studio gives you a surface you rotate by hand, then insert exactly that view.
+Commutative diagrams come from the bundled offline copy of
+[quiver](https://github.com/varkor/quiver) as editable `fletcher`. Feynman diagrams are
+drawn visually and come out as editable `cetz`. Flowchart to Code turns drawn logic
+into `while`, `if`, and `for`. General 2D plotting runs through `cetz` and `cetz-plot`.
 
 ### Maths that computes
-- **Run code, insert result** (Python, Julia, Wolfram): take the text output, a
-  generated figure, or, in *equation mode*, write plain maths like
-  `diff(sin(x**2), x)` and get a typeset equation back automatically.
-- **Compute on a selection**: highlight an expression and simplify, solve,
-  differentiate, integrate, or evaluate it with sympy, dropped back in as an equation.
-- **Ready-made physics examples** in the runner: General Relativity with
-  [xAct](http://www.xact.es/) (Schwarzschild curvature to the Ricci tensor and the
-  Kretschmann scalar), Penrose (conformal) diagrams, and Clebsch-Gordan and Wigner
-  3-j coefficients, as a rendered image or a typeset equation.
 
-### References & bibliography
-- A **reference and label manager** listing every label and `@reference`, flagging
-  undefined, duplicate, or unused ones.
-- A **citation manager**: look a paper up by DOI or arXiv id, save it to `refs.bib`,
-  and cite it with `@key` (the bibliography section is added for you).
+Run code and insert the result (Python, Julia, or Wolfram) as text output, a generated
+figure, or, in *equation mode*, write plain maths like `diff(sin(x**2), x)` and get a
+typeset equation back.
+
+Run Notebook executes every ```` ```python ```` and ```` ```julia ```` block in the
+document as one session, so variables persist between cells. Output and plots land
+below each block, and the compiled PDF badges each block with its language logo.
+
+Compute on a selection: highlight an expression and simplify, solve, differentiate,
+integrate, or evaluate it with sympy, dropped back in as an equation.
+
+The runner ships with physics examples: General Relativity with
+[xAct](http://www.xact.es/) (Schwarzschild curvature through to the Ricci tensor and
+the Kretschmann scalar), Penrose diagrams, and Clebsch-Gordan and Wigner 3-j
+coefficients, as a rendered image or a typeset equation.
+
+### References and bibliography
+
+A reference and label manager lists every label and `@reference`, flagging the
+undefined, duplicated, and unused ones. The citation manager looks a paper up by DOI
+or arXiv id, saves it to `refs.bib`, and cites it with `@key`, adding the bibliography
+section for you.
 
 ### Getting things in and out
-- Import data (CSV, JSON, YAML, TOML) with the matching Typst reader wired up.
-- **Import your own fonts** (`.ttf` / `.otf`) via File → Import Font.
-- **Templates** from Typst Universe with a rendered preview.
-- **Git**: init, commit, push to GitHub.
-- **Export** to PDF, HTML, `.typ`, a local folder, Google Drive, or WebDAV
-  (Nextcloud / ownCloud).
-- **Manage installed Typst packages**: search, download, remove.
 
-### Reliability & platform
-- **Auto-updater** (Tauri build): checks on launch, asks before installing, and is
-  best-effort. If the check can't run, the app still starts normally.
-- **Crash isolation**: heavy tools (3D studio, Plot Studio, whiteboard, code runner)
-  are sandboxed, so an error shows a dismissible message instead of blanking the
-  editor.
-- A failed compile keeps your last good preview; on Windows, background tools never
-  flash a console window; the backend survives a misbehaving tool.
-- **Offline**: bundled Typst packages are cached locally, so documents compile with
-  no network and no downloads.
+Import data from CSV, TSV, or Excel with a preview, then insert it as a Typst table, a
+plot with the columns you choose, or a variable. JSON, YAML, and TOML come in with the
+matching Typst reader wired up. Import your own fonts (`.ttf` / `.otf`) via
+File → Import Font.
+
+Templates come from Typst Universe with a rendered preview, and five ship with the app
+for offline use, including a two-column journal paper. Export goes to PDF (with page
+ranges, PDF/A standards, tagging, and pretty-printing), PNG, SVG, HTML, plain `.typ`,
+or the whole project folder, through your system's save dialog. Git support covers
+init, commit, and push to GitHub. There's also sync to a local folder, Google Drive,
+or WebDAV (Nextcloud and ownCloud), and a package manager to search, download, and
+remove Typst packages.
+
+### Reliability and platform
+
+The auto-updater (Tauri build) checks on launch and asks before installing. If the
+check can't run, the app still starts normally.
+
+Heavy tools (3D studio, Plot Studio, whiteboard, code runner) are isolated, so an
+error in one shows a dismissible message instead of blanking the editor. A failed
+compile keeps your last good preview. On Windows, background tools never flash a
+console window. Bundled Typst packages are cached locally, so documents compile with
+no network and no downloads.
 
 ---
 
@@ -255,43 +288,42 @@ The full list, grouped by what you're doing.
 Hilbert drives external tools rather than reimplementing them, so a couple of things
 must be on your `PATH`:
 
-- **[Typst CLI](https://github.com/typst/typst) 0.14 or newer**, required for
-  compiling. Install it with `brew install typst`, `winget install Typst.Typst`,
+- [Typst CLI](https://github.com/typst/typst) 0.15 or newer, required for compiling.
+  Install it with `brew install typst`, `winget install Typst.Typst`,
   `cargo install typst-cli`, or a release binary. Verify with `typst --version`.
-- Optional but recommended: **[tinymist](https://github.com/Myriad-Dreamin/tinymist)**,
-  the Typst language server, for hover docs and smart autocomplete.
-  - **macOS:** `brew install tinymist`
-  - **Windows:** `winget install Myriad-Dreamin.tinymist` (or `scoop install tinymist`)
-  - **Linux, or any OS with Rust:** `cargo install tinymist`
+- [tinymist](https://github.com/Myriad-Dreamin/tinymist), the Typst language server,
+  is optional but recommended, for hover docs and autocomplete.
+  - macOS: `brew install tinymist`
+  - Windows: `winget install Myriad-Dreamin.tinymist` (or `scoop install tinymist`)
+  - Linux, or any OS with Rust: `cargo install tinymist`
+
   Without it the editor still works fully; those two features just stay quiet.
-- Optional, only for running code:
-  - **Python 3** with `numpy`, `matplotlib`, `sympy`
-  - **Julia** (`Latexify` for equation mode)
-  - **WolframScript**
-- **Node.js 18+**, only if you run from source.
+- For running code, optionally: Python 3 (with `numpy`, `matplotlib`, `sympy`), Julia
+  (`Latexify` for equation mode), and WolframScript.
+- Node.js 18+, only if you run from source.
 
 ---
 
 ## Get it
 
-The **[landing page](https://rousan.netlify.app/hilbert/)** has an overview and
-download links. Prebuilt installers are on the
-[**Releases**](https://github.com/aburousan/hilbert-editor/releases) page. The app is
-tiny (~9 MB), light on memory, and it auto-updates.
+The [landing page](https://rousan.netlify.app/hilbert/) has an overview and download
+links. Prebuilt installers are on the
+[Releases](https://github.com/aburousan/hilbert-editor/releases) page. The app is
+small, light on memory, and auto-updates.
 
 | Platform | Download |
 | --- | --- |
-| **Windows** | `.exe` / `.msi` |
-| **macOS, Apple Silicon** | `…-macOS-arm64.dmg` |
-| **macOS, Intel** | `…-macOS-x64.dmg` |
-| **Linux** | `.AppImage` (auto-updates) / `.deb` |
+| Windows | `.exe` / `.msi` |
+| macOS, Apple Silicon | `…-macOS-arm64.dmg` |
+| macOS, Intel | `…-macOS-x64.dmg` |
+| Linux | `.AppImage` (auto-updates) / `.deb` |
 
 On a Mac, pick Apple Silicon for M-series chips and Intel for older Macs (*About This
-Mac* tells you which). The desktop app still needs the **Typst CLI** on your `PATH`.
+Mac* tells you which). The desktop app still needs the Typst CLI on your `PATH`.
 
 > **macOS, first launch.** The app isn't notarised (there's no paid Apple developer
 > account), so macOS quarantines it, and renaming or moving the `.app` can break its
-> ad-hoc signature. If it won't open or says it's *"damaged"*, run these two commands
+> ad-hoc signature. If it won't open, or says it's *"damaged"*, run these two commands
 > once:
 > ```bash
 > xattr -cr "/Applications/Hilbert.app"
@@ -304,9 +336,10 @@ Mac* tells you which). The desktop app still needs the **Typst CLI** on your `PA
 > build it yourself. This is a one-time step.
 
 ### Windows
+
 Download the `.exe` (or `.msi`) from Releases and run it. It behaves like a normal
 Windows app: launching tools never flashes a console window, and a failed compile
-shows an error panel instead of closing. You still need the **Typst CLI** on `PATH`.
+shows an error panel instead of closing. You still need the Typst CLI on `PATH`.
 
 ---
 
@@ -318,12 +351,14 @@ cd hilbert-editor
 bash scripts/setup.sh   # installs Typst + Python deps and runs npm install (macOS/Linux)
 npm run dev             # Vite UI on http://localhost:5173, backend on http://127.0.0.1:3001
 ```
-`npm run dev` serves the UI with Vite and starts the Rust backend (the Tauri binary
-in headless mode) on port 3001, so it needs the sibling `../typst-editor-tauri`
-checkout and a Rust toolchain. To build the desktop app, run `cargo tauri build` in
+
+`npm run dev` serves the UI with Vite and starts the Rust backend (the Tauri binary in
+headless mode) on port 3001, so it needs the sibling `../typst-editor-tauri` checkout
+and a Rust toolchain. To build the desktop app, run `cargo tauri build` in
 `../typst-editor-tauri`.
 
 On Windows, run from source with:
+
 ```powershell
 winget install Typst.Typst
 git clone https://github.com/aburousan/hilbert-editor.git
@@ -334,13 +369,15 @@ cd hilbert-editor ; npm install ; npm run dev   # then open http://localhost:517
 
 ## A few tips
 
-- **Compile**: edits recompile after a short pause; **⌘S** saves and recompiles now.
-- **Numbering**: put the cursor on a heading or block equation and press **⌘⇧N**.
-- **Cross-references**: add a label (`= Intro <sec:intro>`), then type `@` and pick it.
-- **Cite a paper**: Insert → References → Citations, look it up by DOI/arXiv, hit **Cite**.
-- **Plots**: Insert → Plots → **Plot Studio** for everything, or **cetz Canvas** for
-  free-form diagrams.
-- **Compute**: select an expression, Insert → Math → Compute Selection.
+- Compile: edits recompile after a short pause; ⌘S saves and recompiles now.
+- Find anything: ⌘K opens the command palette; every menu action is in it.
+- Numbering: put the cursor on a heading or block equation and press ⌘⇧N.
+- Cross-references: add a label (`= Intro <sec:intro>`), then type `@` and pick it.
+- Cite a paper: Insert → References → Citations, look it up by DOI or arXiv, hit Cite.
+- Plots: Insert → Plots → Plot Studio for everything, or cetz Canvas for free-form
+  diagrams.
+- Compute: select an expression, then Insert → Math → Compute Selection.
+- Run code: the `</>` toolbar button runs every code block in the file as one session.
 
 ---
 
@@ -356,7 +393,7 @@ cd hilbert-editor ; npm install ; npm run dev   # then open http://localhost:517
   ```
 - **Window is blank, or it says "couldn't start its local engine".** Something else is
   using port 3001. Quit it and reopen.
-- **It opens but nothing compiles.** The **Typst CLI** isn't installed or on `PATH`.
+- **It opens but nothing compiles.** The Typst CLI isn't installed or on `PATH`.
   Install it and confirm `typst --version` works.
 - **A template fails with an error inside `@preview/…`.** That's a package
   compatibility problem, not the editor: some Typst Universe templates pull in helper
@@ -376,43 +413,50 @@ cd hilbert-editor ; npm install ; npm run dev   # then open http://localhost:517
 
 Interpreters (including conda environments) are auto-detected; choose the default per
 language in **App Settings → Interpreters**. Your documents live in
-`~/Documents/Hilbert`.
+`~/Documents/Hilbert`. Each workspace keeps its scratch files in a hidden `.hilbert/`
+folder, which is safe to delete.
 
 ---
 
 ## Security model
 
-The backend is built for **local, single-user** use:
-- Binds to `127.0.0.1` only; CORS limited to `localhost` / `127.0.0.1`.
-- File access is confined to the workspace (path traversal rejected).
-- Code execution is opt-outable (`ALLOW_CODE_EXECUTION=0`), time-limited, runs in a
-  `sandbox/` dir, and is screened for process / network / shell / destructive calls.
+The backend is built for local, single-user use:
+
+- It binds to `127.0.0.1` only, and CORS is limited to `localhost` and `127.0.0.1`.
+  Requests carrying a foreign `Origin` or `Host` header are rejected, so a website you
+  happen to have open cannot reach it.
+- File access is confined to the workspace, and path traversal is rejected.
+- Code execution can be turned off (`ALLOW_CODE_EXECUTION=0`). When on, it is
+  time-limited, runs in a scratch directory under `.hilbert/run/` with OS resource
+  limits on file size and CPU, has its output capped, and is screened for process,
+  network, shell, and destructive calls.
 
 These are guardrails, not a hardened sandbox: code runs with your user privileges.
 Don't expose port 3001 to a network, and don't run untrusted documents. For untrusted
-use you'd want real OS-level isolation (a container or VM).
+use you'd want real OS-level isolation, a container or a VM.
 
 Cloud credentials (Google Drive OAuth, WebDAV) live only in your browser's local
-storage.
+storage. A GitHub token is used for the one push you asked for and is never written to
+`.git/config`.
 
 ---
 
 ## What's next
 
-Hilbert already does most of what a scientific-writing IDE should, so the next
-releases are about making what's here rock-solid: fixing rough edges, and making it
-faster and lighter (tracked in the [benchmarks](docs/PERFORMANCE.md)) rather than
-piling on more. If something breaks or feels slow, that's exactly what I want to hear.
-Open a [Discussion](https://github.com/aburousan/hilbert-editor/discussions).
+I built Hilbert for my own writing, and at this point it does everything I personally
+need. So there's no roadmap of features I'm racing to add. From here it's bug fixes,
+whatever users ask for, and the occasional update when something genuinely useful comes
+along.
 
-## Support
-
-Built and maintained by [Kazi Abu Rousan](https://rousan.netlify.app/). If it saves
-you time, you can [buy me a coffee](https://buymeacoffee.com/rousan). It's genuinely
-appreciated (there's also a button in the app's **About** dialog).
+That means the fastest way to change what happens next is to ask. If something is
+broken, missing, or annoying, open an
+[Issue](https://github.com/aburousan/hilbert-editor/issues) or a
+[Discussion](https://github.com/aburousan/hilbert-editor/discussions). Feature requests
+from people actually writing papers are what I'll act on first.
 
 ## License
 
-MIT; see [LICENSE](LICENSE). Bundled third-party software:
+MIT; see [LICENSE](LICENSE). Built and maintained by
+[Kazi Abu Rousan](https://rousan.netlify.app/). Bundled third-party software:
 [quiver](https://github.com/varkor/quiver) (MIT, © varkor) with
 [KaTeX](https://katex.org/) (MIT) under `public/quiver/`.

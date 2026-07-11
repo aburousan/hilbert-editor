@@ -52,6 +52,11 @@ const SYMBOLS: { name: string; ch: string }[] = [
   { name: 'NN', ch: 'ℕ' }, { name: 'QQ', ch: 'ℚ' },
   // Misc
   { name: 'dagger', ch: '†' }, { name: 'hbar', ch: 'ℏ' }, { name: 'star', ch: '⋆' },
+  { name: 'perp', ch: '⊥' }, { name: 'parallel', ch: '∥' }, { name: 'ell', ch: 'ℓ' },
+  { name: 'aleph', ch: 'ℵ' }, { name: 'bullet', ch: '•' },
+  { name: 'chevron.l', ch: '⟨' }, { name: 'chevron.r', ch: '⟩' },
+  { name: 'floor.l', ch: '⌊' }, { name: 'floor.r', ch: '⌋' },
+  { name: 'ceil.l', ch: '⌈' }, { name: 'ceil.r', ch: '⌉' },
 ];
 
 const GRID = 32;
@@ -200,18 +205,99 @@ function skeletonPoints(src: HTMLCanvasElement): Pt[] {
   return pts;
 }
 
-type Template = { name: string; ch: string; vec: Float32Array; cloud: Pt[] };
+type Template = { name: string; ch: string; vec: Float32Array; cloud: Pt[]; ar: number };
+
+// Width/height of the ink, as a log so wide (→) and tall (↑) are symmetric
+// around 0 and a penalty on the difference reads naturally.
+const logAspect = (pts: Pt[]): number => {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of pts) { minX = Math.min(minX, p.x); minY = Math.min(minY, p.y); maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y); }
+  return Math.log(Math.max(maxX - minX, 1) / Math.max(maxY - minY, 1));
+};
+
+const canvasInkPoints = (cv: HTMLCanvasElement): Pt[] => {
+  const d = cv.getContext('2d', { willReadFrequently: true })!.getImageData(0, 0, cv.width, cv.height).data;
+  const pts: Pt[] = [];
+  for (let y = 0; y < cv.height; y++) for (let x = 0; x < cv.width; x++) if (d[(y * cv.width + x) * 4 + 3] > 40) pts.push({ x, y });
+  return pts;
+};
 
 // Hand-drawn-style extra templates for glyphs whose font shape differs from how
-// people actually draw them: a drawn ∫ is a broad S-curve, while the font's is a
-// nearly straight bar (which used to lose against ↑/↓). Same name → the best
-// score of the font and synthetic variants wins.
+// people actually draw them: a drawn ∫ is a broad S-curve while the font's is a
+// nearly straight bar, drawn arrows have separate head strokes, a drawn Σ is a
+// zigzag, and so on. Same name → the best score of font and synthetic wins.
+// All in a 0–100 box, y down (canvas orientation).
+const seg = (x1: number, y1: number, x2: number, y2: number, n = 20): Pt[] =>
+  Array.from({ length: n }, (_, i) => { const t = i / (n - 1); return { x: x1 + (x2 - x1) * t, y: y1 + (y2 - y1) * t }; });
+const poly = (pts: [number, number][]): Pt[] => {
+  const out: Pt[] = [];
+  for (let i = 0; i < pts.length - 1; i++) out.push(...seg(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1], 14));
+  return out;
+};
+const arc = (cx: number, cy: number, rx: number, ry: number, a0: number, a1: number, n = 36): Pt[] =>
+  Array.from({ length: n }, (_, i) => { const a = a0 + (a1 - a0) * i / (n - 1); return { x: cx + rx * Math.cos(a), y: cy + ry * Math.sin(a) }; });
+const PI = Math.PI, TAU = 2 * Math.PI;
+const rHead = (x: number, y: number): Pt[][] => [seg(x, y, x - 20, y - 17), seg(x, y, x - 20, y + 17)];
+const lemniscate = (): Pt[] => Array.from({ length: 72 }, (_, i) => {
+  const t = TAU * i / 71, d = 1 + Math.sin(t) * Math.sin(t);
+  return { x: 50 + 44 * Math.cos(t) / d, y: 50 + 32 * Math.sin(t) * Math.cos(t) / d };
+});
+
 const SYNTH: { name: string; ch: string; strokes: Pt[][] }[] = [
-  { name: 'integral', ch: '∫', strokes: [Array.from({ length: 65 }, (_, i) => { const t = i / 64; return { x: 60 + 34 * Math.cos(Math.PI * t), y: 10 + 140 * t }; })] },
+  { name: 'integral', ch: '∫', strokes: [Array.from({ length: 65 }, (_, i) => { const t = i / 64; return { x: 60 + 34 * Math.cos(PI * t), y: 10 + 140 * t }; })] },
   { name: 'integral.cont', ch: '∮', strokes: [
-    Array.from({ length: 65 }, (_, i) => { const t = i / 64; return { x: 60 + 34 * Math.cos(Math.PI * t), y: 10 + 140 * t }; }),
-    Array.from({ length: 33 }, (_, i) => { const a = (i / 32) * 2 * Math.PI; return { x: 60 + 22 * Math.cos(a), y: 80 + 22 * Math.sin(a) }; }),
+    Array.from({ length: 65 }, (_, i) => { const t = i / 64; return { x: 60 + 34 * Math.cos(PI * t), y: 10 + 140 * t }; }),
+    arc(60, 80, 22, 22, 0, TAU),
   ] },
+  { name: 'sum', ch: '∑', strokes: [poly([[85, 12], [18, 12], [58, 50], [18, 88], [85, 88]])] },
+  { name: 'product', ch: '∏', strokes: [seg(15, 12, 85, 12), seg(30, 12, 30, 90), seg(70, 12, 70, 90)] },
+  { name: 'sqrt(x)', ch: '√', strokes: [poly([[8, 55], [28, 88], [52, 10], [95, 10]])] },
+  { name: 'infinity', ch: '∞', strokes: [lemniscate()] },
+  { name: 'approx', ch: '≈', strokes: [
+    Array.from({ length: 40 }, (_, i) => { const t = i / 39; return { x: 10 + 80 * t, y: 38 + 9 * Math.sin(TAU * t) }; }),
+    Array.from({ length: 40 }, (_, i) => { const t = i / 39; return { x: 10 + 80 * t, y: 64 + 9 * Math.sin(TAU * t) }; }),
+  ] },
+  { name: 'equiv', ch: '≡', strokes: [seg(14, 26, 86, 26), seg(14, 50, 86, 50), seg(14, 74, 86, 74)] },
+  { name: 'eq.not', ch: '≠', strokes: [seg(14, 40, 86, 40), seg(14, 62, 86, 62), seg(68, 14, 32, 88)] },
+  { name: 'plus.minus', ch: '±', strokes: [seg(50, 8, 50, 60), seg(20, 34, 80, 34), seg(20, 86, 80, 86)] },
+  { name: 'times', ch: '×', strokes: [seg(20, 20, 80, 80), seg(80, 20, 20, 80)] },
+  { name: 'arrow.r', ch: '→', strokes: [seg(8, 50, 88, 50), ...rHead(88, 50)] },
+  { name: 'arrow.l', ch: '←', strokes: [seg(92, 50, 12, 50), seg(12, 50, 32, 33), seg(12, 50, 32, 67)] },
+  { name: 'arrow.t', ch: '↑', strokes: [seg(50, 92, 50, 12), seg(50, 12, 33, 32), seg(50, 12, 67, 32)] },
+  { name: 'arrow.b', ch: '↓', strokes: [seg(50, 8, 50, 88), seg(50, 88, 33, 68), seg(50, 88, 67, 68)] },
+  { name: 'arrow.l.r', ch: '↔', strokes: [seg(10, 50, 90, 50), seg(90, 50, 72, 35), seg(90, 50, 72, 65), seg(10, 50, 28, 35), seg(10, 50, 28, 65)] },
+  { name: 'arrow.r.double', ch: '⇒', strokes: [seg(8, 40, 80, 40), seg(8, 60, 80, 60), seg(88, 50, 64, 24), seg(88, 50, 64, 76)] },
+  { name: 'arrow.r.bar', ch: '↦', strokes: [seg(12, 22, 12, 78), seg(12, 50, 88, 50), ...rHead(88, 50)] },
+  { name: 'nabla', ch: '∇', strokes: [poly([[14, 14], [86, 14], [50, 88], [14, 14]])] },
+  { name: 'Delta', ch: 'Δ', strokes: [poly([[50, 10], [88, 86], [12, 86], [50, 10]])] },
+  { name: 'theta', ch: 'θ', strokes: [arc(50, 50, 27, 41, 0, TAU), seg(25, 50, 75, 50)] },
+  { name: 'phi', ch: 'φ', strokes: [arc(50, 56, 27, 27, 0, TAU), seg(50, 6, 50, 95)] },
+  { name: 'psi', ch: 'ψ', strokes: [arc(50, 26, 26, 46, 0, PI), seg(50, 8, 50, 92)] },
+  { name: 'pi', ch: 'π', strokes: [seg(12, 26, 88, 26), seg(35, 26, 31, 86), seg(65, 26, 70, 86)] },
+  { name: 'lambda', ch: 'λ', strokes: [seg(28, 10, 76, 90), seg(52, 46, 26, 90)] },
+  { name: 'mu', ch: 'μ', strokes: [
+    [...seg(32, 15, 32, 55, 12), ...arc(50, 55, 18, 25, PI, 0), ...seg(68, 55, 68, 18, 10)],
+    seg(32, 55, 28, 94),
+  ] },
+  { name: 'omega', ch: 'ω', strokes: [poly([[18, 32], [22, 62], [33, 78], [45, 63], [50, 44], [55, 63], [67, 78], [78, 62], [82, 32]])] },
+  { name: 'Omega', ch: 'Ω', strokes: [arc(50, 44, 31, 34, 0.8 * PI, 2.2 * PI), seg(14, 88, 42, 88), seg(58, 88, 86, 88)] },
+  { name: 'alpha', ch: 'α', strokes: [poly([[80, 24], [55, 38], [30, 34], [20, 55], [28, 76], [50, 78], [66, 62], [73, 45], [80, 80]])] },
+  { name: 'in', ch: '∈', strokes: [arc(58, 50, 42, 42, 0.4 * PI, 1.6 * PI), seg(20, 50, 88, 50)] },
+  { name: 'subset', ch: '⊂', strokes: [arc(58, 50, 42, 42, 0.4 * PI, 1.6 * PI)] },
+  { name: 'union', ch: '∪', strokes: [[...seg(20, 14, 20, 48, 10), ...arc(50, 48, 30, 40, PI, TAU, 30).reverse(), ...seg(80, 48, 80, 14, 10)]] },
+  { name: 'inter', ch: '∩', strokes: [[...seg(20, 86, 20, 52, 10), ...arc(50, 52, 30, 40, PI, 0, 30), ...seg(80, 52, 80, 86, 10)]] },
+  { name: 'forall', ch: '∀', strokes: [seg(15, 10, 50, 90), seg(85, 10, 50, 90), seg(32, 48, 68, 48)] },
+  { name: 'exists', ch: '∃', strokes: [seg(28, 12, 80, 12), seg(80, 12, 80, 88), seg(80, 88, 28, 88), seg(80, 50, 38, 50)] },
+  { name: 'dagger', ch: '†', strokes: [seg(50, 8, 50, 92), seg(28, 30, 72, 30)] },
+  { name: 'degree', ch: '°', strokes: [arc(50, 30, 18, 18, 0, TAU)] },
+  { name: 'perp', ch: '⊥', strokes: [seg(50, 12, 50, 86), seg(12, 86, 88, 86)] },
+  { name: 'parallel', ch: '∥', strokes: [seg(38, 10, 38, 90), seg(62, 10, 62, 90)] },
+  { name: 'chevron.l', ch: '⟨', strokes: [poly([[68, 8], [28, 50], [68, 92]])] },
+  { name: 'chevron.r', ch: '⟩', strokes: [poly([[32, 8], [72, 50], [32, 92]])] },
+  { name: 'floor.l', ch: '⌊', strokes: [poly([[35, 8], [35, 92], [72, 92]])] },
+  { name: 'floor.r', ch: '⌋', strokes: [poly([[65, 8], [65, 92], [28, 92]])] },
+  { name: 'ceil.l', ch: '⌈', strokes: [poly([[72, 8], [35, 8], [35, 92]])] },
+  { name: 'ceil.r', ch: '⌉', strokes: [poly([[28, 8], [65, 8], [65, 92]])] },
 ];
 
 const TEMPLATE_FONT = (px: number) => `${px}px "STIX Two Math", "Cambria Math", "STIXGeneral", "Apple Symbols", "Segoe UI Symbol", serif`;
@@ -240,12 +326,12 @@ function buildTemplates(): Template[] {
     if (ink < 20) continue; // glyph unsupported by available fonts
     const sk = skeletonPoints(cv);
     if (sk.length < 5) continue;
-    out.push({ name: sym.name, ch: sym.ch, vec: toVector(cv), cloud: samplePoints(normalizeCloud(sk), CLOUD_N) });
+    out.push({ name: sym.name, ch: sym.ch, vec: toVector(cv), cloud: samplePoints(normalizeCloud(sk), CLOUD_N), ar: logAspect(canvasInkPoints(cv)) });
   }
   for (const s of SYNTH) {
     const gc = gestureCanvas(s.strokes);
     if (!gc) continue;
-    out.push({ name: s.name, ch: s.ch, vec: toVector(gc), cloud: samplePoints(normalizeCloud(s.strokes.flat()), CLOUD_N) });
+    out.push({ name: s.name, ch: s.ch, vec: toVector(gc), cloud: samplePoints(normalizeCloud(s.strokes.flat()), CLOUD_N), ar: logAspect(s.strokes.flat()) });
   }
   return out;
 }
@@ -278,10 +364,26 @@ export default function SymbolDraw({ onClose, onInsert }: { onClose: () => void;
   const drawingRef = useRef(false);
   const [results, setResults] = useState<{ name: string; ch: string; score: number }[]>([]);
   const [ready, setReady] = useState(false);
+  const resultsRef = useRef(results);
+  resultsRef.current = results;
 
   useEffect(() => {
     const t = setTimeout(() => { templatesRef.current = buildTemplates(); setReady(true); }, 0);
     return () => clearTimeout(t);
+  }, []);
+
+  // Enter inserts the best match, 1–9 pick the nth, backspace removes a stroke.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const rs = resultsRef.current;
+      if (e.key === 'Escape') { e.preventDefault(); onClose(); }
+      else if (e.key === 'Enter' && rs.length) { e.preventDefault(); onInsert(rs[0].name); }
+      else if (e.key === 'Backspace') { e.preventDefault(); undo(); }
+      else if (/^[1-9]$/.test(e.key) && rs[Number(e.key) - 1]) { e.preventDefault(); onInsert(rs[Number(e.key) - 1].name); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const ctx = () => canvasRef.current?.getContext('2d') || null;
@@ -330,11 +432,23 @@ export default function SymbolDraw({ onClose, onInsert }: { onClose: () => void;
     const v = toVector(gc);
     const raw = strokesRef.current.flat();
     const gcloud = raw.length >= CLOUD_N ? samplePoints(normalizeCloud(raw), CLOUD_N) : samplePoints(normalizeCloud(skeletonPoints(gc)), CLOUD_N);
-    const scored = templates.map(t => {
-      const simB = cosine(v, t.vec);                 // 0..1, higher better
-      const simP = 1 / (1 + greedyMatch(gcloud, t.cloud)); // ~0..1, higher better
-      return { name: t.name, ch: t.ch, score: 0.55 * simP + 0.45 * simB };
-    });
+    const gAr = logAspect(raw);
+    const simB = templates.map(t => cosine(v, t.vec));
+    const simP = templates.map(t => 1 / (1 + greedyMatch(gcloud, t.cloud)));
+    // Raw cosines all cluster high on blurred bitmaps, and the two signals sit
+    // on different scales — standardise each across the template set so the
+    // blend actually weighs them as intended, then subtract an aspect-ratio
+    // penalty (a wide → should not lose to a tall ↑ of similar shape).
+    const z = (xs: number[]) => {
+      const m = xs.reduce((a, b) => a + b, 0) / xs.length;
+      const sd = Math.sqrt(xs.reduce((a, b) => a + (b - m) * (b - m), 0) / xs.length) || 1;
+      return xs.map(x => (x - m) / sd);
+    };
+    const zB = z(simB), zP = z(simP);
+    const scored = templates.map((t, i) => ({
+      name: t.name, ch: t.ch,
+      score: 0.55 * zP[i] + 0.45 * zB[i] - 0.7 * Math.min(2.5, Math.abs(gAr - t.ar)),
+    }));
     scored.sort((a, b) => b.score - a.score);
     // A symbol can have several template variants (font + hand-drawn) — show it once.
     const seen = new Set<string>();
@@ -342,6 +456,7 @@ export default function SymbolDraw({ onClose, onInsert }: { onClose: () => void;
   };
 
   const clear = () => { strokesRef.current = []; setResults([]); redraw(); };
+  const undo = () => { strokesRef.current.pop(); redraw(); strokesRef.current.length ? recognize() : setResults([]); };
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -364,10 +479,12 @@ export default function SymbolDraw({ onClose, onInsert }: { onClose: () => void;
                 onPointerUp={up}
                 onPointerLeave={up}
               />
-              <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+              <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'center' }}>
                 <button className="btn-ghost" onClick={clear}>Clear</button>
+                <button className="btn-ghost" onClick={undo} title="Remove the last stroke (Backspace)">Undo stroke</button>
                 {!ready && <span className="form-hint" style={{ margin: 0 }}>Preparing recognizer…</span>}
               </div>
+              <div className="form-hint" style={{ marginTop: 6 }}>Enter inserts the top match · 1–9 pick another</div>
             </div>
             <div style={{ flex: 1, minWidth: 0 }}>
               <span className="form-field" style={{ marginBottom: 6 }}><span>Best matches</span></span>
