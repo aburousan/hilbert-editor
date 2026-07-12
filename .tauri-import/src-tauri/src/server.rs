@@ -1,0 +1,3015 @@
+// Rust port of the Typst Editor backend (server.js), endpoint-for-endpoint.
+// The React UI is served from `dist` on the same origin, so the unmodified
+// frontend build works exactly as it does under Electron + Express.
+use axum::{
+    body::Bytes,
+    extract::{DefaultBodyLimit, Query, State},
+    http::{header, HeaderMap, Method, StatusCode, Uri},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use base64::Engine;
+use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use regex::Regex;
+use serde_json::{json, Value};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Component, Path, PathBuf},
+    process::Stdio,
+    sync::{atomic::{AtomicU64, Ordering}, Arc, LazyLock, Mutex, RwLock},
+    time::{Duration, Instant, SystemTime},
+};
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, serde::Serialize)]
+pub struct Interp {
+    pub label: String,
+    pub path: String,
+}
+
+#[derive(Clone, serde::Serialize, Default)]
+pub struct Interpreters {
+    pub python: Vec<Interp>,
+    pub julia: Vec<Interp>,
+    pub wolfram: Vec<Interp>,
+}
+
+impl Interpreters {
+    fn for_lang(&self, lang: &str) -> &[Interp] {
+        match lang {
+            "python" => &self.python,
+            "julia" => &self.julia,
+            "wolfram" => &self.wolfram,
+            _ => &[],
+        }
+    }
+}
+
+// A universe package with its searchable text lowercased once at index time,
+// so a search request doesn't re-allocate a haystack per package per keystroke.
+pub struct Pkg {
+    pub value: Value,
+    pub name_lc: String,
+    pub hay: String,
+}
+
+pub struct AppState {
+    pub workspace: RwLock<PathBuf>,
+    pub dist: Option<PathBuf>,
+    pub interpreters: Interpreters,
+    pub allow_exec: bool,
+    pub exec_timeout_ms: u64,
+    pub universe: tokio::sync::Mutex<Option<(Instant, Arc<Vec<Pkg>>)>>,
+    pub http: reqwest::Client,
+    pub app: Mutex<Option<tauri::AppHandle>>,
+}
+
+impl AppState {
+    pub fn new(workspace: PathBuf, dist: Option<PathBuf>) -> Self {
+        AppState {
+            workspace: RwLock::new(workspace),
+            dist,
+            interpreters: detect_interpreters(),
+            allow_exec: std::env::var("ALLOW_CODE_EXECUTION").ok().as_deref() != Some("0"),
+            exec_timeout_ms: std::env::var("EXEC_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(45000),
+            universe: tokio::sync::Mutex::new(None),
+            http: reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10)).build().unwrap(),
+            app: Mutex::new(None),
+        }
+    }
+
+    fn ws(&self) -> PathBuf {
+        // Recover from a poisoned lock instead of panicking: a workspace path is
+        // always readable, and one panicked handler shouldn't wedge every request.
+        self.workspace.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+type St = State<Arc<AppState>>;
+type Q = Query<HashMap<String, String>>;
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+fn json_err(status: StatusCode, msg: impl Into<String>) -> Response {
+    (status, Json(json!({ "error": msg.into() }))).into_response()
+}
+
+fn text_err(status: StatusCode, msg: &'static str) -> Response {
+    (status, msg).into_response()
+}
+
+fn parse_json(body: &Bytes) -> Value {
+    serde_json::from_slice(body).unwrap_or(Value::Null)
+}
+
+fn jstr<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(|x| x.as_str())
+}
+
+// Node's path.resolve is purely lexical (no symlink resolution) — mirror that.
+fn lexical_resolve(base: &Path, p: &str) -> PathBuf {
+    let path = Path::new(p);
+    let mut result = if path.is_absolute() { PathBuf::from("/") } else { base.to_path_buf() };
+    for comp in path.components() {
+        match comp {
+            Component::RootDir | Component::Prefix(_) | Component::CurDir => {}
+            Component::ParentDir => {
+                result.pop();
+            }
+            Component::Normal(c) => result.push(c),
+        }
+    }
+    result
+}
+
+// Confine a user-supplied path to the workspace, blocking `../` traversal and
+// absolute paths that would escape it.
+fn safe_workspace_path(ws: &Path, p: &str) -> Option<PathBuf> {
+    if p.is_empty() {
+        return None;
+    }
+    let target = lexical_resolve(ws, p);
+    if target != ws && !target.starts_with(ws) {
+        return None;
+    }
+    Some(target)
+}
+
+fn epoch_ms(t: SystemTime) -> f64 {
+    t.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0)
+}
+
+struct CmdOut {
+    code: Option<i32>,
+    killed: bool,
+    stdout: String,
+    stderr: String,
+}
+
+// Run a command, capture output, kill it after `timeout_ms` (if given).
+// When the app runs from a Linux AppImage, the AppRun launcher exports
+// PYTHONHOME / PYTHONPATH / LD_LIBRARY_PATH pointing inside the mounted image
+// (e.g. /tmp/.mount_XXXX/usr). Those leak into any tool we spawn: the user's
+// system python3 then hunts for its standard library inside the image and dies
+// with "No module named 'encodings'". When we detect the image, drop the
+// injected values so spawned interpreters use their own environment. Parts of
+// LD_LIBRARY_PATH that don't belong to the image are preserved.
+#[cfg(target_os = "linux")]
+fn strip_appimage_env(cmd: &mut Command) {
+    if std::env::var("APPIMAGE").is_err() && std::env::var("APPDIR").is_err() {
+        return; // not launched from an AppImage
+    }
+    let appdir = std::env::var("APPDIR").ok().filter(|d| !d.is_empty());
+    let looks_injected = |v: &str| {
+        v.contains("/.mount_") || appdir.as_deref().map_or(false, |d| v.contains(d))
+    };
+    for key in ["PYTHONHOME", "PYTHONPATH"] {
+        if std::env::var(key).map(|v| looks_injected(&v)).unwrap_or(false) {
+            cmd.env_remove(key);
+        }
+    }
+    if let Ok(v) = std::env::var("LD_LIBRARY_PATH") {
+        let kept: Vec<&str> = v.split(':').filter(|s| !s.is_empty() && !looks_injected(s)).collect();
+        if kept.is_empty() {
+            cmd.env_remove("LD_LIBRARY_PATH");
+        } else {
+            cmd.env("LD_LIBRARY_PATH", kept.join(":"));
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn strip_appimage_env(_cmd: &mut Command) {}
+
+// Cap on captured stdout/stderr. A runaway `while True: print(...)` can emit
+// gigabytes long before the wall-clock timeout fires; without a cap the backend
+// buffers all of it and can OOM. We keep draining the pipe (so a benign, slightly
+// chatty program still exits cleanly) but stop storing past the cap.
+const MAX_CAPTURE: usize = 8 * 1024 * 1024;
+
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R) -> (Vec<u8>, bool) {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut truncated = false;
+    loop {
+        match r.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if out.len() < MAX_CAPTURE {
+                    let take = n.min(MAX_CAPTURE - out.len());
+                    out.extend_from_slice(&buf[..take]);
+                    if out.len() >= MAX_CAPTURE { truncated = true; }
+                }
+            }
+        }
+    }
+    (out, truncated)
+}
+
+async fn run_cmd(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    timeout_ms: Option<u64>,
+) -> std::io::Result<CmdOut> {
+    run_cmd_inner(program, args, cwd, timeout_ms, false).await
+}
+
+// Like run_cmd, but for untrusted user code: applies per-process OS resource
+// limits (max file size, CPU seconds) on top of the wall-clock timeout so a
+// runaway cell can't fill the disk or peg a core if the kill is ever missed.
+async fn run_exec_cmd(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    timeout_ms: Option<u64>,
+) -> std::io::Result<CmdOut> {
+    run_cmd_inner(program, args, cwd, timeout_ms, true).await
+}
+
+async fn run_cmd_inner(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    timeout_ms: Option<u64>,
+    sandboxed: bool,
+) -> std::io::Result<CmdOut> {
+    let mut cmd = Command::new(program);
+    // Windows: don't flash a console window for each spawned tool (typst, git,
+    // python, julia…). CREATE_NO_WINDOW = 0x08000000. No-op on other platforms.
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    // Never let a spawned tool block on an interactive prompt. Without this a
+    // `git push` that needs a password (no TTY available) would hang the request
+    // instead of failing fast. Harmless to the other tools we run.
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    strip_appimage_env(&mut cmd);
+    if let Some(d) = cwd {
+        cmd.current_dir(d);
+    }
+    // Defence-in-depth for code execution: hard caps enforced by the kernel on the
+    // child. RLIMIT_FSIZE stops disk-fill; RLIMIT_CPU is a generous backstop to the
+    // wall-clock timeout. Kept loose enough not to disturb normal numerical work.
+    #[cfg(unix)]
+    if sandboxed {
+        let cpu_secs = timeout_ms.map(|ms| ms / 1000 + 30).unwrap_or(180);
+        unsafe {
+            cmd.pre_exec(move || {
+                // The resource argument is c_int on macOS/BSD but __rlimit_resource_t
+                // (u32) on Linux, so let the compiler infer it from the constant
+                // rather than naming a type that is only right on one platform.
+                let set = |res, cur: u64, max: u64| {
+                    let lim = libc::rlimit { rlim_cur: cur as libc::rlim_t, rlim_max: max as libc::rlim_t };
+                    libc::setrlimit(res, &lim);
+                };
+                set(libc::RLIMIT_FSIZE, 256 * 1024 * 1024, 256 * 1024 * 1024);
+                set(libc::RLIMIT_CPU, cpu_secs, cpu_secs + 5);
+                Ok(())
+            });
+        }
+    }
+    let _ = sandboxed; // (Windows: limits are enforced by the wall-clock timeout only.)
+    let mut child = cmd.spawn()?;
+    let so = child.stdout.take().unwrap();
+    let se = child.stderr.take().unwrap();
+    let so_task = tokio::spawn(read_capped(so));
+    let se_task = tokio::spawn(read_capped(se));
+    let dur = Duration::from_millis(timeout_ms.unwrap_or(u64::MAX / 1000));
+    let mut killed = false;
+    let code = match tokio::time::timeout(dur, child.wait()).await {
+        Ok(Ok(status)) => status.code(),
+        Ok(Err(_)) => None,
+        Err(_) => {
+            killed = true;
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            None
+        }
+    };
+    let (so_bytes, so_trunc) = so_task.await.unwrap_or_default();
+    let (se_bytes, se_trunc) = se_task.await.unwrap_or_default();
+    let mut stdout = String::from_utf8_lossy(&so_bytes).into_owned();
+    let stderr = String::from_utf8_lossy(&se_bytes).into_owned();
+    if so_trunc || se_trunc {
+        stdout.push_str("\n[output truncated — exceeded 8 MB]");
+    }
+    Ok(CmdOut { code, killed, stdout, stderr })
+}
+
+const TYPST_NOT_FOUND: &str = "Typst compiler not found. Install the Typst CLI (macOS: `brew install typst`; Linux: a release binary from github.com/typst/typst or `cargo install typst-cli`) so that `typst --version` works, then restart the editor.";
+const TYPST_NOT_FOUND_SHORT: &str = "Typst compiler not found — install the Typst CLI so `typst --version` works.";
+
+// ---------------------------------------------------------------------------
+// Workspace file tree + files
+// ---------------------------------------------------------------------------
+
+fn get_tree(dir: &Path, ws: &Path) -> Vec<Value> {
+    let mut out = Vec::new();
+    let Ok(rd) = fs::read_dir(dir) else { return out };
+    let mut items: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    items.sort();
+    for item in items {
+        // Hide dotfiles, node_modules and the sandbox scratch dir. PDFs (both the
+        // compiled out.pdf and any the user adds) stay visible so they can be
+        // opened and downloaded from the tree.
+        if item.starts_with('.') || item == "node_modules" || item == "sandbox" {
+            continue;
+        }
+        let full = dir.join(&item);
+        let Ok(st) = fs::metadata(&full) else { continue };
+        let rel = full.strip_prefix(ws).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+        if st.is_dir() {
+            out.push(json!({ "type": "directory", "name": item, "path": rel, "children": get_tree(&full, ws) }));
+        } else {
+            let mtime = st.modified().map(epoch_ms).unwrap_or(0.0);
+            out.push(json!({ "type": "file", "name": item, "path": rel, "size": st.len(), "mtime": mtime }));
+        }
+    }
+    out
+}
+
+async fn workspace_tree(State(st): St) -> Response {
+    let ws = st.ws();
+    Json(get_tree(&ws, &ws)).into_response()
+}
+
+async fn workspace_root_get(State(st): St) -> Response {
+    Json(json!({ "root": st.ws().to_string_lossy() })).into_response()
+}
+
+async fn workspace_root_post(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let Some(raw) = jstr(&v, "path").map(str::trim).filter(|s| !s.is_empty()) else {
+        return json_err(StatusCode::BAD_REQUEST, "Folder path required.");
+    };
+    let home = dirs::home_dir().unwrap_or_default();
+    let expanded = if raw == "~" {
+        home.to_string_lossy().into_owned()
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        home.join(rest).to_string_lossy().into_owned()
+    } else {
+        raw.to_string()
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let resolved = lexical_resolve(&cwd, &expanded);
+    match fs::metadata(&resolved) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => return json_err(StatusCode::BAD_REQUEST, format!("Not a folder: {}", resolved.display())),
+        Err(_) => return json_err(StatusCode::BAD_REQUEST, format!("Not a folder: {}", resolved.display())),
+    }
+    *st.workspace.write().unwrap_or_else(|e| e.into_inner()) = resolved.clone();
+    Json(json!({ "ok": true, "root": resolved.to_string_lossy() })).into_response()
+}
+
+// Empty the current workspace (browser "Open Folder" imports into it).
+async fn workspace_clear(State(st): St) -> Response {
+    let ws = st.ws();
+    let rd = match fs::read_dir(&ws) {
+        Ok(r) => r,
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    for entry in rd.flatten() {
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let p = entry.path();
+        let _ = if p.is_dir() { fs::remove_dir_all(&p) } else { fs::remove_file(&p) };
+    }
+    Json(json!({ "ok": true })).into_response()
+}
+
+async fn workspace_file_get(State(st): St, Query(q): Q) -> Response {
+    let Some(full) = q.get("path").and_then(|p| safe_workspace_path(&st.ws(), p)) else {
+        return text_err(StatusCode::BAD_REQUEST, "Invalid path");
+    };
+    match fs::read(&full) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned().into_response(),
+        Err(_) => text_err(StatusCode::NOT_FOUND, "Not found"),
+    }
+}
+
+async fn workspace_file_post(State(st): St, Query(q): Q, headers: HeaderMap, body: Bytes) -> Response {
+    let Some(full) = q.get("path").and_then(|p| safe_workspace_path(&st.ws(), p)) else {
+        return text_err(StatusCode::BAD_REQUEST, "Invalid path");
+    };
+    // Accept both a raw text body and JSON { content } — like express.text/json.
+    let is_json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("application/json"))
+        .unwrap_or(false);
+    let content: Vec<u8> = if is_json {
+        parse_json(&body).get("content").and_then(|c| c.as_str()).unwrap_or("").as_bytes().to_vec()
+    } else {
+        body.to_vec()
+    };
+    if let Some(parent) = full.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match fs::write(&full, content) {
+        Ok(_) => "OK".into_response(),
+        Err(_) => text_err(StatusCode::INTERNAL_SERVER_ERROR, "Error"),
+    }
+}
+
+async fn workspace_file_delete(State(st): St, Query(q): Q) -> Response {
+    let ws = st.ws();
+    let Some(full) = q.get("path").and_then(|p| safe_workspace_path(&ws, p)) else {
+        return text_err(StatusCode::BAD_REQUEST, "Invalid path");
+    };
+    if full == ws {
+        return text_err(StatusCode::BAD_REQUEST, "Invalid path");
+    }
+    let res = match fs::metadata(&full) {
+        Ok(m) if m.is_dir() => fs::remove_dir_all(&full),
+        _ => fs::remove_file(&full),
+    };
+    match res {
+        Ok(_) => "OK".into_response(),
+        Err(_) => text_err(StatusCode::INTERNAL_SERVER_ERROR, "Error"),
+    }
+}
+
+async fn workspace_mkdir(State(st): St, Query(q): Q) -> Response {
+    let Some(full) = q.get("path").and_then(|p| safe_workspace_path(&st.ws(), p)) else {
+        return text_err(StatusCode::BAD_REQUEST, "Invalid path");
+    };
+    match fs::create_dir_all(&full) {
+        Ok(_) => "OK".into_response(),
+        Err(_) => text_err(StatusCode::INTERNAL_SERVER_ERROR, "Error"),
+    }
+}
+
+async fn workspace_upload(State(st): St, Query(q): Q, body: Bytes) -> Response {
+    let Some(full) = q.get("path").and_then(|p| safe_workspace_path(&st.ws(), p)) else {
+        return text_err(StatusCode::BAD_REQUEST, "Invalid path");
+    };
+    if let Some(parent) = full.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match fs::write(&full, body) {
+        Ok(_) => "OK".into_response(),
+        Err(_) => text_err(StatusCode::INTERNAL_SERVER_ERROR, "Error"),
+    }
+}
+
+// Convert an uploaded spreadsheet (xlsx/xls/xlsb/ods) into one CSV per sheet.
+// Typst only reads CSV natively, so Excel import goes through here — fully
+// offline, no dependency on Excel or a Python/pandas install.
+async fn data_xlsx(body: Bytes) -> Response {
+    use calamine::{open_workbook_auto_from_rs, Data, Reader};
+    let mut wb = match open_workbook_auto_from_rs(std::io::Cursor::new(body.to_vec())) {
+        Ok(w) => w,
+        Err(e) => return json_err(StatusCode::BAD_REQUEST, format!("Could not read spreadsheet: {e}")),
+    };
+    fn field(c: &Data) -> String {
+        let s = if matches!(c, Data::Empty) { String::new() } else { c.to_string() };
+        if s.contains(['"', ',', '\n', '\r']) {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        } else {
+            s
+        }
+    }
+    let mut sheets = Vec::new();
+    for name in wb.sheet_names().to_owned() {
+        let Ok(range) = wb.worksheet_range(&name) else { continue };
+        let mut csv = String::new();
+        for row in range.rows() {
+            let cols: Vec<String> = row.iter().map(field).collect();
+            csv.push_str(&cols.join(","));
+            csv.push('\n');
+        }
+        sheets.push(json!({ "name": name, "csv": csv, "rows": range.height(), "cols": range.width() }));
+    }
+    if sheets.is_empty() {
+        return json_err(StatusCode::BAD_REQUEST, "No readable sheets in that file.");
+    }
+    Json(json!({ "sheets": sheets })).into_response()
+}
+
+// Save a base64 data-URL image into the workspace (3D Plot Studio).
+async fn workspace_save_image(State(st): St, body: Bytes) -> Response {
+    static DATA_URL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)^data:image/\w+;base64,(.+)$").unwrap());
+    let v = parse_json(&body);
+    let path = jstr(&v, "path").unwrap_or("");
+    let Some(full) = safe_workspace_path(&st.ws(), path) else {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid path");
+    };
+    let data_url = jstr(&v, "dataUrl").unwrap_or("");
+    let Some(caps) = DATA_URL.captures(data_url) else {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid image data.");
+    };
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(caps[1].replace(['\n', '\r'], "")) else {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid image data.");
+    };
+    if let Some(parent) = full.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match fs::write(&full, bytes) {
+        Ok(_) => Json(json!({ "ok": true, "path": path })).into_response(),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// Copy a file within the workspace (e.g. promote a sandbox plot into images/).
+async fn workspace_copy(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let ws = st.ws();
+    let (Some(src), Some(dst)) = (
+        jstr(&v, "from").and_then(|p| safe_workspace_path(&ws, p)),
+        jstr(&v, "to").and_then(|p| safe_workspace_path(&ws, p)),
+    ) else {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid path");
+    };
+    if !src.exists() {
+        return json_err(StatusCode::NOT_FOUND, "Source not found.");
+    }
+    if let Some(parent) = dst.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match fs::copy(&src, &dst) {
+        Ok(_) => Json(json!({ "ok": true, "path": jstr(&v, "to").unwrap_or("") })).into_response(),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// Rename / move a file or folder within the workspace.
+async fn workspace_rename(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let ws = st.ws();
+    let (Some(src), Some(dst)) = (
+        jstr(&v, "from").and_then(|p| safe_workspace_path(&ws, p)),
+        jstr(&v, "to").and_then(|p| safe_workspace_path(&ws, p)),
+    ) else {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid path");
+    };
+    if !src.exists() {
+        return json_err(StatusCode::NOT_FOUND, "Source not found.");
+    }
+    if dst.exists() {
+        return json_err(StatusCode::CONFLICT, "Destination already exists.");
+    }
+    if let Some(parent) = dst.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match fs::rename(&src, &dst) {
+        Ok(_) => Json(json!({ "ok": true, "path": jstr(&v, "to").unwrap_or("") })).into_response(),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// Reveal a file or folder in the native OS file manager.
+async fn workspace_reveal(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let ws = st.ws();
+    let target = jstr(&v, "path").and_then(|p| safe_workspace_path(&ws, p)).unwrap_or_else(|| ws.clone());
+    if !target.exists() {
+        return json_err(StatusCode::NOT_FOUND, "Path not found");
+    }
+    reveal_in_file_manager(&target);
+    Json(json!({ "ok": true })).into_response()
+}
+
+// Full-text search across the workspace (skips dotfiles, binaries, build output).
+async fn workspace_search(State(st): St, Query(q): Q) -> Response {
+    let query = q.get("q").map(|s| s.to_lowercase()).unwrap_or_default();
+    if query.is_empty() {
+        return Json(json!([])).into_response();
+    }
+    let ws = st.ws();
+    let mut results: Vec<Value> = Vec::new();
+    search_walk(&ws, &ws, &query, &mut results);
+    Json(results).into_response()
+}
+
+fn search_walk(dir: &Path, ws: &Path, q: &str, out: &mut Vec<Value>) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || name == "node_modules" || name == "sandbox" || name.ends_with(".pdf") {
+            continue;
+        }
+        let full = entry.path();
+        let Ok(meta) = fs::metadata(&full) else { continue };
+        if meta.is_dir() {
+            search_walk(&full, ws, q, out);
+            continue;
+        }
+        let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+        if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "bmp" | "zip" | "tar" | "gz") {
+            continue;
+        }
+        // Skip very large files — reading a huge data file into memory would stall
+        // search and spike RAM.
+        if meta.len() > 2 * 1024 * 1024 {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&full) else { continue };
+        let Ok(content) = String::from_utf8(bytes) else { continue };
+        if !content.to_lowercase().contains(q) {
+            continue;
+        }
+        let matches: Vec<Value> = content
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.to_lowercase().contains(q))
+            .map(|(i, line)| json!({ "lineNum": i + 1, "text": line.trim() }))
+            .collect();
+        if !matches.is_empty() {
+            let rel = full.strip_prefix(ws).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+            out.push(json!({ "path": rel, "matches": matches }));
+        }
+    }
+}
+
+// Serve a raw workspace file (e.g. image / file preview) with a guessed MIME type.
+async fn workspace_raw(State(st): St, Query(q): Q) -> Response {
+    let Some(full) = q.get("path").and_then(|p| safe_workspace_path(&st.ws(), p)) else {
+        return text_err(StatusCode::BAD_REQUEST, "Invalid path");
+    };
+    match fs::read(&full) {
+        Ok(bytes) => {
+            let mime = mime_guess::from_path(&full).first_or_octet_stream();
+            ([(header::CONTENT_TYPE, mime.as_ref())], bytes).into_response()
+        }
+        Err(_) => text_err(StatusCode::NOT_FOUND, "Not found"),
+    }
+}
+
+// Compress selected files/folders into a zip archive inside the workspace.
+async fn workspace_compress(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let ws = st.ws();
+    let Some(paths) = v.get("paths").and_then(|p| p.as_array()).filter(|a| !a.is_empty()) else {
+        return json_err(StatusCode::BAD_REQUEST, "Paths required");
+    };
+    let archive_name = jstr(&v, "archiveName").filter(|s| !s.is_empty()).unwrap_or("archive.zip");
+    let Some(out_path) = safe_workspace_path(&ws, archive_name) else {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid archive name");
+    };
+    let mut rel_paths: Vec<String> = Vec::new();
+    for p in paths {
+        if let Some(full) = p.as_str().and_then(|s| safe_workspace_path(&ws, s)) {
+            if let Ok(rel) = full.strip_prefix(&ws) {
+                rel_paths.push(rel.to_string_lossy().into_owned());
+            }
+        }
+    }
+    if rel_paths.is_empty() {
+        return json_err(StatusCode::BAD_REQUEST, "No valid paths");
+    }
+    let mut args: Vec<String> = vec!["-r".into(), out_path.to_string_lossy().into_owned()];
+    args.extend(rel_paths);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    match run_cmd("zip", &argv, Some(&ws), None).await {
+        Ok(o) if o.code == Some(0) => Json(json!({ "ok": true })).into_response(),
+        Ok(o) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            if o.stderr.is_empty() { format!("Compression failed with code {}", o.code.map(|c| c.to_string()).unwrap_or_else(|| "null".into())) } else { o.stderr },
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json_err(StatusCode::INTERNAL_SERVER_ERROR, "The `zip` command was not found on this system."),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compile
+// ---------------------------------------------------------------------------
+
+async fn compile(State(st): St, Query(q): Q, body: Bytes) -> Response {
+    let ws = st.ws();
+    let main_q = q.get("main").map(String::as_str).unwrap_or("main.typ");
+    let Some(main_path) = safe_workspace_path(&ws, main_q) else {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid main path");
+    };
+    ensure_hilbert(&ws);
+    let output_path = hilbert_dir(&ws).join("out.pdf");
+    let body_str = String::from_utf8_lossy(&body);
+    if !body_str.trim().is_empty() {
+        let _ = fs::write(&main_path, body_str.as_bytes());
+    }
+    // Make any fonts the user imported into <workspace>/fonts discoverable by the
+    // compiler so `#set text(font: "…")` works with custom .ttf/.otf files.
+    // `--root <ws>` lets `#include`/`#import` reach any file in the workspace
+    // (multi-file projects), matching the Electron backend.
+    let mut compile_args: Vec<String> = vec!["compile".into(), "--root".into(), ws.to_string_lossy().into_owned()];
+    if ws.join("fonts").is_dir() {
+        compile_args.push("--font-path".into());
+        compile_args.push("fonts".into());
+    }
+    compile_args.push(main_path.to_string_lossy().into_owned());
+    compile_args.push(output_path.to_string_lossy().into_owned());
+    let compile_argv: Vec<&str> = compile_args.iter().map(String::as_str).collect();
+    let out = match run_cmd("typst", &compile_argv, Some(&ws), None).await {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return json_err(StatusCode::INTERNAL_SERVER_ERROR, TYPST_NOT_FOUND),
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not run typst: {e}")),
+    };
+    if out.code != Some(0) {
+        let msg = if out.stderr.is_empty() {
+            format!("typst exited with code {}", out.code.map(|c| c.to_string()).unwrap_or_else(|| "null".into()))
+        } else {
+            out.stderr
+        };
+        return json_err(StatusCode::BAD_REQUEST, msg);
+    }
+    match fs::read(&output_path) {
+        Ok(bytes) => ([(header::CONTENT_TYPE, "application/pdf")], bytes).into_response(),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn init_template(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let Some(template) = jstr(&v, "template").filter(|t| !t.is_empty()) else {
+        return json_err(StatusCode::BAD_REQUEST, "Template name required");
+    };
+    let ws = st.ws();
+    let _ = fs::remove_dir_all(&ws);
+    let out = match run_cmd("typst", &["init", template, &ws.to_string_lossy()], None, None).await {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return json_err(StatusCode::INTERNAL_SERVER_ERROR, TYPST_NOT_FOUND),
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    if out.code != Some(0) {
+        return json_err(StatusCode::BAD_REQUEST, out.stderr);
+    }
+    let files: Vec<String> = fs::read_dir(&ws)
+        .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+    // `typst init` prints the real entrypoint, e.g. `> typst watch main.typ`.
+    // Trust that over "first .typ alphabetically" so multi-file templates open the
+    // correct entry (a chapter file could otherwise sort ahead of it).
+    static ENTRY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?:watch|compile)\s+"?([^\s"]+\.typ)"#).unwrap());
+    let haystack = format!("{}\n{}", out.stdout, out.stderr);
+    let entry = ENTRY_RE
+        .captures(&haystack)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+        .filter(|e| ws.join(e).exists())
+        .or_else(|| if files.iter().any(|f| f == "main.typ") { Some("main.typ".into()) } else { files.iter().find(|f| f.ends_with(".typ")).cloned() })
+        .unwrap_or_else(|| "main.typ".into());
+    match fs::read_to_string(ws.join(&entry)) {
+        Ok(content) => Json(json!({ "code": content, "entrypoint": entry })).into_response(),
+        Err(_) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to read template files"),
+    }
+}
+
+// Compile to HTML and return it (for in-browser download).
+async fn compile_html(State(st): St, Query(q): Q) -> Response {
+    let ws = st.ws();
+    let main_q = q.get("main").map(String::as_str).unwrap_or("main.typ");
+    let Some(main_path) = safe_workspace_path(&ws, main_q) else {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid main path");
+    };
+    let out_file = ws.join(".out.html");
+    let ws_s = ws.to_string_lossy();
+    let out = match run_cmd(
+        "typst",
+        &["compile", "--root", &ws_s, "--format", "html", "--features", "html", &main_path.to_string_lossy(), &out_file.to_string_lossy()],
+        Some(&ws),
+        None,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return json_err(StatusCode::INTERNAL_SERVER_ERROR, TYPST_NOT_FOUND_SHORT),
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    if out.code != Some(0) {
+        return json_err(StatusCode::BAD_REQUEST, if out.stderr.is_empty() { "HTML export failed.".into() } else { out.stderr });
+    }
+    match fs::read(&out_file) {
+        Ok(bytes) => ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], bytes).into_response(),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// Export a single file (compiled PDF/HTML or Typst source) into a target folder.
+fn export_ext(format: &str) -> &'static str {
+    match format { "png" => "png", "svg" => "svg", "html" => "html", "typ" => "typ", _ => "pdf" }
+}
+
+// Build the typst CLI args for the requested format + the user's export options
+// (page range, PDF standard, tagging, pretty-print, PNG resolution).
+fn export_opts_args(v: &Value, format: &str) -> Vec<String> {
+    let mut a: Vec<String> = vec!["--format".into(), format.into()];
+    if format == "html" { a.push("--features".into()); a.push("html".into()); }
+    if let Some(p) = jstr(v, "pages").map(str::trim).filter(|s| !s.is_empty()) {
+        a.push("--pages".into()); a.push(p.to_string());
+    }
+    if format == "pdf" {
+        if let Some(s) = jstr(v, "pdfStandard").map(str::trim).filter(|s| !s.is_empty() && *s != "default") {
+            a.push("--pdf-standard".into()); a.push(s.to_string());
+        }
+        // Typst tags PDFs by default; the flag opts out.
+        if v.get("tagged").and_then(Value::as_bool) == Some(false) {
+            a.push("--no-pdf-tags".into());
+        }
+    }
+    if format == "png" {
+        let ppi = v.get("ppi").and_then(Value::as_f64).filter(|n| (16.0..=2400.0).contains(n)).unwrap_or(144.0);
+        a.push("--ppi".into()); a.push((ppi as u32).to_string());
+    }
+    if matches!(format, "pdf" | "svg" | "html") && v.get("pretty").and_then(Value::as_bool) == Some(true) {
+        a.push("--pretty".into());
+    }
+    a
+}
+
+// Run one typst export (input → output) with the option args applied.
+async fn run_typst_export(ws: &Path, main_abs: &Path, out_path: &Path, v: &Value, format: &str) -> Result<(), String> {
+    let ws_s = ws.to_string_lossy().into_owned();
+    let main_s = main_abs.to_string_lossy().into_owned();
+    let out_s = out_path.to_string_lossy().into_owned();
+    let opts = export_opts_args(v, format);
+    let mut args: Vec<&str> = vec!["compile", "--root", &ws_s];
+    for o in &opts { args.push(o); }
+    args.push(&main_s);
+    args.push(&out_s);
+    match run_cmd("typst", &args, Some(ws), None).await {
+        Ok(o) if o.code == Some(0) => Ok(()),
+        Ok(o) => Err(if o.stderr.is_empty() { "Compilation failed.".into() } else { o.stderr }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(TYPST_NOT_FOUND_SHORT.into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+// PNG/SVG can emit one file per page (via the `{p}` template). Count what was
+// produced; if only one page was written, drop the "-1" suffix for a clean name.
+fn collapse_pages(dir: &Path, stem: &str, ext: &str) -> (usize, String) {
+    let prefix = format!("{stem}-");
+    let suffix = format!(".{ext}");
+    let mut pages: Vec<PathBuf> = fs::read_dir(dir).into_iter().flatten().flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str())
+            .map(|n| n.starts_with(&prefix) && n.ends_with(&suffix)).unwrap_or(false))
+        .collect();
+    pages.sort();
+    if pages.len() == 1 {
+        let single = dir.join(format!("{stem}{suffix}"));
+        let _ = fs::rename(&pages[0], &single);
+        return (1, single.to_string_lossy().into_owned());
+    }
+    (pages.len(), pages.first().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default())
+}
+
+// Export directly into a caller-supplied folder (the "save to folder" path).
+// Show a file selected in Finder / Explorer, rather than opening it.
+fn reveal_in_file_manager(target: &Path) {
+    #[cfg(target_os = "macos")]
+    { let _ = std::process::Command::new("open").arg("-R").arg(target).spawn(); }
+    #[cfg(target_os = "windows")]
+    { let _ = std::process::Command::new("explorer").arg(format!("/select,{}", target.display())).spawn(); }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let dir = if target.is_dir() { target.to_path_buf() } else { target.parent().map(Path::to_path_buf).unwrap_or_else(|| target.to_path_buf()) };
+        let _ = open::that_detached(dir);
+    }
+}
+
+// "Open after export". A multi-page export reveals the file instead of opening N
+// viewer windows. So does SVG: the app registered for it is often a source editor
+// (LaTeXiT, an IDE, a text editor) rather than a renderer, and handing the user a
+// wall of XML reads like the export failed. Everything else opens normally.
+fn open_exported(target: &str, count: u64) {
+    let p = Path::new(target);
+    let is_svg = p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("svg"));
+    if count > 1 || is_svg {
+        reveal_in_file_manager(p);
+    } else {
+        let _ = open::that_detached(p);
+    }
+}
+
+fn wants_open(v: &Value) -> bool {
+    v.get("open").and_then(Value::as_bool).unwrap_or(false)
+}
+
+// Export through the OS "save file" dialog so the user picks the exact location
+// (no more silent writes to Downloads). Returns { noDialog: true } when there's
+// no desktop app handle (headless / browser dev), so the UI can fall back to a
+// plain download.
+async fn export_native(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let format = jstr(&v, "format").unwrap_or("pdf").to_string();
+    let name = jstr(&v, "name").filter(|n| !n.is_empty()).unwrap_or("document").to_string();
+    let main_file = jstr(&v, "main").filter(|m| !m.is_empty()).unwrap_or("main.typ").to_string();
+    let ws = st.ws();
+    let ext = export_ext(&format).to_string();
+
+    let Some(app) = st.app.lock().unwrap().clone() else {
+        return Json(json!({ "ok": false, "noDialog": true })).into_response();
+    };
+    let suggested = format!("{name}.{ext}");
+    let ext_up = ext.to_uppercase();
+    let ext_filter = ext.clone();
+    let chosen = tokio::task::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        app.dialog().file().set_title("Export").set_file_name(&suggested)
+            .add_filter(ext_up, &[ext_filter.as_str()]).blocking_save_file()
+    }).await.ok().flatten().and_then(|fp| fp.into_path().ok());
+    let Some(chosen) = chosen else {
+        return Json(json!({ "ok": false, "cancelled": true })).into_response();
+    };
+
+    if format == "typ" {
+        return match fs::copy(ws.join(&main_file), &chosen) {
+            Ok(_) => {
+                if wants_open(&v) { open_exported(&chosen.to_string_lossy(), 1); }
+                Json(json!({ "ok": true, "target": chosen.to_string_lossy(), "count": 1 })).into_response()
+            }
+            Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+    }
+
+    let main_abs = ws.join(&main_file);
+    let multi = matches!(format.as_str(), "png" | "svg");
+    let dir = chosen.parent().map(Path::to_path_buf).unwrap_or_else(|| ws.clone());
+    let stem = chosen.file_stem().and_then(|s| s.to_str()).unwrap_or(&name).to_string();
+    let out_path = if multi { dir.join(format!("{stem}-{{p}}.{ext}")) } else { chosen.clone() };
+    match run_typst_export(&ws, &main_abs, &out_path, &v, &format).await {
+        Ok(()) => {
+            let (count, first) = if multi { collapse_pages(&dir, &stem, &ext) }
+                else { (1, chosen.to_string_lossy().into_owned()) };
+            if wants_open(&v) { open_exported(&first, count as u64); }
+            Json(json!({ "ok": true, "target": first, "count": count })).into_response()
+        }
+        Err(msg) => json_err(StatusCode::BAD_REQUEST, msg),
+    }
+}
+
+// Export the whole project as a single .zip through the OS save dialog. Uses a
+// pure-Rust zip writer, so it behaves the same on Windows, macOS and Linux with
+// no dependency on a system `zip` binary. The file set matches cloud sync: source
+// plus assets, skipping dotfiles, node_modules, the sandbox and built PDFs.
+async fn export_project_native(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let name = jstr(&v, "name").filter(|n| !n.is_empty()).unwrap_or("project").to_string();
+    let open_after = wants_open(&v);
+    let ws = st.ws();
+
+    let Some(app) = st.app.lock().unwrap().clone() else {
+        return Json(json!({ "ok": false, "noDialog": true })).into_response();
+    };
+    let suggested = format!("{name}.zip");
+    let chosen = tokio::task::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        app.dialog().file().set_title("Export project").set_file_name(&suggested)
+            .add_filter("ZIP archive", &["zip"]).blocking_save_file()
+    }).await.ok().flatten().and_then(|fp| fp.into_path().ok());
+    let Some(chosen) = chosen else {
+        return Json(json!({ "ok": false, "cancelled": true })).into_response();
+    };
+
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    collect_workspace(&ws, "", &mut files);
+    if files.is_empty() {
+        return json_err(StatusCode::BAD_REQUEST, "The project has no files to archive.");
+    }
+
+    let target = chosen.clone();
+    let res = tokio::task::spawn_blocking(move || -> std::io::Result<usize> {
+        use std::io::Write as _;
+        use zip::write::{SimpleFileOptions, ZipWriter};
+        let f = fs::File::create(&target)?;
+        let mut zip = ZipWriter::new(f);
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let mut n = 0usize;
+        for (rel, full) in &files {
+            let Ok(bytes) = fs::read(full) else { continue };
+            zip.start_file(rel.as_str(), opts)?;
+            zip.write_all(&bytes)?;
+            n += 1;
+        }
+        zip.finish()?;
+        Ok(n)
+    }).await;
+
+    match res {
+        Ok(Ok(count)) => {
+            if open_after { reveal_in_file_manager(&chosen); }
+            Json(json!({ "ok": true, "target": chosen.to_string_lossy(), "count": count })).into_response()
+        }
+        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Typst Universe package search (index cached on disk, matched locally)
+// ---------------------------------------------------------------------------
+
+const UNIVERSE_INDEX_URL: &str = "https://packages.typst.org/preview/index.json";
+const UNIVERSE_TTL: Duration = Duration::from_secs(24 * 3600);
+
+fn universe_cache_file() -> PathBuf {
+    std::env::temp_dir().join("typst-editor-universe-index.json")
+}
+
+fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
+    let pa: Vec<i64> = a.split('.').map(|n| n.parse().unwrap_or(0)).collect();
+    let pb: Vec<i64> = b.split('.').map(|n| n.parse().unwrap_or(0)).collect();
+    for i in 0..3 {
+        let (x, y) = (*pa.get(i).unwrap_or(&0), *pb.get(i).unwrap_or(&0));
+        if x != y {
+            return x.cmp(&y);
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+async fn get_universe_index(st: &AppState) -> Option<Arc<Vec<Pkg>>> {
+    let mut guard = st.universe.lock().await;
+    if let Some((at, idx)) = guard.as_ref() {
+        if at.elapsed() < UNIVERSE_TTL {
+            return Some(idx.clone());
+        }
+    }
+    let mut raw: Option<String> = None;
+    if let Ok(resp) = st.http.get(UNIVERSE_INDEX_URL).timeout(Duration::from_secs(15)).send().await {
+        if resp.status().is_success() {
+            if let Ok(text) = resp.text().await {
+                let _ = fs::write(universe_cache_file(), &text);
+                raw = Some(text);
+            }
+        }
+    }
+    if raw.is_none() {
+        raw = fs::read_to_string(universe_cache_file()).ok();
+    }
+    let raw = match raw {
+        Some(r) => r,
+        None => return guard.as_ref().map(|(_, idx)| idx.clone()),
+    };
+    let all: Vec<Value> = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return guard.as_ref().map(|(_, idx)| idx.clone()),
+    };
+    // Keep only the latest version of each package.
+    let mut by_name: HashMap<String, Value> = HashMap::new();
+    for p in all {
+        let Some(name) = p.get("name").and_then(|n| n.as_str()).map(String::from) else { continue };
+        let ver = p.get("version").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        match by_name.get(&name) {
+            Some(cur) => {
+                let cur_v = cur.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                if cmp_version(&ver, cur_v) == std::cmp::Ordering::Greater {
+                    by_name.insert(name, p);
+                }
+            }
+            None => {
+                by_name.insert(name, p);
+            }
+        }
+    }
+    let idx = Arc::new(by_name.into_values().map(|value| {
+        let name_lc = value.get("name").and_then(|x| x.as_str()).unwrap_or("").to_lowercase();
+        let desc = value.get("description").and_then(|x| x.as_str()).unwrap_or("");
+        let keywords = value.get("keywords").and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|k| k.as_str()).collect::<Vec<_>>().join(" ")).unwrap_or_default();
+        let categories = value.get("categories").and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|k| k.as_str()).collect::<Vec<_>>().join(" ")).unwrap_or_default();
+        let hay = format!("{name_lc} {desc} {keywords} {categories}").to_lowercase();
+        Pkg { value, name_lc, hay }
+    }).collect::<Vec<_>>());
+    *guard = Some((Instant::now(), idx.clone()));
+    Some(idx)
+}
+
+async fn packages_search(State(st): St, Query(q): Q) -> Response {
+    static EMAIL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s*<[^>]*>").unwrap());
+    let query = q.get("q").map(String::as_str).unwrap_or("").to_lowercase();
+    let query = query.trim();
+    let Some(idx) = get_universe_index(&st).await else {
+        return Json(json!([])).into_response();
+    };
+    let tokens: Vec<&str> = query.split(|c: char| !c.is_ascii_alphanumeric()).filter(|t| t.len() > 1).collect();
+    let mut scored: Vec<(i64, &Value)> = Vec::new();
+    for p in idx.iter() {
+        let mut score = 0i64;
+        if tokens.is_empty() {
+            score = 1;
+        } else {
+            for t in &tokens {
+                if p.name_lc.contains(t) {
+                    score += 3;
+                } else if p.hay.contains(t) {
+                    score += 1;
+                }
+            }
+        }
+        if score > 0 {
+            scored.push((score, &p.value));
+        }
+    }
+    scored.sort_by_key(|x| std::cmp::Reverse(x.0));
+    let out: Vec<Value> = scored
+        .iter()
+        .take(15)
+        .map(|(_, p)| {
+            let authors: Vec<String> = p
+                .get("authors")
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .map(|s| EMAIL.replace_all(&s.as_str().map(String::from).unwrap_or_else(|| s.to_string()), "").trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            json!({
+                "name": p.get("name").and_then(|x| x.as_str()).unwrap_or(""),
+                "version": p.get("version").and_then(|x| x.as_str()).unwrap_or(""),
+                "description": p.get("description").and_then(|x| x.as_str()).unwrap_or(""),
+                "authors": authors,
+            })
+        })
+        .collect();
+    Json(out).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Git integration (via the local `git` CLI inside the workspace folder)
+// ---------------------------------------------------------------------------
+
+async fn git(ws: &Path, args: &[&str]) -> CmdOut {
+    match run_cmd("git", args, Some(ws), None).await {
+        Ok(o) => o,
+        Err(e) => CmdOut { code: Some(1), killed: false, stdout: String::new(), stderr: e.to_string() },
+    }
+}
+
+// Same as git(), but with a wall-clock cap for the network operations (push)
+// so a stalled connection can't leave the request hanging indefinitely.
+async fn git_timed(ws: &Path, args: &[&str], ms: u64) -> CmdOut {
+    match run_cmd("git", args, Some(ws), Some(ms)).await {
+        Ok(o) => o,
+        Err(e) => CmdOut { code: Some(1), killed: false, stdout: String::new(), stderr: e.to_string() },
+    }
+}
+
+fn is_repo(ws: &Path) -> bool {
+    ws.join(".git").exists()
+}
+
+// Drop any credentials embedded in a remote URL (https://token@host/… or
+// https://user:pass@host/…) before it's shown in the UI or logged. Only the
+// userinfo ahead of the host is touched; the path is left alone.
+fn strip_url_creds(url: &str) -> String {
+    if let Some(i) = url.find("://") {
+        let (scheme, rest) = url.split_at(i + 3);
+        let host_end = rest.find('/').unwrap_or(rest.len());
+        if let Some(at) = rest[..host_end].find('@') {
+            return format!("{scheme}{}", &rest[at + 1..]);
+        }
+    }
+    url.to_string()
+}
+
+async fn git_status(State(st): St) -> Response {
+    let ws = st.ws();
+    if !is_repo(&ws) {
+        return Json(json!({ "initialized": false })).into_response();
+    }
+    let branch = git(&ws, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+    let status = git(&ws, &["status", "--porcelain"]).await;
+    let remote = git(&ws, &["remote", "get-url", "origin"]).await;
+    let files: Vec<String> = status.stdout.split('\n').filter(|l| !l.is_empty()).map(|l| l.to_string()).collect();
+    Json(json!({
+        "initialized": true,
+        "branch": if branch.code == Some(0) { branch.stdout.trim().to_string() } else { "main".to_string() },
+        "remote": if remote.code == Some(0) { Value::String(strip_url_creds(remote.stdout.trim())) } else { Value::Null },
+        "changes": files,
+        "clean": files.is_empty(),
+    }))
+    .into_response()
+}
+
+async fn git_init_defaults(ws: &Path) {
+    let _ = git(ws, &["config", "user.name", "Typst Editor"]).await;
+    let _ = git(ws, &["config", "user.email", "typst-editor@localhost"]).await;
+}
+
+async fn git_init(State(st): St) -> Response {
+    let ws = st.ws();
+    if is_repo(&ws) {
+        return Json(json!({ "ok": true, "message": "Repository already initialized." })).into_response();
+    }
+    let init = git(&ws, &["init", "-b", "main"]).await;
+    if init.code != Some(0) {
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, if init.stderr.is_empty() { "git init failed".into() } else { init.stderr });
+    }
+    git_init_defaults(&ws).await;
+    let _ = fs::write(ws.join(".gitignore"), ".hilbert/\n*.pdf\n.DS_Store\n");
+    Json(json!({ "ok": true, "message": "Initialized empty Git repository." })).into_response()
+}
+
+async fn git_remote(State(st): St, body: Bytes) -> Response {
+    let ws = st.ws();
+    if !is_repo(&ws) {
+        return json_err(StatusCode::BAD_REQUEST, "Repository not initialized.");
+    }
+    let v = parse_json(&body);
+    let Some(url) = jstr(&v, "url").filter(|u| !u.is_empty()) else {
+        return json_err(StatusCode::BAD_REQUEST, "Repository URL required.");
+    };
+    let has = git(&ws, &["remote", "get-url", "origin"]).await;
+    let r = if has.code == Some(0) {
+        git(&ws, &["remote", "set-url", "origin", url]).await
+    } else {
+        git(&ws, &["remote", "add", "origin", url]).await
+    };
+    if r.code != Some(0) {
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, if r.stderr.is_empty() { "Failed to set remote.".into() } else { r.stderr });
+    }
+    Json(json!({ "ok": true })).into_response()
+}
+
+async fn git_commit(State(st): St, body: Bytes) -> Response {
+    let ws = st.ws();
+    if !is_repo(&ws) {
+        let init = git(&ws, &["init", "-b", "main"]).await;
+        if init.code != Some(0) {
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, init.stderr);
+        }
+        git_init_defaults(&ws).await;
+    }
+    let v = parse_json(&body);
+    let message = jstr(&v, "message").filter(|m| !m.is_empty()).unwrap_or("Update from Typst Editor");
+    let _ = git(&ws, &["add", "-A"]).await;
+    let commit = git(&ws, &["commit", "-m", message]).await;
+    if commit.code != Some(0) {
+        let msg = format!("{}{}", commit.stdout, commit.stderr).to_lowercase();
+        if msg.contains("nothing to commit") {
+            return Json(json!({ "ok": true, "message": "Nothing to commit — working tree clean." })).into_response();
+        }
+        let err = if !commit.stderr.is_empty() {
+            commit.stderr
+        } else if !commit.stdout.is_empty() {
+            commit.stdout
+        } else {
+            "Commit failed.".into()
+        };
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, err);
+    }
+    Json(json!({ "ok": true, "message": commit.stdout.trim() })).into_response()
+}
+
+async fn git_push(State(st): St, body: Bytes) -> Response {
+    let ws = st.ws();
+    if !is_repo(&ws) {
+        return json_err(StatusCode::BAD_REQUEST, "Repository not initialized.");
+    }
+    let v = parse_json(&body);
+    let url = jstr(&v, "url").unwrap_or("");
+    let token = jstr(&v, "token").unwrap_or("");
+    let branch = jstr(&v, "branch").filter(|b| !b.is_empty()).unwrap_or("main");
+
+    // Keep `origin` pointed at the clean URL — the token is never written into
+    // .git/config (the settings panel promises it isn't stored). It's injected
+    // only into the one-shot push target below.
+    if !url.is_empty() {
+        let has = git(&ws, &["remote", "get-url", "origin"]).await;
+        let set = if has.code == Some(0) {
+            git(&ws, &["remote", "set-url", "origin", url]).await
+        } else {
+            git(&ws, &["remote", "add", "origin", url]).await
+        };
+        if set.code != Some(0) {
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, set.stderr);
+        }
+    }
+
+    // Push straight to a tokened URL when we have one, so authentication works
+    // without leaving the secret behind. Otherwise fall back to `origin`.
+    let target = if !token.is_empty() && url.starts_with("https://") {
+        url.replacen("https://", &format!("https://{token}@"), 1)
+    } else if !url.is_empty() {
+        url.to_string()
+    } else {
+        "origin".to_string()
+    };
+    let refspec = format!("HEAD:{branch}");
+    let push = git_timed(&ws, &["push", &target, &refspec], 120_000).await;
+    // Scrub the token from any echoed output before returning it.
+    let scrub = |s: &str| if token.is_empty() { s.to_string() } else { s.replace(token, "***") };
+    if push.code != Some(0) {
+        let err = if push.killed {
+            "Push timed out after 120s — check your connection and token.".to_string()
+        } else if !push.stderr.is_empty() {
+            scrub(&push.stderr)
+        } else {
+            "Push failed.".to_string()
+        };
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, err);
+    }
+    let msg = if !push.stderr.is_empty() {
+        push.stderr
+    } else if !push.stdout.is_empty() {
+        push.stdout
+    } else {
+        "Pushed.".into()
+    };
+    Json(json!({ "ok": true, "message": scrub(&msg) })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Local-folder sync (works with the Google Drive Desktop synced folder)
+// ---------------------------------------------------------------------------
+
+fn copy_all(dir: &Path, ws: &Path, folder: &Path, count: &mut u64) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == ".DS_Store" || name == ".git" || name.ends_with(".pdf") {
+            continue;
+        }
+        let src = entry.path();
+        let rel = src.strip_prefix(ws).unwrap_or(&src).to_path_buf();
+        let dest = folder.join(&rel);
+        if entry.metadata()?.is_dir() {
+            fs::create_dir_all(&dest)?;
+            copy_all(&src, ws, folder, count)?;
+        } else {
+            if let Some(p) = dest.parent() {
+                fs::create_dir_all(p)?;
+            }
+            fs::copy(&src, &dest)?;
+            *count += 1;
+        }
+    }
+    Ok(())
+}
+
+async fn drive_sync(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let Some(folder) = jstr(&v, "folder").filter(|f| !f.is_empty()) else {
+        return json_err(StatusCode::BAD_REQUEST, "Target folder path required.");
+    };
+    let ws = st.ws();
+    let target = PathBuf::from(folder);
+    if let Err(e) = fs::create_dir_all(&target) {
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+    let mut count = 0u64;
+    match copy_all(&ws, &ws, &target, &mut count) {
+        Ok(_) => Json(json!({ "ok": true, "count": count, "folder": folder })).into_response(),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WebDAV sync (Nextcloud, ownCloud, any WebDAV server)
+// ---------------------------------------------------------------------------
+
+// JS encodeURIComponent keeps A-Za-z0-9 - _ . ! ~ * ' ( )
+const ENC_URI_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'!')
+    .remove(b'~')
+    .remove(b'*')
+    .remove(b'\'')
+    .remove(b'(')
+    .remove(b')');
+
+fn enc(s: &str) -> String {
+    utf8_percent_encode(s, ENC_URI_COMPONENT).to_string()
+}
+
+fn collect_workspace(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    let mut items: Vec<_> = rd.flatten().collect();
+    items.sort_by_key(|e| e.file_name());
+    for entry in items {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || name == "node_modules" || name == "sandbox" || name.ends_with(".pdf") {
+            continue;
+        }
+        let full = entry.path();
+        let rel = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+        if entry.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+            collect_workspace(&full, &rel, out);
+        } else {
+            out.push((rel, full));
+        }
+    }
+}
+
+async fn compile_to_pdf(ws: &Path, main: &Path, out: &Path) -> bool {
+    match run_cmd("typst", &["compile", "--root", &ws.to_string_lossy(), &main.to_string_lossy(), &out.to_string_lossy()], Some(ws), Some(30000)).await {
+        Ok(o) => o.code == Some(0) && out.exists(),
+        Err(_) => false,
+    }
+}
+
+async fn webdav_sync(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let Some(url) = jstr(&v, "url").filter(|u| !u.is_empty()) else {
+        return json_err(StatusCode::BAD_REQUEST, "WebDAV URL required.");
+    };
+    let username = jstr(&v, "username").unwrap_or("");
+    let password = jstr(&v, "password").unwrap_or("");
+    let project = jstr(&v, "projectName").unwrap_or("Typst Project");
+    static BAD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"[\\/:*?"<>|]+"#).unwrap());
+    let proj = {
+        let cleaned = BAD.replace_all(project, "_").trim().to_string();
+        if cleaned.is_empty() { "Typst Project".to_string() } else { cleaned }
+    };
+    let auth = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}")));
+    let root = if url.ends_with('/') { url.to_string() } else { format!("{url}/") };
+    let base = format!("{root}{}/", enc(&proj));
+    let mkcol = Method::from_bytes(b"MKCOL").unwrap();
+
+    let ws = st.ws();
+    let res: Result<(u64, String), String> = async {
+        // Create the project folder (also verifies auth early).
+        let mk = st.http.request(mkcol.clone(), &base).header("Authorization", &auth).send().await.map_err(|e| e.to_string())?;
+        if mk.status().as_u16() == 401 {
+            return Err("Authentication failed (check username / app password).".into());
+        }
+        let mut files = Vec::new();
+        collect_workspace(&ws, "", &mut files);
+        let mut made_dirs: std::collections::HashSet<String> = Default::default();
+        let mut count = 0u64;
+        let tmp = std::env::temp_dir().join(format!("typst-dav-{}", std::process::id()));
+        let _ = fs::create_dir_all(&tmp);
+
+        let put = |rel: String, bytes: Vec<u8>| {
+            let url = format!("{base}{}", rel.split('/').map(enc).collect::<Vec<_>>().join("/"));
+            let client = st.http.clone();
+            let auth = auth.clone();
+            async move {
+                let r = client.put(&url).header("Authorization", &auth).body(bytes).send().await.map_err(|e| e.to_string())?;
+                let s = r.status().as_u16();
+                if !r.status().is_success() && ![200u16, 201, 204].contains(&s) {
+                    if s == 401 {
+                        return Err("Authentication failed (check username / app password).".to_string());
+                    }
+                    return Err(format!("Upload of {rel} failed (HTTP {s})."));
+                }
+                Ok::<(), String>(())
+            }
+        };
+
+        for (rel, full) in &files {
+            // Ensure parent collections exist inside the project folder.
+            let parts: Vec<&str> = rel.split('/').collect();
+            let mut acc = String::new();
+            for part in parts.iter().take(parts.len().saturating_sub(1)) {
+                if !acc.is_empty() {
+                    acc.push('/');
+                }
+                acc.push_str(part);
+                if made_dirs.insert(acc.clone()) {
+                    let url = format!("{base}{}", acc.split('/').map(enc).collect::<Vec<_>>().join("/"));
+                    let _ = st.http.request(mkcol.clone(), &url).header("Authorization", &auth).send().await;
+                }
+            }
+            let bytes = fs::read(full).map_err(|e| e.to_string())?;
+            put(rel.clone(), bytes).await?;
+            count += 1;
+
+            // Compile .typ files to PDF and upload alongside.
+            if rel.ends_with(".typ") {
+                let out_pdf = tmp.join("out.pdf");
+                if compile_to_pdf(&ws, full, &out_pdf).await {
+                    if let Ok(bytes) = fs::read(&out_pdf) {
+                        put(rel.trim_end_matches(".typ").to_string() + ".pdf", bytes).await?;
+                        count += 1;
+                    }
+                    let _ = fs::remove_file(&out_pdf);
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(&tmp);
+        Ok((count, proj.clone()))
+    }
+    .await;
+
+    match res {
+        Ok((count, folder)) => Json(json!({ "ok": true, "count": count, "folder": folder })).into_response(),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live code execution (Python / Julia / Wolfram)
+// ---------------------------------------------------------------------------
+
+const IMAGE_EXT: [&str; 5] = [".png", ".jpg", ".jpeg", ".svg", ".gif"];
+
+// Cross-platform `which`: walk PATH ourselves. On Windows the entries are
+// separated by ';' and we try each PATHEXT extension so `which("python")`
+// matches `python.exe`; on Unix it's ':' and a bare name.
+fn which(name: &str) -> Option<String> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let exts: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".into())
+            .split(';')
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+    for dir in path.split(sep) {
+        if dir.is_empty() {
+            continue;
+        }
+        for ext in &exts {
+            let cand = Path::new(dir).join(format!("{name}{ext}"));
+            if cand.is_file() {
+                return Some(cand.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
+// Discover every interpreter we can offer (conda envs, venvs, juliaup, ...).
+fn detect_interpreters() -> Interpreters {
+    let home = dirs::home_dir().unwrap_or_default();
+    let mut out = Interpreters::default();
+
+    // Interpreter binary layout differs by OS: bin/python (Unix) vs python.exe
+    // (Windows). Returns whichever exists under an env dir.
+    let py_in = |dir: &Path| -> Option<String> {
+        let p = if cfg!(windows) { dir.join("python.exe") } else { dir.join("bin/python") };
+        if p.is_file() { Some(p.to_string_lossy().into_owned()) } else { None }
+    };
+    let first_file = |cands: &[PathBuf]| cands.iter().find(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned());
+
+    let base_py = which("python3")
+        .or_else(|| which("python"))
+        .or_else(|| if cfg!(windows) { which("py") } else { None })
+        .or_else(|| {
+            let mut cands: Vec<PathBuf> = if cfg!(windows) {
+                vec![
+                    PathBuf::from(r"C:\Python313\python.exe"),
+                    PathBuf::from(r"C:\Python312\python.exe"),
+                    PathBuf::from(r"C:\Python311\python.exe"),
+                ]
+            } else {
+                vec![
+                    home.join("miniconda3/bin/python3"),
+                    PathBuf::from("/opt/homebrew/bin/python3"),
+                    PathBuf::from("/usr/local/bin/python3"),
+                    PathBuf::from("/usr/bin/python3"),
+                ]
+            };
+            // Windows per-user installs: %LOCALAPPDATA%\Programs\Python\Python3xx\python.exe
+            if cfg!(windows) {
+                if let Ok(rd) = fs::read_dir(home.join("AppData/Local/Programs/Python")) {
+                    for e in rd.flatten() {
+                        cands.push(e.path().join("python.exe"));
+                    }
+                }
+            }
+            first_file(&cands)
+        });
+    if let Some(p) = base_py {
+        out.python.push(Interp { label: "Default (python)".into(), path: p });
+    }
+
+    // conda / mamba environments — root locations differ per platform.
+    let conda_roots: Vec<PathBuf> = if cfg!(windows) {
+        ["miniconda3", "anaconda3", "mambaforge", "miniforge3"]
+            .iter()
+            .flat_map(|r| vec![home.join(r), PathBuf::from(format!(r"C:\{r}")), PathBuf::from(format!(r"C:\ProgramData\{r}"))])
+            .collect()
+    } else {
+        ["miniconda3", "anaconda3", "mambaforge", "miniforge3"].iter().map(|r| home.join(r)).collect()
+    };
+    for root in &conda_roots {
+        let envs_dir = root.join("envs");
+        if let Ok(rd) = fs::read_dir(&envs_dir) {
+            let mut envs: Vec<_> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            envs.sort();
+            for env in envs {
+                if let Some(p) = py_in(&envs_dir.join(&env)) {
+                    out.python.push(Interp { label: format!("conda: {env}"), path: p });
+                }
+            }
+        }
+    }
+
+    let venv_dir = home.join(".virtualenvs");
+    if let Ok(rd) = fs::read_dir(&venv_dir) {
+        let mut envs: Vec<_> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        envs.sort();
+        for env in envs {
+            if let Some(p) = py_in(&venv_dir.join(&env)) {
+                out.python.push(Interp { label: format!("venv: {env}"), path: p });
+            }
+        }
+    }
+
+    let jl = which("julia").or_else(|| {
+        first_file(&if cfg!(windows) {
+            vec![home.join(".juliaup/bin/julia.exe"), home.join("AppData/Local/Programs/Julia/bin/julia.exe")]
+        } else {
+            vec![home.join(".juliaup/bin/julia"), PathBuf::from("/opt/homebrew/bin/julia"), PathBuf::from("/usr/local/bin/julia")]
+        })
+    });
+    if let Some(p) = jl {
+        out.julia.push(Interp { label: "Default (julia)".into(), path: p });
+    }
+
+    let wl = which("wolframscript").or_else(|| {
+        first_file(&if cfg!(windows) {
+            vec![PathBuf::from(r"C:\Program Files\Wolfram Research\WolframScript\wolframscript.exe")]
+        } else {
+            vec![PathBuf::from("/usr/local/bin/wolframscript"), PathBuf::from("/opt/homebrew/bin/wolframscript")]
+        })
+    });
+    if let Some(p) = wl {
+        out.wolfram.push(Interp { label: "WolframScript".into(), path: p });
+    }
+
+    out
+}
+
+async fn tools(State(st): St) -> Response {
+    Json(json!({
+        "execEnabled": st.allow_exec,
+        "interpreters": st.interpreters,
+        "available": {
+            "python": !st.interpreters.python.is_empty(),
+            "julia": !st.interpreters.julia.is_empty(),
+            "wolfram": !st.interpreters.wolfram.is_empty(),
+        }
+    }))
+    .into_response()
+}
+
+fn ext_for(lang: &str) -> Option<&'static str> {
+    match lang {
+        "python" => Some("py"),
+        "julia" => Some("jl"),
+        "wolfram" => Some("wls"),
+        _ => None,
+    }
+}
+
+// Auto-convert a result to LaTeX so users write plain maths and still get a
+// typeset equation — without writing TeXForm / latex() themselves.
+fn wrap_for_equation(lang: &str, code: &str) -> String {
+    let lines: Vec<&str> = code
+        .split('\n')
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("//"))
+        .collect();
+    if lines.is_empty() {
+        return code.to_string();
+    }
+    match lang {
+        "wolfram" => format!("Print[ToString[TeXForm[(\n{}\n)]]]", lines.join(";\n")),
+        "python" => {
+            let last = lines[lines.len() - 1];
+            let setup = lines[..lines.len() - 1].join("\n");
+            format!("from sympy import *\nx, y, z, t, n, k, a, b, c = symbols('x y z t n k a b c')\n{setup}\nprint(latex({last}))")
+        }
+        "julia" => {
+            let last = lines[lines.len() - 1];
+            let setup = lines[..lines.len() - 1].join("\n");
+            format!("using Latexify\n{setup}\nprint(latexify({last}))")
+        }
+        _ => code.to_string(),
+    }
+}
+
+// Extra safety layer: refuse code that does process spawning, networking, shell
+// access or destructive file ops. Heuristic, NOT a real sandbox.
+static DENY_COMMON: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    [
+        // process / shell / dynamic-exec
+        r"\bsubprocess\b", r"\bos\.system\b", r"\bos\.popen\b", r"(?i)\bpopen\b",
+        r"\bos\.fork\b", r"\bos\.exec\w*", r"\bos\.spawn\w*", r"\bposix_spawn\b",
+        r"\bmultiprocessing\b", r"\bpty\b", r"\bcommands\b",
+        r"\beval\s*\(", r"\bexec\s*\(", r"\bcompile\s*\(", r"\b__import__\b",
+        r"\bimportlib\b", r"\bmarshal\b",
+        // networking
+        r"\bsocket\b", r"\brequests\b", r"\burllib\b", r"\bhttpx\b", r"\baiohttp\b",
+        r"\bhttp\.client\b", r"\bsmtplib\b", r"\bftplib\b", r"\btelnetlib\b",
+        r"\bxmlrpc\b", r"\bsocketserver\b", r"\bwebbrowser\b", r"\bparamiko\b",
+        // filesystem: destructive, escaping cwd, or environment tampering
+        r"\bshutil\b", r"\bos\.remove\b", r"\bos\.unlink\b", r"\.unlink\s*\(",
+        r"\brmtree\b", r"\bos\.rmdir\b", r"\bos\.rename\b", r"\bos\.replace\b",
+        r"\bos\.chdir\b", r"\bos\.chmod\b", r"\bos\.chown\b", r"\bos\.truncate\b",
+        r"\bos\.environ\b", r"\bos\.putenv\b", r"\bpickle\b", r"\bctypes\b",
+        r#"open\s*\(\s*[rbfu]*['"]\s*(/|~|\.\.)"#,
+    ]
+    .iter()
+    .map(|p| Regex::new(p).unwrap())
+    .collect()
+});
+static DENY_JULIA: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    [
+        r"\brun\s*\(", r"\bdownload\s*\(", r"\bSys\.\w", r"\bccall\b", r"\bpipeline\s*\(",
+        r"\bopen\s*\(`", r"\brm\s*\(", r"\bmv\s*\(", r"\bcp\s*\(", r"\bcd\s*\(",
+        r"\btouch\s*\(", r"\bchmod\s*\(", r"\bchown\s*\(", r"\bsymlink\s*\(",
+        r"\binclude\s*\(", r"\bevalfile\b", r"\bLibdl\b", r"\bLibc\b", r"\bunsafe_\w",
+        r"\bPkg\.", r"\bHTTP\.", r"\bSockets\b", r"\bDistributed\b", r"\baddprocs\b",
+        r#"open\s*\(\s*"\s*(/|~|\.\.)"#,
+    ]
+        .iter()
+        .map(|p| Regex::new(p).unwrap())
+        .collect()
+});
+static DENY_WOLFRAM: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    [
+        r"\bRun\s*\[", r"\bRunProcess\s*\[", r"\bStartProcess\s*\[", r"\bDeleteFile\s*\[",
+        r"\bDeleteDirectory\s*\[", r"\bURL(Fetch|Read|Submit|Save|Download|Execute)\s*\[",
+        r"\bSystemOpen\s*\[", r"\bCreateFile\s*\[", r#"(?i)\bImport\s*\[\s*"https?:"#,
+        r"\bExternalEvaluate\s*\[", r"\bStartExternalSession\s*\[", r"\bLibraryFunctionLoad\s*\[",
+        r"\bInstall\s*\[", r"\bDumpSave\s*\[", r"\bOpenWrite\s*\[", r"\bOpenAppend\s*\[",
+        r"\bSendMail\s*\[", r"\bCloudDeploy\s*\[", r"\bDeleteObject\s*\[",
+    ]
+    .iter()
+    .map(|p| Regex::new(p).unwrap())
+    .collect()
+});
+
+static DENY_NONE: LazyLock<Vec<Regex>> = LazyLock::new(Vec::new);
+
+fn screen_code(lang: &str, code: &str) -> Option<String> {
+    let extra: &Vec<Regex> = match lang {
+        "julia" => &DENY_JULIA,
+        "wolfram" => &DENY_WOLFRAM,
+        _ => &DENY_NONE,
+    };
+    for re in DENY_COMMON.iter().chain(extra.iter()) {
+        if let Some(m) = re.find(code) {
+            return Some(m.as_str().to_string());
+        }
+    }
+    None
+}
+
+fn image_stats(dir: &Path) -> HashMap<String, f64> {
+    let mut m = HashMap::new();
+    let Ok(rd) = fs::read_dir(dir) else { return m };
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let lower = name.to_lowercase();
+        if !IMAGE_EXT.iter().any(|e| lower.ends_with(e)) {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(t) = meta.modified() {
+                m.insert(name, epoch_ms(t));
+            }
+        }
+    }
+    m
+}
+
+// Reserved per-workspace scratch dir. Compile output and code-exec scratch live
+// here (hidden, since it's a dotfile), so they never clutter the user's files —
+// and it's the future home for per-workspace settings and logs.
+fn hilbert_dir(ws: &Path) -> PathBuf { ws.join(".hilbert") }
+fn hilbert_run(ws: &Path) -> PathBuf { hilbert_dir(ws).join("run") }
+
+// Python/Julia logos used to badge code blocks in the compiled PDF. Written into
+// the (hidden) .hilbert dir so a document's `#image(".hilbert/logos/…")` show
+// rule always resolves, and they never clutter the user's files.
+const PY_LOGO_SVG: &str = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><path fill='#3776AB' d='M15.9 2C9 2 9.5 5 9.5 5v3.1h6.6v.9H6.9S2.5 8.6 2.5 15.9c0 7.4 3.8 7.1 3.8 7.1h2.3v-3.3s-.1-3.9 3.8-3.9h6.5s3.7.1 3.7-3.6V6.2S24 2 15.9 2zM12.2 4.1c.6 0 1.1.5 1.1 1.1s-.5 1.1-1.1 1.1-1.1-.5-1.1-1.1.5-1.1 1.1-1.1z'/><path fill='#FFD43B' d='M16.1 30c6.9 0 6.4-3 6.4-3v-3.1h-6.6v-.9h9.2s4.4.5 4.4-7.1c0-7.3-3.8-7.1-3.8-7.1h-2.3v3.3s.1 3.9-3.8 3.9h-6.5s-3.7-.1-3.7 3.6v6.1S8 30 16.1 30zm3.7-2.1c-.6 0-1.1-.5-1.1-1.1s.5-1.1 1.1-1.1 1.1.5 1.1 1.1-.5 1.1-1.1 1.1z'/></svg>";
+const JL_LOGO_SVG: &str = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='10' cy='22' r='5.5' fill='#389826'/><circle cx='22' cy='22' r='5.5' fill='#9558B2'/><circle cx='16' cy='9' r='5.5' fill='#CB3C33'/></svg>";
+
+// Ensure the scratch dir exists, drop the legacy root out.pdf, and make sure the
+// code-block logos are present so a compile referencing them never fails.
+fn ensure_hilbert(ws: &Path) {
+    let _ = fs::create_dir_all(hilbert_run(ws));
+    let legacy = ws.join("out.pdf");
+    if legacy.exists() { let _ = fs::remove_file(&legacy); }
+    let logos = hilbert_dir(ws).join("logos");
+    let _ = fs::create_dir_all(&logos);
+    let py = logos.join("python.svg");
+    if !py.exists() { let _ = fs::write(&py, PY_LOGO_SVG); }
+    let jl = logos.join("julia.svg");
+    if !jl.exists() { let _ = fs::write(&jl, JL_LOGO_SVG); }
+}
+
+// Move freshly-produced plot images out of the ephemeral run dir into a visible,
+// persistent assets/ folder. A document that embeds a plot references it, so it
+// must survive the scratch dir being swept — assets/ is the right home for it.
+// Returns the workspace-relative paths to reference from the document.
+fn promote_images(ws: &Path, run_dir: &Path, names: &[String]) -> Vec<String> {
+    if names.is_empty() { return Vec::new(); }
+    let assets = ws.join("assets");
+    let _ = fs::create_dir_all(&assets);
+    let mut out = Vec::new();
+    for name in names {
+        let from = run_dir.join(name);
+        let to = assets.join(name);
+        // rename is atomic within one filesystem; fall back to copy+remove.
+        if fs::rename(&from, &to).is_ok()
+            || (fs::copy(&from, &to).is_ok() && { let _ = fs::remove_file(&from); true })
+        {
+            out.push(format!("assets/{name}"));
+        } else if from.exists() {
+            out.push(format!(".hilbert/run/{name}"));
+        }
+    }
+    out.sort();
+    out
+}
+
+async fn run_code(State(st): St, body: Bytes) -> Response {
+    static CONNECTING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Connecting….*?\n").unwrap());
+    if !st.allow_exec {
+        return json_err(StatusCode::FORBIDDEN, "Code execution is disabled on this server (ALLOW_CODE_EXECUTION=0).");
+    }
+    let v = parse_json(&body);
+    let lang = jstr(&v, "lang").unwrap_or("");
+    let mut code = jstr(&v, "code").unwrap_or("").to_string();
+    let bin = jstr(&v, "bin").unwrap_or("");
+    let output_mode = jstr(&v, "outputMode").unwrap_or("");
+    let Some(ext) = ext_for(lang) else {
+        return json_err(StatusCode::BAD_REQUEST, "Valid lang and code are required.");
+    };
+    if code.is_empty() {
+        return json_err(StatusCode::BAD_REQUEST, "Valid lang and code are required.");
+    }
+
+    if let Some(blocked) = screen_code(lang, &code) {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            format!("Blocked for safety: code uses \"{blocked}\" (process/network/filesystem access is not allowed). Disable this check only if you trust the code."),
+        );
+    }
+
+    if output_mode == "equation" {
+        code = wrap_for_equation(lang, &code);
+    }
+
+    // Pick the interpreter: an explicit path if it is one we detected, else the default.
+    let options = st.interpreters.for_lang(lang);
+    let Some(chosen) = options.iter().find(|o| o.path == bin).or_else(|| options.first()) else {
+        return json_err(StatusCode::BAD_REQUEST, format!("{lang} is not available on this system."));
+    };
+
+    let ws = st.ws();
+    let sandbox = hilbert_run(&ws);
+    let _ = fs::create_dir_all(&sandbox);
+    let script_name = format!("_run.{ext}");
+    let script_path = sandbox.join(&script_name);
+
+    let before = image_stats(&sandbox);
+    if fs::write(&script_path, &code).is_err() {
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, "Could not write script.");
+    }
+
+    // Julia: skip the user's startup.jl and stay quiet — noticeably snappier.
+    let args: Vec<&str> = match lang {
+        "wolfram" => vec!["-file", &script_name],
+        "julia" => vec!["--startup-file=no", "-q", &script_name],
+        _ => vec![&script_name],
+    };
+    let out = match run_exec_cmd(&chosen.path, &args, Some(&sandbox), Some(st.exec_timeout_ms)).await {
+        Ok(o) => o,
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start {lang}: {e}")),
+    };
+
+    // New OR rewritten images become persistent assets/ files (see promote_images).
+    let after = image_stats(&sandbox);
+    let changed: Vec<String> = after
+        .iter()
+        .filter(|(f, t)| before.get(*f).map(|old| old != *t).unwrap_or(true))
+        .map(|(f, _)| f.clone())
+        .collect();
+    let images = promote_images(&ws, &sandbox, &changed);
+
+    Json(json!({
+        "ok": out.code == Some(0) && !out.killed,
+        "exitCode": out.code,
+        "timedOut": out.killed,
+        "interpreter": chosen.label,
+        "stdout": out.stdout,
+        "stderr": CONNECTING.replace_all(&out.stderr, "").into_owned(),
+        "images": images,
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Notebook execution — run a document's code chunks in ONE persistent session
+// per language, so variables carry from chunk to chunk (Jupyter-style). Idea
+// borrowed from calepin: a single interpreter process executes every chunk in a
+// shared namespace, and each chunk's result is framed with a random sentinel so
+// the combined output can be split back apart. Nothing stays resident between
+// runs — the process lives only for the length of one run.
+// ---------------------------------------------------------------------------
+
+const NB_PY: &str = r#"import sys, io, os, base64, traceback, ast
+os.environ.setdefault("MPLBACKEND", "Agg")
+SEP = "__SEP__"; SENT = "__SENT__"
+src = open("nb_cells.txt", encoding="utf-8").read()
+cells = src.split("\n" + SEP + "\n") if src else []
+g = {"__name__": "__main__"}
+real = sys.__stdout__
+def _pngs(): return {f: os.path.getmtime(f) for f in os.listdir(".") if f.lower().endswith(".png")}
+def _b(s): return base64.b64encode(s.encode("utf-8")).decode("ascii")
+for i, code in enumerate(cells):
+    before = _pngs(); buf = io.StringIO(); old = sys.stdout; sys.stdout = buf; err = ""
+    try:
+        tree = ast.parse(code)
+        if tree.body and isinstance(tree.body[-1], ast.Expr):
+            last = tree.body.pop()
+            exec(compile(tree, "<cell>", "exec"), g)
+            val = eval(compile(ast.Expression(last.value), "<cell>", "eval"), g)
+            if val is not None: print(repr(val))
+        else:
+            exec(compile(code, "<cell>", "exec"), g)
+    except SystemExit:
+        pass
+    except BaseException:
+        err = traceback.format_exc()
+    finally:
+        sys.stdout = old
+    imgs = []
+    try:
+        import matplotlib.pyplot as plt
+        if plt.get_fignums():
+            p = "nb_cell%d.png" % i; plt.gcf().savefig(p, dpi=130, bbox_inches="tight"); plt.close("all"); imgs.append(p)
+    except Exception:
+        pass
+    after = _pngs()
+    for f in sorted(after):
+        if f not in imgs and (f not in before or after[f] != before[f]): imgs.append(f)
+    real.write("%s\t%d\t%s\t%s\t%s\n" % (SENT, i, _b(buf.getvalue()), _b(err), ",".join(imgs))); real.flush()
+"#;
+
+const NB_JL: &str = r#"using Base64
+SEP = "__SEP__"; SENT = "__SENT__"
+src = read("nb_cells.txt", String)
+cells = isempty(src) ? String[] : split(src, "\n" * SEP * "\n")
+real = stdout
+pngs() = Dict(f => mtime(f) for f in filter(x->endswith(lowercase(x), ".png"), readdir(".")))
+for (idx, code) in enumerate(cells)
+    i = idx - 1
+    before = pngs()
+    outfile = "nb_out_$i.txt"
+    err = ""
+    open(outfile, "w") do io
+        redirect_stdout(io) do
+            try
+                val = include_string(Main, code, "cell_$i")
+                # Echo the last expression's value, IJulia-style, unless the cell
+                # ends with ';' or the value is nothing.
+                if val !== nothing && !endswith(rstrip(code), ";")
+                    # invokelatest: the cell may have just `using`-ed a package
+                    # (e.g. Plots), defining methods in a newer world age. This
+                    # loop body runs at the world captured before that, so calling
+                    # show()/showable() directly would hit "method too new" world-age
+                    # errors — invokelatest runs them in the current world instead.
+                    # A displayable value (a plot) is written to a PNG so the
+                    # notebook shows it as an image; anything else echoes as text.
+                    if Base.invokelatest(showable, "image/png", val)
+                        open("nb_plot_$i.png", "w") do pio
+                            Base.invokelatest(show, pio, "image/png", val)
+                        end
+                    else
+                        Base.invokelatest(show, stdout, "text/plain", val); println(stdout)
+                    end
+                end
+            catch e
+                err = sprint(showerror, e)
+            end
+        end
+    end
+    out = read(outfile, String)
+    rm(outfile, force=true)
+    after = pngs()
+    imgs = sort([f for f in keys(after) if !haskey(before, f) || after[f] != before[f]])
+    println(real, join([SENT, string(i), base64encode(out), base64encode(err), join(imgs, ",")], "\t"))
+    flush(real)
+end
+"#;
+
+async fn notebook_run(State(st): St, body: Bytes) -> Response {
+    if !st.allow_exec {
+        return json_err(StatusCode::FORBIDDEN, "Code execution is disabled on this server (ALLOW_CODE_EXECUTION=0).");
+    }
+    let v = parse_json(&body);
+    let lang = jstr(&v, "lang").unwrap_or("");
+    let bin = jstr(&v, "bin").unwrap_or("");
+    if lang != "python" && lang != "julia" {
+        return json_err(StatusCode::BAD_REQUEST, "Notebook run supports only python and julia.");
+    }
+    let cells: Vec<String> = v.get("cells").and_then(|c| c.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    if cells.is_empty() {
+        return json_err(StatusCode::BAD_REQUEST, "No code cells to run.");
+    }
+    // Same heuristic safety screen as the one-shot runner, per cell.
+    for (i, c) in cells.iter().enumerate() {
+        if let Some(blocked) = screen_code(lang, c) {
+            return json_err(StatusCode::BAD_REQUEST, format!("Cell {} blocked for safety: code uses \"{}\" (process/network/filesystem access is not allowed).", i + 1, blocked));
+        }
+    }
+    let options = st.interpreters.for_lang(lang);
+    let Some(chosen) = options.iter().find(|o| o.path == bin).or_else(|| options.first()) else {
+        return json_err(StatusCode::BAD_REQUEST, format!("{lang} is not available on this system."));
+    };
+
+    let ws = st.ws();
+    let sandbox = hilbert_run(&ws);
+    let _ = fs::create_dir_all(&sandbox);
+
+    // Random sentinel + separator so user output can never be mistaken for framing.
+    let tag = format!("{:x}{:x}", std::process::id(), epoch_ms(SystemTime::now()) as u64);
+    let sep = format!("<<<CELL {tag}>>>");
+    let sent = format!("@@NB{tag}@@");
+
+    let joined = cells.join(&format!("\n{sep}\n"));
+    if fs::write(sandbox.join("nb_cells.txt"), joined).is_err() {
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, "Could not stage notebook cells.");
+    }
+    let (script_name, harness) = match lang {
+        "julia" => ("_nb.jl", NB_JL),
+        _ => ("_nb.py", NB_PY),
+    };
+    let script = harness.replace("__SEP__", &sep).replace("__SENT__", &sent);
+    if fs::write(sandbox.join(script_name), script).is_err() {
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, "Could not write notebook harness.");
+    }
+
+    let args: Vec<&str> = match lang {
+        "julia" => vec!["--startup-file=no", "-q", script_name],
+        _ => vec![script_name],
+    };
+    // One process runs every cell, so give it room proportional to cell count.
+    let timeout = st.exec_timeout_ms.saturating_mul(cells.len() as u64).min(600_000);
+    let out = match run_exec_cmd(&chosen.path, &args, Some(&sandbox), Some(timeout)).await {
+        Ok(o) => o,
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start {lang}: {e}")),
+    };
+
+    // Split the sentinel-framed lines into per-cell results.
+    let mut results: Vec<Value> = (0..cells.len())
+        .map(|_| json!({ "stdout": "", "error": "Cell did not run (the session ended before reaching it).", "images": [] }))
+        .collect();
+    let dec = |s: &str| -> String {
+        base64::engine::general_purpose::STANDARD.decode(s).ok().and_then(|b| String::from_utf8(b).ok()).unwrap_or_default()
+    };
+    let prefix = format!("{sent}\t");
+    for line in out.stdout.lines() {
+        let Some(rest) = line.strip_prefix(&prefix) else { continue };
+        let parts: Vec<&str> = rest.splitn(4, '\t').collect();
+        if parts.len() < 4 { continue; }
+        let Ok(idx) = parts[0].parse::<usize>() else { continue };
+        if idx >= results.len() { continue; }
+        let names: Vec<String> = parts[3].split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+        let imgs = promote_images(&ws, &sandbox, &names);
+        results[idx] = json!({ "stdout": dec(parts[1]), "error": dec(parts[2]), "images": imgs });
+    }
+
+    let any_sentinel = out.stdout.contains(&sent);
+    Json(json!({
+        "ok": out.code == Some(0) && !out.killed && any_sentinel,
+        "timedOut": out.killed,
+        "interpreter": chosen.label,
+        "results": results,
+        "stderr": if any_sentinel { String::new() } else { out.stderr },
+    })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Template preview (one page, cached on disk)
+// ---------------------------------------------------------------------------
+
+async fn template_preview(State(st): St, Query(q): Q) -> Response {
+    static NAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[\w-]+$").unwrap());
+    static VER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[\w.]*$").unwrap());
+    let name = q.get("name").map(String::as_str).unwrap_or("");
+    let version = q.get("version").map(String::as_str).unwrap_or("");
+    if !NAME_RE.is_match(name) {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid template name.");
+    }
+    if !VER_RE.is_match(version) {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid template version.");
+    }
+    let ws = st.ws();
+    let cache_dir = ws.join(".previews");
+    let _ = fs::create_dir_all(&cache_dir);
+    let cached = cache_dir.join(format!("{name}-{}.png", if version.is_empty() { "latest" } else { version }));
+    if cached.exists() {
+        if let Ok(bytes) = fs::read(&cached) {
+            return ([(header::CONTENT_TYPE, "image/png")], bytes).into_response();
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!("typst-tpl-{}-{}", std::process::id(), name));
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::create_dir_all(&dir);
+    let target = dir.join("t");
+    let spec = if version.is_empty() { format!("@preview/{name}") } else { format!("@preview/{name}:{version}") };
+    let cleanup = |dir: &Path| {
+        let _ = fs::remove_dir_all(dir);
+    };
+
+    let init = match run_cmd("typst", &["init", &spec, &target.to_string_lossy()], None, Some(45000)).await {
+        Ok(o) => o,
+        Err(_) => {
+            cleanup(&dir);
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, "typst not found");
+        }
+    };
+    if init.code != Some(0) {
+        cleanup(&dir);
+        return json_err(StatusCode::BAD_REQUEST, "Could not scaffold template.");
+    }
+    let files: Vec<String> = match fs::read_dir(&target) {
+        Ok(rd) => rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect(),
+        Err(_) => {
+            cleanup(&dir);
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, "No template files.");
+        }
+    };
+    let main = files
+        .iter()
+        .find(|f| f.eq_ignore_ascii_case("main.typ"))
+        .or_else(|| files.iter().find(|f| f.ends_with(".typ")))
+        .cloned();
+    let Some(main) = main else {
+        cleanup(&dir);
+        return json_err(StatusCode::BAD_REQUEST, "No .typ entry point.");
+    };
+    let out = target.join("preview.png");
+    let comp = run_cmd(
+        "typst",
+        &["compile", "--format", "png", "--pages", "1", &target.join(&main).to_string_lossy(), &out.to_string_lossy()],
+        Some(&target),
+        Some(45000),
+    )
+    .await;
+    let ok = matches!(comp, Ok(ref o) if o.code == Some(0)) && out.exists();
+    if !ok {
+        cleanup(&dir);
+        return json_err(StatusCode::BAD_REQUEST, "Could not render preview.");
+    }
+    let bytes = fs::read(&out).unwrap_or_default();
+    let _ = fs::write(&cached, &bytes);
+    cleanup(&dir);
+    ([(header::CONTENT_TYPE, "image/png")], bytes).into_response()
+}
+
+// Render page 1 of an app-bundled starter template to a PNG, so the New-from-
+// Template dialog can preview the built-ins the same way it previews Universe
+// ones. The template's files ride along in the request (they live in the
+// frontend), get written to a throwaway temp dir, and are compiled there —
+// never in the user's workspace. Cached by a hash of the entry content so
+// re-selecting a template is instant.
+async fn builtin_preview(body: Bytes) -> Response {
+    use std::hash::{Hash, Hasher};
+    let v = parse_json(&body);
+    let Some(entry) = jstr(&v, "entry").filter(|e| !e.is_empty()) else {
+        return json_err(StatusCode::BAD_REQUEST, "entry required");
+    };
+    let Some(files) = v.get("files").and_then(|f| f.as_array()) else {
+        return json_err(StatusCode::BAD_REQUEST, "files required");
+    };
+    let entry_content = files
+        .iter()
+        .find(|f| f.get("path").and_then(|x| x.as_str()) == Some(entry))
+        .and_then(|f| f.get("content").and_then(|x| x.as_str()))
+        .unwrap_or("");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    entry_content.hash(&mut hasher);
+    let key = format!("{:x}", hasher.finish());
+
+    let cache_dir = std::env::temp_dir().join("typst-editor-builtin-previews");
+    let _ = fs::create_dir_all(&cache_dir);
+    let cached = cache_dir.join(format!("{key}.png"));
+    if let Ok(bytes) = fs::read(&cached) {
+        return ([(header::CONTENT_TYPE, "image/png")], bytes).into_response();
+    }
+
+    let dir = std::env::temp_dir().join(format!("typst-editor-bp-{}-{key}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::create_dir_all(&dir);
+    for f in files {
+        let (Some(p), Some(c)) = (
+            f.get("path").and_then(|x| x.as_str()),
+            f.get("content").and_then(|x| x.as_str()),
+        ) else { continue };
+        let Some(full) = safe_workspace_path(&dir, p) else { continue };
+        if let Some(parent) = full.parent() { let _ = fs::create_dir_all(parent); }
+        let _ = fs::write(&full, c);
+    }
+    let Some(entry_path) = safe_workspace_path(&dir, entry) else {
+        let _ = fs::remove_dir_all(&dir);
+        return json_err(StatusCode::BAD_REQUEST, "bad entry path");
+    };
+    let out = dir.join("preview.png");
+    let comp = run_cmd(
+        "typst",
+        &["compile", "--root", &dir.to_string_lossy(), "--format", "png", "--pages", "1", &entry_path.to_string_lossy(), &out.to_string_lossy()],
+        Some(&dir),
+        Some(45000),
+    )
+    .await;
+    let ok = matches!(comp, Ok(ref o) if o.code == Some(0)) && out.exists();
+    if !ok {
+        let _ = fs::remove_dir_all(&dir);
+        return json_err(StatusCode::BAD_REQUEST, "Could not render preview.");
+    }
+    let bytes = fs::read(&out).unwrap_or_default();
+    let _ = fs::write(&cached, &bytes);
+    let _ = fs::remove_dir_all(&dir);
+    ([(header::CONTENT_TYPE, "image/png")], bytes).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Typst package cache — list installed, download, remove
+// ---------------------------------------------------------------------------
+
+fn typst_cache_dir() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("TYPST_PACKAGE_CACHE_PATH") {
+        let dir = Path::new(&p).join("preview");
+        let _ = fs::create_dir_all(&dir);
+        return Some(dir);
+    }
+    let home = dirs::home_dir()?;
+    [home.join("Library/Caches/typst/packages/preview"), home.join(".cache/typst/packages/preview")]
+        .into_iter()
+        .find(|p| p.exists())
+}
+
+async fn packages_installed(State(_st): St) -> Response {
+    static DESC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"description\s*=\s*"([^"]*)""#).unwrap());
+    static AUTH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"authors\s*=\s*\[([^\]]*)\]").unwrap());
+    let Some(dir) = typst_cache_dir() else {
+        return Json(json!([])).into_response();
+    };
+    let mut out: Vec<(String, String, String, Vec<String>)> = Vec::new();
+    let Ok(rd) = fs::read_dir(&dir) else { return Json(json!([])).into_response() };
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let nd = entry.path();
+        if !nd.is_dir() {
+            continue;
+        }
+        let Ok(vd) = fs::read_dir(&nd) else { continue };
+        for ver in vd.flatten() {
+            let version = ver.file_name().to_string_lossy().into_owned();
+            let mut description = String::new();
+            let mut authors: Vec<String> = Vec::new();
+            if let Ok(toml) = fs::read_to_string(nd.join(&version).join("typst.toml")) {
+                if let Some(c) = DESC_RE.captures(&toml) {
+                    description = c[1].to_string();
+                }
+                if let Some(c) = AUTH_RE.captures(&toml) {
+                    authors = c[1]
+                        .split(',')
+                        .map(|s| s.chars().filter(|ch| *ch != '"' && !ch.is_whitespace()).collect::<String>())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+            }
+            out.push((name.clone(), version, description, authors));
+        }
+    }
+    out.sort_by(|a, b| if a.0 == b.0 { b.1.cmp(&a.1) } else { a.0.cmp(&b.0) });
+    let arr: Vec<Value> = out
+        .into_iter()
+        .map(|(name, version, description, authors)| json!({ "name": name, "version": version, "description": description, "authors": authors }))
+        .collect();
+    Json(arr).into_response()
+}
+
+static PKG_NAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[\w-]+$").unwrap());
+static PKG_VER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[\w.]+$").unwrap());
+
+async fn packages_download(State(_st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let name = jstr(&v, "name").unwrap_or("");
+    let version = jstr(&v, "version").unwrap_or("");
+    if !PKG_NAME_RE.is_match(name) || !PKG_VER_RE.is_match(version) {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid package name/version.");
+    }
+    let dir = std::env::temp_dir().join(format!("typst-pkg-{}-{name}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::create_dir_all(&dir);
+    let file = dir.join("t.typ");
+    let _ = fs::write(&file, format!("#import \"@preview/{name}:{version}\"\n"));
+    let out = run_cmd("typst", &["compile", &file.to_string_lossy(), &dir.join("o.pdf").to_string_lossy()], None, None).await;
+    let err = match &out {
+        Ok(o) => o.stderr.clone(),
+        Err(e) => e.to_string(),
+    };
+    let _ = fs::remove_dir_all(&dir);
+    // Typst fetches the package before evaluating, so it's cached even if the
+    // bare import errors — verify by looking in the cache.
+    let installed = typst_cache_dir().map(|c| c.join(name).join(version).exists()).unwrap_or(false);
+    if installed {
+        Json(json!({ "ok": true })).into_response()
+    } else {
+        let first = err.lines().next().unwrap_or("").to_string();
+        json_err(StatusCode::BAD_REQUEST, if first.is_empty() { "Could not download package.".into() } else { first })
+    }
+}
+
+async fn packages_remove(State(_st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let name = jstr(&v, "name").unwrap_or("");
+    let version = jstr(&v, "version").unwrap_or("");
+    if !PKG_NAME_RE.is_match(name) || !PKG_VER_RE.is_match(version) {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid package name/version.");
+    }
+    let Some(dir) = typst_cache_dir() else {
+        return json_err(StatusCode::BAD_REQUEST, "No package cache found.");
+    };
+    let target = lexical_resolve(&dir, &format!("{name}/{version}"));
+    if !target.starts_with(&dir) || target == dir {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid path.");
+    }
+    if !target.exists() {
+        return json_err(StatusCode::NOT_FOUND, "Not installed.");
+    }
+    match fs::remove_dir_all(&target) {
+        Ok(_) => {
+            let name_dir = dir.join(name);
+            if fs::read_dir(&name_dir).map(|mut rd| rd.next().is_none()).unwrap_or(false) {
+                let _ = fs::remove_dir_all(&name_dir);
+            }
+            Json(json!({ "ok": true })).into_response()
+        }
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bibliography lookup — DOI or arXiv id → BibTeX
+// ---------------------------------------------------------------------------
+
+fn unesc(s: &str) -> String {
+    static WS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
+    let s = s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'");
+    WS.replace_all(&s, " ").trim().to_string()
+}
+
+fn cite_key(author: &str, year: &str) -> String {
+    let author = if author.is_empty() { "ref" } else { author };
+    let first = author.split(" and ").next().unwrap_or("ref");
+    let first = first.split(',').next().unwrap_or("ref").trim();
+    let last = first.split_whitespace().last().unwrap_or("ref");
+    let clean: String = last.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    format!("{}{year}", if clean.is_empty() { "ref".to_string() } else { clean.to_lowercase() })
+}
+
+fn arxiv_to_bibtex(xml: &str, id: &str) -> Option<(String, String)> {
+    static ENTRY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<entry>(.*?)</entry>").unwrap());
+    static TITLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<title>(.*?)</title>").unwrap());
+    static NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<name>(.*?)</name>").unwrap());
+    static PUBLISHED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<published>(\d{4})").unwrap());
+    static DOI: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<arxiv:doi[^>]*>(.*?)</arxiv:doi>").unwrap());
+    static VER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"v\d+$").unwrap());
+    let entry = ENTRY.captures(xml)?.get(1)?.as_str();
+    let title = unesc(TITLE.captures(entry).and_then(|c| c.get(1)).map(|m| m.as_str()).unwrap_or(""));
+    let authors: Vec<String> = NAME.captures_iter(entry).filter_map(|c| c.get(1)).map(|m| unesc(m.as_str())).collect();
+    let year = PUBLISHED.captures(entry).and_then(|c| c.get(1)).map(|m| m.as_str()).unwrap_or("").to_string();
+    let doi = unesc(DOI.captures(entry).and_then(|c| c.get(1)).map(|m| m.as_str()).unwrap_or(""));
+    let clean_id = VER.replace(id, "").into_owned();
+    let key = cite_key(authors.first().map(String::as_str).unwrap_or(""), &year);
+    let mut fields = vec![
+        format!("  title = {{{title}}}"),
+        format!("  author = {{{}}}", authors.join(" and ")),
+        format!("  year = {{{year}}}"),
+        format!("  eprint = {{{id}}}"),
+        "  archivePrefix = {arXiv}".to_string(),
+    ];
+    if !doi.is_empty() {
+        fields.push(format!("  doi = {{{doi}}}"));
+    }
+    fields.push(format!("  url = {{https://arxiv.org/abs/{clean_id}}}"));
+    let bibtex = format!("@article{{{key},\n{},\n}}\n", fields.join(",\n"));
+    Some((key, bibtex))
+}
+
+async fn bib_fetch(State(st): St, body: Bytes) -> Response {
+    static ARXIV1: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)arxiv[:/ ]?\s*([0-9]{4}\.[0-9]{4,5}(?:v\d+)?)").unwrap());
+    static ARXIV2: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^([0-9]{4}\.[0-9]{4,5}(?:v\d+)?)$").unwrap());
+    static DOI_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(10\.\d{4,9}/[^\s"'<>]+)"#).unwrap());
+    static KEY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@\w+\{\s*([^,\s]+)").unwrap());
+    let v = parse_json(&body);
+    let raw = jstr(&v, "id").unwrap_or("").trim().to_string();
+    if raw.is_empty() {
+        return json_err(StatusCode::BAD_REQUEST, "Enter a DOI or arXiv id.");
+    }
+    let timeout_err = |e: &reqwest::Error| if e.is_timeout() { "Lookup timed out.".to_string() } else { e.to_string() };
+
+    // arXiv? (2101.12345, arXiv:2101.12345v2, or an arxiv.org URL)
+    let arxiv_id = ARXIV1.captures(&raw).or_else(|| ARXIV2.captures(&raw)).map(|c| c[1].to_string());
+    if let Some(id) = arxiv_id {
+        let url = format!("http://export.arxiv.org/api/query?id_list={}", enc(&id));
+        let resp = match st.http.get(&url).timeout(Duration::from_secs(15)).send().await {
+            Ok(r) => r,
+            Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, timeout_err(&e)),
+        };
+        let xml = resp.text().await.unwrap_or_default();
+        return match arxiv_to_bibtex(&xml, &id) {
+            Some((key, bibtex)) => Json(json!({ "key": key, "bibtex": bibtex })).into_response(),
+            None => json_err(StatusCode::NOT_FOUND, "arXiv paper not found."),
+        };
+    }
+    // DOI? (bare 10.xxxx/… or a doi.org URL)
+    if let Some(c) = DOI_RE.captures(&raw) {
+        let doi = c[1].trim_end_matches(['.', ',', ';']).to_string();
+        let url = format!("https://doi.org/{doi}");
+        let resp = match st
+            .http
+            .get(&url)
+            .header("Accept", "application/x-bibtex; charset=utf-8")
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, timeout_err(&e)),
+        };
+        if !resp.status().is_success() {
+            return json_err(StatusCode::NOT_FOUND, format!("DOI lookup failed (HTTP {}).", resp.status().as_u16()));
+        }
+        let bibtex = resp.text().await.unwrap_or_default().trim().to_string();
+        if !bibtex.starts_with('@') {
+            return json_err(StatusCode::NOT_FOUND, "No BibTeX returned for that DOI.");
+        }
+        let key = KEY_RE.captures(&bibtex).and_then(|c| c.get(1)).map(|m| m.as_str().to_string()).unwrap_or_else(|| cite_key("", ""));
+        return Json(json!({ "key": key, "bibtex": format!("{bibtex}\n") })).into_response();
+    }
+    json_err(StatusCode::BAD_REQUEST, "Could not recognise a DOI or arXiv id in that input.")
+}
+
+// ---------------------------------------------------------------------------
+// Desktop bridges (replace the Electron preload/IPC)
+// ---------------------------------------------------------------------------
+
+async fn desktop_pick_folder(State(st): St) -> Response {
+    let app = st.app.lock().unwrap().clone();
+    let Some(app) = app else {
+        return Json(json!({ "path": null })).into_response();
+    };
+    let picked = tokio::task::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        app.dialog().file().set_title("Open Folder as Workspace").blocking_pick_folder()
+    })
+    .await
+    .ok()
+    .flatten();
+    let path = picked.and_then(|fp| fp.into_path().ok()).map(|p| p.to_string_lossy().into_owned());
+    Json(json!({ "path": path })).into_response()
+}
+
+async fn desktop_open(body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let url = jstr(&v, "url").unwrap_or("");
+    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
+        let _ = open::that_detached(url);
+        return Json(json!({ "ok": true })).into_response();
+    }
+    json_err(StatusCode::BAD_REQUEST, "Invalid URL.")
+}
+
+// ---------------------------------------------------------------------------
+// Static file serving (built UI) with SPA fallback
+// ---------------------------------------------------------------------------
+
+async fn static_fallback(State(st): St, method: Method, uri: Uri) -> Response {
+    let Some(dist) = st.dist.as_ref().filter(|d| d.exists()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if method != Method::GET {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let raw_path = uri.path();
+    let decoded = percent_decode_str(raw_path).decode_utf8_lossy().into_owned();
+    let rel = decoded.trim_start_matches('/');
+    if !rel.is_empty() {
+        let target = lexical_resolve(dist, rel);
+        if target.starts_with(dist) && target.is_file() {
+            let mime = mime_guess::from_path(&target).first_or_octet_stream();
+            // Vite content-hashes everything under assets/ — let the webview
+            // cache those forever (Monaco alone is ~3.6 MB). Everything else
+            // (index.html, quiver, logos) must revalidate so updates land.
+            let cache = if rel.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
+            if let Ok(bytes) = fs::read(&target) {
+                return ([(header::CONTENT_TYPE, mime.as_ref().to_string()), (header::CACHE_CONTROL, cache.to_string())], bytes).into_response();
+            }
+        }
+    }
+    // SPA fallback: any GET path without a dot serves the app shell.
+    if !decoded.contains('.') {
+        if let Ok(bytes) = fs::read(dist.join("index.html")) {
+            return (
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()), (header::CACHE_CONTROL, "no-cache".to_string())],
+                bytes,
+            )
+                .into_response();
+        }
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Router + serve
+// ---------------------------------------------------------------------------
+
+static ORIGIN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^http://(localhost|127\.0\.0\.1):\d+$").unwrap());
+
+// Defence beyond binding to loopback: reject requests whose Host header isn't
+// local (DNS-rebinding — a hostile domain resolving to 127.0.0.1 to reach this
+// server from a victim's browser) and any browser request carrying a foreign
+// Origin (drive-by websites POSTing to localhost; browsers always attach
+// Origin to cross-site POSTs, and "simple" ones skip the CORS preflight).
+async fn local_guard(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if let Some(host) = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()) {
+        let hostname = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+        if hostname != "127.0.0.1" && hostname != "localhost" {
+            return (StatusCode::FORBIDDEN, "Forbidden: non-local Host").into_response();
+        }
+    }
+    if let Some(origin) = req.headers().get(header::ORIGIN).and_then(|h| h.to_str().ok()) {
+        if !ORIGIN_RE.is_match(origin) {
+            return (StatusCode::FORBIDDEN, "Forbidden: cross-site request").into_response();
+        }
+    }
+    next.run(req).await
+}
+
+// ---------------------------------------------------------------------------
+// Tinymist LSP proxy for hover/docs & command completion
+// ---------------------------------------------------------------------------
+// A single long-lived `tinymist lsp` process on the backend, driven over its
+// stdio JSON-RPC channel. Two trivial REST endpoints (/lsp/hover,
+// /lsp/completion) let Monaco's providers query it without shipping the full
+// LSP protocol (WebSockets, monaco-languageclient) to the browser. This mirrors
+// the Express port's implementation in server.js.
+
+use tokio::io::AsyncWriteExt as _;
+use tokio::sync::oneshot;
+
+struct LspProxy {
+    stdin: tokio::process::ChildStdin,
+    pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
+    opened: HashMap<String, (i64, u64)>, // uri → (last version sent, content hash)
+    next_id: i64,
+}
+
+// Resolve the tinymist LSP binary: prefer a bundled copy (main.rs sets
+// TINYMIST_BIN to the app-resource path when present), else `tinymist` on PATH.
+fn tinymist_bin() -> String {
+    std::env::var("TINYMIST_BIN")
+        .ok()
+        .filter(|p| Path::new(p).exists())
+        .unwrap_or_else(|| "tinymist".into())
+}
+
+fn content_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+static LSP: LazyLock<tokio::sync::Mutex<Option<LspProxy>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(None));
+
+static LSP_CMD_LINK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[.*?\]\(command:[^)]+\)(?:\s*\|\s*)?").unwrap());
+static LSP_TRAILING_RULE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\n+---\n*$").unwrap());
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+async fn lsp_write(stdin: &mut tokio::process::ChildStdin, obj: &Value) {
+    let json = obj.to_string();
+    let header = format!("Content-Length: {}\r\n\r\n", json.len());
+    let _ = stdin.write_all(header.as_bytes()).await;
+    let _ = stdin.write_all(json.as_bytes()).await;
+    let _ = stdin.flush().await;
+}
+
+impl LspProxy {
+    // Write a request and hand back the receiver for its id-correlated response.
+    async fn begin_request(&mut self, method: &str, params: Value) -> oneshot::Receiver<Value> {
+        self.next_id += 1;
+        let id = self.next_id;
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(id, tx);
+        lsp_write(
+            &mut self.stdin,
+            &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
+        )
+        .await;
+        rx
+    }
+
+    async fn notify(&mut self, method: &str, params: Value) {
+        lsp_write(
+            &mut self.stdin,
+            &json!({ "jsonrpc": "2.0", "method": method, "params": params }),
+        )
+        .await;
+    }
+
+    // Keep tinymist's view of the file current: didOpen once, then didChange —
+    // but only push a didChange when the text actually differs from last time,
+    // so repeated hovers on an unchanged doc don't force a full re-parse.
+    async fn sync_file(&mut self, uri: &str, content: &str) {
+        let hash = content_hash(content);
+        match self.opened.get(uri).copied() {
+            None => {
+                self.opened.insert(uri.to_string(), (1, hash));
+                self.notify(
+                    "textDocument/didOpen",
+                    json!({ "textDocument": { "uri": uri, "languageId": "typst", "version": 1, "text": content } }),
+                )
+                .await;
+            }
+            Some((ver, prev_hash)) => {
+                if prev_hash == hash {
+                    return;
+                }
+                let nv = ver + 1;
+                self.opened.insert(uri.to_string(), (nv, hash));
+                self.notify(
+                    "textDocument/didChange",
+                    json!({
+                        "textDocument": { "uri": uri, "version": nv },
+                        "contentChanges": [{ "text": content }]
+                    }),
+                )
+                .await;
+            }
+        }
+    }
+}
+
+// Ensure a tinymist process is running and initialized. Returns false if it
+// could not be spawned (e.g. tinymist not installed) so callers degrade to null.
+async fn ensure_lsp(ws: &Path) -> bool {
+    let mut guard = LSP.lock().await;
+    if guard.is_some() {
+        return true;
+    }
+    let mut cmd = Command::new(tinymist_bin());
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — no console popup
+    cmd.arg("lsp")
+        .current_dir(ws)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(false); // keep it alive after this fn drops the Child handle
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    // Reader task: parse Content-Length framed JSON-RPC and dispatch responses.
+    let pending_reader = pending.clone();
+    tokio::spawn(async move {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 16384];
+        loop {
+            let n = match stdout.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            buf.extend_from_slice(&chunk[..n]);
+            while let Some(hdr_end) = find_subslice(&buf, b"\r\n\r\n") {
+                let header = String::from_utf8_lossy(&buf[..hdr_end]).to_ascii_lowercase();
+                let len = header
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok());
+                let Some(len) = len else {
+                    buf.drain(..hdr_end + 4);
+                    continue;
+                };
+                let total = hdr_end + 4 + len;
+                if buf.len() < total {
+                    break;
+                }
+                let body = buf[hdr_end + 4..total].to_vec();
+                buf.drain(..total);
+                if let Ok(msg) = serde_json::from_slice::<Value>(&body) {
+                    if let Some(id) = msg.get("id").and_then(Value::as_i64) {
+                        if let Some(tx) = pending_reader.lock().unwrap().remove(&id) {
+                            let _ = tx.send(msg.get("result").cloned().unwrap_or(Value::Null));
+                        }
+                    }
+                }
+            }
+        }
+        // Process ended — drop the proxy so the next request respawns it.
+        *LSP.lock().await = None;
+    });
+
+    let mut proxy = LspProxy { stdin, pending, opened: HashMap::new(), next_id: 0 };
+
+    // initialize → (await result) → initialized
+    let root_uri = format!("file://{}", ws.to_string_lossy());
+    let rx = proxy
+        .begin_request(
+            "initialize",
+            json!({
+                "processId": std::process::id(),
+                "capabilities": {},
+                "rootUri": root_uri,
+                "workspaceFolders": [{ "uri": root_uri, "name": "workspace" }],
+            }),
+        )
+        .await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), rx).await;
+    proxy.notify("initialized", json!({})).await;
+
+    *guard = Some(proxy);
+    true
+}
+
+fn lsp_pos(v: &Value) -> Option<(String, i64, i64)> {
+    let file = jstr(v, "file")?.to_string();
+    let line = v.get("line")?.as_i64()?;
+    let character = v.get("character")?.as_i64()?;
+    Some((file, line, character))
+}
+
+// POST /lsp/hover { file, line, character, content } → { contents, range }
+async fn lsp_hover(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let Some((file, line, character)) = lsp_pos(&v) else {
+        return Json(json!({ "contents": Value::Null })).into_response();
+    };
+    let content = jstr(&v, "content").unwrap_or("").to_string();
+    let ws = st.ws();
+    if !ensure_lsp(&ws).await {
+        return Json(json!({ "contents": Value::Null })).into_response();
+    }
+    let uri = format!("file://{}", lexical_resolve(&ws, &file).to_string_lossy());
+    let rx = {
+        let mut guard = LSP.lock().await;
+        let Some(p) = guard.as_mut() else {
+            return Json(json!({ "contents": Value::Null })).into_response();
+        };
+        p.sync_file(&uri, &content).await;
+        p.begin_request(
+            "textDocument/hover",
+            json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": character } }),
+        )
+        .await
+    };
+    let result = match tokio::time::timeout(Duration::from_secs(3), rx).await {
+        Ok(Ok(v)) => v,
+        _ => Value::Null,
+    };
+    let md = match result.get("contents") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Object(o)) => o.get("value").and_then(Value::as_str).unwrap_or("").to_string(),
+        _ => String::new(),
+    };
+    if md.trim().is_empty() {
+        return Json(json!({ "contents": Value::Null })).into_response();
+    }
+    // Strip VSCode-specific command links; trim a trailing horizontal rule.
+    let md = LSP_CMD_LINK.replace_all(&md, "");
+    let md = LSP_TRAILING_RULE.replace(&md, "").trim().to_string();
+    Json(json!({ "contents": md, "range": result.get("range").cloned().unwrap_or(Value::Null) }))
+        .into_response()
+}
+
+// POST /lsp/completion { file, line, character, content } → { items: [...] }
+async fn lsp_completion(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let Some((file, line, character)) = lsp_pos(&v) else {
+        return Json(json!({ "items": [] })).into_response();
+    };
+    let content = jstr(&v, "content").unwrap_or("").to_string();
+    let ws = st.ws();
+    if !ensure_lsp(&ws).await {
+        return Json(json!({ "items": [] })).into_response();
+    }
+    let uri = format!("file://{}", lexical_resolve(&ws, &file).to_string_lossy());
+    let rx = {
+        let mut guard = LSP.lock().await;
+        let Some(p) = guard.as_mut() else {
+            return Json(json!({ "items": [] })).into_response();
+        };
+        p.sync_file(&uri, &content).await;
+        p.begin_request(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+                "context": { "triggerKind": 1 }
+            }),
+        )
+        .await
+    };
+    let result = match tokio::time::timeout(Duration::from_secs(3), rx).await {
+        Ok(Ok(v)) => v,
+        _ => Value::Null,
+    };
+    // tinymist may return an array or { isIncomplete, items: [...] }.
+    let items = if result.is_array() {
+        result
+    } else {
+        result.get("items").cloned().unwrap_or_else(|| json!([]))
+    };
+    Json(json!({ "items": items })).into_response()
+}
+
+// Proofreading: spelling (spellbook / Nuspell-compatible) + grammar & style
+// (harper-core with a Typst-aware parser). Runs on a blocking thread so the
+// dictionary work never stalls the async runtime.
+async fn lint_text(body: Bytes) -> Response {
+    // The spell/grammar dictionaries cost ~150 MB resident, and proofreading is off
+    // by default, so nothing is loaded until the feature is actually used. The client
+    // probes this route the moment the user switches proofreading on, and that probe
+    // starts the load in the background, so the dictionaries are ready well before
+    // the first sentence is typed.
+    static WARM: std::sync::Once = std::sync::Once::new();
+    WARM.call_once(|| {
+        std::thread::spawn(crate::proofread::warm);
+    });
+
+    let v = parse_json(&body);
+    let text = jstr(&v, "text").unwrap_or("").to_string();
+    if text.trim().is_empty() {
+        return Json(json!({ "issues": [] })).into_response();
+    }
+    let issues = tokio::task::spawn_blocking(move || crate::proofread::lint(&text)).await.unwrap_or_default();
+    Json(json!({ "issues": issues })).into_response()
+}
+
+// Lazy spelling suggestions for the words the client actually displays. Kept
+// off the lint hot path because each suggestion is a dictionary-wide search.
+async fn lint_suggest(body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let words: Vec<String> = v
+        .get("words")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    if words.is_empty() {
+        return Json(json!({ "suggestions": {} })).into_response();
+    }
+    let pairs = tokio::task::spawn_blocking(move || crate::proofread::suggest_words(&words)).await.unwrap_or_default();
+    let map: serde_json::Map<String, Value> = pairs.into_iter().map(|(w, s)| (w, json!(s))).collect();
+    Json(json!({ "suggestions": map })).into_response()
+}
+
+async fn lint_ignore(body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let word = jstr(&v, "word").unwrap_or("").to_string();
+    if !word.trim().is_empty() {
+        let _ = tokio::task::spawn_blocking(move || crate::proofread::add_ignored_word(&word)).await;
+    }
+    Json(json!({ "ok": true })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Session persistence — remember the last project, open files, and cursor so the
+// app reopens exactly where the user left off, even across reboots. Stored on
+// disk, not the webview's localStorage (which is tied to the port and can vanish).
+// ---------------------------------------------------------------------------
+
+fn session_file() -> PathBuf {
+    // Overridable so headless/test runs don't touch the real user session file.
+    if let Ok(p) = std::env::var("HILBERT_SESSION_FILE") {
+        return PathBuf::from(p);
+    }
+    dirs::config_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"))
+        .join("hilbert")
+        .join("session.json")
+}
+
+// The workspace folder from the last session, if it still exists. Lets the GUI
+// reopen the previous project immediately at startup, before the UI even loads.
+pub fn saved_workspace() -> Option<PathBuf> {
+    let raw = fs::read_to_string(session_file()).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    let p = v.get("workspacePath").and_then(|x| x.as_str())?;
+    let path = PathBuf::from(p);
+    path.is_dir().then_some(path)
+}
+
+async fn session_get() -> Response {
+    match fs::read_to_string(session_file()) {
+        Ok(s) if !s.trim().is_empty() => ([(header::CONTENT_TYPE, "application/json")], s).into_response(),
+        _ => Json(json!({})).into_response(),
+    }
+}
+
+async fn session_post(body: Bytes) -> Response {
+    // Only persist well-formed JSON, and write atomically (temp + rename) so a
+    // crash mid-write can't leave a corrupt file that breaks the next launch.
+    if serde_json::from_slice::<Value>(&body).is_err() {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid session JSON");
+    }
+    let path = session_file();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    // Unique temp name per write so overlapping writes never race on the same file
+    // (the rename onto the target stays atomic; last writer wins).
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!("json.tmp.{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+    if fs::write(&tmp, &body).and_then(|_| fs::rename(&tmp, &path)).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, "Could not save session");
+    }
+    Json(json!({ "ok": true })).into_response()
+}
+
+pub fn router(state: Arc<AppState>) -> Router {
+    use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(|origin, _| origin.to_str().map(|o| ORIGIN_RE.is_match(o)).unwrap_or(false)))
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    Router::new()
+        .route("/workspace", get(workspace_tree))
+        .route("/workspace/root", get(workspace_root_get).post(workspace_root_post))
+        .route("/workspace/clear", post(workspace_clear))
+        .route("/workspace/file", get(workspace_file_get).post(workspace_file_post).delete(workspace_file_delete))
+        .route("/workspace/mkdir", post(workspace_mkdir))
+        .route("/workspace/upload", post(workspace_upload))
+        .route("/workspace/save-image", post(workspace_save_image))
+        .route("/workspace/copy", post(workspace_copy))
+        .route("/workspace/rename", post(workspace_rename))
+        .route("/workspace/reveal", post(workspace_reveal))
+        .route("/workspace/search", get(workspace_search))
+        .route("/workspace/raw", get(workspace_raw))
+        .route("/workspace/compress", post(workspace_compress))
+        .route("/data/xlsx", post(data_xlsx))
+        .route("/compile", post(compile))
+        .route("/compile/html", get(compile_html))
+        .route("/init-template", post(init_template))
+        .route("/packages", get(packages_search))
+        .route("/packages/installed", get(packages_installed))
+        .route("/packages/download", post(packages_download))
+        .route("/packages/remove", post(packages_remove))
+        .route("/git/status", get(git_status))
+        .route("/git/init", post(git_init))
+        .route("/git/remote", post(git_remote))
+        .route("/git/commit", post(git_commit))
+        .route("/git/push", post(git_push))
+        .route("/drive/sync", post(drive_sync))
+        .route("/export/native", post(export_native))
+        .route("/export/project/native", post(export_project_native))
+        .route("/webdav/sync", post(webdav_sync))
+        .route("/tools", get(tools))
+        .route("/run", post(run_code))
+        .route("/notebook/run", post(notebook_run))
+        .route("/template/preview", get(template_preview))
+        .route("/template/render-preview", post(builtin_preview))
+        .route("/bib/fetch", post(bib_fetch))
+        .route("/desktop/pick-folder", post(desktop_pick_folder))
+        .route("/desktop/open", post(desktop_open))
+        .route("/lsp/hover", post(lsp_hover))
+        .route("/lsp/completion", post(lsp_completion))
+        .route("/lint", post(lint_text))
+        .route("/lint/suggest", post(lint_suggest))
+        .route("/lint/ignore", post(lint_ignore))
+        .route("/session", get(session_get).post(session_post))
+        .fallback(static_fallback)
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
+        .layer(cors)
+        .layer(axum::middleware::from_fn(local_guard))
+        .with_state(state)
+}
+
+pub async fn serve(listener: std::net::TcpListener, state: Arc<AppState>) {
+    listener.set_nonblocking(true).expect("nonblocking");
+    let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+    let app = router(state);
+    if let Err(e) = axum::serve(listener, app).await {
+        eprintln!("[typst-editor] server error: {e}");
+    }
+}

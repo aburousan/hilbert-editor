@@ -1,0 +1,7 @@
+src-tauri/target/
+src-tauri/target-linux/
+node_modules/
+releases/
+.DS_Store
+*.key
+src-tauri/workspace/

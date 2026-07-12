@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Hilbert",
+  "version": "0.1.6",
+  "identifier": "com.kaziaburousan.hilbert",
+  "build": {
+    "frontendDist": "ui-dummy"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/aburousan/hilbert-editor/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZFMjE1Mjc3MTM5OTg4ODgKUldTSWlKa1RkMUloYnQrQWVueFMrejk2ZEQzY09MZWttY0RYZHp1R3NVdS8vc2xDbkZiNmRocTIK"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "category": "Productivity",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "resources/dist": "dist",
+      "resources/typst-packages": "typst-packages"
+    },
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    }
+  }
+}

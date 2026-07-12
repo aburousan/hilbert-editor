@@ -1,0 +1,54 @@
+[package]
+name = "typst-editor"
+version = "0.1.6"
+description = "Hilbert — an offline editor for Typst (Unofficial), aimed at maths/physics writing."
+authors = ["Kazi Abu Rousan"]
+license = "MIT"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-updater = "2"
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+regex = "1"
+base64 = "0.22"
+dirs = "6"
+mime_guess = "2"
+percent-encoding = "2"
+open = "5"
+# Spreadsheet reading (xlsx/xls/xlsb/ods) so data import can convert Excel files
+# to CSV offline, with no runtime dependency on Excel or Python.
+calamine = "0.26"
+# Pure-Rust zip writer for archiving a project on export — works identically on
+# Windows/macOS/Linux with no dependency on a system `zip` binary.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Proofreading: spellbook is a pure-Rust, Nuspell/Hunspell-compatible spell
+# checker; harper-core + harper-typst provide native grammar/style linting that
+# understands Typst syntax (prose only, skipping code/math).
+spellbook = "0.4"
+harper-core = "2.5"
+harper-typst = "2.5"
+
+# Keep this LAST: a [target.…] header ends [dependencies], so anything written
+# below it would silently become unix-only.
+[target.'cfg(unix)'.dependencies]
+# Per-process resource limits (CPU time, max file size) applied to spawned
+# Python/Julia code so a runaway cell can't fill the disk or peg a core.
+libc = "0.2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
+panic = "abort"
