@@ -63,6 +63,7 @@ pub struct Pkg {
 pub struct AppState {
     pub workspace: RwLock<PathBuf>,
     pub dist: Option<PathBuf>,
+    api_token: String,
     pub interpreters: Interpreters,
     pub allow_exec: bool,
     pub exec_timeout_ms: u64,
@@ -76,9 +77,12 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(workspace: PathBuf, dist: Option<PathBuf>) -> Self {
+        let mut token_bytes = [0u8; 32];
+        getrandom::fill(&mut token_bytes).expect("operating-system randomness for API token");
         AppState {
             workspace: RwLock::new(workspace),
             dist,
+            api_token: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes),
             interpreters: detect_interpreters(),
             allow_exec: std::env::var("ALLOW_CODE_EXECUTION").ok().as_deref() != Some("0"),
             exec_timeout_ms: std::env::var("EXEC_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(45000),
@@ -95,6 +99,10 @@ impl AppState {
         // Recover from a poisoned lock instead of panicking: a workspace path is
         // always readable, and one panicked handler shouldn't wedge every request.
         self.workspace.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn api_token(&self) -> &str {
+        &self.api_token
     }
 }
 
@@ -2761,6 +2769,42 @@ async fn local_guard(req: axum::extract::Request, next: axum::middleware::Next) 
     next.run(req).await
 }
 
+fn valid_bearer(headers: &HeaderMap, expected: &str) -> bool {
+    let Some(value) = headers.get(header::AUTHORIZATION).and_then(|h| h.to_str().ok()) else {
+        return false;
+    };
+    let Some(candidate) = value.strip_prefix("Bearer ") else {
+        return false;
+    };
+    let candidate = candidate.as_bytes();
+    let expected = expected.as_bytes();
+    let mut difference = candidate.len() ^ expected.len();
+    for i in 0..candidate.len().max(expected.len()) {
+        difference |= usize::from(candidate.get(i).copied().unwrap_or(0) ^ expected.get(i).copied().unwrap_or(0));
+    }
+    difference == 0
+}
+
+async fn auth_guard(State(st): St, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if !valid_bearer(req.headers(), &st.api_token) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+    next.run(req).await
+}
+
+#[cfg(debug_assertions)]
+async fn dev_api_token(State(st): St, headers: HeaderMap) -> Response {
+    let from_vite = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(|origin| DEV_ORIGIN_RE.is_match(origin))
+        .unwrap_or(false);
+    if !from_vite {
+        return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+    }
+    Json(json!({ "token": st.api_token })).into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Tinymist LSP proxy for hover/docs & command completion
 // ---------------------------------------------------------------------------
@@ -3166,7 +3210,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    Router::new()
+    let api = Router::new()
         .route("/workspace", get(workspace_tree))
         .route("/workspace/root", get(workspace_root_get).post(workspace_root_post))
         .route("/workspace/clear", post(workspace_clear))
@@ -3216,6 +3260,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/lint/suggest", post(lint_suggest))
         .route("/lint/ignore", post(lint_ignore))
         .route("/session", get(session_get).post(session_post))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), auth_guard));
+
+    let app = Router::new().merge(api);
+    #[cfg(debug_assertions)]
+    let app = app.route("/auth/dev-token", get(dev_api_token));
+
+    app
         .fallback(static_fallback)
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(cors)
@@ -3287,5 +3338,15 @@ mod tests {
         assert!(!allowed_external_url("https://"));
         assert!(!allowed_external_url("file:///etc/passwd"));
         assert!(!allowed_external_url("javascript:alert(1)"));
+    }
+
+    #[test]
+    fn api_bearer_token_must_match_exactly() {
+        let mut headers = HeaderMap::new();
+        assert!(!valid_bearer(&headers, "fixed-token"));
+        headers.insert(header::AUTHORIZATION, "Bearer wrong-token".parse().unwrap());
+        assert!(!valid_bearer(&headers, "fixed-token"));
+        headers.insert(header::AUTHORIZATION, "Bearer fixed-token".parse().unwrap());
+        assert!(valid_bearer(&headers, "fixed-token"));
     }
 }

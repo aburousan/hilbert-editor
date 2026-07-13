@@ -7178,6 +7178,7 @@ dependencies = [
  "base64 0.22.1",
  "calamine",
  "dirs",
+ "getrandom 0.3.4",
  "harper-core",
  "harper-typst",
  "libc",

@@ -163,6 +163,12 @@ const INIT_SCRIPT: &str = r#"
 })();
 "#;
 
+fn init_script(api_token: &str) -> String {
+    format!(
+        r#"Object.defineProperty(window,"__HILBERT_API_TOKEN__",{{value:"{api_token}",enumerable:false,writable:false,configurable:false}});"#
+    ) + INIT_SCRIPT
+}
+
 fn headless_main() {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
@@ -272,6 +278,7 @@ fn main() {
             let (listener, port) = bind_free_port(3001);
             let state = Arc::new(server::AppState::new(ws, dist));
             *state.app.lock().unwrap() = Some(app.handle().clone());
+            let init_script = init_script(state.api_token());
             tauri::async_runtime::spawn(server::serve(listener, state));
             // Dictionaries load on the first /lint call; see the note in headless_main.
 
@@ -284,7 +291,7 @@ fn main() {
                 // by Tauri's native handler, so dragging files onto the file tree
                 // fires the app's own drop upload.
                 .disable_drag_drop_handler()
-                .initialization_script(INIT_SCRIPT)
+                .initialization_script(&init_script)
                 // Open external links (mailto:, https:) in the real browser, not the app.
                 .on_navigation(|url| {
                     let scheme = url.scheme();
