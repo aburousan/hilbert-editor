@@ -16,7 +16,6 @@
     func(use-loc)
   }
 }
-
 /// Place content at a specific location on the page relative to the top left corner
 /// of the page, regardless of margins, current container, etc.
 ///
@@ -102,4 +101,3 @@
     },
   )
 }
-

@@ -113,7 +113,7 @@
   let _hw = 0.5 * _arrow-width
   let _c = calc.cos(_angle)
   let _s = calc.sin(_angle)
-  
+
   polygon(
     fill: fill,
     stroke: stroke,
