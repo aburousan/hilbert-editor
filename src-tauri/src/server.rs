@@ -66,6 +66,9 @@ pub struct AppState {
     pub interpreters: Interpreters,
     pub allow_exec: bool,
     pub exec_timeout_ms: u64,
+    pub compile_gate: tokio::sync::Semaphore,
+    pub render_gate: tokio::sync::Semaphore,
+    pub exec_gate: tokio::sync::Semaphore,
     pub universe: tokio::sync::Mutex<Option<(Instant, Arc<Vec<Pkg>>)>>,
     pub http: reqwest::Client,
     pub app: Mutex<Option<tauri::AppHandle>>,
@@ -79,6 +82,9 @@ impl AppState {
             interpreters: detect_interpreters(),
             allow_exec: std::env::var("ALLOW_CODE_EXECUTION").ok().as_deref() != Some("0"),
             exec_timeout_ms: std::env::var("EXEC_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(45000),
+            compile_gate: tokio::sync::Semaphore::new(1),
+            render_gate: tokio::sync::Semaphore::new(2),
+            exec_gate: tokio::sync::Semaphore::new(1),
             universe: tokio::sync::Mutex::new(None),
             http: reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10)).build().unwrap(),
             app: Mutex::new(None),
@@ -705,6 +711,9 @@ async fn workspace_compress(State(st): St, body: Bytes) -> Response {
 // ---------------------------------------------------------------------------
 
 async fn compile(State(st): St, Query(q): Q, body: Bytes) -> Response {
+    let Ok(_permit) = st.compile_gate.acquire().await else {
+        return json_err(StatusCode::SERVICE_UNAVAILABLE, "Compiler is shutting down.");
+    };
     let ws = st.ws();
     let main_q = q.get("main").map(String::as_str).unwrap_or("main.typ");
     let Some(main_path) = safe_workspace_path(&ws, main_q) else {
@@ -787,6 +796,9 @@ async fn init_template(State(st): St, body: Bytes) -> Response {
 // this to draw real previews of tool-inserted blocks on the canvas. Unique
 // temp names inside .hilbert keep concurrent requests and user files apart.
 async fn render_snippet(State(st): St, body: Bytes) -> Response {
+    let Ok(_permit) = st.render_gate.acquire().await else {
+        return json_err(StatusCode::SERVICE_UNAVAILABLE, "Preview renderer is shutting down.");
+    };
     let ws = st.ws();
     ensure_hilbert(&ws);
     let stamp = std::time::SystemTime::now()
@@ -1930,6 +1942,9 @@ async fn run_code(State(st): St, body: Bytes) -> Response {
     let Some(chosen) = options.iter().find(|o| o.path == bin).or_else(|| options.first()) else {
         return json_err(StatusCode::BAD_REQUEST, format!("{lang} is not available on this system."));
     };
+    let Ok(_permit) = st.exec_gate.acquire().await else {
+        return json_err(StatusCode::SERVICE_UNAVAILABLE, "Code runner is shutting down.");
+    };
 
     let ws = st.ws();
     let sandbox = hilbert_run(&ws);
@@ -2094,6 +2109,9 @@ async fn notebook_run(State(st): St, body: Bytes) -> Response {
     let options = st.interpreters.for_lang(lang);
     let Some(chosen) = options.iter().find(|o| o.path == bin).or_else(|| options.first()) else {
         return json_err(StatusCode::BAD_REQUEST, format!("{lang} is not available on this system."));
+    };
+    let Ok(_permit) = st.exec_gate.acquire().await else {
+        return json_err(StatusCode::SERVICE_UNAVAILABLE, "Code runner is shutting down.");
     };
 
     let ws = st.ws();
@@ -2649,10 +2667,19 @@ async fn desktop_pick_folder(State(st): St) -> Response {
     Json(json!({ "path": path })).into_response()
 }
 
+fn allowed_external_url(raw: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else { return false };
+    match url.scheme() {
+        "http" | "https" => url.host_str().is_some(),
+        "mailto" => !url.path().trim().is_empty(),
+        _ => false,
+    }
+}
+
 async fn desktop_open(body: Bytes) -> Response {
     let v = parse_json(&body);
     let url = jstr(&v, "url").unwrap_or("");
-    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
+    if allowed_external_url(url) {
         let _ = open::that_detached(url);
         return Json(json!({ "ok": true })).into_response();
     }
@@ -3143,18 +3170,18 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/workspace", get(workspace_tree))
         .route("/workspace/root", get(workspace_root_get).post(workspace_root_post))
         .route("/workspace/clear", post(workspace_clear))
-        .route("/workspace/file", get(workspace_file_get).post(workspace_file_post).delete(workspace_file_delete))
+        .route("/workspace/file", get(workspace_file_get).post(workspace_file_post).delete(workspace_file_delete).layer(DefaultBodyLimit::max(16 * 1024 * 1024)))
         .route("/workspace/mkdir", post(workspace_mkdir))
-        .route("/workspace/upload", post(workspace_upload))
-        .route("/workspace/save-image", post(workspace_save_image))
+        .route("/workspace/upload", post(workspace_upload).layer(DefaultBodyLimit::max(50 * 1024 * 1024)))
+        .route("/workspace/save-image", post(workspace_save_image).layer(DefaultBodyLimit::max(50 * 1024 * 1024)))
         .route("/workspace/copy", post(workspace_copy))
         .route("/workspace/rename", post(workspace_rename))
         .route("/workspace/reveal", post(workspace_reveal))
         .route("/workspace/search", get(workspace_search))
         .route("/workspace/raw", get(workspace_raw))
         .route("/workspace/compress", post(workspace_compress))
-        .route("/data/xlsx", post(data_xlsx))
-        .route("/compile", post(compile))
+        .route("/data/xlsx", post(data_xlsx).layer(DefaultBodyLimit::max(50 * 1024 * 1024)))
+        .route("/compile", post(compile).layer(DefaultBodyLimit::max(16 * 1024 * 1024)))
         .route("/compile/html", get(compile_html))
         .route("/render/snippet", post(render_snippet))
         .route("/zotero/ping", get(zotero_ping))
@@ -3190,7 +3217,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/lint/ignore", post(lint_ignore))
         .route("/session", get(session_get).post(session_post))
         .fallback(static_fallback)
-        .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(cors)
         .layer(axum::middleware::from_fn(local_guard))
         .with_state(state)
@@ -3251,5 +3278,14 @@ mod tests {
         assert!(origin_allowed("127.0.0.1:3001", "http://127.0.0.1:3001"));
         assert!(!origin_allowed("127.0.0.1:3001", "http://localhost:4444"));
         assert_eq!(origin_allowed("127.0.0.1:3001", "http://localhost:5173"), cfg!(debug_assertions));
+    }
+
+    #[test]
+    fn external_urls_require_an_allowed_scheme_and_valid_target() {
+        assert!(allowed_external_url("https://typst.app/docs"));
+        assert!(allowed_external_url("mailto:author@example.com"));
+        assert!(!allowed_external_url("https://"));
+        assert!(!allowed_external_url("file:///etc/passwd"));
+        assert!(!allowed_external_url("javascript:alert(1)"));
     }
 }
