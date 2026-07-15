@@ -157,7 +157,8 @@ The full list, grouped by what you're doing.
 
 The Monaco editor handles Typst highlighting, and
 [tinymist](https://github.com/Myriad-Dreamin/tinymist) supplies hover documentation
-and autocomplete: hover any function for its signature and docs, and get completions
+and autocomplete, plus live errors, warnings, information, and hints in Monaco and
+the Problems panel. Hover any function for its signature and docs, and get completions
 for every builtin, package export, and label. There's `@`-reference autocomplete, and
 image-path autocomplete inside `image("…")`. Control-flow completions offer both the
 `{ }` code body and the `[ ]` content body for `if`, `for`, and `while`.
@@ -166,6 +167,11 @@ The PDF preview recompiles as you type, with zoom, fit-to-width, a dark PDF mode
 double-click-to-source (it reads the surrounding words to land on the right
 occurrence). When a compile fails you keep the last good preview and the errors move
 to their own Problems tab, so a typo mid-sentence doesn't blank the page.
+
+Slide Studio builds editable 16:9 decks with templates, drag-and-drop positioning,
+shapes, curves with optional arrowheads, equations, app-tool inserts, alignment controls, copy/paste,
+undo/redo, optional grid snapping, and drag-reorderable slide thumbnails. Its layout
+is stored inside ordinary Typst source, so an existing deck can be reopened and edited.
 
 Multi-file projects compile from the project root (`main.typ`, or the `typst.toml`
 entrypoint), so `#include`d chapters that share a bibliography or labels render as a
@@ -293,15 +299,19 @@ must be on your `PATH`:
   Install it with `brew install typst`, `winget install Typst.Typst`,
   `cargo install typst-cli`, or a release binary. Verify with `typst --version`.
 - [tinymist](https://github.com/Myriad-Dreamin/tinymist), the Typst language server,
-  is optional but recommended, for hover docs and autocomplete.
+  is optional but recommended, for diagnostics, hover docs, and autocomplete.
   - macOS: `brew install tinymist`
   - Windows: `winget install Myriad-Dreamin.tinymist` (or `scoop install tinymist`)
   - Linux, or any OS with Rust: `cargo install tinymist`
 
-  Without it the editor still works fully; those two features just stay quiet.
+  Hilbert checks `TINYMIST_BIN` first (bundled builds set it automatically), then its
+  managed app-data location, and finally `PATH`. The exact path, source, version, running state, and
+  restart control are shown under **App Settings → General**. Without Tinymist the
+  editor still compiles and previews normally; language-server features stay quiet.
 - For running code, optionally: Python 3 (with `numpy`, `matplotlib`, `sympy`), Julia
   (`Latexify` for equation mode), and WolframScript.
-- Node.js 18+, only if you run from source.
+- Node.js 18+ and a [Rust toolchain](https://rustup.rs) (stable), only if you run
+  from source — the backend is compiled by `cargo` on first run.
 
 ---
 
@@ -346,6 +356,10 @@ shows an error panel instead of closing. You still need the Typst CLI on `PATH`.
 
 ## Run from source
 
+Everything lives in this one repository: the React/Monaco frontend at the root and
+the Rust backend under `src-tauri/`. You need Node.js 18+ and a stable
+[Rust toolchain](https://rustup.rs); the first run compiles the backend.
+
 ```bash
 git clone https://github.com/aburousan/hilbert-editor.git
 cd hilbert-editor
@@ -353,10 +367,10 @@ bash scripts/setup.sh   # installs Typst + Python deps and runs npm install (mac
 npm run dev             # Vite UI on http://localhost:5173, backend on http://127.0.0.1:3001
 ```
 
-`npm run dev` serves the UI with Vite and starts the Rust backend (the Tauri binary in
-headless mode) on port 3001. The backend lives under `src-tauri/`, so no sibling
-checkout or manual frontend copy is required. Run `npm run desktop` to build the
-frontend and open the complete native application.
+`npm run dev` serves the UI with Vite (hot reload) and starts the Rust backend in
+headless mode on port 3001. For the real desktop app, `npm run desktop` builds the
+frontend (`tsc`, Vite, and the bundled-secret strip) and opens the native window —
+that's also what a release build ships.
 
 On Windows, run from source with:
 

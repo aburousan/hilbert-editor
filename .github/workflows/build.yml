@@ -76,9 +76,7 @@ jobs:
           tagName: tauri-v__VERSION__
           releaseName: "Hilbert (Tauri) v__VERSION__"
           releaseBody: |
-            Fixes the a4/us-letter page size in the preview and improves the bidirectional source/PDF link.
-
-            This release is a bit larger than usual because it lays the groundwork for spelling and grammar checking, which is coming in the next update.
+            Draft — full notes are pasted from docs/RELEASE_NOTES.md when this release is published.
           releaseDraft: true
           prerelease: false
 

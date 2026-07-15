@@ -4,6 +4,77 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.1.7
+
+A feature release. The project also moved to a single repository — the frontend
+and the Rust backend now live together, so building from source is one clone and
+one `npm run dev` (see "Run from source" in the README).
+
+### Slide Studio
+
+A visual builder for 16:9 presentation slides. Drag, resize, and double-click-edit
+text, equations, images, shapes, arrows, a translucent highlighter, and freehand
+curves placed point by point (curves can now carry arrowheads at either end).
+It comes with slide templates, undo/redo, copy/paste/duplicate, alignment helpers,
+optional grid snapping, and a thumbnail rail you can reorder by dragging. The deck
+is stored as ordinary Typst inside your document, so reopening the studio picks it
+up for further editing — and while it's open, the equation galleries, Matrix
+Studio, Feynman builder, plot tools and the rest drop their output onto the
+current slide instead of into the text.
+
+### Zotero citations
+
+If the Zotero desktop app with the Better BibTeX plugin is running, Hilbert talks
+to it locally: "Pick & cite" opens Zotero's own picker, and the chosen papers land
+in `refs.bib` and are cited at the cursor in one go; "Import entire library"
+merges your whole library without duplicates. Citation keys are sanitised to
+Typst's legal character set (Better BibTeX can emit `$` inside a key when a title
+contains maths, which breaks `@key` references), and keys already broken in
+`refs.bib` heal themselves on the next import. If Zotero's main window is closed
+— the app keeps running without one — Hilbert now reopens it automatically
+instead of failing with a cryptic error.
+
+### The preview recompiles several times faster while you type
+
+The backend keeps one `typst watch` process per project, so a warm recompile
+reuses the compiler's incremental state instead of paying process startup and a
+full parse every time: roughly 120 ms instead of 500+ ms even for small
+documents, and the default auto-compile delay dropped from 1 s to 0.1 s.
+Switching projects, changing the main file, or importing fonts swaps the watcher
+cleanly, a one-shot compile remains as the fallback, and quitting the app now
+reliably shuts down the watcher and the language server instead of leaving them
+running.
+
+### Live errors from tinymist, before you compile
+
+With tinymist installed, errors, warnings, and hints appear as squiggles in the
+editor and in the Problems panel as you type. App Settings → General shows which
+tinymist binary Hilbert found (bundled, environment, managed folder, or PATH),
+its version, whether it's running, and a restart button.
+
+### The local API now requires a per-launch token
+
+The backend always listened on 127.0.0.1 only, with Host and Origin checks. On
+top of that, every request now needs a random bearer token minted at launch and
+handed only to the app's own window, so other local processes can't drive the
+API. Scripted/headless use passes a `HILBERT_API_TOKEN` environment variable.
+
+### Smaller things
+
+- Wrapping a selection that cuts an emoji or a combining accent in half no
+  longer produces invalid Typst — selections snap to character boundaries
+  (the proofreader uses the same logic for its underlines).
+- Edit Settings now edits your existing `#set text(...)` rule in place instead
+  of stacking a new one on top, and accepts any font name and size.
+- Problems panel entries say where they came from (Typst compiler vs tinymist).
+- Code execution and compile endpoints are rate-bounded, and optional UI loads
+  on first use, trimming startup work.
+
+Existing installs from 0.1.3 onwards pick this release up through the
+auto-updater.
+
+---
+
 ## 0.1.6
 
 A hotfix for three things people ran into with 0.1.5.
