@@ -16,7 +16,7 @@ export type SyncPayload = {
   docFraction: number; // 0..1 position of the focus in its document (a prior)
 };
 
-const WORD_RE = /[\p{L}\p{N}][\p{L}\p{N}_'’-]*/gu;
+const WORD_RE = /[\p{L}\p{N}][\p{L}\p{N}\p{M}_'’-]*/gu;
 
 /** Lowercase and strip edge punctuation, keeping intra-word marks (’, -, _). */
 export function normalizeWord(w: string): string {

@@ -1,8 +1,131 @@
 import React, { useState } from 'react';
 
+type TextRule = {
+  start: number;
+  end: number;
+  body: string;
+};
+
+const KNOWN_FONTS = [
+  'New Computer Modern',
+  'Linux Libertine',
+  'Arial',
+  'Times New Roman',
+];
+
+function findTextRules(source: string): TextRule[] {
+  const rules: TextRule[] = [];
+  const pattern = /#set\s+text\s*\(/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = pattern.exec(source))) {
+    const open = match.index + match[0].lastIndexOf('(');
+    let depth = 1;
+    let quote = '';
+    let escaped = false;
+
+    for (let i = open + 1; i < source.length; i++) {
+      const char = source[i];
+      if (quote) {
+        if (escaped) escaped = false;
+        else if (char === '\\') escaped = true;
+        else if (char === quote) quote = '';
+        continue;
+      }
+      if (char === '"' || char === "'") {
+        quote = char;
+        continue;
+      }
+      if (char === '(') depth++;
+      if (char === ')' && --depth === 0) {
+        rules.push({ start: match.index, end: i + 1, body: source.slice(open + 1, i) });
+        pattern.lastIndex = i + 1;
+        break;
+      }
+    }
+  }
+  return rules;
+}
+
+function splitArguments(body: string): string[] {
+  const parts: string[] = [];
+  let start = 0;
+  let round = 0;
+  let square = 0;
+  let curly = 0;
+  let quote = '';
+  let escaped = false;
+
+  for (let i = 0; i < body.length; i++) {
+    const char = body[i];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === quote) quote = '';
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === '(') round++;
+    else if (char === ')') round--;
+    else if (char === '[') square++;
+    else if (char === ']') square--;
+    else if (char === '{') curly++;
+    else if (char === '}') curly--;
+    else if (char === ',' && round === 0 && square === 0 && curly === 0) {
+      parts.push(body.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(body.slice(start));
+  return parts;
+}
+
+function namedArgument(body: string, name: string): string | null {
+  const part = splitArguments(body).find(arg => new RegExp(`^\\s*${name}\\s*:`).test(arg));
+  return part ? part.replace(new RegExp(`^\\s*${name}\\s*:\\s*`), '').trim() : null;
+}
+
+function detectedTextSettings(source: string) {
+  let fontValue: string | null = null;
+  let sizeValue: string | null = null;
+  for (const rule of findTextRules(source)) {
+    fontValue = namedArgument(rule.body, 'font') || fontValue;
+    sizeValue = namedArgument(rule.body, 'size') || sizeValue;
+  }
+  const fontMatch = fontValue?.match(/^"((?:\\.|[^"\\])*)"$/);
+  const sizeMatch = sizeValue?.match(/^(\d+(?:\.\d+)?)pt$/);
+  return {
+    fontFamily: fontMatch ? fontMatch[1].replace(/\\([\\"])/g, '$1') : 'New Computer Modern',
+    fontSize: sizeMatch ? sizeMatch[1] : '11',
+  };
+}
+
+function setNamedArgument(body: string, name: string, value: string): string {
+  const parts = splitArguments(body);
+  const index = parts.findIndex(arg => new RegExp(`^\\s*${name}\\s*:`).test(arg));
+  if (index >= 0) {
+    const leading = parts[index].match(/^\s*/)?.[0] || '';
+    const trailing = parts[index].match(/\s*$/)?.[0] || '';
+    parts[index] = `${leading}${name}: ${value}${trailing}`;
+    return parts.join(',');
+  }
+
+  const trailing = body.match(/\s*$/)?.[0] || '';
+  const content = body.slice(0, body.length - trailing.length);
+  return `${content}${content.trim() ? ', ' : ''}${name}: ${value}${trailing}`;
+}
+
+function escapeTypstString(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
 export default function EditSettings({ onClose, editorRef, monaco }: { onClose: () => void, editorRef: React.MutableRefObject<any>, monaco: any }) {
-  const [fontSize, setFontSize] = useState('11pt');
-  const [fontFamily, setFontFamily] = useState('New Computer Modern');
+  const initialText = detectedTextSettings(editorRef.current?.getValue?.() || '');
+  const [fontSize, setFontSize] = useState(initialText.fontSize);
+  const [fontFamily, setFontFamily] = useState(initialText.fontFamily);
   const [margin, setMargin] = useState('auto');
   const [pageColor, setPageColor] = useState('#ffffff');
   const [alignment, setAlignment] = useState('left');
@@ -10,17 +133,48 @@ export default function EditSettings({ onClose, editorRef, monaco }: { onClose: 
 
   const handleApply = () => {
     if (!editorRef.current || !monaco) return;
-    let code = `\n#set text(font: "${fontFamily}", size: ${fontSize})\n`;
+    const model = editorRef.current.getModel?.();
+    if (!model) return;
+    const family = fontFamily.trim() || 'New Computer Modern';
+    const size = Math.min(144, Math.max(1, Number(fontSize) || 11));
+    const source = model.getValue();
+    const edits: { range: any, text: string, forceMoveMarkers: boolean }[] = [];
+    const textRules = findTextRules(source);
+    if (textRules.length) {
+      const fontRule = [...textRules].reverse().find(rule => namedArgument(rule.body, 'font') !== null);
+      const sizeRule = [...textRules].reverse().find(rule => namedArgument(rule.body, 'size') !== null);
+      const fallbackRule = fontRule || sizeRule || textRules[0];
+      const replacements = new Map<number, { rule: TextRule, body: string }>();
+      const replaceArgument = (rule: TextRule, name: string, value: string) => {
+        const current = replacements.get(rule.start) || { rule, body: rule.body };
+        current.body = setNamedArgument(current.body, name, value);
+        replacements.set(rule.start, current);
+      };
+      replaceArgument(fontRule || fallbackRule, 'font', `"${escapeTypstString(family)}"`);
+      replaceArgument(sizeRule || fallbackRule, 'size', `${size}pt`);
+      for (const { rule, body } of replacements.values()) {
+        edits.push({
+          range: monaco.Range.fromPositions(model.getPositionAt(rule.start), model.getPositionAt(rule.end)),
+          text: `#set text(${body})`,
+          forceMoveMarkers: true,
+        });
+      }
+    } else {
+      edits.push({
+        range: new monaco.Range(1, 1, 1, 1),
+        text: `#set text(font: "${escapeTypstString(family)}", size: ${size}pt)\n`,
+        forceMoveMarkers: true,
+      });
+    }
+
+    let code = '';
     if (margin !== 'auto') code += `#set page(margin: ${margin})\n`;
     if (pageColor !== '#ffffff') code += `#set page(fill: rgb("${pageColor}"))\n`;
     if (alignment !== 'left') code += `#set align(${alignment})\n`;
     if (headingNumbering !== 'none') code += `#set heading(numbering: "${headingNumbering}")\n`;
+    if (code) edits.push({ range: new monaco.Range(1, 1, 1, 1), text: code, forceMoveMarkers: true });
 
-    editorRef.current.executeEdits('settings', [{
-      range: new monaco.Range(1, 1, 1, 1),
-      text: code,
-      forceMoveMarkers: true,
-    }]);
+    editorRef.current.executeEdits('settings', edits);
     onClose();
   };
 
@@ -36,21 +190,18 @@ export default function EditSettings({ onClose, editorRef, monaco }: { onClose: 
           <div className="form-row">
             <label className="form-field">
               <span>Font family</span>
-              <select value={fontFamily} onChange={e => setFontFamily(e.target.value)}>
-                <option value="New Computer Modern">New Computer Modern</option>
-                <option value="Linux Libertine">Linux Libertine</option>
-                <option value="Arial">Arial</option>
-                <option value="Times New Roman">Times New Roman</option>
-              </select>
+              <input list="document-font-families" value={fontFamily} onChange={e => setFontFamily(e.target.value)} />
+              <datalist id="document-font-families">
+                {KNOWN_FONTS.map(font => <option value={font} key={font} />)}
+              </datalist>
             </label>
             <label className="form-field" style={{ maxWidth: 130 }}>
               <span>Font size</span>
-              <select value={fontSize} onChange={e => setFontSize(e.target.value)}>
-                <option value="10pt">10pt</option>
-                <option value="11pt">11pt</option>
-                <option value="12pt">12pt</option>
-                <option value="14pt">14pt</option>
-              </select>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <input type="number" min="1" max="144" step="0.5" value={fontSize}
+                  onChange={e => setFontSize(e.target.value)} style={{ minWidth: 0, width: '100%' }} />
+                <span style={{ color: 'var(--text-muted)', fontSize: 13 }}>pt</span>
+              </div>
             </label>
           </div>
 

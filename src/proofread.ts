@@ -10,6 +10,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { MutableRefObject } from 'react';
 import { API } from './api';
+import { snapUtf16RangeToGraphemes } from './unicodeRanges';
 
 export type ProofKind = 'spelling' | 'grammar' | 'style';
 
@@ -35,52 +36,67 @@ export interface PlacedIssue extends ProofIssue {
 
 const MARKER_OWNER = 'hilbert-proofread';
 
-// Map char offsets (code-point indices, matching the Rust backend) to Monaco
-// {lineNumber, column} positions. Monaco columns are 1-based UTF-16 units, so
-// we walk code points but advance the column by each char's UTF-16 length.
-function computePositions(text: string, offsets: number[]): Map<number, { lineNumber: number; column: number }> {
-  const sorted = Array.from(new Set(offsets)).sort((a, b) => a - b);
-  const res = new Map<number, { lineNumber: number; column: number }>();
+// Map scalar offsets from Rust to absolute UTF-16 offsets used by Monaco.
+function computeUtf16Offsets(text: string, offsets: number[]): Map<number, number> {
+  const sorted = Array.from(new Set(offsets)).filter((offset) => Number.isInteger(offset) && offset >= 0).sort((a, b) => a - b);
+  const res = new Map<number, number>();
   let cp = 0;
-  let line = 1;
-  let col = 1;
+  let utf16 = 0;
   let ptr = 0;
   const record = () => {
     while (ptr < sorted.length && sorted[ptr] === cp) {
-      res.set(sorted[ptr], { lineNumber: line, column: col });
+      res.set(sorted[ptr], utf16);
       ptr++;
     }
   };
   record();
   for (const ch of text) {
     if (ptr >= sorted.length) break;
-    if (ch === '\n') {
-      line++;
-      col = 1;
-    } else {
-      col += ch.length;
-    }
+    utf16 += ch.length;
     cp++;
     record();
   }
   while (ptr < sorted.length) {
-    res.set(sorted[ptr], { lineNumber: line, column: col });
+    res.set(sorted[ptr], utf16);
     ptr++;
   }
   return res;
 }
 
+function lineStarts(text: string): number[] {
+  const starts = [0];
+  for (let i = 0; i < text.length; i++) if (text[i] === '\n') starts.push(i + 1);
+  return starts;
+}
+
+function positionAt(starts: number[], offset: number): { lineNumber: number; column: number } {
+  let low = 0;
+  let high = starts.length - 1;
+  while (low <= high) {
+    const mid = (low + high) >>> 1;
+    if (starts[mid] <= offset) low = mid + 1;
+    else high = mid - 1;
+  }
+  const lineIndex = Math.max(0, high);
+  return { lineNumber: lineIndex + 1, column: offset - starts[lineIndex] + 1 };
+}
+
 function placeIssues(text: string, issues: ProofIssue[]): PlacedIssue[] {
   const offsets: number[] = [];
   for (const i of issues) offsets.push(i.start, i.end);
-  const pos = computePositions(text, offsets);
+  const utf16 = computeUtf16Offsets(text, offsets);
+  const starts = lineStarts(text);
   const out: PlacedIssue[] = [];
   for (const i of issues) {
-    const s = pos.get(i.start);
-    const e = pos.get(i.end);
-    if (!s || !e) continue;
+    const rawStart = utf16.get(i.start);
+    const rawEnd = utf16.get(i.end);
+    if (rawStart === undefined || rawEnd === undefined || rawEnd <= rawStart) continue;
+    const safe = snapUtf16RangeToGraphemes(text, rawStart, rawEnd);
+    const s = positionAt(starts, safe.start);
+    const e = positionAt(starts, safe.end);
     out.push({
       ...i,
+      text: text.slice(safe.start, safe.end),
       range: { startLineNumber: s.lineNumber, startColumn: s.column, endLineNumber: e.lineNumber, endColumn: e.column },
     });
   }
