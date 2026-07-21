@@ -328,8 +328,8 @@ body {
   background: var(--hover-color);
 }
 
-/* GitHub Sponsors link in the About card, under the author name. */
-.about-sponsor {
+/* Donation link in the About card, under the author name. */
+.about-donate {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -346,7 +346,7 @@ body {
   border: 1px solid rgba(219, 97, 162, 0.45);
   transition: background-color 0.12s ease, border-color 0.12s ease;
 }
-.about-sponsor:hover {
+.about-donate:hover {
   background: rgba(219, 97, 162, 0.18);
   border-color: #db61a2;
 }

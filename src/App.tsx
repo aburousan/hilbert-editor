@@ -4361,9 +4361,9 @@ export default function App() {
             <div className="about-version">An offline editor for Typst · Unofficial</div>
             <div className="about-version">Version {__APP_VERSION__}</div>
             <div className="about-author">Created by <a href="https://rousan.netlify.app/" target="_blank" rel="noreferrer" style={{ color: 'inherit', fontWeight: 600, textDecoration: 'underline', textDecorationColor: 'var(--accent)' }}>Kazi Abu Rousan</a></div>
-            <a className="about-sponsor" href="https://github.com/sponsors/aburousan" target="_blank" rel="noreferrer" title="Support Hilbert's development through GitHub Sponsors">
+            <a className="about-donate" href="https://github.com/sponsors/aburousan" target="_blank" rel="noreferrer" title="Support Hilbert's development with a donation">
               <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"></path></svg>
-              Sponsor
+              Donate
             </a>
             <div className="about-links">
               <a href="https://github.com/aburousan/hilbert-editor" target="_blank" rel="noreferrer">GitHub</a>
