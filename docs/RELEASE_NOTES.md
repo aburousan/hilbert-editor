@@ -4,6 +4,66 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.1.8
+
+Mostly things people reported after 0.1.7.
+
+### The cursor no longer jumps while you are typing
+
+Starting to type could throw the cursor somewhere else in the file, so the
+next few characters landed in the wrong place. Hilbert restores the cursor
+position from your last session on startup, but it was waiting for the wrong
+signal: the editor loads lazily, so the restore arrived too late and then fired
+on the next change to the document — which is your first keystroke. It is
+applied when the editor opens now, and typing cancels it outright. Coming back
+to a tab also returns you to where you left off rather than to the top.
+
+### Choose any Python or Julia, including one Hilbert didn't find
+
+Settings → Interpreters now finds uv and pyenv environments, and the `.venv`
+inside the project you have open — which is usually the one you actually want,
+since it is the environment the code runs in. Anything else you can point at
+yourself: browse to it or paste the path. Hilbert checks the file really is an
+interpreter for that language before accepting it, labels it after the project
+it belongs to, and remembers it.
+
+Windows in particular got worse than it should have been: only `<env>\python.exe`
+was checked, which is where conda puts it, while venv, virtualenv and uv put it
+in `Scripts\`. That is why conda environments appeared there and project
+`.venv`s did not. Both layouts are checked now. Windows also registers 0-byte
+"app execution alias" stubs for python that open the Microsoft Store instead of
+running anything; a real installation is preferred over one of those.
+
+### Comment lines with Ctrl+/
+
+⌘/ on macOS. This already existed through Monaco, but its shortcut is bound to
+the physical US slash key, so it silently did nothing on AZERTY, QWERTZ and
+other layouts where `/` needs a modifier. It now matches the character your
+layout actually produces.
+
+### Zoom the preview with the scroll wheel
+
+Hold Ctrl (⌘ on macOS) and scroll over the page, or pinch on a trackpad, and
+the preview zooms around the pointer. Alongside that, a bug that could leave
+the page sitting off-centre next to a band of empty grey — with Fit unable to
+put it back — is fixed. Each zoom level rebuilds the invisible text layer over
+every page, and a slow rebuild for an old zoom level could finish last and
+stretch the scrollable area. That also means double-clicking a word to jump to
+its source is accurate again right after zooming.
+
+### Hide the parts you are not using
+
+A new View menu, and a status bar along the bottom, switch the file tree, file
+outline, problems, editor and PDF preview on and off individually. Hide the
+editor to read, hide the preview to write. The problem count in the corner
+toggles the Problems panel the way an IDE does. Your layout is remembered, and
+the editor and the preview cannot both be hidden.
+
+Existing installs from 0.1.3 onwards pick this release up through the
+auto-updater.
+
+---
+
 ## 0.1.7
 
 A feature release. The project also moved to a single repository — the frontend

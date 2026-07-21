@@ -80,7 +80,7 @@ jobs:
           # user-facing summary and refresh it for every release. The full
           # notes from docs/RELEASE_NOTES.md are pasted in at publish time.
           releaseBody: |
-            Slide Studio for building presentation decks, Zotero citations, a much faster live preview, and live error checking from tinymist.
+            Fixes the cursor jumping while you type, adds uv/pyenv/project-venv detection and hand-picked interpreters, Ctrl+/ to comment, Ctrl+scroll to zoom the preview, and a View menu for hiding panels.
           releaseDraft: true
           prerelease: false
 
