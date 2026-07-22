@@ -6,6 +6,7 @@ import { useProofread } from './proofread';
 import { useTinymistDiagnostics, type EditorProblem } from './tinymistDiagnostics';
 import ProofreadPanel from './components/ProofreadPanel';
 import { tokenizeLine, bestMatch, type SyncPayload } from './syncMatch';
+import { commentEdits, commentTokenFor } from './commentLines';
 import { snapUtf16OffsetToGrapheme, snapUtf16RangeToGraphemes } from './unicodeRanges';
 import type { PdfHandle } from './components/PdfPreview';
 import { PackageInstaller } from './PackageInstaller';
@@ -115,6 +116,16 @@ const DEFAULT_PANELS: PanelState = { tree: true, outline: true, problems: true, 
 const PANEL_LABELS: Record<PanelKey, string> = {
   tree: 'File Tree', outline: 'File Outline', problems: 'Problems', editor: 'Editor', preview: 'PDF Preview',
 };
+// Which end of the status bar each switch belongs to. A switch sits on the same
+// side of the window as the panel it hides, so reaching for the file tree's
+// switch doesn't mean crossing to the opposite corner from the tree itself.
+const LEFT_PANEL_KEYS: PanelKey[] = ['tree', 'outline', 'problems', 'editor'];
+const RIGHT_PANEL_KEYS: PanelKey[] = ['preview'];
+
+// The rest of the menus spell shortcuts with ⌘ throughout; the ones added here
+// are shown with the modifier the user's keyboard actually has.
+const IS_MAC = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+
 
 // Show rule injected once when a notebook runs: badges each python/julia code
 // block in the compiled PDF with its language logo (files under .hilbert/logos/,
@@ -535,6 +546,16 @@ export default function App() {
     if (!next.editor && !next.preview) next[key === 'editor' ? 'preview' : 'editor'] = true;
     return next;
   });
+  const renderPanelToggle = (key: PanelKey) => (
+    <button
+      key={key}
+      className={`status-btn ${panels[key] ? 'on' : ''}`}
+      onClick={() => togglePanel(key)}
+      title={`${panels[key] ? 'Hide' : 'Show'} ${PANEL_LABELS[key]}`}
+    >
+      {PANEL_LABELS[key]}
+    </button>
+  );
   // Hiding the sidebar keeps the section choices; showing it again with every
   // section switched off would open an empty strip, so restore them.
   const toggleSidebar = () => {
@@ -556,6 +577,7 @@ export default function App() {
   const problemsResizeStart = useRef({ y: 0, height: 0 });
   const sidebarRef = useRef<HTMLDivElement | null>(null);
   const toggleNumberingRef = useRef<() => void>(() => {});
+  const toggleCommentRef = useRef<() => void>(() => {});
 
   const monaco = useMonaco();
 
@@ -859,6 +881,21 @@ export default function App() {
       if (key === 's' && !e.shiftKey) { e.preventDefault(); saveActiveFile(); return; }
       if (key === 'k' && !e.shiftKey) { e.preventDefault(); setShowPalette(v => !v); return; }
       if (key === 'n' && e.shiftKey) { e.preventDefault(); toggleNumberingRef.current(); return; }
+      // Comment toggle, handled here rather than inside the editor. Monaco binds
+      // it to the physical US slash key, so it never fires on a layout where "/"
+      // needs a modifier (AZERTY, QWERTZ); matching the character the layout
+      // actually produced does. This listener is on the window in the capture
+      // phase, which is the only place that reliably beats Monaco's own — an
+      // earlier attempt sat on the editor's DOM node, a child of the container
+      // Monaco listens on, so both handlers ran and the second toggle undid the
+      // first. Stopping the event here keeps the toggle to exactly one.
+      if ((e.key === '/' || e.code === 'NumpadDivide') && !e.altKey) {
+        if (!(e.target as HTMLElement)?.closest?.('.monaco-editor')) return;
+        e.preventDefault();
+        e.stopPropagation();
+        toggleCommentRef.current();
+        return;
+      }
       const action = shortcutRef.current[`${e.shiftKey ? 'S-' : ''}${key}`];
       if (!action) return;
       const t = e.target as HTMLElement;
@@ -2000,6 +2037,33 @@ export default function App() {
     }]);
     editor.focus();
   };
+
+  // Comment or uncomment the current line, or every line the selection touches.
+  // It only uncomments when all of them are already commented, which is what
+  // makes the one key a toggle.
+  const toggleComment = () => {
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    const selection = editor?.getSelection();
+    if (!editor || !model || !selection) return;
+
+    const first = selection.startLineNumber;
+    // A selection that stops at the very start of a line doesn't reach into it.
+    const last = selection.endLineNumber > first && selection.endColumn === 1
+      ? selection.endLineNumber - 1
+      : selection.endLineNumber;
+
+    const texts: string[] = [];
+    for (let n = first; n <= last; n++) texts.push(model.getLineContent(n));
+    const edits = commentEdits(texts, first, commentTokenFor(activeTabRef.current?.path || ''));
+    if (!edits.length) return;
+
+    editor.pushUndoStop();
+    editor.executeEdits('hilbert.comment', edits as any);
+    editor.pushUndoStop();
+    editor.focus();
+  };
+  toggleCommentRef.current = toggleComment;
 
   // --- Insert helpers (all driven by the styled InputModal) -------------------
   const docLabels = () => {
@@ -3338,6 +3402,7 @@ export default function App() {
     { category: 'Edit', title: 'Redo', run: () => editorRef.current?.trigger('palette', 'redo', null) },
     { category: 'Edit', title: 'Find...', run: () => editorRef.current?.getAction('actions.find')?.run() },
     { category: 'Edit', title: 'Find & Replace...', run: () => editorRef.current?.getAction('editor.action.startFindReplaceAction')?.run() },
+    { category: 'Edit', title: 'Comment / Uncomment Lines', hint: IS_MAC ? '⌘/' : 'Ctrl+/', run: toggleComment },
     { category: 'Edit', title: 'Toggle Numbering (at cursor)', hint: '⌘⇧N', run: toggleNumbering },
     { category: 'Edit', title: 'Toggle Equation Numbering (all)', run: toggleEquationNumbering },
     { category: 'Edit', title: 'Document Settings...', run: () => setShowEditSettings(true) },
@@ -3478,6 +3543,8 @@ export default function App() {
                   <div className="dropdown-divider"></div>
                   <div className="dropdown-item" onClick={() => { editorRef.current?.getAction('actions.find')?.run(); setActiveMenu(null); }}>Find...</div>
                   <div className="dropdown-item" onClick={() => { editorRef.current?.getAction('editor.action.startFindReplaceAction')?.run(); setActiveMenu(null); }}>Find &amp; Replace...</div>
+                  <div className="dropdown-divider"></div>
+                  <div className="dropdown-item" onClick={() => { toggleComment(); setActiveMenu(null); }}>Comment / Uncomment Lines <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{IS_MAC ? '⌘/' : 'Ctrl+/'}</span></div>
                   <div className="dropdown-divider"></div>
                   <div className="dropdown-item" onClick={() => { toggleNumbering(); setActiveMenu(null); }}>Toggle Numbering (at cursor) <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧N</span></div>
                   <div className="dropdown-item" onClick={() => { toggleEquationNumbering(); setActiveMenu(null); }}>Toggle Equation Numbering (all)</div>
@@ -4141,14 +4208,42 @@ export default function App() {
                       editorRef.current = e;
                       // Remember cursor position for session restore (debounced write)
                       // and, per file, so a recreated editor lands back where it was.
+                      // One step of cursor history. The caret has already been
+                      // moved by the time a content change reaches us, so the
+                      // guard below needs the position from before it moved.
+                      let priorPos: { lineNumber: number; column: number } | null = null;
+                      let livePos = e.getPosition();
                       e.onDidChangeCursorPosition(() => {
                         const p = e.getPosition();
                         if (!p) return;
+                        priorPos = livePos;
+                        livePos = p;
                         const uri = e.getModel()?.uri.toString();
                         if (uri) cursorMemoryRef.current[uri] = { lineNumber: p.lineNumber, column: p.column };
                         sessionRef.current.cursor = { line: p.lineNumber, column: p.column };
                         sessionRef.current.scrollTop = e.getScrollTop?.();
                         scheduleSaveSession();
+                      });
+                      // The editor's text is a controlled prop, so whenever the app
+                      // changes a tab's content behind the editor's back the wrapper
+                      // re-applies it as a single edit spanning the whole document —
+                      // and that leaves the caret at the very end of the file. From
+                      // the outside it looks like the editor throwing you to the
+                      // bottom for no reason. Spot a whole-document replacement and
+                      // put the caret back where it was.
+                      let docLength = e.getModel()?.getValueLength() ?? 0;
+                      e.onDidChangeModelContent((ev: any) => {
+                        const model = e.getModel();
+                        if (!model) return;
+                        const wasLength = docLength;
+                        docLength = model.getValueLength();
+                        const replacedAll = wasLength > 0 && !ev.isUndoing && !ev.isRedoing
+                          && ev.changes.length === 1
+                          && ev.changes[0].rangeOffset === 0
+                          && ev.changes[0].rangeLength >= wasLength;
+                        if (!replacedAll || !priorPos) return;
+                        const line = Math.min(priorPos.lineNumber, model.getLineCount());
+                        e.setPosition({ lineNumber: line, column: Math.min(priorPos.column, model.getLineMaxColumn(line)) });
                       });
                       // Switching tabs swaps the model under the same editor, which
                       // resets the caret to the top; put it back too.
@@ -4166,17 +4261,6 @@ export default function App() {
                       monacoInstance.editor.setTheme(theme);
                       e.updateOptions({ hover: { enabled: true, delay: 300 } });
                       e.addCommand(monacoInstance.KeyMod.CtrlCmd | monacoInstance.KeyCode.KeyY, () => e.trigger('keyboard', 'redo', null));
-                      // Ctrl/⌘+/ comments the selected lines. Monaco's own binding
-                      // is on the physical US slash key, so it never fires on
-                      // layouts where "/" needs a modifier (AZERTY, QWERTZ); match
-                      // the character the layout produced instead. defaultPrevented
-                      // means Monaco already handled it — don't toggle twice.
-                      e.getDomNode()?.addEventListener('keydown', (ev: KeyboardEvent) => {
-                        if (ev.defaultPrevented || ev.altKey || !(ev.ctrlKey || ev.metaKey)) return;
-                        if (ev.key !== '/' && ev.code !== 'NumpadDivide') return;
-                        ev.preventDefault();
-                        e.getAction('editor.action.commentLine')?.run();
-                      });
                       // Forward sync: reveal the cursor's line in the PDF preview.
                       e.addAction({
                         id: 'hilbert.syncToPdf',
@@ -4193,14 +4277,19 @@ export default function App() {
                       const m = e.getModel();
                       if (m && !applyPendingCursor()) {
                         // Otherwise a file we've already been editing reopens
-                        // where the caret was, and only a document we've never
-                        // seen starts at the end — that's the starter template,
-                        // where you want to type after it, not inside it.
-                        // Scroll back too: a fresh editor starts at the top, so
-                        // restoring only the caret would still look like a jump.
+                        // where the caret was. Scroll back too: a fresh editor
+                        // starts at the top, so restoring only the caret would
+                        // still look like a jump.
+                        //
+                        // With nothing remembered, stay at the top. Only the
+                        // starter template opens at the end, because that is the
+                        // one document you want to type after rather than into —
+                        // doing it for every unseen file is itself a jump to the
+                        // bottom, and it used to get written back into the saved
+                        // session, so the next launch started down there too.
                         const saved = cursorMemoryRef.current[m.uri.toString()];
                         if (saved) { e.setPosition(saved); e.revealLineInCenter(saved.lineNumber); }
-                        else { const last = m.getLineCount(); e.setPosition({ lineNumber: last, column: m.getLineMaxColumn(last) }); }
+                        else if (m.getValue() === DEFAULT_CODE) { const last = m.getLineCount(); e.setPosition({ lineNumber: last, column: m.getLineMaxColumn(last) }); }
                       }
                     }}
                     options={editorOptions}
@@ -4291,8 +4380,9 @@ export default function App() {
         </div>
       </div>
 
-      {/* Status bar: the problem count on the left the way an IDE puts it, and
-          a switch per panel on the right, mirroring the View menu. */}
+      {/* Status bar: the problem count on the left the way an IDE puts it, then
+          a switch per panel, each at the end of the bar nearest the panel it
+          hides. The View menu still lists all five together. */}
       <div className="status-bar">
         <button
           className={`status-btn ${panels.problems ? 'on' : ''}`}
@@ -4308,17 +4398,10 @@ export default function App() {
           })()}
         </button>
         {isCompiling && <span className="status-note">Compiling…</span>}
+        <span className="status-sep" />
+        {LEFT_PANEL_KEYS.map(renderPanelToggle)}
         <span style={{ flex: 1 }} />
-        {(Object.keys(PANEL_LABELS) as PanelKey[]).map(key => (
-          <button
-            key={key}
-            className={`status-btn ${panels[key] ? 'on' : ''}`}
-            onClick={() => togglePanel(key)}
-            title={`${panels[key] ? 'Hide' : 'Show'} ${PANEL_LABELS[key]}`}
-          >
-            {PANEL_LABELS[key]}
-          </button>
-        ))}
+        {RIGHT_PANEL_KEYS.map(renderPanelToggle)}
       </div>
 
       {showPackageInstaller && <PackageInstaller onClose={() => setShowPackageInstaller(false)} onInsert={(pkg) => {

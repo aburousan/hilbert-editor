@@ -80,7 +80,7 @@ jobs:
           # user-facing summary and refresh it for every release. The full
           # notes from docs/RELEASE_NOTES.md are pasted in at publish time.
           releaseBody: |
-            Fixes the cursor jumping while you type, adds uv/pyenv/project-venv detection and hand-picked interpreters, Ctrl+/ to comment, Ctrl+scroll to zoom the preview, and a View menu for hiding panels.
+            Hotfix for 0.1.8. Ctrl+/ (⌘/) really comments now — it did nothing at all before, and it works in Python, Julia and .bib files too. Comment / Uncomment Lines is in the Edit menu and the command palette. The panel switches moved beside the panel they hide, and the caret no longer jumps to the end when a document is reloaded.
           releaseDraft: true
           prerelease: false
 

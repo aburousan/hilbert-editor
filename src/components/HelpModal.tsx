@@ -19,7 +19,7 @@ const SECTIONS: Section[] = [
       { title: 'Formatting', where: 'Formatting menu / toolbar', keys: '⌘B · ⌘I', desc: 'Bold, italic, underline, sub/superscript, small caps, colours, highlights, alignment, rotation, letter spacing, boxes.' },
       { title: 'Spelling & grammar', where: 'Tick icon in the header', desc: 'Offline proofreading (Nuspell + Harper). Squiggles in the editor, an issues panel in the sidebar, one-click fixes, personal dictionary.' },
       { title: 'Version history', where: 'Clock icon in the header', desc: 'Snapshots of your file as you work — restore any earlier version.' },
-      { title: 'Comment lines', where: 'Editor', keys: '⌘/ · Ctrl+/', desc: 'Comment or uncomment the current line, or every line in the selection.' },
+      { title: 'Comment lines', where: 'Edit menu, or the command palette', keys: '⌘/ · Ctrl+/', desc: 'Comment or uncomment the current line, or every line in the selection. Uses the comment syntax of the file you are in — // in Typst, # in Python and Julia, % in a .bib.' },
       { title: 'Show / hide panels', where: 'View menu, or the status bar', desc: 'Switch the file tree, outline, problems, editor and PDF preview on and off — hide the editor to read, hide the preview to write. Your layout is remembered.' },
       { title: 'Click-to-source', where: 'PDF preview', desc: 'Click anywhere in the rendered PDF to jump to the matching line in the source, and back.' },
       { title: 'Zoom the preview', where: 'PDF preview', keys: '⌘/Ctrl + scroll', desc: 'Hold Ctrl (⌘ on macOS) and scroll — or pinch on a trackpad — to zoom around the pointer. The toolbar’s +/−, a zoom menu and Fit width are still there.' },

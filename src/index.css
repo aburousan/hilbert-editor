@@ -240,6 +240,14 @@ body {
   white-space: nowrap;
   transition: background-color 0.11s ease, color 0.11s ease;
 }
+/* Keeps the problem count reading as its own thing, separate from the row of
+   panel switches that follows it. */
+.status-sep {
+  width: 1px;
+  height: 12px;
+  margin: 0 4px;
+  background: var(--border-color);
+}
 .status-btn:hover { background: var(--panel-lighter); color: var(--text-main); }
 .status-btn.on { color: var(--text-main); }
 .status-btn.on::before {

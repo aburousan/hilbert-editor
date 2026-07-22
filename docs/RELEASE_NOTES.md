@@ -4,6 +4,50 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.1.9
+
+A hotfix for 0.1.8.
+
+### Ctrl+/ actually comments now
+
+It did nothing at all in 0.1.8, on every platform. Two handlers were listening
+for the shortcut: the one added in 0.1.8 and Monaco's own, on an element
+containing it. Both ran, so the second toggle undid the first and the line came
+back exactly as it was. Only one of them handles it now.
+
+Two more things were wrong with it. The comment syntax was taken from the
+editor's language configuration, which only exists for `.typ` here, so the
+shortcut was a no-op in a `.py`, `.jl`, `.bib` or `.toml` file; the syntax now
+follows the file you are in — `//`, `#`, `%` or `--`. And commenting a block
+starts from the shallowest line in it, so an indented block keeps its shape.
+
+### Comment / Uncomment Lines is in the Edit menu and the command palette
+
+It was reachable only by its shortcut before, which is no help when the
+shortcut is the thing that isn't working, or when your keyboard puts `/`
+somewhere unusual. macOS shows ⌘/ and everywhere else Ctrl+/.
+
+### Panel switches sit beside the panel they hide
+
+The five switches in the status bar were all bunched in the bottom-right
+corner, so hiding the file tree meant reaching for the opposite corner from the
+tree. The sidebar and editor switches are on the left now and the PDF preview's
+switch stays on the right. The View menu still lists all five together.
+
+### The caret keeps its place when a document is reloaded
+
+The editor's text is a controlled value, so whenever the app replaced a
+document's contents behind the editor's back the whole file was rewritten in
+one edit and the caret was left at the very end. It stays where it was. A file
+with nothing remembered about it also opens at the top rather than the bottom —
+only the starter template still opens at the end, which is the one place you
+want to type after the text rather than into it.
+
+Existing installs from 0.1.3 onwards pick this release up through the
+auto-updater.
+
+---
+
 ## 0.1.8
 
 Mostly things people reported after 0.1.7.

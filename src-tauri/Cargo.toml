@@ -1,6 +1,6 @@
 [package]
 name = "typst-editor"
-version = "0.1.8"
+version = "0.1.9"
 description = "Hilbert — an offline editor for Typst (Unofficial), aimed at maths/physics writing."
 authors = ["Kazi Abu Rousan"]
 license = "MIT"
