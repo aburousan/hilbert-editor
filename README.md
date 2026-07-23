@@ -11,7 +11,7 @@
 > **Automatic updates:** Hilbert updates itself. Install it once and every future
 > version arrives on its own (it asks before installing). Grab it from the
 > [latest release](https://github.com/aburousan/hilbert-editor/releases/latest)
-> (currently 0.1.6). On Linux the AppImage auto-updates; the `.deb` does not.
+> (currently 0.1.10). On Linux the AppImage auto-updates; the `.deb` does not.
 > [What changed in each version](docs/RELEASE_NOTES.md).
 
 It started as "an offline, Overleaf-feeling place to write physics and maths," and
@@ -161,12 +161,18 @@ and autocomplete, plus live errors, warnings, information, and hints in Monaco a
 the Problems panel. Hover any function for its signature and docs, and get completions
 for every builtin, package export, and label. There's `@`-reference autocomplete, and
 image-path autocomplete inside `image("…")`. Control-flow completions offer both the
-`{ }` code body and the `[ ]` content body for `if`, `for`, and `while`.
+`{ }` code body and the `[ ]` content body for `if`, `for`, and `while`. The same
+engine drives code intelligence from the Edit menu and the editor's right-click menu:
+go to definition, find references, rename a symbol across the file, quick fixes, and
+whole-document formatting (F2) with the bundled typstyle formatter.
 
 The PDF preview recompiles as you type, with zoom, fit-to-width, a dark PDF mode, and
 double-click-to-source (it reads the surrounding words to land on the right
 occurrence). When a compile fails you keep the last good preview and the errors move
-to their own Problems tab, so a typo mid-sentence doesn't blank the page.
+to their own Problems tab, so a typo mid-sentence doesn't blank the page — the last
+good render stays up from the moment you open a project, with a slim strip at the
+bottom you click for the full error list. There's also an experimental **HTML Preview**
+(View menu) that renders the document through Typst's HTML export.
 
 Slide Studio builds editable 16:9 decks with templates, drag-and-drop positioning,
 shapes, curves with optional arrowheads, equations, app-tool inserts, alignment controls, copy/paste,
@@ -181,7 +187,12 @@ whole. The root file shows a MAIN badge; right-click any `.typ` and choose
 There's also a clickable Problems panel, a File Outline, resizable panes, a ⌘K command
 palette covering every menu action, a Help window listing the features, and a live
 word count of the rendered document (read from the PDF, so `#set` and `#import` lines
-don't inflate it).
+don't inflate it). The View menu and a status bar along the bottom switch the file
+tree, outline, problems, editor, and preview on and off individually — hide the editor
+to read, hide the preview to write. **File → New Window** opens another project in a
+second window; it's one app (a single Dock icon) with independent windows, each with
+its own preview, and comment/uncomment works on the current line or selection (⌘/ or
+Ctrl+/, in Typst, Python, Julia, `.bib`, and more).
 
 ### Projects and files (VS Code style)
 
@@ -190,6 +201,9 @@ on the desktop app and in Chrome/Edge, plus **File → Open Recent**. The file t
 multi-select, drag-and-drop moves, rename, duplicate, delete, cut, copy, paste, a
 right-click menu, new file and folder, asset upload, compress to `.zip`, and
 reveal-in-file-manager. Full-text search across the workspace jumps you to the line.
+Files changed on disk by Git or another editor are picked up automatically; if you had
+unsaved edits, Hilbert shows both versions side by side and lets you choose rather than
+silently overwriting either one.
 
 ### Inserting the annoying stuff
 

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef, useMemo, lazy, Suspense } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo, lazy, Suspense } from 'react';
 import { API } from './api';
 import Editor, { useMonaco } from '@monaco-editor/react';
 import { setupTypstLanguage, setWorkspaceImages } from './typstMonaco';
@@ -38,12 +38,14 @@ const DriveSyncModal = lazy(() => import('./components/DriveSyncModal'));
 const AppSettingsModal = lazy(() => import('./components/AppSettingsModal'));
 const CodeRunnerModal = lazy(() => import('./components/CodeRunnerModal'));
 const SaveAsModal = lazy(() => import('./components/SaveAsModal'));
+const HtmlPreviewModal = lazy(() => import('./components/HtmlPreviewModal'));
 const SymbolDraw = lazy(() => import('./components/SymbolDraw'));
 const DataImportModal = lazy(() => import('./components/DataImportModal'));
 const RefManager = lazy(() => import('./components/RefManager'));
 const BibManager = lazy(() => import('./components/BibManager'));
 import Boundary from './components/Boundary';
 import Toaster from './components/Toaster';
+import ExternalChangeModal, { type ExternalConflict } from './components/ExternalChangeModal';
 import { notify } from './notify';
 import './index.css';
 
@@ -107,7 +109,7 @@ interface FileNode {
   mtime?: number;
   matches?: { lineNum: number; text: string }[];
 }
-type Tab = { path: string; content: string; isDirty: boolean };
+type Tab = { path: string; content: string; isDirty: boolean; diskHash?: string };
 
 // The panels the View menu and the status bar can show and hide.
 type PanelKey = 'tree' | 'outline' | 'problems' | 'editor' | 'preview';
@@ -273,6 +275,7 @@ const PHYSICS_EQS: { group: string, name: string, physica?: boolean, code: strin
 
 type SearchSnippet = { lineNum: number; text: string };
 type SearchResult = { path: string; matches: SearchSnippet[] };
+const NO_SEARCH_RESULTS: SearchResult[] = [];
 
 export default function App() {
   const editorRef = useRef<any>(null);
@@ -283,7 +286,10 @@ export default function App() {
   // its real content on that same model as an *edit* — leaving the template one
   // undo away. The opening tab is chosen once we know whether we're restoring.
   const [tabs, setTabs] = useState<Tab[]>([]);
+  const tabsRef = useRef<Tab[]>([]);
+  tabsRef.current = tabs;
   const [activeTabPath, setActiveTabPath] = useState<string>('');
+  const [externalConflict, setExternalConflict] = useState<ExternalConflict | null>(null);
   const [booted, setBooted] = useState(false);
   const [fileTree, setFileTree] = useState<FileNode[]>([]);
   const [treeSearch, setTreeSearch] = useState<string>('');
@@ -294,13 +300,19 @@ export default function App() {
       setSearchContentResults([]);
       return;
     }
+    const controller = new AbortController();
     const timer = setTimeout(async () => {
       try {
-        const res = await fetch(`${API}/workspace/search?q=${encodeURIComponent(treeSearch)}`);
-        if (res.ok) setSearchContentResults(await res.json());
-      } catch (e) {}
+        const res = await fetch(`${API}/workspace/search?q=${encodeURIComponent(treeSearch)}`, { signal: controller.signal });
+        if (res.ok && !controller.signal.aborted) setSearchContentResults(await res.json());
+      } catch {
+        if (!controller.signal.aborted) setSearchContentResults([]);
+      }
     }, 300);
-    return () => clearTimeout(timer);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
   }, [treeSearch]);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
@@ -463,6 +475,25 @@ export default function App() {
   const [showAppSettings, setShowAppSettings] = useState(false);
   const [activeMenu, setActiveMenu] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, node?: FileNode, type: 'file' | 'folder' | 'empty' } | null>(null);
+  const contextMenuRef = useRef<HTMLDivElement>(null);
+  // The menu opens at the click point and grows down and to the right, so a
+  // right-click low in the file tree or near the right edge would run it off
+  // screen. Once it has a measured size, pull it back inside the window.
+  useLayoutEffect(() => {
+    const el = contextMenuRef.current;
+    if (!el || !contextMenu) return;
+    const position = () => {
+      const pad = 6;
+      const rect = el.getBoundingClientRect();
+      const top = Math.max(pad, Math.min(contextMenu.y, window.innerHeight - rect.height - pad));
+      const left = Math.max(pad, Math.min(contextMenu.x, window.innerWidth - rect.width - pad));
+      el.style.top = `${top}px`;
+      el.style.left = `${left}px`;
+    };
+    position();
+    window.addEventListener('resize', position);
+    return () => window.removeEventListener('resize', position);
+  }, [contextMenu]);
   const [fileClipboard, setFileClipboard] = useState<{ path: string, type: 'copy' | 'cut' } | null>(null);
   const [renamingPath, setRenamingPath] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState<string>('');
@@ -514,6 +545,7 @@ export default function App() {
   }), [editorFontSize]);
   const [codeRunner, setCodeRunner] = useState<null | { initialLang?: 'python' | 'julia' | 'wolfram'; initialCode?: string; initialMode?: 'text' | 'equation' }>(null);
   const [showSaveAs, setShowSaveAs] = useState(false);
+  const [showHtmlPreview, setShowHtmlPreview] = useState(false);
   const [showPalette, setShowPalette] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [showPlot3D, setShowPlot3D] = useState(false);
@@ -585,6 +617,48 @@ export default function App() {
   const tinymist = useTinymistDiagnostics(monaco, editorRef, activeTab?.path, activeTab?.content);
 
   useEffect(() => { if (monaco) setupTypstLanguage(monaco); }, [monaco]);
+  const lspModelHashesRef = useRef<Record<string, string | undefined>>({});
+  useEffect(() => {
+    const onModelOpened = (event: Event) => {
+      const detail = (event as CustomEvent<{ file: string; content: string; diskHash?: string }>).detail;
+      if (!detail?.file) return;
+      lspModelHashesRef.current[detail.file] = detail.diskHash;
+      setTabs(prev => prev.some(tab => tab.path === detail.file)
+        ? prev
+        : [...prev, { path: detail.file, content: detail.content, isDirty: false, diskHash: detail.diskHash }]);
+    };
+    window.addEventListener('hilbert:lsp-model-opened', onModelOpened);
+    return () => window.removeEventListener('hilbert:lsp-model-opened', onModelOpened);
+  }, []);
+  useEffect(() => {
+    if (!monaco) return;
+    const subscriptions = new Map<any, { dispose: () => void }>();
+    const attach = (model: any) => {
+      if (subscriptions.has(model) || model.getLanguageId() !== 'typst') return;
+      subscriptions.set(model, model.onDidChangeContent(() => {
+        if (editorRef.current?.getModel() === model) return;
+        const path = model.uri.path.replace(/^\//, '');
+        const content = model.getValue();
+        setTabs(prev => {
+          if (!prev.some(tab => tab.path === path)) {
+            return [...prev, {
+              path,
+              content,
+              isDirty: true,
+              diskHash: lspModelHashesRef.current[path],
+            }];
+          }
+          return prev.map(tab => tab.path === path ? { ...tab, content, isDirty: true } : tab);
+        });
+      }));
+    };
+    monaco.editor.getModels().forEach(attach);
+    const created = monaco.editor.onDidCreateModel(attach);
+    return () => {
+      created.dispose();
+      subscriptions.forEach(subscription => subscription.dispose());
+    };
+  }, [monaco]);
   // Keep the editor's image-path autocomplete (inside image("…")) in sync with
   // the workspace's image files.
   useEffect(() => { setWorkspaceImages(workspaceImages); }, [workspaceImages]);
@@ -663,9 +737,9 @@ export default function App() {
   const dirHandleRef = useRef<any>(null);
 
   // Write a file back to the opened on-disk folder (browser File System Access).
-  const syncToDisk = async (path: string, content: string) => {
+  const syncToDisk = async (path: string, content: string): Promise<boolean> => {
     const root = dirHandleRef.current;
-    if (!root) return;
+    if (!root) return true;
     try {
       const parts = path.split('/');
       let dir = root;
@@ -674,7 +748,54 @@ export default function App() {
       const w = await fh.createWritable();
       await w.write(content);
       await w.close();
-    } catch { /* ignore (permission revoked / removed) */ }
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const readFileState = async (path: string): Promise<{ content: string; hash?: string }> => {
+    const response = await fetch(`${API}/workspace/file/state?path=${encodeURIComponent(path)}`);
+    if (!response.ok) throw new Error(`Could not inspect ${path} (${response.status}).`);
+    const state = await response.json();
+    return { content: state.content || '', hash: state.hash || undefined };
+  };
+
+  const showExternalConflict = (tab: Tab, disk: { content: string; hash?: string }) => {
+    if (!disk.hash) return;
+    setExternalConflict(current => current || {
+      path: tab.path,
+      local: tab.content,
+      disk: disk.content,
+      diskHash: disk.hash!,
+    });
+  };
+
+  const writeTab = async (tab: Tab, signal?: AbortSignal): Promise<string> => {
+    let expected = tab.diskHash;
+    if (!expected) {
+      const disk = await readFileState(tab.path);
+      expected = disk.hash;
+      if (disk.hash && disk.content !== tab.content) {
+        showExternalConflict(tab, disk);
+        throw new Error('external-conflict');
+      }
+    }
+    const headers: Record<string, string> = { 'Content-Type': 'text/plain' };
+    if (expected) headers['If-Match'] = expected;
+    const saved = await fetch(`${API}/workspace/file?path=${encodeURIComponent(tab.path)}`, {
+      method: 'POST', body: tab.content, headers, signal,
+    });
+    const data = await saved.json().catch(() => ({}));
+    if (saved.status === 409) {
+      showExternalConflict(tab, { content: data.content || '', hash: data.hash });
+      throw new Error('external-conflict');
+    }
+    if (!saved.ok) throw new Error(`Could not save ${tab.path} (${saved.status}).`);
+    if (!await syncToDisk(tab.path, tab.content)) {
+      throw new Error(`Could not save ${tab.path} back to the opened folder. Check its write permission.`);
+    }
+    return data.hash || expected || '';
   };
 
   const fetchTree = async () => {
@@ -705,12 +826,12 @@ export default function App() {
     compileAbortRef.current = ac;
     setIsCompiling(true);
     try {
+      const savedHashes = new Map<string, string>();
       for (const tab of tabs) {
-        if (tab.isDirty || tab.path === mainFile) {
-          await fetch(`${API}/workspace/file?path=${encodeURIComponent(tab.path)}`, {
-            method: 'POST', body: tab.content, headers: { 'Content-Type': 'text/plain' }
-          });
-          if (tab.isDirty) syncToDisk(tab.path, tab.content);   // mirror edits to the opened folder on disk
+        if (tab.isDirty) {
+          const hash = await writeTab(tab, ac.signal);
+          savedHashes.set(tab.path, hash);
+          setTabs(prev => prev.map(item => item.path === tab.path ? { ...item, diskHash: hash } : item));
         }
       }
 
@@ -735,10 +856,15 @@ export default function App() {
         w.logTiming('First compile');
       }
 
-      setTabs(prev => prev.map(t => ({ ...t, isDirty: false })));
+      setTabs(prev => prev.map(t => ({
+        ...t,
+        isDirty: false,
+        diskHash: savedHashes.get(t.path) || t.diskHash,
+      })));
       fetchTree();
     } catch (error) {
       if (ac.signal.aborted) return;   // superseded by a newer compile — stay quiet
+      if (error instanceof Error && error.message === 'external-conflict') return;
       const msg = error instanceof Error && /fetch/i.test(error.message)
         ? "Couldn't reach the local Typst engine. Make sure the app's backend is running, then recompile."
         : String(error);
@@ -824,26 +950,8 @@ export default function App() {
     });
   }, []);
 
-  // Points at the latest runNotebook (defined further down). Held in a ref so an
-  // intentional save can trigger it without pulling it into save's dependencies.
-
-  const saveActiveFile = useCallback(async () => {
-    if (!activeTab) return;
-    try {
-      await fetch(`${API}/workspace/file?path=${encodeURIComponent(activeTab.path)}`, {
-        method: 'POST', body: activeTab.content, headers: { 'Content-Type': 'text/plain' }
-      });
-      snapshotHistory(activeTab.path, activeTab.content);   // keep a version, this save only
-      syncToDisk(activeTab.path, activeTab.content);   // mirror to the opened folder on disk
-      setTabs(prev => prev.map(t => t.path === activeTab.path ? { ...t, isDirty: false } : t));
-      fetchTree();
-      compileTypst(currentMain);
-      webdavAutoSync();
-    } catch (e) {}
-  }, [activeTab, currentMain, compileTypst, snapshotHistory]);
-
   // If the user enabled WebDAV auto-sync, push the project on every save.
-  const webdavAutoSync = () => {
+  const webdavAutoSync = useCallback(() => {
     if (localStorage.getItem('webdav_autosync') !== 'true') return;
     const url = localStorage.getItem('webdav_url');
     if (!url) return;
@@ -851,7 +959,25 @@ export default function App() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url, username: localStorage.getItem('webdav_user') || '', password: localStorage.getItem('webdav_pass') || '', projectName })
     }).catch(() => {});
-  };
+  }, [projectName]);
+
+  // Points at the latest runNotebook (defined further down). Held in a ref so an
+  // intentional save can trigger it without pulling it into save's dependencies.
+
+  const saveActiveFile = useCallback(async () => {
+    if (!activeTab) return;
+    try {
+      const hash = await writeTab(activeTab);
+      snapshotHistory(activeTab.path, activeTab.content);   // keep a version, this save only
+      setTabs(prev => prev.map(t => t.path === activeTab.path ? { ...t, isDirty: false, diskHash: hash } : t));
+      fetchTree();
+      compileTypst(currentMain);
+      webdavAutoSync();
+    } catch (e) {
+      if (e instanceof Error && e.message === 'external-conflict') return;
+      notify(e instanceof Error ? e.message : 'Could not save the file.');
+    }
+  }, [activeTab, currentMain, compileTypst, snapshotHistory, webdavAutoSync]);
 
   // Global shortcuts. Routed through a ref so the handler never captures stale
   // state; ⌘S is intercepted so the browser "Save As" dialog never appears.
@@ -934,7 +1060,94 @@ export default function App() {
     }
   }, [activeTabPath]);
 
+  // Until the first successful compile of a session there is no "last good
+  // preview", so an error on the very first build used to take over the whole
+  // pane. The previous session's built PDF is still on disk — show that from
+  // the start, and the error state stays a footnote under a visible document.
+  useEffect(() => {
+    if (!backendReady) return;
+    (async () => {
+      try {
+        const r = await fetch(`${API}/workspace/raw?path=${encodeURIComponent('.hilbert/out.pdf')}`);
+        if (!r.ok) return;
+        const blob = await r.blob();
+        if (!blob.size) return;
+        const url = URL.createObjectURL(blob);
+        // A compile may have finished while this fetch ran — its result wins.
+        setPdfUrl(prev => { if (prev) { URL.revokeObjectURL(url); return prev; } return url; });
+      } catch {}
+    })();
+  }, [backendReady]);
+
+  useEffect(() => {
+    if (!backendReady) return;
+    let stopped = false;
+    let checking = false;
+    const checkOpenFiles = async () => {
+      if (checking || stopped) return;
+      checking = true;
+      try {
+        // One batched request for every open text tab, instead of a request per
+        // tab: the hashes come back together and only changed files are fetched.
+        const watched = tabsRef.current.filter(t => /\.(typ|bib|txt|md|csv|json|ya?ml|toml|xml|tex|html|css|js)$/i.test(t.path));
+        if (!watched.length) return;
+        let states: Record<string, string | null> = {};
+        try {
+          const r = await fetch(`${API}/workspace/files/state`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ paths: watched.map(t => t.path) }),
+          });
+          if (!r.ok) return;
+          states = (await r.json()).states || {};
+        } catch { return; }
+        for (const tab of watched) {
+          const hash = states[tab.path];
+          const current = tabsRef.current.find(item => item.path === tab.path);
+          if (!hash || stopped || !current || (current.diskHash && hash === current.diskHash)) continue;
+          const disk = await readFileState(tab.path).catch(() => null);
+          if (!disk?.hash || stopped) continue;
+          // Re-read the tab: a keystroke may have landed during the fetch, and a
+          // decision made on the stale snapshot could overwrite it. The updaters
+          // below also skip dirty tabs for the same reason — a tab that turned
+          // dirty mid-flight gets the conflict prompt on the next tick instead.
+          const fresh = tabsRef.current.find(item => item.path === tab.path);
+          if (!fresh) continue;
+          if (!fresh.diskHash) {
+            if (disk.content === fresh.content) {
+              setTabs(prev => prev.map(item => item.path === fresh.path ? { ...item, diskHash: disk.hash } : item));
+            } else if (fresh.isDirty) {
+              showExternalConflict(fresh, disk);
+            } else {
+              setTabs(prev => prev.map(item => item.path === fresh.path && !item.isDirty
+                ? { ...item, content: disk.content, diskHash: disk.hash, isDirty: false }
+                : item));
+              notify(`Reloaded ${fresh.path} after an external change.`);
+            }
+            continue;
+          }
+          if (fresh.isDirty) {
+            showExternalConflict(fresh, disk);
+          } else {
+            setTabs(prev => prev.map(item => item.path === fresh.path && !item.isDirty
+              ? { ...item, content: disk.content, diskHash: disk.hash, isDirty: false }
+              : item));
+            notify(`Reloaded ${fresh.path} after an external change.`);
+          }
+        }
+      } finally {
+        checking = false;
+      }
+    };
+    const timer = window.setInterval(checkOpenFiles, 2000);
+    checkOpenFiles();
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [backendReady]);
+
   const IMG_EXT = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp'];
+  const openFileRef = useRef<(path: string) => Promise<void>>(async () => {});
   
   const openFile = async (path: string) => {
     const ext = (path.split('.').pop() || '').toLowerCase();
@@ -947,17 +1160,17 @@ export default function App() {
     } else {
       if (!tabs.find(t => t.path === path)) {
         try {
-          const res = await fetch(`${API}/workspace/file?path=${encodeURIComponent(path)}`);
-          if (res.ok) {
-            const content = await res.text();
-            setTabs(prev => [...prev, { path, content, isDirty: false }]);
-          }
+          const state = await readFileState(path);
+          setTabs(prev => prev.some(t => t.path === path) ? prev : [...prev, {
+            path, content: state.content, isDirty: false, diskHash: state.hash,
+          }]);
         } catch (e) {}
       }
     }
     
     setActiveTabPath(path);
   };
+  openFileRef.current = openFile;
 
   const closeTab = (e: React.MouseEvent, path: string) => {
     e.stopPropagation();
@@ -1511,6 +1724,22 @@ export default function App() {
     setActiveTabPath('main.typ');
   };
 
+  // With no session to restore, open the workspace's existing main.typ (clean,
+  // with its disk hash) rather than seeding the starter template over it — a
+  // dirty template would otherwise read as an external change against the file
+  // already on disk. Only a workspace without a main.typ gets the template.
+  const openEntryOrSeed = async () => {
+    try {
+      const disk = await readFileState('main.typ');
+      if (disk.hash) {
+        setTabs([{ path: 'main.typ', content: disk.content, isDirty: false, diskHash: disk.hash }]);
+        setActiveTabPath('main.typ');
+        return;
+      }
+    } catch {}
+    seedDefaultTab();
+  };
+
   // On launch: if a previous session exists, switch to its folder (desktop only —
   // it needs a native path) and reopen its tabs; otherwise load the default workspace.
   const restoreSessionOrDefault = async () => {
@@ -1530,7 +1759,7 @@ export default function App() {
         if (await restoreTabsFromSession(sess)) { setBooted(true); return; }
       } catch {}
     }
-    seedDefaultTab();
+    await openEntryOrSeed();
     setBooted(true);
     fetchTree();
   };
@@ -1767,13 +1996,17 @@ export default function App() {
 
     // Line-anchored so a fence printed *inside* a cell's output can't be mistaken
     // for a real cell on a later run.
-    const CELL_RE = /^```(python|julia)[^\n]*\n([\s\S]*?)^```/gm;
     type Cell = { lang: 'python' | 'julia'; code: string; end: number; result?: any };
-    const cells: Cell[] = [];
-    let m: RegExpExecArray | null;
-    while ((m = CELL_RE.exec(content))) {
-      cells.push({ lang: m[1] as 'python' | 'julia', code: m[2].replace(/\n$/, ''), end: CELL_RE.lastIndex });
-    }
+    const scanCells = (text: string): Cell[] => {
+      const re = /^```(python|julia)[^\n]*\n([\s\S]*?)^```/gm;
+      const out: Cell[] = [];
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(text))) {
+        out.push({ lang: m[1] as 'python' | 'julia', code: m[2].replace(/\n$/, ''), end: re.lastIndex });
+      }
+      return out;
+    };
+    const cells = scanCells(content);
     if (!cells.length) { notify('No ```python or ```julia code blocks found in this file.', 'info'); return; }
 
     setNotebookRunning(true);
@@ -1808,10 +2041,23 @@ export default function App() {
         return `// >>> nb-output — auto-generated; re-run replaces this\n#block(fill: luma(245), inset: 6pt, radius: 3pt, width: 100%)[\n${inner}\n]\n// <<< nb-output`;
       };
 
+      // The run can take seconds, and the document is editable the whole time —
+      // splicing into the snapshot the run started from would erase anything
+      // typed meanwhile. Re-scan the editor's CURRENT text and splice into that;
+      // outputs pair with cells by position, so this only needs the cell layout
+      // (count and languages) to still match. If it doesn't — a cell was added,
+      // removed, or its language changed mid-run — keep the document untouched.
+      const live = model.getValue();
+      const liveCells = scanCells(live);
+      if (liveCells.map(c => c.lang).join() !== cells.map(c => c.lang).join()) {
+        notify('The code cells changed while the notebook was running — outputs were not inserted. Run it again.');
+        return;
+      }
+      liveCells.forEach((c, i) => { c.result = cells[i].result; });
       // Splice outputs in back-to-front so earlier offsets stay valid.
-      let next = content;
-      for (let i = cells.length - 1; i >= 0; i--) {
-        const c = cells[i];
+      let next = live;
+      for (let i = liveCells.length - 1; i >= 0; i--) {
+        const c = liveCells[i];
         const after = next.slice(c.end);
         const existing = after.match(/^\s*\/\/ >>> nb-output[\s\S]*?\n\/\/ <<< nb-output[^\n]*/);
         const removeLen = existing ? existing[0].length : 0;
@@ -3087,6 +3333,12 @@ export default function App() {
     return [...compileProblems, ...tinymist.problems.filter(problem => problem.severity !== 'error')];
   }, [compileProblems, tinymist.problems]);
 
+  // The last non-empty error list. Diagnostics are cleared and re-published on
+  // every recompile, so mid-cycle the list is briefly empty — showing the held
+  // copy instead keeps the Problems card from collapsing and re-growing on each
+  // keystroke while an error is on screen.
+  const lastErrsRef = useRef<EditorProblem[]>([]);
+
   const jumpToProblem = async (p: EditorProblem) => {
     if (!p.line) return;
     if (p.file && p.file !== activeTabPath && !p.file.includes('@preview')) {
@@ -3113,6 +3365,19 @@ export default function App() {
     const range = { startLineNumber: line, startColumn: col, endLineNumber: line, endColumn: col + Math.max(1, len) };
     syncDecorations.current = ed.deltaDecorations(syncDecorations.current, [{ range, options: { inlineClassName: 'sync-flash' } }]);
     setTimeout(() => { if (editorRef.current) syncDecorations.current = editorRef.current.deltaDecorations(syncDecorations.current, []); }, 1300);
+  };
+
+  const flashWhenFileReady = (path: string, line: number) => {
+    let attempts = 0;
+    const tryFlash = () => {
+      const modelPath = editorRef.current?.getModel()?.uri.path.replace(/^\//, '');
+      if (activeTabRef.current?.path === path && modelPath === path) {
+        flashSourceRange(line, 1, 0);
+      } else if (attempts++ < 40) {
+        setTimeout(tryFlash, 25);
+      }
+    };
+    tryFlash();
   };
 
   // Flatten the active model into positioned word tokens, skipping line comments
@@ -3160,8 +3425,10 @@ export default function App() {
           const score = ctx.reduce((n, w) => n + (text.includes(w) ? 1 : 0), 0);
           if (score > bestScore) { bestScore = score; bestHit = hit; bestLine = m.lineNum; }
         }
-        handleNodeClick({} as any, bestHit.path, false);
-        setTimeout(() => flashSourceRange(bestLine, 1, 0), 120);
+        setSelectedPaths([bestHit.path]);
+        setLastSelectedPath(bestHit.path);
+        await openFileRef.current(bestHit.path);
+        flashWhenFileReady(bestHit.path, bestLine);
         return;
       }
     } catch {}
@@ -3301,24 +3568,10 @@ export default function App() {
     ));
   };
 
-  const filterTree = (nodes: FileNode[], query: string, contentMatches: SearchResult[]): FileNode[] => {
+  const filterTree = useCallback((nodes: FileNode[], query: string, contentMatches: SearchResult[], dirtyTabMatches: SearchResult[]): FileNode[] => {
     if (!query) return nodes;
     const lowerQuery = query.toLowerCase();
-    
-    // Also find any unsaved tabs that match the query
-    const dirtyTabMatches: SearchResult[] = tabs
-      .map(t => {
-        const lines = t.content.split('\n');
-        const matches: SearchSnippet[] = [];
-        lines.forEach((line, i) => {
-          if (line.toLowerCase().includes(lowerQuery)) {
-            matches.push({ lineNum: i + 1, text: line.trim() });
-          }
-        });
-        return matches.length > 0 ? { path: t.path, matches } : null;
-      })
-      .filter(Boolean) as SearchResult[];
-    
+
     // Map of path to matches
     const allMatches = new Map<string, SearchSnippet[]>();
     for (const r of [...contentMatches, ...dirtyTabMatches]) {
@@ -3345,14 +3598,25 @@ export default function App() {
       }).filter(Boolean) as FileNode[];
     };
     return walk(nodes);
-  };
+  }, []);
 
   // Memoize derived views so typing doesn't re-walk the tree / re-scan headings
   // on every keystroke (they only depend on the tree and the active file).
   // The tree reads tabs only for the dirty markers, so key it on the set of
   // dirty paths — not the tabs array, whose identity changes on every keystroke.
   const dirtyPathsKey = useMemo(() => tabs.filter(t => t.isDirty).map(t => t.path).sort().join('\u0001'), [tabs]);
-  const treeJsx = useMemo(() => renderTree(filterTree(fileTree, treeSearch, searchContentResults)), [fileTree, activeTabPath, renamingPath, renameValue, selectedPaths, collapsedDirs, currentMain, dirtyPathsKey, treeSearch, searchContentResults]);
+  const dirtyTabMatches = useMemo<SearchResult[]>(() => {
+    if (!treeSearch) return NO_SEARCH_RESULTS;
+    const query = treeSearch.toLowerCase();
+    return tabs.map(tab => {
+      const matches: SearchSnippet[] = [];
+      tab.content.split('\n').forEach((line, i) => {
+        if (line.toLowerCase().includes(query)) matches.push({ lineNum: i + 1, text: line.trim() });
+      });
+      return matches.length ? { path: tab.path, matches } : null;
+    }).filter(Boolean) as SearchResult[];
+  }, [tabs, treeSearch]);
+  const treeJsx = useMemo(() => renderTree(filterTree(fileTree, treeSearch, searchContentResults, dirtyTabMatches)), [fileTree, activeTabPath, renamingPath, renameValue, selectedPaths, collapsedDirs, currentMain, dirtyPathsKey, treeSearch, searchContentResults, dirtyTabMatches, filterTree]);
   const outline = useMemo(() => (sidebarVisible && panels.outline ? getOutline() : []), [activeTab?.content, sidebarVisible, panels.outline]);
 
   const toggleMenu = (e: React.MouseEvent, menuName: string) => {
@@ -3368,6 +3632,18 @@ export default function App() {
 
   const revealInFileManager = async (path?: string) => {
     try { await fetch(`${API}/workspace/reveal`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: path || '' }) }); } catch {}
+  };
+  // Launch a second, independent instance so two projects can be open at once.
+  const openNewWindow = async () => {
+    try {
+      const response = await fetch(`${API}/app/new-window`, { method: 'POST' });
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        notify(data.error || 'Could not open a new window.');
+      }
+    } catch {
+      notify('Could not reach Hilbert to open a new window.');
+    }
   };
   const copyToClipboard = (text: string) => navigator.clipboard.writeText(text);
   const collectDirPaths = (nodes: FileNode[], acc: string[] = []): string[] => {
@@ -3386,6 +3662,45 @@ export default function App() {
     } catch {}
   };
 
+  const formatActiveDocument = async () => {
+    if (!activeTab || !activeTab.path.endsWith('.typ') || !monaco || !editorRef.current) {
+      notify('Open a Typst document to format it.');
+      return;
+    }
+    try {
+      const response = await fetch(`${API}/lsp/format`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file: activeTab.path, content: activeTab.content }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!data.available) {
+        notify('Formatting is unavailable because Tinymist is not installed or could not start.');
+        return;
+      }
+      const edits = (data.edits || []).map((edit: any) => ({
+        range: new monaco.Range(
+          edit.range.start.line + 1,
+          edit.range.start.character + 1,
+          edit.range.end.line + 1,
+          edit.range.end.character + 1,
+        ),
+        text: edit.newText,
+        forceMoveMarkers: true,
+      }));
+      if (!edits.length) {
+        notify('The document is already formatted.');
+        return;
+      }
+      editorRef.current.pushUndoStop();
+      editorRef.current.executeEdits('typstyle', edits);
+      editorRef.current.pushUndoStop();
+      editorRef.current.focus();
+    } catch {
+      notify('Could not reach Tinymist to format the document.');
+    }
+  };
+
   // Everything reachable from the menus, exposed to the ⌘K palette. Built on
   // open (not memoised) so each command closes over current state.
   const paletteCommands = (): PaletteCommand[] => [
@@ -3402,10 +3717,16 @@ export default function App() {
     { category: 'Edit', title: 'Redo', run: () => editorRef.current?.trigger('palette', 'redo', null) },
     { category: 'Edit', title: 'Find...', run: () => editorRef.current?.getAction('actions.find')?.run() },
     { category: 'Edit', title: 'Find & Replace...', run: () => editorRef.current?.getAction('editor.action.startFindReplaceAction')?.run() },
+    { category: 'Code', title: 'Go to Definition', run: () => editorRef.current?.getAction('editor.action.revealDefinition')?.run() },
+    { category: 'Code', title: 'Find References', run: () => editorRef.current?.getAction('editor.action.goToReferences')?.run() },
+    { category: 'Code', title: 'Rename Symbol', hint: 'F2', run: () => editorRef.current?.getAction('editor.action.rename')?.run() },
+    { category: 'Code', title: 'Quick Fix / Code Actions', run: () => editorRef.current?.getAction('editor.action.quickFix')?.run() },
+    { category: 'Code', title: 'Format Typst Document', run: formatActiveDocument },
     { category: 'Edit', title: 'Comment / Uncomment Lines', hint: IS_MAC ? '⌘/' : 'Ctrl+/', run: toggleComment },
     { category: 'Edit', title: 'Toggle Numbering (at cursor)', hint: '⌘⇧N', run: toggleNumbering },
     { category: 'Edit', title: 'Toggle Equation Numbering (all)', run: toggleEquationNumbering },
     { category: 'Edit', title: 'Document Settings...', run: () => setShowEditSettings(true) },
+    { category: 'File', title: 'New Window', run: openNewWindow },
     { category: 'View', title: 'Toggle Sidebar', run: toggleSidebar },
     ...(Object.keys(PANEL_LABELS) as PanelKey[]).map(key => ({
       category: 'View', title: `Show / Hide ${PANEL_LABELS[key]}`, run: () => togglePanel(key),
@@ -3414,6 +3735,7 @@ export default function App() {
     { category: 'View', title: 'Toggle Editor Theme (dark / light)', run: () => setTheme(t => t === 'typst-dark' ? 'typst-light' : 'typst-dark') },
     { category: 'View', title: 'Version History...', run: () => setShowHistoryModal(true) },
     { category: 'View', title: 'Recompile Document', run: () => compileTypst(currentMain) },
+    { category: 'View', title: 'Preview HTML (experimental)', run: () => setShowHtmlPreview(true) },
     { category: 'View', title: 'App Settings (interpreters, git, cloud)...', run: () => setShowAppSettings(true) },
     { category: 'Insert', title: 'Title Block...', run: insertTitleBlock },
     { category: 'Insert', title: 'Author...', run: insertAuthor },
@@ -3491,6 +3813,23 @@ export default function App() {
   return (
     <div className="app-container" onClick={() => { setActiveMenu(null); setColorPopAt(null); setHighlightPopAt(null); setFontSizePopAt(null); setContextMenu(null); }} onContextMenu={() => setContextMenu(null)}>
       <Toaster />
+      {externalConflict && (
+        <ExternalChangeModal
+          conflict={externalConflict}
+          onReload={() => {
+            setTabs(prev => prev.map(tab => tab.path === externalConflict.path
+              ? { ...tab, content: externalConflict.disk, diskHash: externalConflict.diskHash, isDirty: false }
+              : tab));
+            setExternalConflict(null);
+          }}
+          onKeep={() => {
+            setTabs(prev => prev.map(tab => tab.path === externalConflict.path
+              ? { ...tab, diskHash: externalConflict.diskHash, isDirty: true }
+              : tab));
+            setExternalConflict(null);
+          }}
+        />
+      )}
       {showPalette && <CommandPalette commands={paletteCommands()} onClose={() => setShowPalette(false)} />}
       <header className="header">
         <div className="header-left">
@@ -3504,6 +3843,7 @@ export default function App() {
               {activeMenu === 'file' && (
                 <div className="dropdown">
                   <div className="dropdown-item" onClick={createNewFile}>New File...</div>
+                  <div className="dropdown-item" onClick={() => { openNewWindow(); setActiveMenu(null); }}>New Window</div>
                   <div className="dropdown-item" onClick={() => { openFromDisk(); setActiveMenu(null); }}>Open File...</div>
                   <div className="dropdown-item" onClick={() => { openFolderAsRoot(); setActiveMenu(null); }}>Open Folder... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.72rem' }}>as workspace</span></div>
                   <div className="dropdown-item has-submenu">
@@ -3544,6 +3884,13 @@ export default function App() {
                   <div className="dropdown-item" onClick={() => { editorRef.current?.getAction('actions.find')?.run(); setActiveMenu(null); }}>Find...</div>
                   <div className="dropdown-item" onClick={() => { editorRef.current?.getAction('editor.action.startFindReplaceAction')?.run(); setActiveMenu(null); }}>Find &amp; Replace...</div>
                   <div className="dropdown-divider"></div>
+                  <div className="dropdown-header">Typst code</div>
+                  <div className="dropdown-item" onClick={() => { editorRef.current?.getAction('editor.action.revealDefinition')?.run(); setActiveMenu(null); }}>Go to Definition</div>
+                  <div className="dropdown-item" onClick={() => { editorRef.current?.getAction('editor.action.goToReferences')?.run(); setActiveMenu(null); }}>Find References</div>
+                  <div className="dropdown-item" onClick={() => { editorRef.current?.getAction('editor.action.rename')?.run(); setActiveMenu(null); }}>Rename Symbol <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>F2</span></div>
+                  <div className="dropdown-item" onClick={() => { editorRef.current?.getAction('editor.action.quickFix')?.run(); setActiveMenu(null); }}>Quick Fix / Code Actions</div>
+                  <div className="dropdown-item" onClick={() => { formatActiveDocument(); setActiveMenu(null); }}>Format Typst Document</div>
+                  <div className="dropdown-divider"></div>
                   <div className="dropdown-item" onClick={() => { toggleComment(); setActiveMenu(null); }}>Comment / Uncomment Lines <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{IS_MAC ? '⌘/' : 'Ctrl+/'}</span></div>
                   <div className="dropdown-divider"></div>
                   <div className="dropdown-item" onClick={() => { toggleNumbering(); setActiveMenu(null); }}>Toggle Numbering (at cursor) <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧N</span></div>
@@ -3558,6 +3905,11 @@ export default function App() {
                 // Clicks here don't close the menu (the app-level handler is
                 // stopped), so several panels can be toggled in one visit.
                 <div className="dropdown" onClick={e => e.stopPropagation()}>
+                  <div className="dropdown-item" onClick={() => { setShowHtmlPreview(true); setActiveMenu(null); }}>
+                    <span className="dropdown-check"></span>HTML Preview
+                    <span style={{ marginLeft: 'auto', color: '#d97706', fontSize: '0.65rem' }}>experimental</span>
+                  </div>
+                  <div className="dropdown-divider"></div>
                   {(['tree', 'outline', 'problems'] as const).map(key => (
                     <div key={key} className="dropdown-item" onClick={() => togglePanel(key)}>
                       <span className="dropdown-check">{panels[key] ? '✓' : ''}</span>{PANEL_LABELS[key]}
@@ -4208,15 +4560,15 @@ export default function App() {
                       editorRef.current = e;
                       // Remember cursor position for session restore (debounced write)
                       // and, per file, so a recreated editor lands back where it was.
-                      // One step of cursor history. The caret has already been
-                      // moved by the time a content change reaches us, so the
-                      // guard below needs the position from before it moved.
-                      let priorPos: { lineNumber: number; column: number } | null = null;
+                      // livePos tracks the caret through our own listener. Monaco
+                      // delivers the model-content event BEFORE this cursor listener
+                      // runs for that same edit, so inside the replace guard below
+                      // livePos still holds the caret from before the replacement —
+                      // exactly the position to put back.
                       let livePos = e.getPosition();
                       e.onDidChangeCursorPosition(() => {
                         const p = e.getPosition();
                         if (!p) return;
-                        priorPos = livePos;
                         livePos = p;
                         const uri = e.getModel()?.uri.toString();
                         if (uri) cursorMemoryRef.current[uri] = { lineNumber: p.lineNumber, column: p.column };
@@ -4237,17 +4589,23 @@ export default function App() {
                         if (!model) return;
                         const wasLength = docLength;
                         docLength = model.getValueLength();
+                        const caret = livePos;
                         const replacedAll = wasLength > 0 && !ev.isUndoing && !ev.isRedoing
                           && ev.changes.length === 1
                           && ev.changes[0].rangeOffset === 0
                           && ev.changes[0].rangeLength >= wasLength;
-                        if (!replacedAll || !priorPos) return;
-                        const line = Math.min(priorPos.lineNumber, model.getLineCount());
-                        e.setPosition({ lineNumber: line, column: Math.min(priorPos.column, model.getLineMaxColumn(line)) });
+                        if (!replacedAll || !caret) return;
+                        const line = Math.min(caret.lineNumber, model.getLineCount());
+                        e.setPosition({ lineNumber: line, column: Math.min(caret.column, model.getLineMaxColumn(line)) });
                       });
                       // Switching tabs swaps the model under the same editor, which
-                      // resets the caret to the top; put it back too.
+                      // resets the caret to the top; put it back too. The replace
+                      // guard's remembered position belongs to the old tab, so drop
+                      // it — otherwise a whole-document replacement arriving just
+                      // after a switch would restore coordinates from another file.
                       e.onDidChangeModel(() => {
+                        livePos = e.getPosition();
+                        docLength = e.getModel()?.getValueLength() ?? 0;
                         const model = e.getModel();
                         const saved = model && cursorMemoryRef.current[model.uri.toString()];
                         if (saved) { e.setPosition(saved); e.revealLineInCenter(saved.lineNumber); }
@@ -4320,7 +4678,11 @@ export default function App() {
               <div className="empty-preview">{isCompiling ? 'Generating PDF…' : 'Nothing to preview yet — write some Typst and it renders here.'}</div>
             )}
             {compileError && (previewTab === 'problems' || !pdfUrl) && (() => {
-              const errs = problems.filter(p => p.severity === 'error');
+              const liveErrs = problems.filter(p => p.severity === 'error');
+              if (liveErrs.length) lastErrsRef.current = liveErrs;
+              // While a recompile is in flight the fresh list may not have
+              // arrived yet; hold the previous one so the card doesn't flap.
+              const errs = liveErrs.length || !isCompiling ? liveErrs : lastErrsRef.current;
               // Errors coming from inside an installed package (a template's
               // dependency) usually mean the package isn't compatible with the
               // installed Typst version — reassure the user it isn't their file.
@@ -4355,7 +4717,10 @@ export default function App() {
                     ) : (
                       <pre className="preview-error-raw">{compileError}</pre>
                     )}
-                    <div className="preview-error-foot">{isCompiling ? 'Recompiling…' : 'The preview updates automatically as soon as it compiles cleanly.'}</div>
+                    {/* Static on purpose: swapping this line with "Recompiling…"
+                        made the card flicker on every keystroke — the status
+                        strip below and the header dot already show that state. */}
+                    <div className="preview-error-foot">The preview updates automatically as soon as it compiles cleanly.</div>
                   </div>
                 </div>
               );
@@ -4397,7 +4762,9 @@ export default function App() {
             return `${errs} error${errs === 1 ? '' : 's'}${rest ? `, ${rest} other${rest === 1 ? '' : 's'}` : ''}`;
           })()}
         </button>
-        {isCompiling && <span className="status-note">Compiling…</span>}
+        {/* Always mounted: toggling visibility instead of unmounting keeps the
+            panel switches from shifting sideways on every recompile. */}
+        <span className="status-note" style={{ visibility: isCompiling ? 'visible' : 'hidden' }}>Compiling…</span>
         <span className="status-sep" />
         {LEFT_PANEL_KEYS.map(renderPanelToggle)}
         <span style={{ flex: 1 }} />
@@ -4491,6 +4858,7 @@ export default function App() {
       )}
       {codeRunner && <Boundary name="Code Runner" onClose={() => setCodeRunner(null)}><Suspense fallback={null}><CodeRunnerModal {...codeRunner} onClose={() => setCodeRunner(null)} onInsert={(code) => { insertCode(code); setCodeRunner(null); }} onInsertEquation={(latex, codeBlock) => { insertEquationFromLatex(latex, codeBlock); setCodeRunner(null); }} onChanged={fetchTree} /></Suspense></Boundary>}
       {showSaveAs && activeTab && <Suspense fallback={null}><SaveAsModal onClose={() => setShowSaveAs(false)} fileName={activeTabPath} content={activeTab.content} pdfUrl={pdfUrl} projectName={projectName} mainFile={currentMain} /></Suspense>}
+      {showHtmlPreview && <Suspense fallback={null}><HtmlPreviewModal mainFile={currentMain} onClose={() => setShowHtmlPreview(false)} /></Suspense>}
       {showPlot3D && <Boundary name="3D Plot Studio" onClose={() => setShowPlot3D(false)}><Suspense fallback={null}><Plot3DStudio onClose={() => setShowPlot3D(false)} onInsert={(code) => { insertCode(code); setShowPlot3D(false); fetchTree(); }} /></Suspense></Boundary>}
       {showPlotStudio && <Boundary name="Plot Studio" onClose={() => setShowPlotStudio(false)}><Suspense fallback={null}><PlotStudio onClose={() => setShowPlotStudio(false)} onInsert={(code) => insertCode(code)} onEnsureSetup={ensureSetup} onOpenInteractive={() => setShowPlot3D(true)} onOpenPython={() => setCodeRunner({ initialLang: 'python', initialCode: SURFACE_3D_TEMPLATE })} /></Suspense></Boundary>}
       {showSymbolDraw && <Suspense fallback={null}><SymbolDraw onClose={() => setShowSymbolDraw(false)} onInsert={(name) => { insertCode(name + ' '); setShowSymbolDraw(false); }} /></Suspense>}
@@ -4525,7 +4893,7 @@ export default function App() {
       {showSymbolPicker && <Suspense fallback={null}><SymbolPicker onClose={() => setShowSymbolPicker(false)} onInsert={(code) => { insertCode(code + ' '); setShowSymbolPicker(false); }} /></Suspense>}
 
       {contextMenu && (
-        <div className="context-menu dropdown" style={{ position: 'fixed', top: contextMenu.y, left: contextMenu.x, zIndex: 9999, display: 'block' }} onClick={e => e.stopPropagation()}>
+        <div ref={contextMenuRef} className="context-menu dropdown" style={{ position: 'fixed', top: contextMenu.y, left: contextMenu.x, zIndex: 9999, display: 'block', maxHeight: 'calc(100vh - 12px)', overflowY: 'auto' }} onClick={e => e.stopPropagation()}>
           {contextMenu.type === 'empty' ? (
             <>
               <div className="dropdown-item" onClick={() => { createNewFile(''); setContextMenu(null); }}>New File...</div>

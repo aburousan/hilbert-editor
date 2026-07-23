@@ -390,6 +390,148 @@ export function setupTypstLanguage(monacoInstance: any) {
     }
   });
 
+  const fromLspRange = (range: any) => ({
+    startLineNumber: range.start.line + 1,
+    startColumn: range.start.character + 1,
+    endLineNumber: range.end.line + 1,
+    endColumn: range.end.character + 1,
+  });
+
+  const documentPayload = (model: any, position?: any) => ({
+    file: model.uri.path.replace(/^\//, ''),
+    content: model.getValue(),
+    ...(position ? { line: position.lineNumber - 1, character: position.column - 1 } : {}),
+  });
+
+  const ensureWorkspaceModel = async (file: string) => {
+    const uri = monacoInstance.Uri.file('/' + file.replace(/^\/+/, ''));
+    const existing = monacoInstance.editor.getModel(uri);
+    if (existing) return existing;
+    const response = await fetch(`${API}/workspace/file/state?path=${encodeURIComponent(file)}`);
+    if (!response.ok) return null;
+    const state = await response.json();
+    const model = monacoInstance.editor.createModel(state.content || '', languageId, uri);
+    window.dispatchEvent(new CustomEvent('hilbert:lsp-model-opened', {
+      detail: { file, content: state.content || '', diskHash: state.hash || undefined },
+    }));
+    return model;
+  };
+
+  const locations = async (items: any[]) => {
+    const out = [];
+    for (const item of items || []) {
+      const model = await ensureWorkspaceModel(item.file);
+      if (model && item.range) out.push({ uri: model.uri, range: fromLspRange(item.range) });
+    }
+    return out;
+  };
+
+  const workspaceEdits = async (changes: any[]) => {
+    const edits = [];
+    for (const change of changes || []) {
+      const model = await ensureWorkspaceModel(change.file);
+      if (!model) continue;
+      for (const edit of change.edits || []) {
+        if (!edit.range || typeof edit.newText !== 'string') continue;
+        edits.push({
+          resource: model.uri,
+          textEdit: { range: fromLspRange(edit.range), text: edit.newText },
+          versionId: model.getVersionId(),
+        });
+      }
+    }
+    return edits;
+  };
+
+  monacoInstance.languages.registerDefinitionProvider(languageId, {
+    provideDefinition: async (model: any, position: any) => {
+      try {
+        const response = await fetch(`${API}/lsp/definition`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(documentPayload(model, position)),
+        });
+        return locations((await response.json()).locations);
+      } catch {
+        return [];
+      }
+    },
+  });
+
+  monacoInstance.languages.registerReferenceProvider(languageId, {
+    provideReferences: async (model: any, position: any) => {
+      try {
+        const response = await fetch(`${API}/lsp/references`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(documentPayload(model, position)),
+        });
+        return locations((await response.json()).locations);
+      } catch {
+        return [];
+      }
+    },
+  });
+
+  monacoInstance.languages.registerRenameProvider(languageId, {
+    provideRenameEdits: async (model: any, position: any, newName: string) => {
+      try {
+        const response = await fetch(`${API}/lsp/rename`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...documentPayload(model, position), newName }),
+        });
+        const data = await response.json();
+        return { edits: await workspaceEdits(data.changes) };
+      } catch {
+        return { edits: [], rejectReason: 'Tinymist could not rename this symbol.' };
+      }
+    },
+  });
+
+  monacoInstance.languages.registerDocumentFormattingEditProvider(languageId, {
+    provideDocumentFormattingEdits: async (model: any) => {
+      try {
+        const response = await fetch(`${API}/lsp/format`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(documentPayload(model)),
+        });
+        const data = await response.json();
+        return (data.edits || []).map((edit: any) => ({
+          range: fromLspRange(edit.range),
+          text: edit.newText,
+        }));
+      } catch {
+        return [];
+      }
+    },
+  });
+
+  monacoInstance.languages.registerCodeActionProvider(languageId, {
+    provideCodeActions: async (model: any, range: any) => {
+      try {
+        const response = await fetch(`${API}/lsp/code-actions`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...documentPayload(model, { lineNumber: range.startLineNumber, column: range.startColumn }),
+            endLine: range.endLineNumber - 1,
+            endCharacter: range.endColumn - 1,
+          }),
+        });
+        const data = await response.json();
+        const actions = [];
+        for (const action of data.actions || []) {
+          actions.push({
+            title: action.title,
+            kind: action.kind || 'quickfix',
+            isPreferred: !!action.preferred,
+            edit: { edits: await workspaceEdits(action.changes) },
+          });
+        }
+        return { actions, dispose: () => {} };
+      } catch {
+        return { actions: [], dispose: () => {} };
+      }
+    },
+  });
+
   // ─── Control-flow: content-block ([ ]) variants ────────────────────────────
   // Typst lets `if`/`else`/`for`/`while` take EITHER a code block `{ … }` (runs
   // statements; bare words are variables) OR a content block `[ … ]` (shows

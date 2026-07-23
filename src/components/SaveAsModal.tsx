@@ -1,13 +1,14 @@
 import { useState } from 'react';
 import { API } from '../api';
 
-type Fmt = 'pdf' | 'png' | 'svg' | 'html' | 'typ' | 'folder';
+type Fmt = 'pdf' | 'png' | 'svg' | 'html' | 'bundle' | 'typ' | 'folder';
 
 const FORMATS: { id: Fmt; label: string }[] = [
   { id: 'pdf', label: 'PDF' },
   { id: 'png', label: 'PNG' },
   { id: 'svg', label: 'SVG' },
   { id: 'html', label: 'HTML' },
+  { id: 'bundle', label: 'Bundle' },
   { id: 'typ', label: 'Typst' },
   { id: 'folder', label: 'Project' },
 ];
@@ -22,12 +23,12 @@ const PDF_VERSIONS: { v: string; label: string }[] = [
   { v: '2.0', label: '2.0' },
 ];
 
-const CONFORMANCE: { v: string; label: string }[] = [
-  { v: 'none', label: 'None' },
-  { v: 'a-2b', label: 'PDF/A-2b — archival' },
-  { v: 'a-3b', label: 'PDF/A-3b — archival + attachments' },
-  { v: 'a-4', label: 'PDF/A-4' },
+const PDF_STANDARDS: { v: string; label: string }[] = [
   { v: 'ua-1', label: 'PDF/UA-1 — accessible' },
+  { v: 'a-2a', label: 'PDF/A-2a — accessible archive' },
+  { v: 'a-3a', label: 'PDF/A-3a — accessible archive + attachments' },
+  { v: 'a-2u', label: 'PDF/A-2u — Unicode archive' },
+  { v: 'a-4', label: 'PDF/A-4 — PDF 2.0 archive' },
 ];
 
 // Name the reveal action after the host OS's file manager, not always "Finder".
@@ -50,7 +51,7 @@ export default function SaveAsModal({ onClose, fileName, content, pdfUrl, projec
   const [fmt, setFmt] = useState<Fmt>(() => (localStorage.getItem('export_fmt') as Fmt) || 'pdf');
   const [pages, setPages] = useState('');
   const [pdfVersion, setPdfVersion] = useState('1.7');
-  const [conformance, setConformance] = useState('none');
+  const [standards, setStandards] = useState<string[]>([]);
   const [tagged, setTagged] = useState(true);
   const [pretty, setPretty] = useState(false);
   const [ppi, setPpi] = useState(144);
@@ -58,30 +59,37 @@ export default function SaveAsModal({ onClose, fileName, content, pdfUrl, projec
   const [status, setStatus] = useState('');
   const [err, setErr] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [preflight, setPreflight] = useState<{ ok: boolean; error?: string; checks?: { label: string; ok: boolean; advisory?: boolean }[] } | null>(null);
 
   const defaultName = (projectName || fileName.replace(/\.typ$/, '') || 'document').replace(/\s+/g, '_');
   const [nameInput, setNameInput] = useState(defaultName);
   const baseName = nameInput.trim().replace(/\s+/g, '_') || defaultName;
-  const ext = fmt === 'typ' ? 'typ' : fmt === 'folder' ? 'zip' : fmt;
+  const ext = fmt === 'typ' ? 'typ' : (fmt === 'folder' || fmt === 'bundle') ? 'zip' : fmt;
 
   const pickFmt = (f: Fmt) => { setFmt(f); localStorage.setItem('export_fmt', f); };
   const toggleOpenAfter = (on: boolean) => { setOpenAfter(on); localStorage.setItem('export_open', on ? '1' : '0'); };
   const say = (m: string, isErr = false) => { setStatus(m); setErr(isErr); };
 
-  // A conformance standard implies its own PDF version, so send that alone and
-  // leave the plain version out; otherwise send the chosen version (1.7 is the
-  // Typst default, so it needs no flag).
   const pdfStandardValue = () =>
-    conformance !== 'none' ? conformance
-      : pdfVersion === '1.7' ? 'default'
-        : pdfVersion;
+    standards.length ? standards.join(',') : pdfVersion === '1.7' ? 'default' : pdfVersion;
+
+  const toggleStandard = (standard: string) => {
+    setPreflight(null);
+    setStandards(current => {
+      if (current.includes(standard)) return current.filter(item => item !== standard);
+      if (standard === 'a-4') return ['a-4'];
+      if (standard.startsWith('a-')) return [...current.filter(item => !item.startsWith('a-')), standard];
+      return [...current.filter(item => item !== 'a-4'), standard];
+    });
+    if (standard !== 'a-4') setTagged(true);
+  };
 
   const opts = () => ({
     format: fmt, name: baseName, main: mainFile, open: openAfter,
     pages: pages.trim() || undefined,
     ...(fmt === 'pdf' ? { pdfStandard: pdfStandardValue(), tagged } : {}),
     ...(fmt === 'png' ? { ppi } : {}),
-    ...((fmt === 'pdf' || fmt === 'svg' || fmt === 'html') ? { pretty } : {}),
+    ...((fmt === 'pdf' || fmt === 'svg' || fmt === 'html' || fmt === 'bundle') ? { pretty } : {}),
   });
 
   const download = (blob: Blob, name: string) => {
@@ -106,7 +114,27 @@ export default function SaveAsModal({ onClose, fileName, content, pdfUrl, projec
       if (!res.ok) { say('HTML export failed.', true); return; }
       download(await res.blob(), `${baseName}.html`); say(`Downloaded ${baseName}.html`); return;
     }
-    say(`${fmt === 'folder' ? 'Project archiving' : 'PNG/SVG export'} needs the desktop app.`, true);
+    say(`${fmt === 'folder' ? 'Project archiving' : fmt === 'bundle' ? 'Bundle export' : 'PNG/SVG export'} needs the desktop app.`, true);
+  };
+
+  const runPreflight = async () => {
+    setBusy(true);
+    setPreflight(null);
+    say('Running Typst accessibility checks…');
+    try {
+      const response = await fetch(`${API}/export/preflight`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opts()),
+      });
+      const data = await response.json().catch(() => ({}));
+      setPreflight({ ...data, ok: response.ok && !!data.ok });
+      say(response.ok && data.ok ? 'Preflight passed.' : 'Preflight found issues.', !response.ok || !data.ok);
+    } catch {
+      say('Could not run the preflight.', true);
+    } finally {
+      setBusy(false);
+    }
   };
 
   const doSave = async () => {
@@ -137,7 +165,7 @@ export default function SaveAsModal({ onClose, fileName, content, pdfUrl, projec
     fontFamily: 'inherit', width: '100%', boxSizing: 'border-box',
   };
 
-  const revealOrOpen = fmt === 'folder' || fmt === 'svg';
+  const revealOrOpen = fmt === 'folder' || fmt === 'bundle' || fmt === 'svg';
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -148,7 +176,7 @@ export default function SaveAsModal({ onClose, fileName, content, pdfUrl, projec
         </div>
         <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
           {/* Format picker */}
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: 6 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 6 }}>
             {FORMATS.map(f => (
               <button key={f.id} onClick={() => { pickFmt(f.id); say(''); }}
                 style={{
@@ -171,7 +199,7 @@ export default function SaveAsModal({ onClose, fileName, content, pdfUrl, projec
               <input style={inputStyle} value={nameInput} onChange={e => setNameInput(e.target.value)} spellCheck={false} placeholder={defaultName} />
             </label>
 
-            {fmt !== 'typ' && fmt !== 'folder' && (
+            {fmt !== 'typ' && fmt !== 'folder' && fmt !== 'bundle' && (
               <label style={field}>
                 <span style={labelTxt}>Pages</span>
                 <input style={inputStyle} value={pages} onChange={e => setPages(e.target.value)} placeholder="All — e.g. 1-3, 5, 8-" spellCheck={false} />
@@ -183,25 +211,47 @@ export default function SaveAsModal({ onClose, fileName, content, pdfUrl, projec
                 <div style={{ display: 'flex', gap: 12 }}>
                   <label style={{ ...field, flex: 1 }}>
                     <span style={labelTxt}>PDF version</span>
-                    <select style={{ ...inputStyle, opacity: conformance === 'none' ? 1 : 0.5 }} value={pdfVersion}
-                      disabled={conformance !== 'none'} onChange={e => setPdfVersion(e.target.value)}>
+                    <select style={{ ...inputStyle, opacity: standards.length === 0 ? 1 : 0.5 }} value={pdfVersion}
+                      disabled={standards.length > 0} onChange={e => setPdfVersion(e.target.value)}>
                       {PDF_VERSIONS.map(s => <option key={s.v} value={s.v}>{s.label}</option>)}
                     </select>
                   </label>
-                  <label style={{ ...field, flex: 1 }}>
-                    <span style={labelTxt}>Conformance</span>
-                    <select style={inputStyle} value={conformance} onChange={e => setConformance(e.target.value)}>
-                      {CONFORMANCE.map(s => <option key={s.v} value={s.v}>{s.label}</option>)}
-                    </select>
-                  </label>
+                  <div style={{ ...field, flex: 1 }}>
+                    <span style={labelTxt}>Accessibility preset</span>
+                    <button type="button" className="btn-ghost"
+                      onClick={() => { setStandards(['ua-1', 'a-2a']); setTagged(true); setPreflight(null); }}>
+                      Accessible archive
+                    </button>
+                  </div>
                 </div>
-                {conformance !== 'none' && (
-                  <span className="form-hint" style={{ marginTop: -4 }}>The conformance standard sets its own PDF version.</span>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px 12px' }}>
+                  {PDF_STANDARDS.map(standard => (
+                    <label className="form-check" key={standard.v}>
+                      <input type="checkbox" checked={standards.includes(standard.v)} onChange={() => toggleStandard(standard.v)} />
+                      {standard.label}
+                    </label>
+                  ))}
+                </div>
+                {standards.length > 0 && (
+                  <span className="form-hint" style={{ marginTop: -4 }}>Compatible standards are passed together. PDF/A-4 cannot be combined with PDF/UA-1.</span>
                 )}
                 <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>
-                  <label className="form-check"><input type="checkbox" checked={tagged} onChange={e => setTagged(e.target.checked)} /> Tagged (accessibility)</label>
+                  <label className="form-check"><input type="checkbox" checked={tagged}
+                    disabled={standards.some(value => value === 'ua-1' || value.endsWith('a'))}
+                    onChange={e => setTagged(e.target.checked)} /> Tagged (accessibility)</label>
                   <label className="form-check"><input type="checkbox" checked={pretty} onChange={e => setPretty(e.target.checked)} /> Pretty-print</label>
                 </div>
+                <button type="button" className="btn-ghost" disabled={busy} onClick={runPreflight}>Run accessibility preflight</button>
+                {preflight && (
+                  <div style={{ padding: 8, borderRadius: 6, background: 'var(--bg-color)', fontSize: 12 }}>
+                    {(preflight.checks || []).map(check => (
+                      <div key={check.label} style={{ color: check.ok ? '#10b981' : check.advisory ? '#f59e0b' : '#f87171' }}>
+                        {check.ok ? '✓' : check.advisory ? '!' : '×'} {check.label}
+                      </div>
+                    ))}
+                    {preflight.error && <div style={{ color: '#f87171', whiteSpace: 'pre-wrap', marginTop: 6 }}>{preflight.error}</div>}
+                  </div>
+                )}
               </>
             )}
 
@@ -212,12 +262,13 @@ export default function SaveAsModal({ onClose, fileName, content, pdfUrl, projec
               </label>
             )}
 
-            {(fmt === 'svg' || fmt === 'html') && (
+            {(fmt === 'svg' || fmt === 'html' || fmt === 'bundle') && (
               <label className="form-check"><input type="checkbox" checked={pretty} onChange={e => setPretty(e.target.checked)} /> Pretty-print</label>
             )}
 
             {fmt === 'typ' && <div className="form-hint">Saves the source document as a plain .typ file.</div>}
             {fmt === 'folder' && <div className="form-hint">Bundles the whole project — the .typ source plus images, data and bibliography — into a single .zip archive.</div>}
+            {fmt === 'bundle' && <div className="form-hint">Experimental Typst 0.15+ multi-file output. Generated HTML, PDF, images and assets are packaged as a .zip.</div>}
           </div>
 
           {/* Native save dialog — the one and only save path. */}

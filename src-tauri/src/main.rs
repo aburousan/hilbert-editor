@@ -192,12 +192,93 @@ fn headless_main() {
     });
 }
 
-// Handle to the backend state for the exit hook: the typst-watch preview
-// process and tinymist must be killed on quit or they outlive the app.
-static BACKEND_STATE: std::sync::OnceLock<Arc<server::AppState>> = std::sync::OnceLock::new();
+// Every window's backend, by window label, for the close/exit hooks: the
+// typst-watch preview processes and tinymist must be killed or they outlive
+// the app. Several windows can live in this one process.
+static BACKENDS: std::sync::Mutex<Vec<(String, Arc<server::AppState>)>> = std::sync::Mutex::new(Vec::new());
+static NEXT_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+// One window = its own port + backend + session, hosted in this process so the
+// OS shows a single running app however many windows are open.
+fn open_instance_window(
+    handle: &tauri::AppHandle,
+    label: String,
+    ws: PathBuf,
+    session: PathBuf,
+    dist: Option<PathBuf>,
+) -> tauri::Result<()> {
+    let _ = fs::create_dir_all(&ws);
+    let (listener, port) = bind_free_port(3001);
+    let mut st = server::AppState::new(ws, dist.clone());
+    st.session_file = session;
+    let state = Arc::new(st);
+    *state.app.lock().unwrap() = Some(handle.clone());
+    // "New Window" from any window opens another one in this same process.
+    // Window creation must happen on the main thread on macOS.
+    let opener = handle.clone();
+    let opener_dist = dist;
+    *state.open_window.lock().unwrap() = Some(Box::new(move || {
+        let h = opener.clone();
+        let d = opener_dist.clone();
+        let _ = opener.run_on_main_thread(move || {
+            use tauri::Manager;
+            let n = NEXT_WINDOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let ws = workspace_dir(h.path().document_dir().ok());
+            let _ = open_instance_window(&h, format!("extra-{n}"), ws, server::new_window_session_path(), d);
+        });
+    }));
+    let init_script = init_script(state.api_token());
+    BACKENDS.lock().unwrap().push((label.clone(), state.clone()));
+    tauri::async_runtime::spawn(server::serve(listener, state));
+
+    let url: tauri::Url = format!("http://127.0.0.1:{port}").parse().unwrap();
+    tauri::WebviewWindowBuilder::new(handle, &label, tauri::WebviewUrl::External(url))
+        .title("Hilbert")
+        .inner_size(1440.0, 920.0)
+        .min_inner_size(900.0, 600.0)
+        // Let OS file drops reach the webview instead of being swallowed
+        // by Tauri's native handler, so dragging files onto the file tree
+        // fires the app's own drop upload.
+        .disable_drag_drop_handler()
+        .initialization_script(&init_script)
+        // Open external links (mailto:, https:) in the real browser, not the app.
+        .on_navigation(|url| {
+            let scheme = url.scheme();
+            if scheme == "http" || scheme == "https" {
+                let host = url.host_str().unwrap_or("");
+                if host == "127.0.0.1" || host == "localhost" {
+                    return true;
+                }
+                let _ = open::that_detached(url.as_str());
+                return false;
+            }
+            true
+        })
+        .build()?;
+    Ok(())
+}
+
+fn arg_value(flag: &str) -> Option<String> {
+    let mut it = std::env::args();
+    while let Some(a) = it.next() {
+        if a == flag {
+            return it.next();
+        }
+        if let Some(v) = a.strip_prefix(&format!("{flag}=")) {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
 
 fn main() {
     augment_path();
+    // A window opened from "New Window" is handed its own session file, so extra
+    // windows restore and persist independently and never overwrite the primary
+    // window's remembered project. Set before anything reads the session path.
+    if let Some(path) = arg_value("--session-file") {
+        std::env::set_var("HILBERT_SESSION_FILE", path);
+    }
     if std::env::args().any(|a| a == "--headless") {
         headless_main();
         return;
@@ -278,49 +359,32 @@ fn main() {
             // otherwise fall back to the default documents workspace.
             let ws = server::saved_workspace()
                 .unwrap_or_else(|| workspace_dir(app.path().document_dir().ok()));
-            let _ = fs::create_dir_all(&ws);
-
-            let (listener, port) = bind_free_port(3001);
-            let state = Arc::new(server::AppState::new(ws, dist));
-            *state.app.lock().unwrap() = Some(app.handle().clone());
-            let init_script = init_script(state.api_token());
-            let _ = BACKEND_STATE.set(state.clone());
-            tauri::async_runtime::spawn(server::serve(listener, state));
             // Dictionaries load on the first /lint call; see the note in headless_main.
-
-            let url: tauri::Url = format!("http://127.0.0.1:{port}").parse().unwrap();
-            tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::External(url))
-                .title("Hilbert")
-                .inner_size(1440.0, 920.0)
-                .min_inner_size(900.0, 600.0)
-                // Let OS file drops reach the webview instead of being swallowed
-                // by Tauri's native handler, so dragging files onto the file tree
-                // fires the app's own drop upload.
-                .disable_drag_drop_handler()
-                .initialization_script(&init_script)
-                // Open external links (mailto:, https:) in the real browser, not the app.
-                .on_navigation(|url| {
-                    let scheme = url.scheme();
-                    if scheme == "http" || scheme == "https" {
-                        let host = url.host_str().unwrap_or("");
-                        if host == "127.0.0.1" || host == "localhost" {
-                            return true;
-                        }
-                        let _ = open::that_detached(url.as_str());
-                        return false;
-                    }
-                    true
-                })
-                .build()?;
+            open_instance_window(app.handle(), "main".into(), ws, server::session_file_path(), dist)?;
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
-        .run(|_app, event| {
-            if let tauri::RunEvent::Exit = event {
-                if let Some(state) = BACKEND_STATE.get() {
-                    tauri::async_runtime::block_on(server::shutdown_children(state));
+        .run(|_app, event| match event {
+            // A closed window takes its preview watcher with it; the shared
+            // per-workspace language servers stay for the remaining windows.
+            tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::Destroyed, .. } => {
+                let state = BACKENDS
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(l, _)| *l == label)
+                    .map(|(_, s)| s.clone());
+                if let Some(state) = state {
+                    tauri::async_runtime::block_on(server::shutdown_window(&state));
                 }
             }
+            tauri::RunEvent::Exit => {
+                let states: Vec<_> = BACKENDS.lock().unwrap().iter().map(|(_, s)| s.clone()).collect();
+                for state in states {
+                    tauri::async_runtime::block_on(server::shutdown_children(&state));
+                }
+            }
+            _ => {}
         });
 }

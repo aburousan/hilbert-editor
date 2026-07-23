@@ -80,7 +80,7 @@ jobs:
           # user-facing summary and refresh it for every release. The full
           # notes from docs/RELEASE_NOTES.md are pasted in at publish time.
           releaseBody: |
-            Hotfix for 0.1.8. Ctrl+/ (⌘/) really comments now — it did nothing at all before, and it works in Python, Julia and .bib files too. Comment / Uncomment Lines is in the Edit menu and the command palette. The panel switches moved beside the panel they hide, and the caret no longer jumps to the end when a document is reloaded.
+            A feature release. File → New Window opens a second project as one app with independent windows (one Dock icon). Code intelligence — go to definition, find references, rename, quick fixes, and F2 formatting — comes from tinymist in the Edit and right-click menus. The last good preview stays up even on a first-build error, with errors in a slim bottom strip, and the cursor no longer jumps when a file reloads or notebook output is written. Files changed outside Hilbert reload automatically, showing both versions when you have unsaved edits. Also: accessible PDF/A export with a preflight, an experimental HTML Preview, notebook runs that keep text typed mid-run, and context menus that stay on screen.
           releaseDraft: true
           prerelease: false
 

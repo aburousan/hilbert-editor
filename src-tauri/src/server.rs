@@ -149,6 +149,12 @@ pub struct AppState {
     pub universe: tokio::sync::Mutex<Option<(Instant, Arc<Vec<Pkg>>)>>,
     pub http: reqwest::Client,
     pub app: Mutex<Option<tauri::AppHandle>>,
+    // Windows persist their session separately, so a second window never
+    // overwrites the project the first one will restore on the next launch.
+    pub session_file: PathBuf,
+    // Set by the GUI shell: opens another window IN THIS process (one Dock
+    // icon). When absent — headless — /app/new-window spawns a process instead.
+    pub open_window: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl AppState {
@@ -176,6 +182,8 @@ impl AppState {
             universe: tokio::sync::Mutex::new(None),
             http: reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10)).build().unwrap(),
             app: Mutex::new(None),
+            session_file: session_file(),
+            open_window: Mutex::new(None),
         }
     }
 
@@ -429,6 +437,44 @@ async fn run_cmd_inner(
 const TYPST_NOT_FOUND: &str = "Typst compiler not found. Install the Typst CLI (macOS: `brew install typst`; Linux: a release binary from github.com/typst/typst or `cargo install typst-cli`) so that `typst --version` works, then restart the editor.";
 const TYPST_NOT_FOUND_SHORT: &str = "Typst compiler not found — install the Typst CLI so `typst --version` works.";
 
+async fn toolchain_status() -> Response {
+    let Some(path) = which("typst") else {
+        return Json(json!({
+            "typst": { "available": false },
+            "features": { "html": false, "bundle": false, "multiplePdfStandards": false }
+        }))
+        .into_response();
+    };
+    let output = run_cmd(&path, &["--version"], None, Some(3000)).await.ok();
+    let raw = output
+        .map(|out| if out.stdout.trim().is_empty() { out.stderr } else { out.stdout })
+        .unwrap_or_default();
+    static VERSION_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b(\d+\.\d+(?:\.\d+)?)\b").unwrap());
+    let version = VERSION_RE
+        .captures(&raw)
+        .and_then(|caps| caps.get(1))
+        .map(|value| value.as_str())
+        .unwrap_or("");
+    let html = cmp_version(version, "0.13.0") != std::cmp::Ordering::Less;
+    let v15 = cmp_version(version, "0.15.0") != std::cmp::Ordering::Less;
+    Json(json!({
+        "typst": {
+            "available": true,
+            "version": version,
+            "label": raw.lines().find(|line| !line.trim().is_empty()).unwrap_or("").trim(),
+            "path": path,
+        },
+        "features": {
+            "html": html,
+            "bundle": v15,
+            "multiplePdfStandards": v15,
+            "variableFonts": v15,
+        }
+    }))
+    .into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Workspace file tree + files
 // ---------------------------------------------------------------------------
@@ -491,9 +537,12 @@ async fn workspace_root_post(State(st): St, body: Bytes) -> Response {
         Ok(_) => return json_err(StatusCode::BAD_REQUEST, format!("Not a folder: {}", resolved.display())),
         Err(_) => return json_err(StatusCode::BAD_REQUEST, format!("Not a folder: {}", resolved.display())),
     }
+    let old_ws = st.ws();
     *st.workspace.write().unwrap_or_else(|e| e.into_inner()) = resolved.clone();
     stop_preview_watcher(&st).await;
-    stop_lsp().await;
+    // The old project's language server is no longer needed here. If another
+    // window still shows that project it simply respawns on its next request.
+    stop_lsp_for(&old_ws).await;
     Json(json!({ "ok": true, "root": resolved.to_string_lossy() })).into_response()
 }
 
@@ -524,6 +573,46 @@ async fn workspace_file_get(State(st): St, Query(q): Q) -> Response {
     }
 }
 
+async fn workspace_file_state(State(st): St, Query(q): Q) -> Response {
+    let Some(full) = q.get("path").and_then(|p| safe_workspace_path(&st.ws(), p)) else {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid path");
+    };
+    match fs::read_to_string(&full) {
+        Ok(content) => {
+            let hash = format!("{:016x}", content_hash(&content));
+            if q.get("content").map(String::as_str) == Some("0") {
+                Json(json!({ "hash": hash })).into_response()
+            } else {
+                Json(json!({ "content": content, "hash": hash })).into_response()
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Json(json!({ "content": "", "hash": Value::Null, "missing": true })).into_response()
+        }
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// Hashes for several open files in one round-trip. The editor polls every open
+// tab for external changes; doing that as one request instead of one per tab
+// keeps the poll cheap however many files are open. Missing files hash to null.
+async fn workspace_files_state(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let ws = st.ws();
+    let mut states = serde_json::Map::new();
+    if let Some(paths) = v.get("paths").and_then(Value::as_array) {
+        for p in paths.iter().take(64).filter_map(Value::as_str) {
+            let Some(full) = safe_workspace_path(&ws, p) else { continue };
+            let hash = fs::read_to_string(&full)
+                .ok()
+                .map(|c| Value::String(format!("{:016x}", content_hash(&c))))
+                .unwrap_or(Value::Null);
+            states.insert(p.to_string(), hash);
+        }
+    }
+    Json(json!({ "states": states })).into_response()
+}
+
 async fn workspace_file_post(State(st): St, Query(q): Q, headers: HeaderMap, body: Bytes) -> Response {
     let Some(full) = q.get("path").and_then(|p| safe_workspace_path(&st.ws(), p)) else {
         return text_err(StatusCode::BAD_REQUEST, "Invalid path");
@@ -539,13 +628,29 @@ async fn workspace_file_post(State(st): St, Query(q): Q, headers: HeaderMap, bod
     } else {
         body.to_vec()
     };
+    if let Some(expected) = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()) {
+        let current = fs::read_to_string(&full).unwrap_or_default();
+        let current_hash = format!("{:016x}", content_hash(&current));
+        if expected != current_hash {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "The file changed outside Hilbert.",
+                    "content": current,
+                    "hash": current_hash,
+                })),
+            )
+                .into_response();
+        }
+    }
     if let Some(parent) = full.parent() {
         let _ = fs::create_dir_all(parent);
     }
     match fs::write(&full, content) {
         Ok(_) => {
             st.source_generation.fetch_add(1, Ordering::AcqRel);
-            "OK".into_response()
+            let saved = fs::read_to_string(&full).unwrap_or_default();
+            Json(json!({ "ok": true, "hash": format!("{:016x}", content_hash(&saved)) })).into_response()
         }
         Err(_) => text_err(StatusCode::INTERNAL_SERVER_ERROR, "Error"),
     }
@@ -709,6 +814,23 @@ async fn workspace_reveal(State(st): St, body: Bytes) -> Response {
     Json(json!({ "ok": true })).into_response()
 }
 
+async fn app_new_window(State(st): St) -> Response {
+    // In the GUI the shell registers an opener that creates the window inside
+    // this process, so the OS shows one app with several windows rather than a
+    // second Dock icon per window.
+    {
+        let guard = st.open_window.lock().unwrap();
+        if let Some(open) = guard.as_ref() {
+            open();
+            return Json(json!({ "ok": true })).into_response();
+        }
+    }
+    match spawn_new_instance() {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not open a new window: {e}")),
+    }
+}
+
 // Full-text search across the workspace (skips dotfiles, binaries, build output).
 async fn workspace_search(State(st): St, Query(q): Q) -> Response {
     let query = q.get("q").map(|s| s.to_lowercase()).unwrap_or_default();
@@ -716,14 +838,25 @@ async fn workspace_search(State(st): St, Query(q): Q) -> Response {
         return Json(json!([])).into_response();
     }
     let ws = st.ws();
-    let mut results: Vec<Value> = Vec::new();
-    search_walk(&ws, &ws, &query, &mut results);
+    let results = tokio::task::spawn_blocking(move || {
+        let mut results: Vec<Value> = Vec::new();
+        search_walk(&ws, &ws, &query, &mut results);
+        results
+    })
+    .await
+    .unwrap_or_default();
     Json(results).into_response()
 }
 
 fn search_walk(dir: &Path, ws: &Path, q: &str, out: &mut Vec<Value>) {
+    if out.len() >= 200 {
+        return;
+    }
     let Ok(rd) = fs::read_dir(dir) else { return };
     for entry in rd.flatten() {
+        if out.len() >= 200 {
+            break;
+        }
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') || name == "node_modules" || name == "sandbox" || name.ends_with(".pdf") {
             continue;
@@ -748,14 +881,17 @@ fn search_walk(dir: &Path, ws: &Path, q: &str, out: &mut Vec<Value>) {
         }
         let Ok(bytes) = fs::read(&full) else { continue };
         let Ok(content) = String::from_utf8(bytes) else { continue };
-        if !content.to_lowercase().contains(q) {
+        let lower = content.to_lowercase();
+        if !lower.contains(q) {
             continue;
         }
         let matches: Vec<Value> = content
             .lines()
+            .zip(lower.lines())
             .enumerate()
-            .filter(|(_, line)| line.to_lowercase().contains(q))
-            .map(|(i, line)| json!({ "lineNum": i + 1, "text": line.trim() }))
+            .filter(|(_, (_, folded))| folded.contains(q))
+            .take(100)
+            .map(|(i, (line, _))| json!({ "lineNum": i + 1, "text": line.trim() }))
             .collect();
         if !matches.is_empty() {
             let rel = full.strip_prefix(ws).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
@@ -789,27 +925,74 @@ async fn workspace_compress(State(st): St, body: Bytes) -> Response {
     let Some(out_path) = safe_workspace_path(&ws, archive_name) else {
         return json_err(StatusCode::BAD_REQUEST, "Invalid archive name");
     };
-    let mut rel_paths: Vec<String> = Vec::new();
+    let mut selected: Vec<PathBuf> = Vec::new();
     for p in paths {
         if let Some(full) = p.as_str().and_then(|s| safe_workspace_path(&ws, s)) {
-            if let Ok(rel) = full.strip_prefix(&ws) {
-                rel_paths.push(rel.to_string_lossy().into_owned());
-            }
+            selected.push(full);
         }
     }
-    if rel_paths.is_empty() {
+    if selected.is_empty() {
         return json_err(StatusCode::BAD_REQUEST, "No valid paths");
     }
-    let mut args: Vec<String> = vec!["-r".into(), out_path.to_string_lossy().into_owned()];
-    args.extend(rel_paths);
-    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    match run_cmd("zip", &argv, Some(&ws), None).await {
-        Ok(o) if o.code == Some(0) => Json(json!({ "ok": true })).into_response(),
-        Ok(o) => json_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            if o.stderr.is_empty() { format!("Compression failed with code {}", o.code.map(|c| c.to_string()).unwrap_or_else(|| "null".into())) } else { o.stderr },
-        ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json_err(StatusCode::INTERNAL_SERVER_ERROR, "The `zip` command was not found on this system."),
+
+    let result = tokio::task::spawn_blocking(move || -> Result<usize, String> {
+        use std::io::Write as _;
+        use zip::write::{SimpleFileOptions, ZipWriter};
+
+        fn collect(path: &Path, ws: &Path, output: &Path, entries: &mut Vec<(String, PathBuf, bool)>) {
+            let Ok(meta) = fs::symlink_metadata(path) else { return };
+            if meta.file_type().is_symlink() || path == output {
+                return;
+            }
+            let Ok(rel) = path.strip_prefix(ws) else { return };
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if rel.is_empty() {
+                return;
+            }
+            if meta.is_dir() {
+                entries.push((format!("{rel}/"), path.to_path_buf(), true));
+                if let Ok(children) = fs::read_dir(path) {
+                    for child in children.flatten() {
+                        collect(&child.path(), ws, output, entries);
+                    }
+                }
+            } else {
+                entries.push((rel, path.to_path_buf(), false));
+            }
+        }
+
+        let mut entries = Vec::new();
+        for path in &selected {
+            collect(path, &ws, &out_path, &mut entries);
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.dedup_by(|a, b| a.0 == b.0);
+        if entries.is_empty() {
+            return Err("No files to compress.".to_string());
+        }
+
+        let file = fs::File::create(&out_path).map_err(|e| e.to_string())?;
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let mut files = 0;
+        for (name, full, is_dir) in entries {
+            if is_dir {
+                zip.add_directory(name, options).map_err(|e| e.to_string())?;
+            } else {
+                let bytes = fs::read(full).map_err(|e| e.to_string())?;
+                zip.start_file(name, options).map_err(|e| e.to_string())?;
+                zip.write_all(&bytes).map_err(|e| e.to_string())?;
+                files += 1;
+            }
+        }
+        zip.finish().map_err(|e| e.to_string())?;
+        Ok(files)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(files)) => Json(json!({ "ok": true, "files": files })).into_response(),
+        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e),
         Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -1192,7 +1375,7 @@ async fn compile_html(State(st): St, Query(q): Q) -> Response {
 
 // Export a single file (compiled PDF/HTML or Typst source) into a target folder.
 fn export_ext(format: &str) -> &'static str {
-    match format { "png" => "png", "svg" => "svg", "html" => "html", "typ" => "typ", _ => "pdf" }
+    match format { "png" => "png", "svg" => "svg", "html" => "html", "bundle" => "zip", "typ" => "typ", _ => "pdf" }
 }
 
 // Build the typst CLI args for the requested format + the user's export options
@@ -1200,6 +1383,7 @@ fn export_ext(format: &str) -> &'static str {
 fn export_opts_args(v: &Value, format: &str) -> Vec<String> {
     let mut a: Vec<String> = vec!["--format".into(), format.into()];
     if format == "html" { a.push("--features".into()); a.push("html".into()); }
+    if format == "bundle" { a.push("--features".into()); a.push("bundle,html".into()); }
     if let Some(p) = jstr(v, "pages").map(str::trim).filter(|s| !s.is_empty()) {
         a.push("--pages".into()); a.push(p.to_string());
     }
@@ -1216,7 +1400,7 @@ fn export_opts_args(v: &Value, format: &str) -> Vec<String> {
         let ppi = v.get("ppi").and_then(Value::as_f64).filter(|n| (16.0..=2400.0).contains(n)).unwrap_or(144.0);
         a.push("--ppi".into()); a.push((ppi as u32).to_string());
     }
-    if matches!(format, "pdf" | "svg" | "html") && v.get("pretty").and_then(Value::as_bool) == Some(true) {
+    if matches!(format, "pdf" | "svg" | "html" | "bundle") && v.get("pretty").and_then(Value::as_bool) == Some(true) {
         a.push("--pretty".into());
     }
     a
@@ -1237,6 +1421,62 @@ async fn run_typst_export(ws: &Path, main_abs: &Path, out_path: &Path, v: &Value
         Ok(o) => Err(if o.stderr.is_empty() { "Compilation failed.".into() } else { o.stderr }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(TYPST_NOT_FOUND_SHORT.into()),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+async fn export_preflight(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let main_file = jstr(&v, "main").filter(|m| !m.is_empty()).unwrap_or("main.typ");
+    let ws = st.ws();
+    let Some(main_abs) = safe_workspace_path(&ws, main_file) else {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid main path");
+    };
+    let source = fs::read_to_string(&main_abs).unwrap_or_default();
+    static TITLE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)#set\s+document\s*\([^)]*\btitle\s*:").unwrap());
+    static LANG_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)#set\s+text\s*\([^)]*\blang\s*:").unwrap());
+    let checks = vec![
+        json!({
+            "label": "Document title is set in the entry file",
+            "ok": TITLE_RE.is_match(&source),
+            "advisory": true,
+        }),
+        json!({
+            "label": "Document language is set in the entry file",
+            "ok": LANG_RE.is_match(&source),
+            "advisory": true,
+        }),
+        json!({
+            "label": "Tagged PDF output is enabled",
+            "ok": v.get("tagged").and_then(Value::as_bool) != Some(false),
+            "advisory": false,
+        }),
+    ];
+    ensure_hilbert(&ws);
+    let stamp = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let output = hilbert_dir(&ws).join(format!("accessibility-preflight-{stamp}.pdf"));
+    let result = run_typst_export(&ws, &main_abs, &output, &v, "pdf").await;
+    let _ = fs::remove_file(&output);
+    match result {
+        Ok(()) => Json(json!({
+            "ok": true,
+            "checks": checks,
+            "message": "Typst completed the PDF standards check.",
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "checks": checks,
+                "error": error,
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -1271,6 +1511,57 @@ fn reveal_in_file_manager(target: &Path) {
         let dir = if target.is_dir() { target.to_path_buf() } else { target.parent().map(Path::to_path_buf).unwrap_or_else(|| target.to_path_buf()) };
         let _ = open::that_detached(dir);
     }
+}
+
+// Launch a second, independent copy of the app so the user can have two
+// projects open at once. Each instance runs its own backend on its own port,
+// so they don't interfere. We relaunch the real installed artifact rather than
+// the bare executable: on macOS ask LaunchServices for a new instance of the
+// .app (otherwise it just refocuses the running one), and on Linux relaunch the
+// .AppImage itself, since the running binary lives on a throwaway mount.
+fn spawn_new_instance() -> std::io::Result<()> {
+    // Its own session file, so the new window starts fresh at the default
+    // workspace and never clobbers the primary window's remembered project.
+    // Passed as an argument (not an env var) because macOS `open` doesn't
+    // forward the caller's environment to the launched app.
+    let session = new_window_session_path();
+    let session = session.to_string_lossy().into_owned();
+    #[cfg(target_os = "macos")]
+    if let Some(app) = macos_app_bundle() {
+        return std::process::Command::new("open")
+            .arg("-n").arg(app).arg("--args")
+            .arg("--session-file").arg(&session)
+            .spawn().map(|_| ());
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Ok(appimage) = std::env::var("APPIMAGE") {
+        return std::process::Command::new(appimage)
+            .arg("--session-file").arg(&session)
+            .spawn().map(|_| ());
+    }
+    std::process::Command::new(std::env::current_exe()?)
+        .arg("--session-file").arg(&session)
+        .spawn().map(|_| ())
+}
+
+// A unique, throwaway session file for an extra window. Kept in the temp dir so
+// the OS reclaims it; the window persists its own state here while open and it
+// is simply not read again afterwards.
+pub fn new_window_session_path() -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("hilbert-window-{}-{stamp}.json", std::process::id()))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_app_bundle() -> Option<PathBuf> {
+    // .../Hilbert.app/Contents/MacOS/hilbert  ->  .../Hilbert.app
+    let exe = std::env::current_exe().ok()?;
+    exe.ancestors()
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("app"))
+        .map(Path::to_path_buf)
 }
 
 // "Open after export". A multi-page export reveals the file instead of opening N
@@ -1329,6 +1620,74 @@ async fn export_native(State(st): St, body: Bytes) -> Response {
     }
 
     let main_abs = ws.join(&main_file);
+    if format == "bundle" {
+        ensure_hilbert(&ws);
+        let stamp = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let bundle_dir = hilbert_dir(&ws).join(format!("bundle-export-{stamp}"));
+        if let Err(error) = fs::create_dir_all(&bundle_dir) {
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
+        }
+        if let Err(error) = run_typst_export(&ws, &main_abs, &bundle_dir, &v, "bundle").await {
+            let _ = fs::remove_dir_all(&bundle_dir);
+            return json_err(StatusCode::BAD_REQUEST, error);
+        }
+        let target = chosen.clone();
+        let source = bundle_dir.clone();
+        let zipped = tokio::task::spawn_blocking(move || -> Result<usize, String> {
+            use std::io::Write as _;
+            use zip::write::{SimpleFileOptions, ZipWriter};
+
+            fn walk(dir: &Path, root: &Path, files: &mut Vec<(String, PathBuf)>) {
+                let Ok(entries) = fs::read_dir(dir) else { return };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let Ok(kind) = entry.file_type() else { continue };
+                    if kind.is_symlink() {
+                        continue;
+                    }
+                    if kind.is_dir() {
+                        walk(&path, root, files);
+                    } else if kind.is_file() {
+                        if let Ok(rel) = path.strip_prefix(root) {
+                            files.push((rel.to_string_lossy().replace('\\', "/"), path));
+                        }
+                    }
+                }
+            }
+
+            let mut files = Vec::new();
+            walk(&source, &source, &mut files);
+            files.sort_by(|a, b| a.0.cmp(&b.0));
+            if files.is_empty() {
+                return Err("The Typst bundle did not produce any files.".into());
+            }
+            let file = fs::File::create(&target).map_err(|error| error.to_string())?;
+            let mut zip = ZipWriter::new(file);
+            let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            for (name, path) in &files {
+                zip.start_file(name, options).map_err(|error| error.to_string())?;
+                let bytes = fs::read(path).map_err(|error| error.to_string())?;
+                zip.write_all(&bytes).map_err(|error| error.to_string())?;
+            }
+            zip.finish().map_err(|error| error.to_string())?;
+            Ok(files.len())
+        })
+        .await;
+        let _ = fs::remove_dir_all(&bundle_dir);
+        return match zipped {
+            Ok(Ok(count)) => {
+                if wants_open(&v) {
+                    reveal_in_file_manager(&chosen);
+                }
+                Json(json!({ "ok": true, "target": chosen.to_string_lossy(), "count": count })).into_response()
+            }
+            Ok(Err(error)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, error),
+            Err(error) => json_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        };
+    }
     let multi = matches!(format.as_str(), "png" | "svg");
     let dir = chosen.parent().map(Path::to_path_buf).unwrap_or_else(|| ws.clone());
     let stem = chosen.file_stem().and_then(|s| s.to_str()).unwrap_or(&name).to_string();
@@ -3492,6 +3851,7 @@ struct LspProxy {
     binary_path: String,
     child: tokio::process::Child,
     diagnostics: Arc<Mutex<LspDiagnosticState>>,
+    capabilities: Value,
     instance: u64,
 }
 
@@ -3548,8 +3908,11 @@ fn content_hash(s: &str) -> u64 {
     h.finish()
 }
 
-static LSP: LazyLock<tokio::sync::Mutex<Option<LspProxy>>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(None));
+// One tinymist per workspace, keyed by root: with several windows in one
+// process each window's project gets its own language server instead of the
+// windows stealing a single slot from each other on every request.
+static LSPS: LazyLock<tokio::sync::Mutex<HashMap<PathBuf, LspProxy>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
 static LSP_INSTANCE: AtomicU64 = AtomicU64::new(0);
 
 static LSP_CMD_LINK: LazyLock<Regex> =
@@ -3647,14 +4010,14 @@ async fn ensure_lsp(ws: &Path) -> bool {
     let Some(binary) = resolve_tinymist() else {
         return false;
     };
-    let mut guard = LSP.lock().await;
-    if let Some(proxy) = guard.as_mut() {
+    let mut guard = LSPS.lock().await;
+    if let Some(proxy) = guard.get_mut(ws) {
         let alive = proxy.child.try_wait().ok().flatten().is_none();
-        if alive && proxy.workspace == ws && proxy.binary_path == binary.path {
+        if alive && proxy.binary_path == binary.path {
             return true;
         }
     }
-    if let Some(mut old) = guard.take() {
+    if let Some(mut old) = guard.remove(ws) {
         let _ = old.child.kill().await;
     }
     let mut cmd = Command::new(&binary.path);
@@ -3680,6 +4043,7 @@ async fn ensure_lsp(ws: &Path) -> bool {
     // Reader task: parse Content-Length framed JSON-RPC and dispatch responses.
     let pending_reader = pending.clone();
     let diagnostics_reader = diagnostics.clone();
+    let ws_key = ws.to_path_buf();
     tokio::spawn(async move {
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 16384];
@@ -3727,9 +4091,9 @@ async fn ensure_lsp(ws: &Path) -> bool {
             }
         }
         // Process ended — drop the proxy so the next request respawns it.
-        let mut guard = LSP.lock().await;
-        if guard.as_ref().map(|proxy| proxy.instance) == Some(instance) {
-            *guard = None;
+        let mut guard = LSPS.lock().await;
+        if guard.get(&ws_key).map(|proxy| proxy.instance) == Some(instance) {
+            guard.remove(&ws_key);
         }
     });
 
@@ -3742,6 +4106,7 @@ async fn ensure_lsp(ws: &Path) -> bool {
         binary_path: binary.path,
         child,
         diagnostics,
+        capabilities: Value::Null,
         instance,
     };
 
@@ -3758,13 +4123,28 @@ async fn ensure_lsp(ws: &Path) -> bool {
             }),
         )
         .await;
-    if !matches!(tokio::time::timeout(Duration::from_secs(5), rx).await, Ok(Ok(result)) if result.is_object()) {
-        let _ = proxy.child.kill().await;
-        return false;
-    }
+    let init = match tokio::time::timeout(Duration::from_secs(5), rx).await {
+        Ok(Ok(result)) if result.is_object() => result,
+        _ => {
+            let _ = proxy.child.kill().await;
+            return false;
+        }
+    };
+    proxy.capabilities = init.get("capabilities").cloned().unwrap_or(Value::Null);
     proxy.notify("initialized", json!({})).await;
+    proxy
+        .notify(
+            "workspace/didChangeConfiguration",
+            json!({ "settings": {
+                "formatterMode": "typstyle",
+                "formatterIndentSize": 2,
+                "formatterPrintWidth": 120,
+                "formatterProseWrap": false
+            }}),
+        )
+        .await;
 
-    *guard = Some(proxy);
+    guard.insert(ws.to_path_buf(), proxy);
     true
 }
 
@@ -3773,6 +4153,225 @@ fn lsp_pos(v: &Value) -> Option<(String, i64, i64)> {
     let line = v.get("line")?.as_i64()?;
     let character = v.get("character")?.as_i64()?;
     Some((file, line, character))
+}
+
+async fn lsp_document_request(
+    st: &AppState,
+    file: &str,
+    content: &str,
+    method: &str,
+    extra: Value,
+) -> Option<(PathBuf, Value)> {
+    let ws = st.ws();
+    if !ensure_lsp(&ws).await {
+        return None;
+    }
+    let full_path = safe_workspace_path(&ws, file)?;
+    let uri = file_uri(&full_path);
+    let mut params = extra.as_object().cloned().unwrap_or_default();
+    params.insert("textDocument".into(), json!({ "uri": uri }));
+    let rx = {
+        let mut guard = LSPS.lock().await;
+        let proxy = guard.get_mut(&ws)?;
+        proxy.sync_file(&uri, content).await;
+        proxy.begin_request(method, Value::Object(params)).await
+    };
+    let result = tokio::time::timeout(Duration::from_secs(5), rx).await.ok()?.ok()?;
+    Some((ws, result))
+}
+
+fn workspace_file_from_uri(ws: &Path, uri: &str) -> Option<String> {
+    let raw = uri.strip_prefix("file://")?;
+    let decoded = percent_decode_str(raw).decode_utf8().ok()?;
+    #[cfg(windows)]
+    let path = decoded.strip_prefix('/').unwrap_or(decoded.as_ref());
+    #[cfg(not(windows))]
+    let path = decoded.as_ref();
+    Path::new(path)
+        .strip_prefix(ws)
+        .ok()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+}
+
+fn normalize_locations(ws: &Path, result: &Value) -> Vec<Value> {
+    let values: Vec<&Value> = match result {
+        Value::Array(items) => items.iter().collect(),
+        Value::Null => Vec::new(),
+        one => vec![one],
+    };
+    values
+        .into_iter()
+        .filter_map(|item| {
+            let uri = item
+                .get("uri")
+                .or_else(|| item.get("targetUri"))
+                .and_then(Value::as_str)?;
+            let range = item
+                .get("range")
+                .or_else(|| item.get("targetSelectionRange"))
+                .or_else(|| item.get("targetRange"))?;
+            Some(json!({ "file": workspace_file_from_uri(ws, uri)?, "range": range }))
+        })
+        .collect()
+}
+
+fn normalize_workspace_edit(ws: &Path, edit: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    if let Some(changes) = edit.get("changes").and_then(Value::as_object) {
+        for (uri, edits) in changes {
+            if let Some(file) = workspace_file_from_uri(ws, uri) {
+                out.push(json!({ "file": file, "edits": edits }));
+            }
+        }
+    }
+    if let Some(changes) = edit.get("documentChanges").and_then(Value::as_array) {
+        for change in changes {
+            let Some(uri) = change.pointer("/textDocument/uri").and_then(Value::as_str) else { continue };
+            let Some(file) = workspace_file_from_uri(ws, uri) else { continue };
+            out.push(json!({
+                "file": file,
+                "edits": change.get("edits").cloned().unwrap_or_else(|| json!([])),
+            }));
+        }
+    }
+    out
+}
+
+async fn lsp_definition(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let Some((file, line, character)) = lsp_pos(&v) else {
+        return Json(json!({ "locations": [] })).into_response();
+    };
+    let content = jstr(&v, "content").unwrap_or("");
+    match lsp_document_request(
+        &st,
+        &file,
+        content,
+        "textDocument/definition",
+        json!({ "position": { "line": line, "character": character } }),
+    )
+    .await
+    {
+        Some((ws, result)) => Json(json!({ "locations": normalize_locations(&ws, &result) })).into_response(),
+        None => Json(json!({ "locations": [] })).into_response(),
+    }
+}
+
+async fn lsp_references(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let Some((file, line, character)) = lsp_pos(&v) else {
+        return Json(json!({ "locations": [] })).into_response();
+    };
+    let content = jstr(&v, "content").unwrap_or("");
+    match lsp_document_request(
+        &st,
+        &file,
+        content,
+        "textDocument/references",
+        json!({
+            "position": { "line": line, "character": character },
+            "context": { "includeDeclaration": true }
+        }),
+    )
+    .await
+    {
+        Some((ws, result)) => Json(json!({ "locations": normalize_locations(&ws, &result) })).into_response(),
+        None => Json(json!({ "locations": [] })).into_response(),
+    }
+}
+
+async fn lsp_rename(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let Some((file, line, character)) = lsp_pos(&v) else {
+        return Json(json!({ "changes": [] })).into_response();
+    };
+    let content = jstr(&v, "content").unwrap_or("");
+    let Some(new_name) = jstr(&v, "newName").filter(|name| !name.trim().is_empty()) else {
+        return json_err(StatusCode::BAD_REQUEST, "A new name is required.");
+    };
+    match lsp_document_request(
+        &st,
+        &file,
+        content,
+        "textDocument/rename",
+        json!({
+            "position": { "line": line, "character": character },
+            "newName": new_name
+        }),
+    )
+    .await
+    {
+        Some((ws, result)) => Json(json!({ "changes": normalize_workspace_edit(&ws, &result) })).into_response(),
+        None => Json(json!({ "changes": [] })).into_response(),
+    }
+}
+
+async fn lsp_format(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let Some(file) = jstr(&v, "file") else {
+        return Json(json!({ "edits": [] })).into_response();
+    };
+    let content = jstr(&v, "content").unwrap_or("");
+    match lsp_document_request(
+        &st,
+        file,
+        content,
+        "textDocument/formatting",
+        json!({ "options": { "tabSize": 2, "insertSpaces": true } }),
+    )
+    .await
+    {
+        Some((_, result)) => Json(json!({ "available": true, "edits": result.as_array().cloned().unwrap_or_default() })).into_response(),
+        None => Json(json!({ "edits": [], "available": false })).into_response(),
+    }
+}
+
+async fn lsp_code_actions(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let Some((file, line, character)) = lsp_pos(&v) else {
+        return Json(json!({ "actions": [] })).into_response();
+    };
+    let content = jstr(&v, "content").unwrap_or("");
+    let end_line = v.get("endLine").and_then(Value::as_i64).unwrap_or(line);
+    let end_character = v.get("endCharacter").and_then(Value::as_i64).unwrap_or(character);
+    match lsp_document_request(
+        &st,
+        &file,
+        content,
+        "textDocument/codeAction",
+        json!({
+            "range": {
+                "start": { "line": line, "character": character },
+                "end": { "line": end_line, "character": end_character }
+            },
+            "context": { "diagnostics": [] }
+        }),
+    )
+    .await
+    {
+        Some((ws, result)) => {
+            let actions: Vec<Value> = result
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|action| {
+                    let title = action.get("title")?.as_str()?;
+                    let changes = normalize_workspace_edit(&ws, action.get("edit").unwrap_or(&Value::Null));
+                    if changes.is_empty() {
+                        return None;
+                    }
+                    Some(json!({
+                        "title": title,
+                        "kind": action.get("kind").cloned().unwrap_or(Value::Null),
+                        "preferred": action.get("isPreferred").cloned().unwrap_or(Value::Bool(false)),
+                        "changes": changes,
+                    }))
+                })
+                .collect();
+            Json(json!({ "actions": actions })).into_response()
+        }
+        None => Json(json!({ "actions": [] })).into_response(),
+    }
 }
 
 // POST /lsp/hover { file, line, character, content } → { contents, range }
@@ -3791,8 +4390,8 @@ async fn lsp_hover(State(st): St, body: Bytes) -> Response {
     };
     let uri = file_uri(&full_path);
     let rx = {
-        let mut guard = LSP.lock().await;
-        let Some(p) = guard.as_mut() else {
+        let mut guard = LSPS.lock().await;
+        let Some(p) = guard.get_mut(&ws) else {
             return Json(json!({ "contents": Value::Null })).into_response();
         };
         p.sync_file(&uri, &content).await;
@@ -3837,8 +4436,8 @@ async fn lsp_completion(State(st): St, body: Bytes) -> Response {
     };
     let uri = file_uri(&full_path);
     let rx = {
-        let mut guard = LSP.lock().await;
-        let Some(p) = guard.as_mut() else {
+        let mut guard = LSPS.lock().await;
+        let Some(p) = guard.get_mut(&ws) else {
             return Json(json!({ "items": [] })).into_response();
         };
         p.sync_file(&uri, &content).await;
@@ -3865,17 +4464,18 @@ async fn lsp_completion(State(st): St, body: Bytes) -> Response {
     Json(json!({ "items": items })).into_response()
 }
 
-async fn lsp_status() -> Response {
+async fn lsp_status(State(st): St) -> Response {
     let binary = resolve_tinymist();
-    let (running, workspace) = {
-        let mut guard = LSP.lock().await;
-        match guard.as_mut() {
+    let (running, workspace, capabilities) = {
+        let mut guard = LSPS.lock().await;
+        match guard.get_mut(&st.ws()) {
             Some(proxy) => (
                 proxy.child.try_wait().ok().flatten().is_none()
                     && binary.as_ref().map(|item| item.path.as_str()) == Some(proxy.binary_path.as_str()),
                 Some(proxy.workspace.to_string_lossy().into_owned()),
+                proxy.capabilities.clone(),
             ),
-            None => (false, None),
+            None => (false, None, Value::Null),
         }
     };
     let Some(binary) = binary else {
@@ -3899,20 +4499,28 @@ async fn lsp_status() -> Response {
         "source": binary.source,
         "version": version,
         "workspace": workspace,
+        "capabilities": capabilities,
         "managedPath": managed_tinymist_path(),
     }))
     .into_response()
 }
 
-async fn stop_lsp() {
-    let mut guard = LSP.lock().await;
-    if let Some(mut proxy) = guard.take() {
+async fn stop_lsp_for(ws: &Path) {
+    let mut guard = LSPS.lock().await;
+    if let Some(mut proxy) = guard.remove(ws) {
+        let _ = proxy.child.kill().await;
+    }
+}
+
+async fn stop_all_lsps() {
+    let mut guard = LSPS.lock().await;
+    for (_, mut proxy) in guard.drain() {
         let _ = proxy.child.kill().await;
     }
 }
 
 async fn lsp_restart(State(st): St) -> Response {
-    stop_lsp().await;
+    stop_lsp_for(&st.ws()).await;
     let available = ensure_lsp(&st.ws()).await;
     Json(json!({
         "ok": available,
@@ -3938,8 +4546,8 @@ async fn lsp_diagnostics(State(st): St, body: Bytes) -> Response {
     }
     let uri = file_uri(&full_path);
     let (target_version, changed, state, baseline) = {
-        let mut guard = LSP.lock().await;
-        let Some(proxy) = guard.as_mut() else {
+        let mut guard = LSPS.lock().await;
+        let Some(proxy) = guard.get_mut(&ws) else {
             return Json(json!({ "available": false, "diagnostics": [] })).into_response();
         };
         let state = proxy.diagnostics.clone();
@@ -4028,6 +4636,11 @@ async fn lint_ignore(body: Bytes) -> Response {
 // disk, not the webview's localStorage (which is tied to the port and can vanish).
 // ---------------------------------------------------------------------------
 
+// The default (primary-window) session path, used by the GUI shell at boot.
+pub fn session_file_path() -> PathBuf {
+    session_file()
+}
+
 fn session_file() -> PathBuf {
     // Overridable so headless/test runs don't touch the real user session file.
     if let Ok(p) = std::env::var("HILBERT_SESSION_FILE") {
@@ -4049,20 +4662,20 @@ pub fn saved_workspace() -> Option<PathBuf> {
     path.is_dir().then_some(path)
 }
 
-async fn session_get() -> Response {
-    match fs::read_to_string(session_file()) {
+async fn session_get(State(st): St) -> Response {
+    match fs::read_to_string(&st.session_file) {
         Ok(s) if !s.trim().is_empty() => ([(header::CONTENT_TYPE, "application/json")], s).into_response(),
         _ => Json(json!({})).into_response(),
     }
 }
 
-async fn session_post(body: Bytes) -> Response {
+async fn session_post(State(st): St, body: Bytes) -> Response {
     // Only persist well-formed JSON, and write atomically (temp + rename) so a
     // crash mid-write can't leave a corrupt file that breaks the next launch.
     if serde_json::from_slice::<Value>(&body).is_err() {
         return json_err(StatusCode::BAD_REQUEST, "Invalid session JSON");
     }
-    let path = session_file();
+    let path = st.session_file.clone();
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -4091,12 +4704,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/workspace/root", get(workspace_root_get).post(workspace_root_post))
         .route("/workspace/clear", post(workspace_clear))
         .route("/workspace/file", get(workspace_file_get).post(workspace_file_post).delete(workspace_file_delete).layer(DefaultBodyLimit::max(16 * 1024 * 1024)))
+        .route("/workspace/file/state", get(workspace_file_state))
+        .route("/workspace/files/state", post(workspace_files_state))
         .route("/workspace/mkdir", post(workspace_mkdir))
         .route("/workspace/upload", post(workspace_upload).layer(DefaultBodyLimit::max(50 * 1024 * 1024)))
         .route("/workspace/save-image", post(workspace_save_image).layer(DefaultBodyLimit::max(50 * 1024 * 1024)))
         .route("/workspace/copy", post(workspace_copy))
         .route("/workspace/rename", post(workspace_rename))
         .route("/workspace/reveal", post(workspace_reveal))
+        .route("/app/new-window", post(app_new_window))
         .route("/workspace/search", get(workspace_search))
         .route("/workspace/raw", get(workspace_raw))
         .route("/workspace/compress", post(workspace_compress))
@@ -4120,9 +4736,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/git/push", post(git_push))
         .route("/drive/sync", post(drive_sync))
         .route("/export/native", post(export_native))
+        .route("/export/preflight", post(export_preflight))
         .route("/export/project/native", post(export_project_native))
         .route("/webdav/sync", post(webdav_sync))
         .route("/tools", get(tools))
+        .route("/toolchain/status", get(toolchain_status))
         .route("/tools/interpreter", post(tools_interpreter_add))
         .route("/tools/interpreter/remove", post(tools_interpreter_remove))
         .route("/tools/interpreter/pick", post(tools_interpreter_pick))
@@ -4137,6 +4755,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/lsp/restart", post(lsp_restart))
         .route("/lsp/hover", post(lsp_hover))
         .route("/lsp/completion", post(lsp_completion))
+        .route("/lsp/definition", post(lsp_definition))
+        .route("/lsp/references", post(lsp_references))
+        .route("/lsp/rename", post(lsp_rename))
+        .route("/lsp/format", post(lsp_format))
+        .route("/lsp/code-actions", post(lsp_code_actions))
         .route("/lsp/diagnostics", post(lsp_diagnostics))
         .route("/lint", post(lint_text))
         .route("/lint/suggest", post(lint_suggest))
@@ -4159,9 +4782,17 @@ pub fn router(state: Arc<AppState>) -> Router {
 // Kill the long-lived child processes (typst watch, tinymist). Called on app
 // exit — a GUI quit doesn't signal children, so without this they would keep
 // running (and recompiling on every file change) after Hilbert closes.
+// Full shutdown at app exit: every watcher owner calls this and the last one
+// also reaps every language server.
 pub async fn shutdown_children(state: &Arc<AppState>) {
     stop_preview_watcher(state).await;
-    stop_lsp().await;
+    stop_all_lsps().await;
+}
+
+// One window closing: its preview watcher dies with it, but language servers
+// are shared per-workspace across windows and stay for the survivors.
+pub async fn shutdown_window(state: &Arc<AppState>) {
+    stop_preview_watcher(state).await;
 }
 
 pub async fn serve(listener: std::net::TcpListener, state: Arc<AppState>) {

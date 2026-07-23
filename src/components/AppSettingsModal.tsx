@@ -21,6 +21,10 @@ type TinymistStatus = {
   workspace?: string;
   managedPath?: string;
 };
+type ToolchainStatus = {
+  typst: { available: boolean; version?: string; label?: string; path?: string };
+  features: { html: boolean; bundle: boolean; multiplePdfStandards: boolean; variableFonts?: boolean };
+};
 
 // An example that matches the machine the user is actually on, so the field
 // shows the shape of a real answer rather than a Unix path on Windows.
@@ -42,6 +46,7 @@ export default function AppSettingsModal({ onClose, theme, onTheme, fontSize, on
   const [activeTab, setActiveTab] = useState<'general' | 'interpreters' | 'git' | 'cloud'>('general');
   const [tools, setTools] = useState<Tools | null>(null);
   const [tinymist, setTinymist] = useState<TinymistStatus | null>(null);
+  const [toolchain, setToolchain] = useState<ToolchainStatus | null>(null);
   const [tinymistBusy, setTinymistBusy] = useState(false);
   const [tinymistLog, setTinymistLog] = useState('');
   const [picked, setPicked] = useState<Record<string, string>>({});
@@ -136,7 +141,18 @@ export default function AppSettingsModal({ onClose, theme, onTheme, fontSize, on
     } catch { setTinymist(null); }
   };
 
-  useEffect(() => { if (activeTab === 'general') refreshTinymist(); }, [activeTab]);
+  const refreshToolchain = async () => {
+    try {
+      const response = await fetch(`${API}/toolchain/status`);
+      setToolchain(response.ok ? await response.json() : null);
+    } catch { setToolchain(null); }
+  };
+
+  useEffect(() => {
+    if (activeTab !== 'general') return;
+    refreshTinymist();
+    refreshToolchain();
+  }, [activeTab]);
 
   const restartTinymist = async () => {
     setTinymistBusy(true);
@@ -248,6 +264,29 @@ export default function AppSettingsModal({ onClose, theme, onTheme, fontSize, on
                     onChange={e => { const v = Number(e.target.value); setExportDpi(v); localStorage.setItem('fc_export_dpi', String(v)); }} />
                   <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Resolution of flowchart / diagram images added to the PDF. Higher = sharper but larger files (96 draft → 500 print).</span>
                 </label>
+                <div style={{ padding: '12px', border: '1px solid var(--border-color)', borderRadius: 7, background: 'var(--bg-color)' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, fontWeight: 600 }}>
+                    <span style={{ width: 8, height: 8, borderRadius: '50%', background: toolchain?.typst.available ? '#10b981' : '#ef4444' }} />
+                    Typst compiler
+                  </div>
+                  <div style={{ marginTop: 8, color: 'var(--text-muted)', fontSize: 12, lineHeight: 1.5 }}>
+                    {toolchain === null ? 'Checking compiler…' : toolchain.typst.available ? (
+                      <>
+                        {toolchain.typst.label || `Typst ${toolchain.typst.version || ''}`}
+                        {toolchain.typst.path && <div style={{ marginTop: 4, overflowWrap: 'anywhere', fontFamily: 'monospace' }}>{toolchain.typst.path}</div>}
+                        <div style={{ marginTop: 7, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                          <span>{toolchain.features.html ? '✓' : '—'} HTML</span>
+                          <span>{toolchain.features.bundle ? '✓' : '—'} Bundle</span>
+                          <span>{toolchain.features.multiplePdfStandards ? '✓' : '—'} Multi-standard PDF</span>
+                          <span>{toolchain.features.variableFonts ? '✓' : '—'} Variable fonts</span>
+                        </div>
+                        {!toolchain.features.bundle && (
+                          <div style={{ marginTop: 6, color: '#f59e0b' }}>Typst 0.15 or newer is required for bundle export and combined PDF standards.</div>
+                        )}
+                      </>
+                    ) : 'Typst was not found on PATH. Preview and export are unavailable until it is installed.'}
+                  </div>
+                </div>
                 <div style={{ padding: '12px', border: '1px solid var(--border-color)', borderRadius: 7, background: 'var(--bg-color)' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, fontWeight: 600 }}>

@@ -4,6 +4,62 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.1.10
+
+A feature release, plus fixes for things people hit while editing.
+
+### Two projects at once
+
+**File → New Window** opens a second window on another project. It's one running
+app — a single icon in the Dock or taskbar — with fully independent windows: each
+has its own preview, its own file tree, its own undo history, and remembers its own
+project, so a second window never disturbs what the first one reopens next time.
+Point a new window at the other project with **File → Open Folder**.
+
+### Code intelligence
+
+With tinymist installed, the Edit menu and the editor's right-click menu now do
+go to definition, find references, rename a symbol across the file, quick fixes,
+and whole-document formatting (F2) with the bundled typstyle formatter — on top of
+the hover docs, completions and live diagnostics that were already there. Each open
+window gets its own language server, so two projects don't interfere.
+
+### The preview stays up, and the caret stays put
+
+The last good render is shown from the moment you open a project — even if the very
+first build has an error — so the page is never blank with just a wall of errors.
+Errors live in a slim strip along the bottom (and the Problems panel); click
+**Details / View errors** for the full list, **Back to preview** to return. Typing
+while an error is on screen no longer makes the panel or the bottom bar jump around.
+
+Separately, the cursor no longer jumps to another place in the file. When Hilbert
+replaced a document's text behind the editor — reloading a file changed on disk, or
+writing notebook output back — the caret could snap elsewhere; it now holds its
+position through those replacements.
+
+### Files changed outside Hilbert
+
+If Git or another editor changes a file you have open, Hilbert reloads it
+automatically. If you had unsaved edits, it shows your version and the version on
+disk side by side and lets you choose, instead of silently overwriting either one.
+Saving uses the same check, so two windows on the same file can't clobber each other.
+
+### Notebook, export, and smaller things
+
+- Running a notebook no longer discards text you typed while it was running — output
+  is spliced into the live document, and it stops safely if the cells changed mid-run.
+- The export dialog gained accessible PDF/A archive standards (PDF/A-2a, -3a, -2u, -4)
+  and an accessibility preflight that checks the document title, language, and tagging
+  before you export.
+- An experimental **HTML Preview** (View menu) renders the document through Typst's
+  HTML export.
+- Right-clicking a file near a window edge no longer pushes its menu off screen — it
+  repositions to stay fully visible.
+
+Existing installs from 0.1.3 onwards pick this release up through the auto-updater.
+
+---
+
 ## 0.1.9
 
 A hotfix for 0.1.8.
