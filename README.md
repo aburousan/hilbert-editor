@@ -377,11 +377,43 @@ Mac* tells you which). The desktop app still needs the Typst CLI on your `PATH`.
 > if the app is elsewhere, e.g. `~/Downloads`.) The code is open, so you can audit or
 > build it yourself. This is a one-time step.
 
+### macOS (Homebrew)
+
+Install and keep it updated through a Homebrew tap:
+
+```bash
+brew install --cask aburousan/hilbert/hilbert
+```
+
+Because the app isn't notarised, Gatekeeper may refuse the first launch. Either add
+`--no-quarantine`:
+
+```bash
+brew install --cask --no-quarantine aburousan/hilbert/hilbert
+```
+
+or use the `.dmg` from Releases and follow the first-launch note above. Update later with
+`brew upgrade --cask hilbert`.
+
 ### Windows
 
 Download the `.exe` (or `.msi`) from Releases and run it. It behaves like a normal
 Windows app: launching tools never flashes a console window, and a failed compile
 shows an error panel instead of closing. You still need the Typst CLI on `PATH`.
+
+### Linux (Debian / Ubuntu)
+
+Install from the apt repository so `apt upgrade` keeps it current:
+
+```bash
+curl -fsSL https://aburousan.github.io/hilbert-apt/hilbert-archive-keyring.asc \
+  | sudo gpg --dearmor -o /usr/share/keyrings/hilbert-archive-keyring.gpg
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/hilbert-archive-keyring.gpg] https://aburousan.github.io/hilbert-apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/hilbert.list
+sudo apt update && sudo apt install hilbert
+```
+
+Or download the `.deb`, `.AppImage`, or `.rpm` from Releases directly.
 
 ---
 
