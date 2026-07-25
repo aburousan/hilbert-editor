@@ -12,7 +12,13 @@ name: Test build (no publish)
 on:
   workflow_dispatch:
   push:
-    branches: [ live-project-sync ]
+    branches: [ main ]
+    # A full four-platform build takes a quarter of an hour, so don't spend one
+    # on a commit that cannot change what gets built.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.github/workflows/build.yml'
 
 permissions:
   contents: read
