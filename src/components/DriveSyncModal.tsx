@@ -162,7 +162,11 @@ export default function DriveSyncModal({
             <>
               <div style={{ padding: '8px 10px', borderRadius: 7, border: '1px solid rgba(245, 158, 11, 0.45)', background: 'rgba(245, 158, 11, 0.09)', fontSize: '0.8rem', lineHeight: 1.45, marginBottom: 10 }}>
                 <b>Experimental.</b> Live sharing still has rough edges — keep your own backup of
-                anything important, and expect the occasional reconnect or out-of-date file.
+                anything important, and expect the occasional reconnect or out-of-date file.{' '}
+                <a href="https://github.com/aburousan/hilbert-editor/blob/main/docs/COLLABORATION.md"
+                  target="_blank" rel="noopener noreferrer" style={{ color: 'inherit', fontWeight: 600 }}>
+                  Read the guide
+                </a>{' '}for setup, rejoining, and troubleshooting.
               </div>
               <p className="form-hint">
                 Share the complete project live: text, images, fonts, whiteboards, file changes,

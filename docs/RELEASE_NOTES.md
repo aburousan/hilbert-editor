@@ -8,6 +8,23 @@ Paste the current section into the GitHub release when you cut a tag.
 
 A feature release, plus fixes for things people hit while editing.
 
+### Live collaboration (experimental)
+
+Share a whole project — text, images, fonts, whiteboards, and plots your code
+generates — with someone else in real time, with no account and no server that
+anyone runs for you. Everything is encrypted before it leaves your machine; the
+relay only ever sees ciphertext, and each person keeps a real copy on their own
+disk and compiles it locally.
+
+It is **experimental**: expect the occasional reconnect or a file that lands a few
+seconds late, and keep your own backup of anything important. Nothing on your disk
+is deleted without asking you first.
+
+**Read [docs/COLLABORATION.md](https://github.com/aburousan/hilbert-editor/blob/main/docs/COLLABORATION.md)
+before your first session** — it covers hosting, joining, rejoining an earlier
+project folder, the three network setups (one router, campus, dedicated relay), and
+troubleshooting.
+
 ### Two projects at once
 
 **File → New Window** opens a second window on another project. It's one running

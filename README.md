@@ -292,7 +292,10 @@ or WebDAV (Nextcloud and ownCloud), and a package manager to search, download, a
 remove Typst packages.
 
 Live collaboration is **experimental** — it works, but expect rough edges, so keep your
-own backup of anything important. It is offline-first and account-free. From the command
+own backup of anything important. **Read [docs/COLLABORATION.md](docs/COLLABORATION.md)
+before your first session**: it covers hosting, joining, rejoining, the network setups
+(one router, campus, dedicated relay), and troubleshooting. It is offline-first and
+account-free. From the command
 palette, share the whole project (text, images, fonts and whiteboards) on the detected
 campus/LAN address and pass on the generated invitation, or paste an invitation to join
 and receive the project into a folder of your choosing. Hilbert starts a separate collaboration-only
