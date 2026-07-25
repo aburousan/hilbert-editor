@@ -29,6 +29,13 @@ export function sniffDelim(firstLine: string): string {
 
 export const sanitizeName = (n: string) => n.replace(/[^\w.\-]+/g, '_');
 
+// Quote a field on the way back out, so a value holding a comma, quote or
+// newline survives the round trip through parseDelimited.
+export const csvField = (v: string) => /[",\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+
+// Spreadsheet formats the backend converts to CSV via /data/xlsx.
+export const EXCEL_EXT = ['xlsx', 'xls', 'xlsb', 'ods'];
+
 // A row is treated as a header when at least one cell is present and not numeric.
 export function looksLikeHeader(row: string[] | undefined): boolean {
   if (!row || !row.length) return false;

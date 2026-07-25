@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react';
 import { API } from '../api';
 import { notify } from '../notify';
-import { parseDelimited, sniffDelim, sanitizeName, looksLikeHeader } from '../csvUtil';
+import { parseDelimited, sniffDelim, sanitizeName, looksLikeHeader, csvField, EXCEL_EXT } from '../csvUtil';
 
 // Visual cetz canvas builder with a LIVE preview. Click shape icons to add
 // primitives; set each one's X/Y (position), Size (radius / length / grid range),
@@ -17,7 +17,22 @@ type Item = {
   // Populated only for 'datacurve': the file to save + parsed columns.
   dataFile?: string; dataContent?: string; dataHeaders?: string[]; dataRows?: string[][];
   dataHasHeader?: boolean; xcol?: number; ycol?: number;
+  // Bézier only: the two control handles, as offsets from the curve's own
+  // centre so moving or resizing the curve carries its shape along. Curves
+  // saved before handles existed have none, and fall back to CTRL_DEFAULT.
+  c1?: Pt; c2?: Pt;
 };
+
+type Pt = { x: number; y: number };
+
+// The classic S-curve the bezier tool has always produced, expressed as
+// handle offsets scaled by the item's size.
+const CTRL_DEFAULT: [Pt, Pt] = [{ x: -0.5, y: 1 }, { x: 0.5, y: -1 }];
+const ctrlOf = (it: Item): [Pt, Pt] => [it.c1 ?? CTRL_DEFAULT[0], it.c2 ?? CTRL_DEFAULT[1]];
+// Handle offsets are stored in units of `size`, so a curve keeps its shape
+// when scaled. These map to and from absolute canvas coordinates.
+const ctrlAbs = (it: Item, c: Pt): Pt => ({ x: it.x + c.x * it.size, y: it.y + c.y * it.size });
+const ctrlRel = (it: Item, p: Pt): Pt => ({ x: (p.x - it.x) / it.size, y: (p.y - it.y) / it.size });
 
 const COLORS = ['blue', 'red', 'green', 'orange', 'purple', 'teal', 'gray', 'black'];
 const HEX: Record<string, string> = {
@@ -29,8 +44,6 @@ const DEF_SIZE: Record<PrimType, number> = {
   arrow: 1.8, arc: 1.5, bezier: 2, grid: 2, dot: 1.5, axes: 2, text: 1, datacurve: 3,
 };
 
-const EXCEL_EXT = ['xlsx', 'xls', 'xlsb', 'ods'];
-const csvField = (v: string) => /[",\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
 
 const PRIMS: { type: PrimType; name: string; icon: React.ReactNode }[] = [
   { type: 'circle',   name: 'Circle',    icon: <circle cx="20" cy="20" r="12" /> },
@@ -57,9 +70,20 @@ export default function DiagramBuilder({ onClose, onInsert, onSaveFile }: { onCl
   const [caption, setCaption] = useState('Diagram');
   const [label, setLabel] = useState('');
   const dataInput = useRef<HTMLInputElement>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
+  // Which Bézier's handles are showing. Only one curve is editable at a time,
+  // so the preview does not fill up with handles once a scene has several.
+  const [editCurve, setEditCurve] = useState<number | null>(null);
+  // True while a control handle is being dragged. The view stops reframing for
+  // that moment: the drag maps screen pixels back through the projection it
+  // started with, and a mid-drag rescale would slide the handle off the cursor.
+  const [bending, setBending] = useState(false);
 
   const add = (type: PrimType) => setScene(s => [...s, { uid: ++counter, type, color: 'blue', x: 0, y: 0, size: DEF_SIZE[type], rot: 0, ...(type === 'text' ? { text: 'Label' } : {}) }]);
-  const remove = (uid: number) => setScene(s => s.filter(i => i.uid !== uid));
+  const remove = (uid: number) => {
+    setScene(s => s.filter(i => i.uid !== uid));
+    setEditCurve(cur => cur === uid ? null : cur);
+  };
   const patch = (uid: number, p: Partial<Item>) => setScene(s => s.map(i => i.uid === uid ? { ...i, ...p } : i));
 
   // Parse a data cell of a chosen column into numbers, skipping unparseable rows.
@@ -122,7 +146,11 @@ export default function DiagramBuilder({ onClose, onInsert, onSaveFile }: { onCl
       case 'line':     body = `line((${cx - s}, ${(cy - s * 0.67).toFixed(2)}), (${cx + s}, ${(cy + s * 0.67).toFixed(2)}), ${st})`; break;
       case 'arrow':    body = `line((${cx - s}, ${cy}), (${cx + s}, ${cy}), mark: (end: ">", scale: ${s}), stroke: (paint: ${c}, thickness: ${(s * 0.9).toFixed(2)}pt))`; break;
       case 'arc':      body = `arc((${cx}, ${cy}), start: 0deg, stop: 260deg, radius: ${s}, ${st})`; break;
-      case 'bezier':   body = `bezier((${cx - s}, ${cy}), (${cx + s}, ${cy}), (${(cx - s / 2).toFixed(2)}, ${cy + s}), (${(cx + s / 2).toFixed(2)}, ${cy - s}), ${st})`; break;
+      case 'bezier': {
+        const [h1, h2] = ctrlOf(it).map(c => ctrlAbs(it, c));
+        body = `bezier((${cx - s}, ${cy}), (${cx + s}, ${cy}), (${h1.x.toFixed(2)}, ${h1.y.toFixed(2)}), (${h2.x.toFixed(2)}, ${h2.y.toFixed(2)}), ${st})`;
+        break;
+      }
       case 'grid':     body = `grid((${cx - s}, ${cy - s}), (${cx + s}, ${cy + s}), step: 1, stroke: gray.lighten(50%))`; break;
       case 'dot':      body = `circle((${cx}, ${cy}), radius: ${Math.max(0.08, s * 0.1).toFixed(2)}, fill: ${c}, stroke: none)`; break;
       case 'axes':     body = `line((${cx - s}, ${cy}), (${cx + s}, ${cy}), mark: (end: ">"), ${st})\n    line((${cx}, ${cy - s}), (${cx}, ${cy + s}), mark: (end: ">"), ${st})`; break;
@@ -153,15 +181,30 @@ export default function DiagramBuilder({ onClose, onInsert, onSaveFile }: { onCl
 
   // ---- live SVG preview ----------------------------------------------------
   const W = 360, H = 240, PAD = 24;
-  const ext = (i: Item): [number, number] => { const s = i.size; return i.type === 'ellipse' ? [s, s / 2] : i.type === 'rect' ? [s, s * 0.62] : i.type === 'text' ? [1, 0.6] : [s, s]; };
+  const ext = (i: Item): [number, number] => {
+    const s = i.size;
+    // A dragged-out control handle can reach past the curve's own box; count it
+    // so the view keeps framing the whole shape.
+    if (i.type === 'bezier') {
+      const [h1, h2] = ctrlOf(i);
+      return [Math.max(s, Math.abs(h1.x) * s, Math.abs(h2.x) * s), Math.max(s, Math.abs(h1.y) * s, Math.abs(h2.y) * s)];
+    }
+    return i.type === 'ellipse' ? [s, s / 2] : i.type === 'rect' ? [s, s * 0.62] : i.type === 'text' ? [1, 0.6] : [s, s];
+  };
   let minX = -3, maxX = 3, minY = -2, maxY = 2;
   if (scene.length) {
     minX = Math.min(...scene.map(i => i.x - ext(i)[0])); maxX = Math.max(...scene.map(i => i.x + ext(i)[0]));
     minY = Math.min(...scene.map(i => i.y - ext(i)[1])); maxY = Math.max(...scene.map(i => i.y + ext(i)[1]));
   }
   minX -= 1; maxX += 1; minY -= 1; maxY += 1;
-  const scale = Math.min((W - 2 * PAD) / Math.max(maxX - minX, 1), (H - 2 * PAD) / Math.max(maxY - minY, 1));
-  const ox = W / 2 - ((minX + maxX) / 2) * scale, oy = H / 2 + ((minY + maxY) / 2) * scale;
+  const live = { scale: 0, ox: 0, oy: 0 };
+  live.scale = Math.min((W - 2 * PAD) / Math.max(maxX - minX, 1), (H - 2 * PAD) / Math.max(maxY - minY, 1));
+  live.ox = W / 2 - ((minX + maxX) / 2) * live.scale;
+  live.oy = H / 2 + ((minY + maxY) / 2) * live.scale;
+  // Hold the projection still for the duration of a handle drag (see `bending`).
+  const frozen = useRef(live);
+  if (!bending) frozen.current = live;
+  const { scale, ox, oy } = bending ? frozen.current : live;
   const px = (x: number) => ox + x * scale, py = (y: number) => oy - y * scale;
 
   const renderShape = (it: Item) => {
@@ -180,7 +223,11 @@ export default function DiagramBuilder({ onClose, onInsert, onSaveFile }: { onCl
       case 'line':     el = <line x1={px(it.x - s)} y1={py(it.y - s * 0.67)} x2={px(it.x + s)} y2={py(it.y + s * 0.67)} {...line} />; break;
       case 'arrow':    { const sw = Math.max(1, s * 1.1); el = <line x1={px(it.x - s)} y1={py(it.y)} x2={px(it.x + s)} y2={py(it.y)} markerEnd="url(#pv-arrow)" stroke={c} strokeWidth={sw} fill="none" />; break; }
       case 'arc':      { const r = s * scale, a1 = 260 * Math.PI / 180; const x0 = px(it.x) + r, y0 = py(it.y); const x1 = px(it.x) + r * Math.cos(a1), y1 = py(it.y) - r * Math.sin(a1); el = <path d={`M ${x0} ${y0} A ${r} ${r} 0 1 0 ${x1} ${y1}`} {...line} />; break; }
-      case 'bezier':   el = <path d={`M ${px(it.x - s)} ${py(it.y)} C ${px(it.x - s / 2)} ${py(it.y + s)}, ${px(it.x + s / 2)} ${py(it.y - s)}, ${px(it.x + s)} ${py(it.y)}`} {...line} />; break;
+      case 'bezier': {
+        const [h1, h2] = ctrlOf(it).map(c => ctrlAbs(it, c));
+        el = <path d={`M ${px(it.x - s)} ${py(it.y)} C ${px(h1.x)} ${py(h1.y)}, ${px(h2.x)} ${py(h2.y)}, ${px(it.x + s)} ${py(it.y)}`} {...line} />;
+        break;
+      }
       case 'grid':     { const els = []; for (let i = -s; i <= s + 1e-6; i++) { els.push(<line key={`h${i}`} x1={px(it.x - s)} y1={py(it.y + i)} x2={px(it.x + s)} y2={py(it.y + i)} stroke="#c9ced6" strokeWidth={1} />); els.push(<line key={`v${i}`} x1={px(it.x + i)} y1={py(it.y - s)} x2={px(it.x + i)} y2={py(it.y + s)} stroke="#c9ced6" strokeWidth={1} />); } el = <g>{els}</g>; break; }
       case 'dot':      el = <circle cx={px(it.x)} cy={py(it.y)} r={Math.max(2.5, s * 0.1 * scale)} fill={c} />; break;
       case 'axes':     el = <g><line x1={px(it.x - s)} y1={py(it.y)} x2={px(it.x + s)} y2={py(it.y)} markerEnd="url(#pv-arrow)" {...line} /><line x1={px(it.x)} y1={py(it.y - s)} x2={px(it.x)} y2={py(it.y + s)} markerEnd="url(#pv-arrow)" {...line} /></g>; break;
@@ -197,6 +244,61 @@ export default function DiagramBuilder({ onClose, onInsert, onSaveFile }: { onCl
       }
     }
     return <g key={it.uid} transform={rot}>{el}</g>;
+  };
+
+  // Drag one of a Bézier's two control handles on the preview. The pointer is
+  // captured so a drag that leaves the SVG still tracks, and the handle is
+  // stored relative to the curve (see ctrlRel) so it survives a later move.
+  const dragHandle = (ev: React.PointerEvent, it: Item, which: 1 | 2) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    const target = ev.currentTarget as SVGElement;
+    const rect = svgRef.current!.getBoundingClientRect();
+    setBending(true);
+    const move = (m: PointerEvent) => {
+      // The SVG is drawn at its viewBox size but laid out responsively, so undo
+      // the CSS scaling before inverting the px/py projection.
+      const kx = W / rect.width, ky = H / rect.height;
+      const sx = (m.clientX - rect.left) * kx, sy = (m.clientY - rect.top) * ky;
+      const world = { x: (sx - ox) / scale, y: (oy - sy) / scale };
+      // Read x/y/size off the live item, not the captured one: a drag patches
+      // state on every move, so the snapshot taken at pointerdown goes stale.
+      setScene(s => s.map(i => {
+        if (i.uid !== it.uid) return i;
+        const rel = ctrlRel(i, world);
+        return which === 1 ? { ...i, c1: rel } : { ...i, c2: rel };
+      }));
+    };
+    const stop = (m: PointerEvent) => {
+      setBending(false);
+      try { target.releasePointerCapture(m.pointerId); } catch { /* already released */ }
+      target.removeEventListener('pointermove', move);
+      target.removeEventListener('pointerup', stop);
+      target.removeEventListener('pointercancel', stop);
+    };
+    try { target.setPointerCapture(ev.pointerId); } catch { /* no capture; window events still fire */ }
+    target.addEventListener('pointermove', move);
+    target.addEventListener('pointerup', stop);
+    target.addEventListener('pointercancel', stop);
+  };
+
+  // The two handles plus their guide lines, drawn over the curve being edited.
+  const renderHandles = (it: Item) => {
+    const c = HEX[it.color] || '#4a90d9';
+    const [h1, h2] = ctrlOf(it).map(h => ctrlAbs(it, h));
+    const ends: [number, number][] = [[it.x - it.size, it.y], [it.x + it.size, it.y]];
+    return (
+      <g key={`h${it.uid}`}>
+        {[h1, h2].map((h, i) => (
+          <line key={`g${i}`} x1={px(ends[i][0])} y1={py(ends[i][1])} x2={px(h.x)} y2={py(h.y)}
+            stroke={c} strokeWidth={1} strokeDasharray="3 3" opacity={0.55} />
+        ))}
+        {[h1, h2].map((h, i) => (
+          <circle key={`p${i}`} cx={px(h.x)} cy={py(h.y)} r={5.5} fill="#fff" stroke={c} strokeWidth={2}
+            style={{ cursor: 'grab' }} onPointerDown={e => dragHandle(e, it, i === 0 ? 1 : 2)} />
+        ))}
+      </g>
+    );
   };
 
   const handleInsert = async () => {
@@ -271,6 +373,13 @@ export default function DiagramBuilder({ onClose, onInsert, onSaveFile }: { onCl
                           {it.dataHeaders?.map((h, i) => <option key={i} value={i}>{h}</option>)}
                         </select>
                       </>)}
+                      {it.type === 'bezier' && (
+                        <button onClick={() => setEditCurve(cur => cur === it.uid ? null : it.uid)}
+                          title={editCurve === it.uid ? 'Done bending' : 'Bend this curve on the preview'}
+                          style={{ background: editCurve === it.uid ? 'rgba(139,92,246,0.3)' : 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 4, color: 'var(--text-color)', cursor: 'pointer', fontSize: '0.68rem', padding: '2px 6px' }}>
+                          {editCurve === it.uid ? 'Done' : 'Bend'}
+                        </button>
+                      )}
                       {lbl('x')}{numIn(it.x, n => patch(it.uid, { x: n }))}
                       {lbl('y')}{numIn(it.y, n => patch(it.uid, { y: n }))}
                       {lbl(it.type === 'grid' ? 'range' : 'size')}{numIn(it.size, n => patch(it.uid, { size: Math.max(0.1, n) }))}
@@ -287,13 +396,17 @@ export default function DiagramBuilder({ onClose, onInsert, onSaveFile }: { onCl
 
             <div>
               <div style={{ fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--text-muted)', marginBottom: 6 }}>Live preview</div>
-              <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ background: '#fbfbfd', borderRadius: 8, border: '1px solid var(--border-color)' }}>
+              <svg ref={svgRef} width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ background: '#fbfbfd', borderRadius: 8, border: '1px solid var(--border-color)', touchAction: 'none' }}>
                 <defs><marker id="pv-arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="context-stroke" /></marker></defs>
                 <line x1={px(minX)} y1={py(0)} x2={px(maxX)} y2={py(0)} stroke="#e6e8ec" strokeWidth={1} />
                 <line x1={px(0)} y1={py(minY)} x2={px(0)} y2={py(maxY)} stroke="#e6e8ec" strokeWidth={1} />
                 {scene.map(renderShape)}
+                {scene.filter(it => it.type === 'bezier' && it.uid === editCurve).map(renderHandles)}
               </svg>
-              <div className="form-hint" style={{ marginTop: 6 }}>Same X, Y → shapes stack. Use <b>size</b> (grid = range) and <b>rot°</b> to shape each.</div>
+              <div className="form-hint" style={{ marginTop: 6 }}>
+                Same X, Y → shapes stack. Use <b>size</b> (grid = range) and <b>rot°</b> to shape each.
+                {editCurve !== null && <> Drag the two round handles to bend the curve.</>}
+              </div>
             </div>
           </div>
 

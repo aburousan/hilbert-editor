@@ -67,11 +67,13 @@ function makeRelay() {
 
 const img = randomBytes(30 * 1024 + 11);   // multi-chunk binary
 const board = randomBytes(5000);           // an svg-as-asset
+const boardSource = Buffer.from('{"type":"excalidraw","version":2,"elements":[]}');
 const hostFs = makeFs({
   'main.typ': { text: '#import "chapters/intro.typ"\n= Title\n' },
   'chapters/intro.typ': { text: 'Intro paragraph.\n' },
   'img/fig.png': { bytes: img },
   'board.svg': { bytes: board },
+  'board.excalidraw': { bytes: boardSource },
 });
 const joinFs = makeFs();
 
@@ -91,7 +93,14 @@ const joinTransfer = new BinaryTransfer(joinCh, { ...tOpts, peerId: 'join' });
 const joinModel = new WorkspaceModel(joinDoc);
 const hostModel = new WorkspaceModel(hostDoc);
 const host = new ProjectSync({ model: hostModel, transfer: hostTransfer, fs: hostFs, hashBytes: sha256 });
-const join = new ProjectSync({ model: joinModel, transfer: joinTransfer, fs: joinFs, hashBytes: sha256 });
+let joinApplyIdle = 0;
+const join = new ProjectSync({
+  model: joinModel,
+  transfer: joinTransfer,
+  fs: joinFs,
+  hashBytes: sha256,
+  onApplyIdle: () => { joinApplyIdle++; },
+});
 let late = null;
 let lateTransfer = null;
 
@@ -110,12 +119,15 @@ try {
   // The whole project reaches the joiner: text verbatim, binaries by hash.
   const gotAll = await waitUntil(async () =>
     joinFs.files.has('main.typ') && joinFs.files.has('chapters/intro.typ') &&
-    joinFs.files.has('img/fig.png') && joinFs.files.has('board.svg'));
+    joinFs.files.has('img/fig.png') && joinFs.files.has('board.svg') &&
+    joinFs.files.has('board.excalidraw'));
   assert.ok(gotAll, 'joiner did not receive the whole project');
   assert.equal((await joinFs.readText('main.typ')), '= Unsaved host buffer\n');
   assert.equal((await joinFs.readText('chapters/intro.typ')), 'Intro paragraph.\n');
   assert.equal(await sha256(await joinFs.readBinary('img/fig.png')), await sha256(img));
   assert.equal(await sha256(await joinFs.readBinary('board.svg')), await sha256(board));
+  assert.equal(await sha256(await joinFs.readBinary('board.excalidraw')), await sha256(boardSource));
+  assert.equal(joinApplyIdle, 1, 'initial multi-file import did not settle as one apply batch');
 
   // The app's real join flow receives the Yjs document before ProjectSync is
   // constructed, then imports that already-present model into a new empty
@@ -142,12 +154,13 @@ try {
   assert.ok(await waitUntil(async () => (await joinFs.readText('main.typ').catch(() => '')) === '= New Title\n'),
     'text edit did not propagate');
 
-  // A new binary added by the host is fetched by the joiner.
+  // A generated plot promoted into assets/ is fetched by the joiner.
   const img2 = randomBytes(12 * 1024);
-  await hostFs.writeBinary('img/new.png', img2);
-  await host.onLocalBinary('img/new.png');
-  assert.ok(await waitUntil(async () => joinFs.files.has('img/new.png') &&
-    (await sha256(await joinFs.readBinary('img/new.png'))) === (await sha256(img2))), 'new binary did not arrive');
+  await hostFs.writeBinary('assets/generated.png', img2);
+  await host.onLocalBinary('assets/generated.png');
+  assert.ok(await waitUntil(async () => joinFs.files.has('assets/generated.png') &&
+    (await sha256(await joinFs.readBinary('assets/generated.png'))) === (await sha256(img2))),
+    'generated plot did not arrive');
 
   // Replacing an existing binary's content (new hash) re-syncs it.
   const img3 = randomBytes(9 * 1024);
@@ -156,7 +169,20 @@ try {
   assert.ok(await waitUntil(async () => (await sha256(await joinFs.readBinary('img/fig.png'))) === (await sha256(img3))),
     'replaced binary did not re-sync');
 
-  // A host delete removes the file on the joiner.
+  // Excalidraw files are binary-channel assets even while open. Saving on one
+  // peer must replace the other peer's local scene file; the app then remounts
+  // its open canvas from these received bytes.
+  join.setOpenPath('board.excalidraw');
+  const boardSource2 = Buffer.from('{"type":"excalidraw","version":2,"elements":[{"id":"remote"}]}');
+  await hostFs.writeBinary('board.excalidraw', boardSource2);
+  await host.onLocalBinary('board.excalidraw');
+  assert.ok(await waitUntil(async () =>
+    (await sha256(await joinFs.readBinary('board.excalidraw'))) === (await sha256(boardSource2))),
+    'open whiteboard file did not re-sync');
+
+  // A host delete removes the file on the joiner. The app deletes from disk
+  // first and then announces it, so do both here.
+  await hostFs.remove('chapters/intro.typ');
   host.onLocalRemove('chapters/intro.typ');
   assert.ok(await waitUntil(async () => !joinFs.files.has('chapters/intro.typ')), 'delete did not propagate');
 
@@ -213,6 +239,56 @@ try {
     await duplicateFs.remove('assets/two.bin');
     isolated.onLocalRemove('assets/two.bin');
     assert.ok(!providers.has(duplicateHash), 'last duplicate did not withdraw its provider');
+  }
+
+  // Rejoining a folder kept from an earlier session. The returning peer starts
+  // with a stale copy of the project plus one file only it has, and the session
+  // meanwhile deleted a file that peer still holds on disk.
+  {
+    const rejoinFs = makeFs({
+      'main.typ': { text: '= Stale local copy\n' },
+      'chapters/intro.typ': { text: 'Intro paragraph.\n' },   // deleted in the session above
+      'my-notes.md': { text: 'only on this machine' },        // never shared
+    });
+    // A real rejoin gets the session state on connect and then stays two-way.
+    const rejoinDoc = new Y.Doc();
+    Y.applyUpdate(rejoinDoc, Y.encodeStateAsUpdate(hostDoc), 'remote');
+    forward(rejoinDoc, hostDoc);
+    forward(hostDoc, rejoinDoc);
+    const rejoinModel = new WorkspaceModel(rejoinDoc);
+    const rejoinTransfer = new BinaryTransfer(relay.join(), { ...tOpts, peerId: 'rejoin' });
+    const rejoin = new ProjectSync({
+      model: rejoinModel,
+      transfer: rejoinTransfer,
+      fs: rejoinFs,
+      hashBytes: sha256,
+    });
+    try {
+      rejoin.start();
+      await rejoin.applyWorkspace();
+      // The session's version wins over the stale local one.
+      assert.equal(await rejoinFs.readText('main.typ'), '= Edited While Open\n',
+        'rejoin did not take the session version of a file it already had');
+
+      const tombstoned = await rejoin.reconcileLocalWorkspace();
+      assert.deepEqual(tombstoned, ['chapters/intro.typ'],
+        'rejoin did not report exactly the file deleted while this peer was away');
+      // A local-only file is published rather than stranded...
+      assert.ok(await waitUntil(async () =>
+        (await hostFs.readText('my-notes.md').catch(() => '')) === 'only on this machine'),
+        'local-only file was not shared on rejoin');
+      // ...while the deleted one is NOT resurrected for everyone else.
+      assert.ok(!hostFs.files.has('chapters/intro.typ'),
+        'rejoin resurrected a file the session had deleted');
+
+      // Only once the user agrees does the local copy go.
+      await rejoin.removeLocalCopies(tombstoned);
+      assert.ok(!rejoinFs.files.has('chapters/intro.typ'), 'confirmed removal did not delete the local copy');
+      assert.ok(rejoinFs.files.has('my-notes.md'), 'removal touched a file it should not have');
+    } finally {
+      rejoin.stop();
+      rejoinTransfer.close();
+    }
   }
 
   console.log('project collab integration tests passed');

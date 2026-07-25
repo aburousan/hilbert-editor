@@ -291,9 +291,11 @@ init, commit, and push to GitHub. There's also sync to a local folder, Google Dr
 or WebDAV (Nextcloud and ownCloud), and a package manager to search, download, and
 remove Typst packages.
 
-Live collaboration is offline-first and account-free. From the command palette, host
-the open text file on the detected campus/LAN address and share the generated
-invitation, or paste an invitation to join. Hilbert starts a separate collaboration-only
+Live collaboration is **experimental** — it works, but expect rough edges, so keep your
+own backup of anything important. It is offline-first and account-free. From the command
+palette, share the whole project (text, images, fonts and whiteboards) on the detected
+campus/LAN address and pass on the generated invitation, or paste an invitation to join
+and receive the project into a folder of your choosing. Hilbert starts a separate collaboration-only
 listener (port 3020 when available); it never exposes the workspace API. Yjs updates,
 presence, and cursors are encrypted end to end with the one-session key in the
 invitation. A user-operated relay can be selected instead by setting its `ws://` or

@@ -95,7 +95,7 @@ const EQ_TEMPLATES: Record<Lang, { label: string; code: string }[]> = {
   ],
 };
 
-export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, onChanged, initialLang, initialCode, initialMode }: { onClose: () => void, onInsert: (code: string) => void, onInsertEquation?: (latex: string, codeBlock?: string) => void, onChanged?: (paths?: string[]) => void, initialLang?: Lang, initialCode?: string, initialMode?: 'text' | 'equation' }) {
+export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, onChanged, initialLang, initialCode, initialMode }: { onClose: () => void, onInsert: (code: string) => void, onInsertEquation?: (latex: string, codeBlock?: string) => void, onChanged?: (paths?: string[]) => void | Promise<void>, initialLang?: Lang, initialCode?: string, initialMode?: 'text' | 'equation' }) {
   const [tools, setTools] = useState<Tools | null>(null);
   const [lang, setLang] = useState<Lang>(initialLang ?? 'python');
   const [bin, setBin] = useState<string>('');
@@ -142,13 +142,16 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
     try {
       await fetch(`${API}/workspace/file?path=${encodeURIComponent(path)}`, { method: 'POST', body: code, headers: { 'Content-Type': 'text/plain' } });
       setSavedPath(path);
-      onChanged?.([path]);
+      await onChanged?.([path]);
     } catch { /* saving is best-effort; a run should still proceed offline */ }
     try {
       const res = await fetch(`${API}/run`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lang, code, bin, outputMode }) });
       const data = await res.json();
       if (!res.ok) { setResult({ ok: false, stdout: '', stderr: data.error || 'Failed.', images: [] }); }
-      else { setResult(data); if (data.images?.length && onChanged) onChanged(); }
+      else {
+        if (data.images?.length && onChanged) await onChanged(data.images);
+        setResult(data);
+      }
     } catch {
       setResult({ ok: false, stdout: '', stderr: 'Could not reach the local server.', images: [] });
     } finally { setRunning(false); }
@@ -165,18 +168,13 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
   };
 
   const insertFigure = async (img: string) => {
-    // Promote the sandbox plot into the workspace images/ folder so it lives with
-    // the document (and survives sandbox cleanup), then reference it there.
-    const base = img.replace(/^sandbox\//, '');
-    const dest = `images/${base}`;
-    let ref = img;
-    try {
-      const r = await fetch(`${API}/workspace/copy`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: img, to: dest }) });
-      if (r.ok) { ref = dest; onChanged?.([dest]); }
-    } catch { /* fall back to sandbox path */ }
+    // The runner has already promoted this plot into the persistent workspace.
+    // Publish that same file before inserting its Typst reference; copying it
+    // again would retain two identical images in every collaborator's project.
+    await onChanged?.([img]);
     let out = '\n';
     if (includeCode) out += codeBlock() + '\n';
-    out += `#figure(\n  image("${ref}", width: 70%),\n  caption: [${lang} output],\n)\n`;
+    out += `#figure(\n  image("${img}", width: 70%),\n  caption: [${lang} output],\n)\n`;
     onInsert(out + '\n');
     onClose();
   };

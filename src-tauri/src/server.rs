@@ -482,16 +482,28 @@ async fn toolchain_status() -> Response {
 // Workspace file tree + files
 // ---------------------------------------------------------------------------
 
+// Entries no workspace walk should descend into: dotfiles (including .hilbert
+// and .git), installed packages, and the code runner's scratch dir. Kept in one
+// place so adding an exclusion cannot reach some walks and miss others.
+fn is_hidden_entry(name: &str) -> bool {
+    name.starts_with('.') || name == "node_modules" || name == "sandbox"
+}
+
+// The same rule for walks that also skip built PDFs. The file tree deliberately
+// does NOT use this: a PDF should stay visible there so it can be opened.
+fn is_hidden_source_entry(name: &str) -> bool {
+    is_hidden_entry(name) || name.ends_with(".pdf")
+}
+
 fn get_tree(dir: &Path, ws: &Path) -> Vec<Value> {
     let mut out = Vec::new();
     let Ok(rd) = fs::read_dir(dir) else { return out };
     let mut items: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
     items.sort();
     for item in items {
-        // Hide dotfiles, node_modules and the sandbox scratch dir. PDFs (both the
-        // compiled out.pdf and any the user adds) stay visible so they can be
-        // opened and downloaded from the tree.
-        if item.starts_with('.') || item == "node_modules" || item == "sandbox" {
+        // PDFs (both the compiled out.pdf and any the user adds) stay visible
+        // here so they can be opened and downloaded from the tree.
+        if is_hidden_entry(&item) {
             continue;
         }
         let full = dir.join(&item);
@@ -535,6 +547,23 @@ async fn workspace_root_post(State(st): St, body: Bytes) -> Response {
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     let resolved = lexical_resolve(&cwd, &expanded);
+    // Join asks only for a parent location and lets the app make the destination
+    // folder. create_dir is atomic: two simultaneous joins cannot both claim the
+    // same empty name, and an old empty folder is never silently reused.
+    if v.get("create").and_then(Value::as_bool).unwrap_or(false) {
+        match fs::create_dir(&resolved) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return json_err(StatusCode::CONFLICT, "That shared-project folder already exists.");
+            }
+            Err(e) => {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    format!("Could not create {}: {e}", resolved.display()),
+                );
+            }
+        }
+    }
     match fs::metadata(&resolved) {
         Ok(m) if m.is_dir() => {}
         Ok(_) => return json_err(StatusCode::BAD_REQUEST, format!("Not a folder: {}", resolved.display())),
@@ -1026,7 +1055,7 @@ fn search_walk(dir: &Path, ws: &Path, q: &str, out: &mut Vec<Value>) {
             break;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') || name == "node_modules" || name == "sandbox" || name.ends_with(".pdf") {
+        if is_hidden_source_entry(&name) {
             continue;
         }
         let full = entry.path();
@@ -2317,7 +2346,7 @@ fn collect_workspace(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>)
     items.sort_by_key(|e| e.file_name());
     for entry in items {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') || name == "node_modules" || name == "sandbox" || name.ends_with(".pdf") {
+        if is_hidden_source_entry(&name) {
             continue;
         }
         let full = entry.path();

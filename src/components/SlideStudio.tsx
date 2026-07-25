@@ -11,8 +11,10 @@ const GRID = 4;      // snap grid, pt
 
 type Pt = { x: number, y: number };
 type Align = 'left' | 'center' | 'right';
-type TextEl = { id: number, type: 'text', x: number, y: number, w: number, size: number, color: string, align: Align, text: string };
-type MathEl = { id: number, type: 'math', x: number, y: number, size: number, color: string, tex: string };
+// `font` is the Typst family name, blank meaning the deck default. Decks saved
+// before this existed have no field at all, and keep the default.
+type TextEl = { id: number, type: 'text', x: number, y: number, w: number, size: number, color: string, align: Align, text: string, font?: string };
+type MathEl = { id: number, type: 'math', x: number, y: number, size: number, color: string, tex: string, font?: string };
 type ImgEl = { id: number, type: 'image', x: number, y: number, w: number, path: string };
 type TypstEl = { id: number, type: 'typst', x: number, y: number, w: number, code: string };
 type HlEl = { id: number, type: 'hl', x: number, y: number, w: number, h: number, color: string };
@@ -37,7 +39,9 @@ let idSeq = 1;
 const nid = () => idSeq++;
 const snap = (v: number) => Math.round(v / GRID) * GRID;
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
-const pt = (v: number) => `${Math.round(v * 100) / 100}pt`;
+// A tenth of a point is well under a screen pixel at slide scale, and trimming
+// the tail keeps the generated deck readable where every element is a coordinate.
+const pt = (v: number) => `${Math.round(v * 10) / 10}pt`;
 const rgb = (c: string) => `rgb("${c}")`;
 
 const packState = (slides: Slide[], imports: string[]) =>
@@ -253,10 +257,10 @@ const TOOL_LAUNCHERS: [string, string][] = [
   ['flowchart', 'Flowchart'],
 ];
 
-// The host document may number equations/headings (#set math.equation(numbering:
-// …)); a numbered equation stretches to full width and re-centers, dragging a
-// placed element off its coordinates. Scope those rules off inside every element.
-const UNNUMBER = '#set math.equation(numbering: none)\n#set heading(numbering: none)\n';
+// A numbered equation stretches to full width and re-centers, which drags a
+// placed element off its coordinates. deckCode turns numbering off once at the
+// top instead of repeating the rules inside every element — the deck already
+// sets the page and text size, so it owns the document either way.
 
 const arrowTriangle = (from: Pt, to: Pt, thickness: number): [Pt, Pt, Pt] => {
   const angle = Math.atan2(to.y - from.y, to.x - from.x);
@@ -281,15 +285,19 @@ const curveArrowTriangles = (e: CurveEl): [Pt, Pt, Pt][] => {
   return triangles;
 };
 
+// A chosen font becomes an extra argument on the element's own text() call, so
+// it applies to that element alone and leaves the rest of the deck untouched.
+const fontArg = (font?: string) => font?.trim() ? `font: "${font.trim().replace(/"/g, '')}", ` : '';
+
 function elCode(e: El): string {
   if (e.type === 'text') {
-    const inner = `text(size: ${pt(e.size)}, fill: ${rgb(e.color)})[${UNNUMBER}${e.text}]`;
+    const inner = `text(${fontArg(e.font)}size: ${pt(e.size)}, fill: ${rgb(e.color)})[${e.text}]`;
     const aligned = e.align === 'left' ? inner : `align(${e.align}, ${inner})`;
     return `#absolute-place(dx: ${pt(e.x)}, dy: ${pt(e.y)}, box(width: ${pt(e.w)}, ${aligned}))`;
   }
-  if (e.type === 'math') return `#absolute-place(dx: ${pt(e.x)}, dy: ${pt(e.y)}, box(text(size: ${pt(e.size)}, fill: ${rgb(e.color)})[${UNNUMBER}$ ${e.tex} $]))`;
+  if (e.type === 'math') return `#absolute-place(dx: ${pt(e.x)}, dy: ${pt(e.y)}, box(text(${fontArg(e.font)}size: ${pt(e.size)}, fill: ${rgb(e.color)})[$ ${e.tex} $]))`;
   if (e.type === 'image') return `#absolute-place(dx: ${pt(e.x)}, dy: ${pt(e.y)}, image("${e.path}", width: ${pt(e.w)}))`;
-  if (e.type === 'typst') return `#absolute-place(dx: ${pt(e.x)}, dy: ${pt(e.y)}, box(width: ${pt(e.w)})[\n${UNNUMBER}${e.code}\n])`;
+  if (e.type === 'typst') return `#absolute-place(dx: ${pt(e.x)}, dy: ${pt(e.y)}, box(width: ${pt(e.w)})[\n${e.code}\n])`;
   // 8-digit hex = translucent marker stroke over whatever sits underneath
   if (e.type === 'hl') return `#absolute-place(dx: ${pt(e.x)}, dy: ${pt(e.y)}, rect(width: ${pt(e.w)}, height: ${pt(e.h)}, fill: rgb("${e.color}73"), radius: 3pt))`;
   if (e.type === 'conn') {
@@ -306,6 +314,8 @@ function elCode(e: El): string {
     ];
     if (e.closed) parts.push('curve.close()');
     const fill = e.closed && e.fill !== 'none' ? `fill: ${rgb(e.fill)}, ` : '';
+    // Each piece needs its own absolute-place: inside one block they would lay
+    // out in sequence, putting the arrowheads after the curve instead of on it.
     const curve = `#absolute-place(dx: 0pt, dy: 0pt, curve(${fill}stroke: ${e.th}pt + ${rgb(e.color)},\n  ${parts.join(',\n  ')}))`;
     const heads = curveArrowTriangles(e).map(points =>
       `#absolute-place(dx: 0pt, dy: 0pt, polygon(fill: ${rgb(e.color)}, stroke: none, ${points.map(p => `(${pt(p.x)}, ${pt(p.y)})`).join(', ')}))`,
@@ -324,14 +334,20 @@ function deckCode(slides: Slide[], imports: string[]): string {
   lines.push(`// >>> hilbert-slides ${packState(slides, imports)}`);
   lines.push('// Deck built with Slides → Slide Studio. The token above holds the layout —');
   lines.push('// reopen the studio to move things around instead of editing coordinates by hand.');
-  lines.push('#import "@preview/pinit:0.2.2": *');
+  // Only the two arrow helpers are used, so name them rather than dumping every
+  // pinit export into the document's scope.
+  lines.push('#import "@preview/pinit:0.2.2": absolute-place, simple-arrow, double-arrow');
   for (const imp of imports) if (!imp.includes('@preview/pinit')) lines.push(imp);
   lines.push('#set page(paper: "presentation-16-9", margin: 0pt)');
   lines.push('#set text(size: 20pt)');
+  // Once for the whole deck; every placed element would otherwise carry its own
+  // copy of these two rules (see UNNUMBER).
+  lines.push('#set math.equation(numbering: none)');
+  lines.push('#set heading(numbering: none)');
   slides.forEach((s, i) => {
     lines.push('');
     if (i > 0) lines.push('#pagebreak()');
-    lines.push(`// slide ${i + 1}`);
+    lines.push(`// ---- slide ${i + 1} of ${slides.length} ----`);
     if (s.fill.toLowerCase() !== '#ffffff') lines.push(`#place(rect(width: 100%, height: 100%, fill: ${rgb(s.fill)}))`);
     for (const e of s.els) lines.push(elCode(e));
   });
@@ -344,10 +360,11 @@ const headPts = (from: Pt, to: Pt, th: number, sc: number) => {
   return arrowTriangle(from, to, th).map(point => `${point.x * sc},${point.y * sc}`).join(' ');
 };
 
-export default function SlideStudio({ onClose, onInsert, workspaceImages = [], existing, registerCapture, onOpenTool }: {
+export default function SlideStudio({ onClose, onInsert, workspaceImages = [], workspaceFonts = [], existing, registerCapture, onOpenTool }: {
   onClose: () => void,
   onInsert: (code: string) => void,
   workspaceImages?: string[],
+  workspaceFonts?: string[],
   existing?: string | null,
   // While the studio is open, App routes the other insert tools' output here
   // so galleries/builders drop their code onto the slide instead of the document.
@@ -543,7 +560,7 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], e
       for (const el of els) {
         const key = el.type === 'typst'
           ? `${Math.round(el.w)}|${imports.join(';')}|${el.code}`
-          : `${el.size}|${el.color}|${imports.join(';')}|${el.tex}`;
+          : `${el.size}|${el.color}|${el.font ?? ''}|${imports.join(';')}|${el.tex}`;
         if (prevKeys.current[el.id] === key) continue;
         prevKeys.current[el.id] = key;
         const doc = [
@@ -557,7 +574,7 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], e
           '#set heading(numbering: none)',
           el.type === 'typst'
             ? el.code
-            : `#text(size: ${pt(el.size)}, fill: ${rgb(el.color)})[$ ${el.tex} $]`,
+            : `#text(${fontArg(el.font)}size: ${pt(el.size)}, fill: ${rgb(el.color)})[$ ${el.tex} $]`,
         ].join('\n');
         fetch(`${API}/render/snippet`, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: doc })
           .then(async r => {
@@ -842,7 +859,9 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], e
         <div key={e.id} style={{
           position: 'absolute', left: e.x * k, top: e.y * k, width: e.w * k,
           fontSize: Math.max(1, e.size * k), color: e.color, textAlign: e.align,
-          fontFamily: 'Georgia, "Times New Roman", serif', lineHeight: 1.3,
+          // A chosen family renders here only if the browser can resolve it; the
+          // compiled PDF is what actually applies the Typst font either way.
+          fontFamily: e.font ? `"${e.font}", Georgia, serif` : 'Georgia, "Times New Roman", serif', lineHeight: 1.3,
           whiteSpace: 'pre-wrap', wordBreak: 'break-word', border: outline, userSelect: 'none',
           cursor: live ? 'move' : undefined,
         }}>{e.text}</div>
@@ -936,38 +955,45 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], e
         }} />
       );
     }
-    return null; // conns are drawn in the svg overlay
+    if (e.type === 'conn' || e.type === 'curve') return renderConn(e, k, live);
+    return null;
   };
 
-  const renderConns = (s: Slide, k: number, live: boolean) => (
-    <svg width={PW * k} height={PH * k} style={{ position: 'absolute', left: 0, top: 0, pointerEvents: 'none' }}>
-      {s.els.map(e => {
-        const isSel = live && e.id === selected;
-        if (e.type === 'curve') {
-          const d = curvePathD(e.pts, e.closed, k);
-          return (
-            <g key={e.id}>
-              {isSel && <path d={d} fill="none" stroke="#7c3aed" strokeOpacity="0.25" strokeWidth={(e.th * k) + 6} />}
-              <path d={d} fill={e.closed && e.fill !== 'none' ? e.fill : 'none'} stroke={e.color} strokeWidth={Math.max(0.5, e.th * k)} />
-              {curveArrowTriangles(e).map((triangle, index) => (
-                <polygon key={index} points={triangle.map(point => `${point.x * k},${point.y * k}`).join(' ')} fill={e.color} />
-              ))}
-            </g>
-          );
-        }
-        if (e.type !== 'conn') return null;
-        const a = { x: e.x1, y: e.y1 }, b = { x: e.x2, y: e.y2 };
-        return (
-          <g key={e.id}>
-            {isSel && <line x1={a.x * k} y1={a.y * k} x2={b.x * k} y2={b.y * k} stroke="#7c3aed" strokeOpacity="0.25" strokeWidth={(e.th * k) + 6} />}
-            <line x1={a.x * k} y1={a.y * k} x2={b.x * k} y2={b.y * k} stroke={e.color} strokeWidth={Math.max(0.5, e.th * k)} />
-            {e.kind !== 'line' && <polygon points={headPts(a, b, e.th, k)} fill={e.color} />}
-            {e.kind === 'double' && <polygon points={headPts(b, a, e.th, k)} fill={e.color} />}
-          </g>
-        );
-      })}
+  // Connectors and curves need an SVG to draw into, but one shared overlay would
+  // always paint them above every box and label — Forward/Backward would reorder
+  // the array and change nothing on screen. Each one gets its own transparent,
+  // full-slide SVG rendered in element order instead, so stacking just works.
+  const renderConn = (e: El, k: number, live: boolean) => (
+    <svg key={e.id} width={PW * k} height={PH * k} style={{ position: 'absolute', left: 0, top: 0, pointerEvents: 'none' }}>
+      {connShape(e, k, live)}
     </svg>
   );
+
+  const connShape = (e: El, k: number, live: boolean) => {
+    const isSel = live && e.id === selected;
+    if (e.type === 'curve') {
+      const d = curvePathD(e.pts, e.closed, k);
+      return (
+        <g>
+          {isSel && <path d={d} fill="none" stroke="#7c3aed" strokeOpacity="0.25" strokeWidth={(e.th * k) + 6} />}
+          <path d={d} fill={e.closed && e.fill !== 'none' ? e.fill : 'none'} stroke={e.color} strokeWidth={Math.max(0.5, e.th * k)} />
+          {curveArrowTriangles(e).map((triangle, index) => (
+            <polygon key={index} points={triangle.map(point => `${point.x * k},${point.y * k}`).join(' ')} fill={e.color} />
+          ))}
+        </g>
+      );
+    }
+    if (e.type !== 'conn') return null;
+    const a = { x: e.x1, y: e.y1 }, b = { x: e.x2, y: e.y2 };
+    return (
+      <g>
+        {isSel && <line x1={a.x * k} y1={a.y * k} x2={b.x * k} y2={b.y * k} stroke="#7c3aed" strokeOpacity="0.25" strokeWidth={(e.th * k) + 6} />}
+        <line x1={a.x * k} y1={a.y * k} x2={b.x * k} y2={b.y * k} stroke={e.color} strokeWidth={Math.max(0.5, e.th * k)} />
+        {e.kind !== 'line' && <polygon points={headPts(a, b, e.th, k)} fill={e.color} />}
+        {e.kind === 'double' && <polygon points={headPts(b, a, e.th, k)} fill={e.color} />}
+      </g>
+    );
+  };
 
   const handleDots = () => {
     if (!sel || tool !== 'select') return null;
@@ -1030,6 +1056,20 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], e
     </div>
   );
 
+  // Free text with suggestions rather than a fixed list: Typst matches on the
+  // font's internal family name, which the file name only approximates, so the
+  // user has to be able to correct it.
+  const fontField = (value: string | undefined, onPick: (f: string) => void) => field('Font', (
+    <>
+      <input list="slide-fonts" value={value ?? ''} onChange={e => onPick(e.target.value)}
+        placeholder="Deck default" style={{ width: '100%' }} spellCheck={false} />
+      <datalist id="slide-fonts">
+        {workspaceFonts.map(f => <option key={f} value={f} />)}
+      </datalist>
+      <div className="form-hint">Blank uses the deck font. Drop a .ttf/.otf into the project's <code>fonts/</code> folder to use your own.</div>
+    </>
+  ));
+
   const inspector = () => {
     if (!sel) {
       return (
@@ -1078,6 +1118,7 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], e
               </div>
             ))}
             {field('Colour', colorRow(sel.color, c => patchSel({ color: c })))}
+            {fontField(sel.font, f => patchSel({ font: f }))}
             <div className="form-hint">Text is Typst markup: <code>*bold*</code>, <code>_italic_</code>, <code>- bullet</code> lines, <code>= heading</code>.</div>
           </>
         )}
@@ -1085,6 +1126,7 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], e
           <>
             {field(`Size — ${sel.size}pt`, <input type="range" min="10" max="96" step="1" value={sel.size} onChange={e => patchSel({ size: Number(e.target.value) })} />)}
             {field('Colour', colorRow(sel.color, c => patchSel({ color: c })))}
+            {fontField(sel.font, f => patchSel({ font: f }))}
             <div className="form-hint">Typst math, e.g. <code>sum_(n=1)^oo 1/n^2 = pi^2/6</code>. Double-click the element to edit.</div>
           </>
         )}
@@ -1251,7 +1293,6 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], e
                   border: i === cur ? '2px solid #7c3aed' : '1px solid #cbd5e1', borderRadius: 3, overflow: 'hidden',
                 }}>
                   {s.els.map(e => renderEl(e, TS, false))}
-                  {renderConns(s, TS, false)}
                 </div>
                 <div style={{ fontSize: '0.68rem', opacity: 0.7, textAlign: 'center', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', padding: '1px 3px' }}>
                   {i + 1}. {slideTitle(s, i)}
@@ -1300,7 +1341,6 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], e
                 }}
               >
                 {slide.els.map(e => renderEl(e, sc, true))}
-                {renderConns(slide, sc, true)}
                 {draft && (tool === 'rect' || tool === 'ellipse' || tool === 'hl') && (
                   <div style={{
                     position: 'absolute', left: Math.min(draft.a.x, draft.b.x) * sc, top: Math.min(draft.a.y, draft.b.y) * sc,

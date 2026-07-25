@@ -152,7 +152,7 @@ export default function DriveSyncModal({
         </div>
         <div className="modal-body">
           <div className="seg">
-            <button className={mode === 'live' ? 'active' : ''} onClick={() => { setMode('live'); setStatus(''); }}>Live</button>
+            <button className={mode === 'live' ? 'active' : ''} onClick={() => { setMode('live'); setStatus(''); }}>Live (experimental)</button>
             <button className={mode === 'google' ? 'active' : ''} onClick={() => { setMode('google'); setStatus(''); }}>Google Drive</button>
             <button className={mode === 'webdav' ? 'active' : ''} onClick={() => { setMode('webdav'); setStatus(''); }}>WebDAV</button>
             <button className={mode === 'local' ? 'active' : ''} onClick={() => { setMode('local'); setStatus(''); }}>Local folder</button>
@@ -160,6 +160,10 @@ export default function DriveSyncModal({
 
           {mode === 'live' && (
             <>
+              <div style={{ padding: '8px 10px', borderRadius: 7, border: '1px solid rgba(245, 158, 11, 0.45)', background: 'rgba(245, 158, 11, 0.09)', fontSize: '0.8rem', lineHeight: 1.45, marginBottom: 10 }}>
+                <b>Experimental.</b> Live sharing still has rough edges — keep your own backup of
+                anything important, and expect the occasional reconnect or out-of-date file.
+              </div>
               <p className="form-hint">
                 Share the complete project live: text, images, fonts, whiteboards, file changes,
                 and cursors. Everything is encrypted before it reaches the direct campus/LAN

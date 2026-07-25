@@ -61,8 +61,10 @@ export function startCollab(opts: {
     WebSocketPolyfill: encryptedWebSocketClass(opts.invite.key),
     // The relay may drop frames under pressure and never answers a sync
     // request itself, so ask the room for a fresh sync step periodically —
-    // this heals a lost update and a joiner that raced a host reconnect.
-    resyncInterval: 15000,
+    // this heals a lost update and a joiner that raced a host reconnect. Kept
+    // short so a burst of edits or deletes that outran the relay's buffer
+    // reconciles within a few seconds rather than lingering out of sync.
+    resyncInterval: 5000,
     // Keep every byte on the encrypted socket; the same-origin
     // BroadcastChannel side path would bypass the AES-GCM wrapper.
     disableBc: true,

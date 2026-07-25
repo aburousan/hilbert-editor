@@ -33,6 +33,7 @@ export type ProjectSyncOptions = {
   isTextPath?: (path: string) => boolean;
   onError?: (message: string) => void;
   onApplied?: (change: WorkspaceChange) => void;
+  onApplyIdle?: () => void;
   onBinaryTransfer?: (pending: number, path: string | null) => void;
 };
 
@@ -44,6 +45,7 @@ export class ProjectSync {
   private readonly isText: (path: string) => boolean;
   private readonly onError: (message: string) => void;
   private readonly onApplied: (change: WorkspaceChange) => void;
+  private readonly onApplyIdle: () => void;
   private readonly onBinaryTransfer: (pending: number, path: string | null) => void;
   // Content hash of each binary we currently hold on disk: skips re-fetching
   // unchanged bytes and records what we are able to serve to other peers.
@@ -53,6 +55,8 @@ export class ProjectSync {
   private readonly hashPaths = new Map<string, Set<string>>();
   private off: (() => void) | null = null;
   private applyQueue: Promise<void> = Promise.resolve();
+  private applyEpoch = 0;
+  private appliedRevision = 0;
   private pendingBinary = 0;
   // The file currently open in the editor. Its Y.Text is bound to Monaco, so
   // remote edits already reach the buffer through that binding and autosave
@@ -73,6 +77,7 @@ export class ProjectSync {
     this.isText = opts.isTextPath ?? isProjectTextPath;
     this.onError = opts.onError ?? (() => {});
     this.onApplied = opts.onApplied ?? (() => {});
+    this.onApplyIdle = opts.onApplyIdle ?? (() => {});
     this.onBinaryTransfer = opts.onBinaryTransfer ?? (() => {});
   }
 
@@ -110,6 +115,60 @@ export class ProjectSync {
       type: 'upserted',
     }));
     return this.enqueueApply(changes);
+  }
+
+  // Rejoin support. A folder reused from an earlier session holds three kinds of
+  // file: ones the session also has (applyWorkspace already overwrote those with
+  // the session's version, which is the merged state of everyone still
+  // connected), ones only this peer has, and ones the session deleted while this
+  // peer was away. Local-only files are published so they are not stranded here.
+  // Deleted-elsewhere files are only reported: removing a file is the user's
+  // call, so the app asks before touching them. Returns those paths.
+  //
+  // Nothing here reads a timestamp, because the model carries none — a file
+  // edited locally while disconnected loses to the session's copy. Call this
+  // after applyWorkspace so the session's writes have already landed.
+  async reconcileLocalWorkspace(): Promise<string[]> {
+    const tombstoned: string[] = [];
+    const files = await this.fs.list();
+    for (const { path } of files) {
+      const key = normalizeWorkspacePath(path);
+      if (!key) continue;
+      const meta = this.model.metaOf(key);
+      if (meta?.deleted) { tombstoned.push(key); continue; }
+      if (meta) continue;   // the session owns this path; it is already current
+      try {
+        if (this.isText(key)) {
+          if (this.openPath === key) continue;   // the Monaco binding owns this one
+          const content = await this.fs.readText(key);
+          this.doc.transact(() => this.model.setText(key, content), LOCAL);
+        } else {
+          await this.mirrorLocalBinary(key);
+        }
+      } catch (e) {
+        this.onError(`Could not share ${key}: ${errText(e)}`);
+      }
+    }
+    return tombstoned;
+  }
+
+  // Delete this peer's copy of paths the session already tombstoned. The model
+  // is left alone: it holds the tombstone that named these files in the first
+  // place, so there is nothing to announce.
+  async removeLocalCopies(paths: string[]): Promise<void> {
+    for (const path of paths) {
+      const key = normalizeWorkspacePath(path);
+      if (!key) continue;
+      this.unregisterBinary(key);
+      this.applyingRemote = true;
+      try {
+        await this.fs.remove(key);
+      } catch (e) {
+        this.onError(`Could not remove ${key}: ${errText(e)}`);
+      } finally {
+        this.applyingRemote = false;
+      }
+    }
   }
 
   // Host action: put the entire current workspace into the shared model so a
@@ -185,9 +244,25 @@ export class ProjectSync {
   }
 
   private enqueueApply(changes: WorkspaceChange[]): Promise<void> {
+    const epoch = ++this.applyEpoch;
+    const revisionBefore = this.appliedRevision;
     const run = this.applyQueue.then(() => this.applyRemote(changes));
     this.applyQueue = run.catch(() => {});
+    void this.applyQueue.then(() => {
+      if (this.off && epoch === this.applyEpoch && this.appliedRevision !== revisionBefore) {
+        try {
+          this.onApplyIdle();
+        } catch (e) {
+          this.onError(`Could not finish applying remote changes: ${errText(e)}`);
+        }
+      }
+    });
     return run;
+  }
+
+  private emitApplied(change: WorkspaceChange): void {
+    this.appliedRevision++;
+    this.onApplied(change);
   }
 
   private async applyOne(change: WorkspaceChange): Promise<void> {
@@ -196,7 +271,7 @@ export class ProjectSync {
       this.unregisterBinary(path);
       this.applyingRemote = true;
       try { await this.fs.remove(path); } finally { this.applyingRemote = false; }
-      this.onApplied(change);
+      this.emitApplied(change);
       return;
     }
     if (meta.kind === 'text') {
@@ -206,7 +281,7 @@ export class ProjectSync {
       if (content == null) return;
       this.applyingRemote = true;
       try { await this.fs.writeText(path, content); } finally { this.applyingRemote = false; }
-      this.onApplied(change);
+      this.emitApplied(change);
       return;
     }
     // Binary: fetch the bytes by hash unless we already hold that exact content.
@@ -226,7 +301,7 @@ export class ProjectSync {
     try { await this.fs.writeBinary(path, bytes); } finally { this.applyingRemote = false; }
     // Now that we hold it, offer to serve it onward to other peers.
     this.registerBinary(path, hash);
-    this.onApplied(change);
+    this.emitApplied(change);
   }
 
   private registerBinary(path: string, hash: string): void {

@@ -1,12 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { API } from '../api';
 import { notify } from '../notify';
-import { parseDelimited, sniffDelim, sanitizeName as sanitize } from '../csvUtil';
+import { parseDelimited, sniffDelim, sanitizeName as sanitize, csvField, EXCEL_EXT } from '../csvUtil';
 
 type ImportPayload = { filename: string; content: string; snippet: string };
 type Props = { onClose: () => void; onImport: (p: ImportPayload) => Promise<void> | void };
 
-const EXCEL_EXT = ['xlsx', 'xls', 'xlsb', 'ods'];
 const STRUCTURED_EXT = ['json', 'yaml', 'yml', 'toml', 'xml'];
 
 function csvSnippet(name: string, delim: string, hasHeader: boolean, withTable: boolean): string {
@@ -33,7 +32,6 @@ ${body}
 }
 
 const escLabel = (s: string) => s.replace(/([\\[\]#])/g, '\\$1');
-const csvField = (v: string) => /[",\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
 
 // A real cetz-plot line plot that reads two columns of the saved CSV at compile
 // time — data-driven, so editing the file updates the figure.

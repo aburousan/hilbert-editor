@@ -476,6 +476,21 @@ export default function App() {
     walk(fileTree);
     return imgs;
   }, [fileTree]);
+  // Font families the deck builder can offer. Fonts the user dropped into
+  // fonts/ come first (Typst finds those via --font-path), followed by families
+  // that ship with Typst itself, so a slide can pick one without typing it.
+  const workspaceFonts = useMemo(() => {
+    const found: string[] = [];
+    const walk = (nodes: typeof fileTree) => {
+      for (const n of nodes) {
+        if (n.type === 'directory' && n.children) walk(n.children);
+        else if (/\.(ttf|otf|ttc|otc)$/i.test(n.name)) found.push(n.name.replace(/\.[^.]+$/, '').replace(/[-_]/g, ' '));
+      }
+    };
+    walk(fileTree);
+    const builtin = ['New Computer Modern', 'New Computer Modern Math', 'Libertinus Serif', 'DejaVu Sans Mono'];
+    return [...new Set([...found, ...builtin])];
+  }, [fileTree]);
   const [showFlowchart, setShowFlowchart] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
   const [showFigureBuilder, setShowFigureBuilder] = useState(false);
@@ -536,6 +551,12 @@ export default function App() {
     status: CollabStatus;
     transferring: number;
   } | null>(null);
+  // Bumped whenever a change arrives from a collaborator. A late-arriving image
+  // (its bytes come over the asset channel after the text that references it)
+  // would otherwise leave the joiner's preview stuck on a missing-file error, so
+  // this drives a recompile once the file is actually on disk.
+  const [remoteApplyRev, setRemoteApplyRev] = useState(0);
+  const remoteApplyPendingRef = useRef(false);
   const disposeProjectSession = (announce = false) => {
     projectSessionRef.current?.sync.stop();
     projectSessionRef.current?.transfer.close();
@@ -544,10 +565,24 @@ export default function App() {
     projectSessionRef.current = null;
     collabRef.current?.stop();
     collabRef.current = null;
+    remoteApplyPendingRef.current = false;
     setCollab(null);
     if (announce) notify('Left the shared project session.', 'info');
   };
   const configuredCollabServer = () => localStorage.getItem('collab_server') || '';
+  // Folders this machine has previously joined a shared project into, most
+  // recent first. Rejoining reuses one of these instead of making yet another
+  // empty "Hilbert Shared Project N" every time.
+  const sharedFolders = (): string[] => {
+    try {
+      const stored = JSON.parse(localStorage.getItem('shared_project_folders') || '[]');
+      return Array.isArray(stored) ? stored.filter((path: unknown) => typeof path === 'string' && path) : [];
+    } catch { return []; }
+  };
+  const rememberSharedFolder = (path: string) => {
+    const next = [path, ...sharedFolders().filter(other => other !== path)].slice(0, 8);
+    localStorage.setItem('shared_project_folders', JSON.stringify(next));
+  };
   const [confirmModal, setConfirmModal] = useState<null | { message: string; danger?: boolean; confirmLabel?: string; resolve: (ok: boolean) => void }>(null);
   const confirmDialog = useCallback((message: string, opts?: { danger?: boolean; confirmLabel?: string }) =>
     new Promise<boolean>(resolve => setConfirmModal({ message, danger: opts?.danger, confirmLabel: opts?.confirmLabel, resolve })), []);
@@ -1147,6 +1182,15 @@ export default function App() {
       return () => clearTimeout(timeoutId);
     }
   }, [backendReady, tabs, compileTypst, currentMain, lastCompiledPath, compileDelay]);
+
+  // Recompile after a collaborator's change lands (see remoteApplyRev). Reads
+  // the current main file fresh, so a late image or an edit to an included file
+  // updates the preview without the joiner having to touch anything.
+  useEffect(() => {
+    if (!backendReady || !remoteApplyRev) return;
+    const id = setTimeout(() => compileTypst(currentMain), 150);
+    return () => clearTimeout(id);
+  }, [remoteApplyRev, backendReady]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   // Stable so @monaco-editor/react doesn't dispose+resubscribe the content
   // listener on every render; identity only changes when the active tab does.
@@ -2157,6 +2201,18 @@ export default function App() {
         }
         group.forEach((c, i) => { c.result = data.results[i]; });
       }
+
+      // The backend promotes generated plots into the project. Publish every
+      // image before inserting Typst references to it, so collaborators never
+      // receive a document that points at a local-only asset.
+      const generatedImages = new Set<string>();
+      for (const cell of cells) {
+        for (const image of (cell.result?.images || [])) {
+          if (typeof image === 'string' && image) generatedImages.add(image);
+        }
+      }
+      for (const image of generatedImages) await mirrorLocalPath(image);
+      if (generatedImages.size) void fetchTree();
 
       const esc = (s: string) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r/g, '').replace(/\n/g, '\\n').replace(/\t/g, '\\t');
       const outputBlock = (r: any) => {
@@ -3787,42 +3843,92 @@ export default function App() {
     return { name, color: palette[h % palette.length] };
   };
 
-  const chooseJoinWorkspace = async (): Promise<boolean> => {
-    let folder = '';
-    try {
-      const picked = await fetch(`${API}/desktop/pick-folder`, { method: 'POST' });
-      folder = String((await picked.json()).path || '').trim();
-    } catch {}
-    if (!folder) {
-      notify('Choose a new empty folder in the desktop app before joining a shared project.');
-      return false;
-    }
+  // Point the backend at a folder that already holds a previously joined copy of
+  // this project, so a rejoin continues from those files rather than starting
+  // empty. The session's own state overwrites whatever is stale (see the merge
+  // in beginCollab), which is why an existing folder is safe to reuse here.
+  const reuseJoinWorkspace = async (folder: string): Promise<boolean> => {
     try {
       const response = await fetch(`${API}/workspace/root`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: folder, requireEmpty: true }),
+        body: JSON.stringify({ path: folder }),
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        notify(data.error || 'Could not use that folder for the shared project.');
+        notify(data.error || 'Could not reopen that shared project folder.');
         return false;
       }
-      dirHandleRef.current = null;
-      workspacePathRef.current = folder;
-      setTabs([]);
-      setActiveTabPath('');
-      setFileTree([]);
-      setMainOverride(null);
-      setDetectedEntry(null);
-      setLastTypPath('');
-      setLastCompiledPath('');
-      setProjectName(folder.replace(/[/\\]+$/, '').split(/[/\\]/).pop() || 'Shared Project');
+      // Already there: keep the open tabs so the rejoin is seamless.
+      if (workspacePathRef.current !== folder) {
+        dirHandleRef.current = null;
+        workspacePathRef.current = folder;
+        setTabs([]);
+        setActiveTabPath('');
+        setFileTree([]);
+        setMainOverride(null);
+        setDetectedEntry(null);
+        setLastTypPath('');
+        setLastCompiledPath('');
+        setProjectName(folder.replace(/[/\\]+$/, '').split(/[/\\]/).pop() || 'Shared Project');
+      }
+      rememberSharedFolder(folder);
       return true;
     } catch {
-      notify('Could not switch to the incoming project folder.');
+      notify('Could not switch to that shared project folder.');
       return false;
     }
+  };
+
+  const chooseJoinWorkspace = async (): Promise<boolean> => {
+    // The native folder picker is the permission step: the user chooses WHERE to
+    // put the shared project, and we create a fresh folder inside it. Nothing in
+    // the chosen location is touched — we only add a new, uniquely named folder.
+    let parent = '';
+    try {
+      const picked = await fetch(`${API}/desktop/pick-folder`, { method: 'POST' });
+      parent = String((await picked.json()).path || '').trim();
+    } catch {}
+    if (!parent) {
+      notify('Choose where to save the shared project, then join.');
+      return false;
+    }
+    const base = parent.replace(/[/\\]+$/, '');
+    const sep = base.includes('\\') ? '\\' : '/';
+    for (let attempt = 0; attempt < 25; attempt++) {
+      const name = attempt === 0 ? 'Hilbert Shared Project' : `Hilbert Shared Project ${attempt + 1}`;
+      const target = `${base}${sep}${name}`;
+      try {
+        const response = await fetch(`${API}/workspace/root`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: target, create: true, requireEmpty: true }),
+        });
+        if (response.status === 409) continue;   // that name already exists; try the next
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          notify(data.error || 'Could not prepare a folder for the shared project.');
+          return false;
+        }
+        dirHandleRef.current = null;
+        workspacePathRef.current = target;
+        setTabs([]);
+        setActiveTabPath('');
+        setFileTree([]);
+        setMainOverride(null);
+        setDetectedEntry(null);
+        setLastTypPath('');
+        setLastCompiledPath('');
+        setProjectName(name);
+        rememberSharedFolder(target);
+        return true;
+      } catch {
+        notify('Could not switch to the incoming project folder.');
+        return false;
+      }
+    }
+    notify('Could not find a free folder name for the shared project.');
+    return false;
   };
 
   const beginCollab = async (
@@ -3869,6 +3975,7 @@ export default function App() {
         hashBytes: sha256Bytes,
         onError: message => notify(message),
         onApplied: change => {
+          remoteApplyPendingRef.current = true;
           if (change.type === 'removed') {
             setTabs(previous => {
               const remaining = previous.filter(tab => tab.path !== change.path);
@@ -3878,11 +3985,33 @@ export default function App() {
               return remaining;
             });
           } else if (change.meta.kind === 'binary') {
-            setTabs(previous => previous.map(tab =>
-              tab.path === change.path ? { ...tab, binaryRevision: (tab.binaryRevision ?? 0) + 1 } : tab));
+            if (change.path.toLowerCase().endsWith('.excalidraw') &&
+                tabsRef.current.some(tab => tab.path === change.path)) {
+              // Excalidraw consumes JSON even though drawings travel through the
+              // binary channel. Refresh the tab content and revision together;
+              // the revision remounts the canvas with the received scene.
+              void fetch(`${API}/workspace/file?path=${encodeURIComponent(change.path)}`)
+                .then(response => response.ok ? response.text() : Promise.reject(new Error('read failed')))
+                .then(content => setTabs(previous => previous.map(tab =>
+                  tab.path === change.path
+                    ? { ...tab, content, isDirty: false, binaryRevision: (tab.binaryRevision ?? 0) + 1 }
+                    : tab)))
+                .catch(() => notify(`Received ${change.path}, but could not refresh the open whiteboard.`));
+            } else {
+              setTabs(previous => previous.map(tab =>
+                tab.path === change.path ? { ...tab, binaryRevision: (tab.binaryRevision ?? 0) + 1 } : tab));
+            }
           }
           window.clearTimeout(refreshTimer);
           refreshTimer = window.setTimeout(() => { void fetchTree(); }, 80);
+        },
+        // Recompile once after the serialized remote apply queue settles. This
+        // still catches late binary assets without compiling once per file
+        // during a large initial project transfer.
+        onApplyIdle: () => {
+          if (!remoteApplyPendingRef.current) return;
+          remoteApplyPendingRef.current = false;
+          setRemoteApplyRev(rev => rev + 1);
         },
         onBinaryTransfer: pending => setCollab(current =>
           current?.room === invite.room ? { ...current, transferring: pending } : current),
@@ -3920,6 +4049,26 @@ export default function App() {
             setCollab(current => current?.room === invite.room ? { ...current, transferring: Math.max(1, current.transferring) } : current);
             await sync.applyWorkspace();
             if (collabRef.current !== handle) return;
+            // Rejoining a folder from an earlier session: files the session also
+            // has were just overwritten with its version, so what is left to
+            // settle are the local-only ones (publish them) and the ones deleted
+            // while this peer was away (ask before removing anything).
+            const tombstoned = await sync.reconcileLocalWorkspace();
+            if (collabRef.current !== handle) return;
+            if (tombstoned.length) {
+              const list = tombstoned.slice(0, 8).join('\n');
+              const more = tombstoned.length > 8 ? `\n…and ${tombstoned.length - 8} more` : '';
+              const remove = await confirmDialog(
+                `${tombstoned.length} file(s) in this folder were deleted from the shared project while you were away:\n\n${list}${more}\n\nRemove your copies too?`,
+                { danger: true, confirmLabel: 'Remove' },
+              );
+              if (collabRef.current !== handle) return;
+              if (remove) {
+                await sync.removeLocalCopies(tombstoned);
+                if (collabRef.current !== handle) return;
+                setTabs(previous => previous.filter(tab => !tombstoned.includes(tab.path)));
+              }
+            }
             await fetchTree();
             const files = handle.workspace.list();
             const first = files.find(file => file.path === 'main.typ')
@@ -3964,7 +4113,7 @@ export default function App() {
     const configured = configuredCollabServer();
     const suggested = configured || urls.find(url => !url.includes('127.0.0.1')) || urls[0] || '';
     setInputModal({
-      title: 'Share this project live',
+      title: 'Share this project live (experimental)',
       submitLabel: 'Share Project & Copy Invite',
       fields: [
         {
@@ -3979,7 +4128,7 @@ export default function App() {
           key: 'name',
           label: 'Your display name',
           default: localStorage.getItem('collab_name') || '',
-          placeholder: 'Kazi',
+          placeholder: 'Your name',
         },
       ],
       onSubmit: async values => {
@@ -3997,15 +4146,37 @@ export default function App() {
   };
 
   const joinCollab = () => {
+    // Offer every folder this machine has joined into before, plus the open
+    // project when that is one of them — rejoining a session should continue
+    // from the files already on disk, not start over in a new empty folder.
+    const NEW_FOLDER = 'New folder…';
+    const known = sharedFolders();
+    const open = workspacePathRef.current;
+    const openIsShared = !!open && known.includes(open);
+    const choices = [
+      ...(openIsShared ? [`Continue in this project (${projectName})`] : []),
+      ...known.filter(folder => folder !== open),
+      NEW_FOLDER,
+    ];
     setInputModal({
-      title: 'Join a shared project',
-      submitLabel: 'Choose Folder & Join',
+      title: 'Join a shared project (experimental)',
+      submitLabel: 'Join Project',
       fields: [
         {
           key: 'ticket',
           label: 'Invitation',
           placeholder: 'hilbert-collab://join?…',
           hint: 'The invitation contains a one-session encryption key. Share it only with intended collaborators.',
+        },
+        {
+          key: 'folder',
+          label: 'Save the project in',
+          type: 'select',
+          default: choices[0],
+          options: choices,
+          hint: choices.length > 1
+            ? 'Reusing a folder you joined before keeps your copy; the session updates it to the latest version.'
+            : 'Hilbert creates the folder for you — you only choose where it goes.',
         },
         {
           key: 'name',
@@ -4023,7 +4194,10 @@ export default function App() {
         }
         const name = (values.name || '').trim().slice(0, 48);
         if (name) localStorage.setItem('collab_name', name);
-        if (!await chooseJoinWorkspace()) return;
+        const folder = values.folder || NEW_FOLDER;
+        const reuse = folder === choices[0] && openIsShared ? open! : (folder === NEW_FOLDER ? '' : folder);
+        const ready = reuse ? await reuseJoinWorkspace(reuse) : await chooseJoinWorkspace();
+        if (!ready) return;
         await beginCollab(invite, 'join');
       },
     });
@@ -4141,8 +4315,8 @@ export default function App() {
     { category: 'Edit', title: 'Toggle Equation Numbering (all)', run: toggleEquationNumbering },
     { category: 'Edit', title: 'Document Settings...', run: () => setShowEditSettings(true) },
     { category: 'File', title: 'New Window', run: openNewWindow },
-    { category: 'Collaborate', title: 'Share this project live…', run: hostCollab },
-    { category: 'Collaborate', title: 'Join a shared project…', run: joinCollab },
+    { category: 'Collaborate', title: 'Share this project live (experimental)…', run: hostCollab },
+    { category: 'Collaborate', title: 'Join a shared project (experimental)…', run: joinCollab },
     { category: 'Collaborate', title: 'Set optional collaboration server…', run: () => setInputModal({
       title: 'Optional collaboration server',
       submitLabel: 'Save',
@@ -4595,12 +4769,12 @@ export default function App() {
           {collab && (
             <button
               className="theme-toggle"
-              onClick={stopCollab}
+              onClick={() => setShowDriveSync(true)}
               style={{
                 color: collab.status === 'connected' || collab.status === 'synced' ? '#34d399' : '#f59e0b',
                 borderColor: collab.status === 'connected' || collab.status === 'synced' ? '#34d399' : '#f59e0b',
               }}
-              title={`End-to-end encrypted shared project (${collab.peers} here, ${collab.status}${collab.transferring ? `, receiving ${collab.transferring} asset(s)` : ''}). Click to leave.`}
+              title={`End-to-end encrypted shared project — experimental (${collab.peers} here, ${collab.status}${collab.transferring ? `, receiving ${collab.transferring} asset(s)` : ''}). Click for sharing details.`}
             >
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M23 21v-2a4 4 0 0 0-3-3.87" /><path d="M16 3.13a4 4 0 0 1 0 7.75" />
@@ -5001,6 +5175,7 @@ export default function App() {
                   return (
                     <Boundary name="Whiteboard" onClose={() => { const rem = tabs.filter(t => t.path !== activeTabPath); setTabs(rem); setActiveTabPath(rem.length ? rem[rem.length - 1].path : ''); }}>
                     <Suspense fallback={<div className="empty-state">Loading whiteboard...</div>}><ExcalidrawEditor
+                      key={`${activeTabPath}:${activeTab.binaryRevision ?? 0}`}
                       path={activeTabPath}
                       initialContent={activeTab.content}
                       onSave={async (jsonContent, svgBlob) => {
@@ -5260,6 +5435,7 @@ export default function App() {
         onClose={() => setShowSlideStudio(false)}
         existing={slideDeckToken}
         workspaceImages={workspaceImages}
+        workspaceFonts={workspaceFonts}
         onInsert={(code) => { insertDeck(code); setShowSlideStudio(false); }}
         registerCapture={registerSlideCapture}
         onOpenTool={(key) => {
@@ -5346,7 +5522,7 @@ export default function App() {
           </div>
         </div>
       )}
-      {codeRunner && <Boundary name="Code Runner" onClose={() => setCodeRunner(null)}><Suspense fallback={null}><CodeRunnerModal {...codeRunner} onClose={() => setCodeRunner(null)} onInsert={(code) => { insertCode(code); setCodeRunner(null); }} onInsertEquation={(latex, codeBlock) => { insertEquationFromLatex(latex, codeBlock); setCodeRunner(null); }} onChanged={(paths) => { void fetchTree(); for (const path of paths || []) void mirrorLocalPath(path); }} /></Suspense></Boundary>}
+      {codeRunner && <Boundary name="Code Runner" onClose={() => setCodeRunner(null)}><Suspense fallback={null}><CodeRunnerModal {...codeRunner} onClose={() => setCodeRunner(null)} onInsert={(code) => { insertCode(code); setCodeRunner(null); }} onInsertEquation={(latex, codeBlock) => { insertEquationFromLatex(latex, codeBlock); setCodeRunner(null); }} onChanged={async (paths) => { void fetchTree(); for (const path of paths || []) await mirrorLocalPath(path); }} /></Suspense></Boundary>}
       {showSaveAs && activeTab && <Suspense fallback={null}><SaveAsModal onClose={() => setShowSaveAs(false)} fileName={activeTabPath} content={activeTab.content} pdfUrl={pdfUrl} projectName={projectName} mainFile={currentMain} /></Suspense>}
       {showHtmlPreview && <Suspense fallback={null}><HtmlPreviewModal mainFile={currentMain} onClose={() => setShowHtmlPreview(false)} /></Suspense>}
       {showPlot3D && <Boundary name="3D Plot Studio" onClose={() => setShowPlot3D(false)}><Suspense fallback={null}><Plot3DStudio onClose={() => setShowPlot3D(false)} onInsert={(code) => { insertCode(code); setShowPlot3D(false); fetchTree(); }} onSaved={(path) => { void mirrorLocalPath(path); void fetchTree(); }} /></Suspense></Boundary>}
