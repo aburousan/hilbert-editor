@@ -24,7 +24,11 @@
     "test:unicode": "node scripts/test-unicode-ranges.mjs",
     "test:comments": "node scripts/test-comment-lines.mjs",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:sync": "node scripts/test-workspace-sync.mjs",
+    "test:binary": "node scripts/test-binary-transfer.mjs",
+    "test:project": "node scripts/test-project-collab.mjs",
+    "test:sync-all": "npm run test:collab && npm run test:sync && npm run test:binary && npm run test:project"
   },
   "dependencies": {
     "@excalidraw/excalidraw": "^0.18.1",

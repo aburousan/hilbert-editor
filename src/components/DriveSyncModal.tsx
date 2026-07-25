@@ -52,9 +52,9 @@ async function uploadFile(token: string, folderId: string, name: string, content
 }
 
 type LiveSession = {
-  file: string;
   peers: number;
   status: string;
+  transferring: number;
 };
 
 export default function DriveSyncModal({
@@ -161,25 +161,26 @@ export default function DriveSyncModal({
           {mode === 'live' && (
             <>
               <p className="form-hint">
-                Edit the open text file together without an account or central Hilbert service.
-                Updates and cursors are encrypted before they reach the direct campus/LAN listener
-                or your optional self-hosted relay.
+                Share the complete project live: text, images, fonts, whiteboards, file changes,
+                and cursors. Everything is encrypted before it reaches the direct campus/LAN
+                listener or your optional self-hosted relay.
               </p>
               {liveSession ? (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                   <div style={{ padding: 10, borderRadius: 7, border: '1px solid rgba(52, 211, 153, 0.4)', background: 'rgba(16, 185, 129, 0.08)', fontSize: '0.82rem', lineHeight: 1.45 }}>
-                    <b>Encrypted session active</b><br />
-                    <code>{liveSession.file}</code> · {liveSession.peers} participant{liveSession.peers === 1 ? '' : 's'} · {liveSession.status}
+                    <b>Encrypted project sharing active</b><br />
+                    Whole project · {liveSession.peers} participant{liveSession.peers === 1 ? '' : 's'} · {liveSession.status}
+                    {liveSession.transferring > 0 && <><br />Receiving project assets… ({liveSession.transferring})</>}
                   </div>
                   <div style={{ display: 'flex', gap: 8 }}>
                     <button className="btn-primary" onClick={() => { onCopyLiveInvite(); onClose(); }}>Copy invitation</button>
-                    <button className="btn-ghost" onClick={() => { onLeaveLive(); onClose(); }}>Leave session</button>
+                    <button className="btn-ghost" onClick={() => { onLeaveLive(); onClose(); }}>Leave shared project</button>
                   </div>
                 </div>
               ) : (
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                  <button className="btn-primary" onClick={() => { onClose(); onHostLive(); }}>Host this file</button>
-                  <button className="btn-ghost" onClick={() => { onClose(); onJoinLive(); }}>Join with invitation</button>
+                  <button className="btn-primary" onClick={() => { onClose(); onHostLive(); }}>Share this project</button>
+                  <button className="btn-ghost" onClick={() => { onClose(); onJoinLive(); }}>Join shared project</button>
                 </div>
               )}
               <p className="form-hint">

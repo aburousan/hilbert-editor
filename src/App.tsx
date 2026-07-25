@@ -48,6 +48,10 @@ import Toaster from './components/Toaster';
 import ExternalChangeModal, { type ExternalConflict } from './components/ExternalChangeModal';
 import { notify } from './notify';
 import type { CollabHandle, CollabStatus } from './collab';
+import type { BinaryTransfer } from './binaryTransfer';
+import type { SocketTransferChannel } from './binarySocketChannel';
+import type { ProjectSync } from './projectCollab';
+import { isProjectTextPath } from './projectFileTypes';
 import './index.css';
 
 const SURFACE_3D_TEMPLATE = `import matplotlib
@@ -110,7 +114,8 @@ interface FileNode {
   mtime?: number;
   matches?: { lineNum: number; text: string }[];
 }
-type Tab = { path: string; content: string; isDirty: boolean; diskHash?: string };
+type Tab = { path: string; content: string; isDirty: boolean; diskHash?: string; binaryRevision?: number };
+const IMG_EXT = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp'];
 
 // The panels the View menu and the status bar can show and hide.
 type PanelKey = 'tree' | 'outline' | 'problems' | 'editor' | 'preview';
@@ -290,6 +295,8 @@ export default function App() {
   const tabsRef = useRef<Tab[]>([]);
   tabsRef.current = tabs;
   const [activeTabPath, setActiveTabPath] = useState<string>('');
+  const activeTabPathRef = useRef('');
+  activeTabPathRef.current = activeTabPath;
   const [externalConflict, setExternalConflict] = useState<ExternalConflict | null>(null);
   const [booted, setBooted] = useState(false);
   const [fileTree, setFileTree] = useState<FileNode[]>([]);
@@ -403,11 +410,14 @@ export default function App() {
   };
   // Track the open tabs / active tab / workspace so the next launch can restore them.
   useEffect(() => {
+    // Startup restores the backend session asynchronously. Saving the initial
+    // empty React state first could erase its workspace path before it is read.
+    if (!booted) return;
     sessionRef.current.workspacePath = workspacePathRef.current || undefined;
     sessionRef.current.openPaths = tabs.map(t => t.path);
     sessionRef.current.activePath = activeTabPath;
     scheduleSaveSession();
-  }, [tabs, activeTabPath]);
+  }, [tabs, activeTabPath, booted]);
   // Put the cursor back where the last session left it, once the restored tab's
   // content is in the editor.
   //
@@ -511,15 +521,32 @@ export default function App() {
   const [projectName, setProjectName] = useState('Project Report');
   const [editingTitle, setEditingTitle] = useState(false);
   const [inputModal, setInputModal] = useState<InputModalConfig | null>(null);
-  // Live collaboration on the open file (Yjs). Dormant until Host/Join is used.
+  // Live collaboration for the whole project. Dormant until Host/Join is used.
   const collabRef = useRef<CollabHandle | null>(null);
+  const projectSessionRef = useRef<{
+    sync: ProjectSync;
+    transfer: BinaryTransfer;
+    channel: SocketTransferChannel;
+    cleanup: () => void;
+  } | null>(null);
   const [collab, setCollab] = useState<{
     room: string;
     ticket: string;
-    file: string;
     peers: number;
     status: CollabStatus;
+    transferring: number;
   } | null>(null);
+  const disposeProjectSession = (announce = false) => {
+    projectSessionRef.current?.sync.stop();
+    projectSessionRef.current?.transfer.close();
+    projectSessionRef.current?.channel.close();
+    projectSessionRef.current?.cleanup();
+    projectSessionRef.current = null;
+    collabRef.current?.stop();
+    collabRef.current = null;
+    setCollab(null);
+    if (announce) notify('Left the shared project session.', 'info');
+  };
   const configuredCollabServer = () => localStorage.getItem('collab_server') || '';
   const [confirmModal, setConfirmModal] = useState<null | { message: string; danger?: boolean; confirmLabel?: string; resolve: (ok: boolean) => void }>(null);
   const confirmDialog = useCallback((message: string, opts?: { danger?: boolean; confirmLabel?: string }) =>
@@ -806,6 +833,9 @@ export default function App() {
     if (!await syncToDisk(tab.path, tab.content)) {
       throw new Error(`Could not save ${tab.path} back to the opened folder. Check its write permission.`);
     }
+    if (tab.path !== activeTabPathRef.current) {
+      projectSessionRef.current?.sync.onLocalText(tab.path, tab.content);
+    }
     return data.hash || expected || '';
   };
 
@@ -822,6 +852,65 @@ export default function App() {
         }
       }
     } catch(e) {}
+  };
+
+  const filePathsUnder = (path: string): string[] => {
+    const out: string[] = [];
+    const walk = (nodes: FileNode[]) => {
+      for (const node of nodes) {
+        if (node.type === 'file' && (node.path === path || node.path.startsWith(path + '/'))) out.push(node.path);
+        if (node.children) walk(node.children);
+      }
+    };
+    walk(fileTree);
+    return out;
+  };
+
+  const mirrorLocalPath = async (path: string, knownText?: string, includeOpen = false) => {
+    const sync = projectSessionRef.current?.sync;
+    if (!sync || sync.applyingRemote) return;
+    if (isProjectTextPath(path)) {
+      if (!includeOpen && path === activeTabPathRef.current) return;
+      let content = knownText;
+      if (content === undefined) {
+        const response = await fetch(`${API}/workspace/file?path=${encodeURIComponent(path)}`);
+        if (!response.ok) return;
+        content = await response.text();
+      }
+      sync.onLocalText(path, content);
+    } else {
+      await sync.onLocalBinary(path);
+    }
+  };
+
+  const mirrorLocalDelete = (path: string) => {
+    const sync = projectSessionRef.current?.sync;
+    if (!sync || sync.applyingRemote) return;
+    const files = filePathsUnder(path);
+    for (const file of files.length ? files : [path]) sync.onLocalRemove(file);
+  };
+
+  const mirrorLocalRename = async (from: string, to: string) => {
+    const sync = projectSessionRef.current?.sync;
+    if (!sync || sync.applyingRemote) return;
+    const files = filePathsUnder(from);
+    const moved = files.length ? files : [from];
+    for (const oldPath of moved) sync.onLocalRemove(oldPath);
+    for (const oldPath of moved) {
+      const newPath = oldPath === from ? to : to + oldPath.slice(from.length);
+      await mirrorLocalPath(newPath, undefined, true);
+    }
+  };
+
+  const mirrorLocalCopy = async (from: string, to: string) => {
+    const sync = projectSessionRef.current?.sync;
+    if (!sync || sync.applyingRemote) return;
+    const files = filePathsUnder(from);
+    const copied = files.length ? files : [from];
+    for (const oldPath of copied) {
+      const newPath = oldPath === from ? to : to + oldPath.slice(from.length);
+      await mirrorLocalPath(newPath, undefined, true);
+    }
   };
 
 
@@ -1095,7 +1184,7 @@ export default function App() {
     let stopped = false;
     let checking = false;
     const checkOpenFiles = async () => {
-      if (checking || stopped) return;
+      if (checking || stopped || projectSessionRef.current?.sync.applyingRemote) return;
       checking = true;
       try {
         // One batched request for every open text tab, instead of a request per
@@ -1112,6 +1201,7 @@ export default function App() {
           states = (await r.json()).states || {};
         } catch { return; }
         for (const tab of watched) {
+          if (projectSessionRef.current?.sync.applyingRemote) return;
           const hash = states[tab.path];
           const current = tabsRef.current.find(item => item.path === tab.path);
           if (!hash || stopped || !current || (current.diskHash && hash === current.diskHash)) continue;
@@ -1132,7 +1222,11 @@ export default function App() {
               setTabs(prev => prev.map(item => item.path === fresh.path && !item.isDirty
                 ? { ...item, content: disk.content, diskHash: disk.hash, isDirty: false }
                 : item));
-              notify(`Reloaded ${fresh.path} after an external change.`);
+              // During a shared session a background file changes because a
+              // collaborator edited it, not because something outside Hilbert
+              // did — the reload is right, but the "external change" wording is
+              // misleading, so stay quiet while a session is live.
+              if (!projectSessionRef.current) notify(`Reloaded ${fresh.path} after an external change.`);
             }
             continue;
           }
@@ -1142,7 +1236,7 @@ export default function App() {
             setTabs(prev => prev.map(item => item.path === fresh.path && !item.isDirty
               ? { ...item, content: disk.content, diskHash: disk.hash, isDirty: false }
               : item));
-            notify(`Reloaded ${fresh.path} after an external change.`);
+            if (!projectSessionRef.current) notify(`Reloaded ${fresh.path} after an external change.`);
           }
         }
       } finally {
@@ -1157,7 +1251,6 @@ export default function App() {
     };
   }, [backendReady]);
 
-  const IMG_EXT = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp'];
   const openFileRef = useRef<(path: string) => Promise<void>>(async () => {});
   
   const openFile = async (path: string) => {
@@ -1211,6 +1304,7 @@ export default function App() {
         const name = (v.name || '').trim();
         if (!name || name.endsWith('/')) return;
         await fetch(`${API}/workspace/file?path=${encodeURIComponent(name)}`, { method: 'POST', body: '' });
+        await mirrorLocalPath(name, '', true);
         fetchTree();
         openFile(name);
       },
@@ -1282,7 +1376,10 @@ export default function App() {
     if (e.key === 'Backspace' || e.key === 'Delete') {
       e.preventDefault();
       if (!await confirmDialog(`Delete ${selectedPaths.length} items?`, { danger: true, confirmLabel: 'Delete' })) return;
-      for (const p of selectedPaths) await fetch(`${API}/workspace/file?path=${encodeURIComponent(p)}`, { method: 'DELETE' });
+      for (const p of selectedPaths) {
+        const response = await fetch(`${API}/workspace/file?path=${encodeURIComponent(p)}`, { method: 'DELETE' });
+        if (response.ok) mirrorLocalDelete(p);
+      }
       setSelectedPaths([]); fetchTree();
     } else if (e.key === 'Enter') {
       e.preventDefault();
@@ -1317,7 +1414,11 @@ export default function App() {
         targetDir = isSelectedDir ? first : (first.includes('/') ? first.substring(0, first.lastIndexOf('/')) : '');
       }
       const toPath = targetDir ? `${targetDir}/${fileClipboard.path.split('/').pop()}` : fileClipboard.path.split('/').pop();
-      await fetch(`${API}/workspace/${fileClipboard.type === 'cut' ? 'rename' : 'copy'}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: fileClipboard.path, to: toPath }) });
+      const response = await fetch(`${API}/workspace/${fileClipboard.type === 'cut' ? 'rename' : 'copy'}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: fileClipboard.path, to: toPath }) });
+      if (response.ok && toPath) {
+        if (fileClipboard.type === 'cut') await mirrorLocalRename(fileClipboard.path, toPath);
+        else await mirrorLocalCopy(fileClipboard.path, toPath);
+      }
       fetchTree();
     }
   };
@@ -1366,6 +1467,7 @@ export default function App() {
             headers: { 'Content-Type': 'application/octet-stream' },
             body: arrayBuffer
           });
+          await mirrorLocalPath(newPath);
         }
         fetchTree();
         return;
@@ -1386,6 +1488,7 @@ export default function App() {
             body: JSON.stringify({ from: p, to: newPath })
           });
           if (res.ok) {
+            await mirrorLocalRename(p, newPath);
             successCount++;
             setTabs(prev => prev.map(t => {
               if (t.path === p) return { ...t, path: newPath };
@@ -1431,9 +1534,10 @@ export default function App() {
             let newName = pattern.replace('#', String(i++));
             if (ext && !newName.endsWith(ext)) newName += ext;
             const newPath = parent ? `${parent}/${newName}` : newName;
-            await fetch(`${API}/workspace/rename`, {
+            const response = await fetch(`${API}/workspace/rename`, {
               method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: p, to: newPath })
             });
+            if (response.ok) await mirrorLocalRename(p, newPath);
           }
           fetchTree();
         },
@@ -1452,6 +1556,7 @@ export default function App() {
         body: JSON.stringify({ from: node.path, to: newPath })
       });
       if (!res.ok) throw new Error('Rename failed');
+      await mirrorLocalRename(node.path, newPath);
       if (node.type === 'file') {
         setTabs(prev => prev.map(t => t.path === node.path ? { ...t, path: newPath } : t));
         if (activeTabPath === node.path) setActiveTabPath(newPath);
@@ -1468,7 +1573,8 @@ export default function App() {
     e.stopPropagation();
     if (!await confirmDialog(`Delete ${isDir ? 'folder' : 'file'} "${path}"?${isDir ? '\nAll of its contents will be removed.' : ''}`, { danger: true, confirmLabel: 'Delete' })) return;
     try {
-      await fetch(`${API}/workspace/file?path=${encodeURIComponent(path)}`, { method: 'DELETE' });
+      const response = await fetch(`${API}/workspace/file?path=${encodeURIComponent(path)}`, { method: 'DELETE' });
+      if (response.ok) mirrorLocalDelete(path);
     } catch {}
     setTabs(prev => {
       const remaining = prev.filter(t => t.path !== path && !t.path.startsWith(path + '/'));
@@ -1495,10 +1601,11 @@ export default function App() {
           const newName = (v.name || '').trim();
           if (!newName || newName === path) return;
           try {
-            await fetch(`${API}/workspace/copy`, {
+            const response = await fetch(`${API}/workspace/copy`, {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ from: path, to: newName })
             });
+            if (response.ok) await mirrorLocalCopy(path, newName);
             fetchTree();
           } catch {}
         },
@@ -1507,7 +1614,8 @@ export default function App() {
       for (const p of pathsToCopy) {
         const match = p.match(/^(.*?)(\.[^.]+)?$/);
         const newPath = `${match?.[1]}_copy${match?.[2] || ''}`;
-        await fetch(`${API}/workspace/copy`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: p, to: newPath }) });
+        const response = await fetch(`${API}/workspace/copy`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: p, to: newPath }) });
+        if (response.ok) await mirrorLocalCopy(p, newPath);
       }
       fetchTree();
     }
@@ -1534,6 +1642,7 @@ export default function App() {
             const path = folder ? `${folder}/${file.name}` : file.name;
             const buf = await file.arrayBuffer();
             await fetch(`${API}/workspace/upload?path=${encodeURIComponent(path)}`, { method: 'POST', body: buf, headers: { 'Content-Type': 'application/octet-stream' } });
+            await mirrorLocalPath(path);
           }
           await fetchTree();
           if (files.length === 1) {
@@ -1611,6 +1720,7 @@ export default function App() {
       const buf = await file.arrayBuffer();
       const detected = readFontFamily(buf) || file.name.replace(/\.(ttf|otf)$/i, '');
       await fetch(`${API}/workspace/upload?path=${encodeURIComponent('fonts/' + file.name)}`, { method: 'POST', body: buf, headers: { 'Content-Type': 'application/octet-stream' } });
+      await mirrorLocalPath('fonts/' + file.name);
       await fetchTree();
       setInputModal({
         title: 'Import Font',
@@ -1633,6 +1743,7 @@ export default function App() {
       const text = await file.text();
       const name = file.name;
       await fetch(`${API}/workspace/file?path=${encodeURIComponent(name)}`, { method: 'POST', body: text, headers: { 'Content-Type': 'text/plain' } });
+      await mirrorLocalPath(name, text, true);
       await fetchTree();
       setTabs(prev => prev.find(t => t.path === name)
         ? prev.map(t => t.path === name ? { ...t, content: text, isDirty: false } : t)
@@ -1660,9 +1771,11 @@ export default function App() {
         if (TEXT_EXT.includes(ext)) {
           const text = await f.text();
           await fetch(`${API}/workspace/file?path=${encodeURIComponent(rel)}`, { method: 'POST', body: text, headers: { 'Content-Type': 'text/plain' } });
+          await mirrorLocalPath(rel, text, true);
         } else {
           const buf = await f.arrayBuffer();
           await fetch(`${API}/workspace/upload?path=${encodeURIComponent(rel)}`, { method: 'POST', body: buf, headers: { 'Content-Type': 'application/octet-stream' } });
+          await mirrorLocalPath(rel);
         }
       }
       await fetchTree();
@@ -1751,15 +1864,15 @@ export default function App() {
     seedDefaultTab();
   };
 
-  // On launch: if a previous session exists, switch to its folder (desktop only —
-  // it needs a native path) and reopen its tabs; otherwise load the default workspace.
+  // On launch, switch to the previous folder and reopen its tabs. The guarded
+  // backend endpoint handles native paths in both the Tauri webview and browser
+  // frontend, so this must not depend on an injected window.desktop helper.
   const restoreSessionOrDefault = async () => {
     let sess: any = null;
     try { sess = await (await fetch(`${API}/session`)).json(); } catch {}
-    const desktop = (window as any).desktop;
     if (sess && Array.isArray(sess.openPaths) && sess.openPaths.length) {
       try {
-        if (sess.workspacePath && desktop?.pickFolder) {
+        if (sess.workspacePath) {
           const res = await fetch(`${API}/workspace/root`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: sess.workspacePath }) });
           if (res.ok) {
             workspacePathRef.current = sess.workspacePath;
@@ -1803,6 +1916,7 @@ export default function App() {
   // Desktop: repoint the backend at an absolute path (also used by Open Recent).
   const openFolderPathAsRoot = async (folder: string) => {
     try {
+      if (collabRef.current) disposeProjectSession();
       const res = await fetch(`${API}/workspace/root`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: folder }) });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) { notify(data.error || 'Could not open that folder.'); return; }
@@ -1822,6 +1936,7 @@ export default function App() {
         notify('Write permission is needed so your edits save back to the folder.', 'info'); return;
       }
       if (ask && !await confirmDialog(`Open “${dir.name}” as the workspace? Your edits will be saved back to this folder on disk.`, { confirmLabel: 'Open' })) return;
+      if (collabRef.current) disposeProjectSession();
       await fetch(`${API}/workspace/clear`, { method: 'POST' });
       workspacePathRef.current = null;   // web-imported working copy: no native path to reopen
       dirHandleRef.current = dir;
@@ -1898,6 +2013,7 @@ export default function App() {
   // matching Typst read snippet at the cursor.
   const handleDataImport = async ({ filename, content, snippet }: { filename: string; content: string; snippet: string }) => {
     await fetch(`${API}/workspace/file?path=${encodeURIComponent(filename)}`, { method: 'POST', body: content, headers: { 'Content-Type': 'text/plain' } });
+    await mirrorLocalPath(filename, content, true);
     await fetchTree();
     insertCode('\n' + snippet + '\n\n');
     setShowDataImport(false);
@@ -1907,6 +2023,7 @@ export default function App() {
   const handleInitTemplate = async (result: string | { code: string; entrypoint?: string }) => {
     setShowTemplateInstaller(false);
     await fetchTree();   // show every file the template created, not just the entry
+    await projectSessionRef.current?.sync.publishWorkspace();
     const entry = typeof result === 'string' ? 'main.typ' : (result.entrypoint || 'main.typ');
     const code = typeof result === 'string' ? result : result.code;
     setMainOverride(entry);   // preview compiles the template's root, not its chapters
@@ -1942,6 +2059,7 @@ export default function App() {
       await fetch(`${API}/workspace/file?path=${encodeURIComponent(target)}`, {
         method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: f.content,
       });
+      await mirrorLocalPath(target, f.content, true);
     }
 
     await fetchTree();
@@ -2809,6 +2927,8 @@ export default function App() {
         
         await fetch(`${API}/workspace/file?path=${encodeURIComponent(excalidrawFile)}`, { method: 'POST', body: '' });
         await fetch(`${API}/workspace/upload?path=${encodeURIComponent(svgFile)}`, { method: 'POST', body: svgBlob, headers: { 'Content-Type': 'application/octet-stream' } });
+        await mirrorLocalPath(excalidrawFile);
+        await mirrorLocalPath(svgFile);
         
         fetchTree();
         insertCode(centerWrap(`#image("${svgFile}", width: 60%)`, 'true'));
@@ -3667,60 +3787,169 @@ export default function App() {
     return { name, color: palette[h % palette.length] };
   };
 
+  const chooseJoinWorkspace = async (): Promise<boolean> => {
+    let folder = '';
+    try {
+      const picked = await fetch(`${API}/desktop/pick-folder`, { method: 'POST' });
+      folder = String((await picked.json()).path || '').trim();
+    } catch {}
+    if (!folder) {
+      notify('Choose a new empty folder in the desktop app before joining a shared project.');
+      return false;
+    }
+    try {
+      const response = await fetch(`${API}/workspace/root`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: folder, requireEmpty: true }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        notify(data.error || 'Could not use that folder for the shared project.');
+        return false;
+      }
+      dirHandleRef.current = null;
+      workspacePathRef.current = folder;
+      setTabs([]);
+      setActiveTabPath('');
+      setFileTree([]);
+      setMainOverride(null);
+      setDetectedEntry(null);
+      setLastTypPath('');
+      setLastCompiledPath('');
+      setProjectName(folder.replace(/[/\\]+$/, '').split(/[/\\]/).pop() || 'Shared Project');
+      return true;
+    } catch {
+      notify('Could not switch to the incoming project folder.');
+      return false;
+    }
+  };
+
   const beginCollab = async (
     invite: { url: string; room: string; key: string },
     mode: 'host' | 'join',
   ) => {
     const editor = editorRef.current;
     const model = editor?.getModel();
-    if (!editor || !model) { notify('Open a file before starting collaboration.'); return; }
-    collabRef.current?.stop();
-    setCollab(null);
+    if (mode === 'host' && (!editor || !model || !activeTabPath || !isProjectTextPath(activeTabPath))) {
+      notify('Open a text file before sharing the project.');
+      return;
+    }
+    disposeProjectSession();
     try {
       const { startCollab } = await import('./collab');
-      const sharedFile = activeTabPath;
+      const [{ BinaryTransfer, ProjectSync }, { createBinarySocketChannel }, { createProjectFs, sha256Bytes }] =
+        await Promise.all([
+          import('./projectCollab'),
+          import('./binarySocketChannel'),
+          import('./projectFs'),
+        ]);
       const handle = startCollab({
         invite,
         mode,
-        model,
-        editor,
         user: collabIdentity(),
-        seedContent: mode === 'host' ? model.getValue() : undefined,
+        initialFile: mode === 'host' ? {
+          path: activeTabPath,
+          model,
+          editor,
+          content: model.getValue(),
+        } : undefined,
       });
       collabRef.current = handle;
+      const channel = createBinarySocketChannel(invite);
+      const transfer = new BinaryTransfer(channel, {
+        hashBytes: sha256Bytes,
+        peerId: crypto.randomUUID?.() || Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join(''),
+      });
+      let refreshTimer = 0;
+      const sync = new ProjectSync({
+        model: handle.workspace,
+        transfer,
+        fs: createProjectFs(),
+        hashBytes: sha256Bytes,
+        onError: message => notify(message),
+        onApplied: change => {
+          if (change.type === 'removed') {
+            setTabs(previous => {
+              const remaining = previous.filter(tab => tab.path !== change.path);
+              if (activeTabPathRef.current === change.path) {
+                setActiveTabPath(remaining.length ? remaining[remaining.length - 1].path : '');
+              }
+              return remaining;
+            });
+          } else if (change.meta.kind === 'binary') {
+            setTabs(previous => previous.map(tab =>
+              tab.path === change.path ? { ...tab, binaryRevision: (tab.binaryRevision ?? 0) + 1 } : tab));
+          }
+          window.clearTimeout(refreshTimer);
+          refreshTimer = window.setTimeout(() => { void fetchTree(); }, 80);
+        },
+        onBinaryTransfer: pending => setCollab(current =>
+          current?.room === invite.room ? { ...current, transferring: pending } : current),
+      });
+      projectSessionRef.current = {
+        sync,
+        transfer,
+        channel,
+        cleanup: () => window.clearTimeout(refreshTimer),
+      };
       setCollab({
         room: invite.room,
         ticket: handle.ticket,
-        file: sharedFile,
         peers: 1,
         status: 'connecting',
+        transferring: 0,
       });
       handle.onPeers(peers => setCollab(current =>
         current?.room === invite.room ? { ...current, peers } : current));
       handle.onStatus(status => setCollab(current =>
         current?.room === invite.room ? { ...current, status } : current));
-      handle.onReady(() => {
-        if (mode === 'host') {
-          navigator.clipboard.writeText(handle.ticket)
-            .then(() => notify('Encrypted collaboration started — invitation copied to the clipboard.', 'success'))
-            .catch(() => notify('Encrypted collaboration started. Use “Copy collaboration invitation” to share it.', 'success'));
-        } else {
-          notify(`Joined the encrypted session for ${sharedFile}.`, 'success');
+      handle.onReady(async () => {
+        if (collabRef.current !== handle || projectSessionRef.current?.sync !== sync) return;
+        sync.start();
+        try {
+          if (mode === 'host') {
+            sync.setOpenPath(activeTabPath);
+            await sync.publishWorkspace();
+            if (collabRef.current !== handle) return;
+            void fetchTree();
+            navigator.clipboard.writeText(handle.ticket)
+              .then(() => notify('Encrypted project sharing started — invitation copied to the clipboard.', 'success'))
+              .catch(() => notify('Encrypted project sharing started. Use “Copy collaboration invitation” to share it.', 'success'));
+          } else {
+            setCollab(current => current?.room === invite.room ? { ...current, transferring: Math.max(1, current.transferring) } : current);
+            await sync.applyWorkspace();
+            if (collabRef.current !== handle) return;
+            await fetchTree();
+            const files = handle.workspace.list();
+            const first = files.find(file => file.path === 'main.typ')
+              ?? files.find(file => file.path.toLowerCase().endsWith('.typ'))
+              ?? files.find(file => file.kind === 'text');
+            if (first) {
+              await openFileRef.current(first.path);
+              sync.setOpenPath(first.path);
+            }
+            setCollab(current => current?.room === invite.room ? { ...current, transferring: 0 } : current);
+            notify('Joined the encrypted shared project.', 'success');
+          }
+        } catch (error) {
+          notify(error instanceof Error ? error.message : 'Could not synchronize the shared project.');
+          disposeProjectSession();
         }
       });
       handle.onError(message => {
-        if (collabRef.current === handle) collabRef.current = null;
-        setCollab(current => current?.room === invite.room ? null : current);
+        if (collabRef.current === handle) disposeProjectSession();
         notify(message);
       });
     } catch (error) {
+      disposeProjectSession();
       notify(error instanceof Error ? error.message : 'Could not start collaboration.');
     }
   };
 
   const hostCollab = async () => {
-    if (!editorRef.current?.getModel()) {
-      notify('Open a text file before starting collaboration.');
+    if (!editorRef.current?.getModel() || !activeTabPath || !isProjectTextPath(activeTabPath)) {
+      notify('Open a text file before sharing the project.');
       return;
     }
     const protocol = await import('./collabProtocol');
@@ -3735,8 +3964,8 @@ export default function App() {
     const configured = configuredCollabServer();
     const suggested = configured || urls.find(url => !url.includes('127.0.0.1')) || urls[0] || '';
     setInputModal({
-      title: 'Host an encrypted collaboration',
-      submitLabel: 'Start & Copy Invite',
+      title: 'Share this project live',
+      submitLabel: 'Share Project & Copy Invite',
       fields: [
         {
           key: 'server',
@@ -3769,8 +3998,8 @@ export default function App() {
 
   const joinCollab = () => {
     setInputModal({
-      title: 'Join an encrypted collaboration',
-      submitLabel: 'Join',
+      title: 'Join a shared project',
+      submitLabel: 'Choose Folder & Join',
       fields: [
         {
           key: 'ticket',
@@ -3794,31 +4023,41 @@ export default function App() {
         }
         const name = (values.name || '').trim().slice(0, 48);
         if (name) localStorage.setItem('collab_name', name);
+        if (!await chooseJoinWorkspace()) return;
         await beginCollab(invite, 'join');
       },
     });
   };
 
   const stopCollab = () => {
-    collabRef.current?.stop();
-    collabRef.current = null;
-    setCollab(null);
-    notify('Left the collaboration session.', 'info');
+    disposeProjectSession(true);
   };
 
   useEffect(() => () => {
+    projectSessionRef.current?.sync.stop();
+    projectSessionRef.current?.transfer.close();
+    projectSessionRef.current?.channel.close();
+    projectSessionRef.current?.cleanup();
     collabRef.current?.stop();
-    collabRef.current = null;
   }, []);
 
   useEffect(() => {
-    const sharedFile = collab?.file;
-    if (!sharedFile || sharedFile === activeTabPath) return;
-    collabRef.current?.stop();
-    collabRef.current = null;
-    setCollab(null);
-    notify(`Left collaboration on ${sharedFile} after switching files.`, 'info');
-  }, [activeTabPath, collab?.file]);
+    const handle = collabRef.current;
+    const sync = projectSessionRef.current?.sync;
+    if (!handle || !sync) return;
+    sync.setOpenPath(activeTabPath || null);
+    const editor = editorRef.current;
+    if (!editor || !activeTabPath || !isProjectTextPath(activeTabPath)) {
+      handle.bindFile(null);
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      const currentEditor = editorRef.current;
+      const currentModel = currentEditor?.getModel();
+      if (currentEditor && currentModel) handle.bindFile(activeTabPath, currentModel, currentEditor);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeTabPath, collab?.room]);
 
   const copyToClipboard = (text: string) => navigator.clipboard.writeText(text);
   const collectDirPaths = (nodes: FileNode[], acc: string[] = []): string[] => {
@@ -3902,8 +4141,8 @@ export default function App() {
     { category: 'Edit', title: 'Toggle Equation Numbering (all)', run: toggleEquationNumbering },
     { category: 'Edit', title: 'Document Settings...', run: () => setShowEditSettings(true) },
     { category: 'File', title: 'New Window', run: openNewWindow },
-    { category: 'Collaborate', title: 'Host an encrypted live session…', run: hostCollab },
-    { category: 'Collaborate', title: 'Join an encrypted live session…', run: joinCollab },
+    { category: 'Collaborate', title: 'Share this project live…', run: hostCollab },
+    { category: 'Collaborate', title: 'Join a shared project…', run: joinCollab },
     { category: 'Collaborate', title: 'Set optional collaboration server…', run: () => setInputModal({
       title: 'Optional collaboration server',
       submitLabel: 'Save',
@@ -3938,7 +4177,7 @@ export default function App() {
         .then(() => notify('Collaboration invitation copied.', 'success'))
         .catch(() => notify('Could not copy the collaboration invitation.')),
     }] : []),
-    ...(collab ? [{ category: 'Collaborate', title: 'Leave the session', run: stopCollab }] : []),
+    ...(collab ? [{ category: 'Collaborate', title: 'Leave the shared project', run: stopCollab }] : []),
     { category: 'View', title: 'Toggle Sidebar', run: toggleSidebar },
     ...(Object.keys(PANEL_LABELS) as PanelKey[]).map(key => ({
       category: 'View', title: `Show / Hide ${PANEL_LABELS[key]}`, run: () => togglePanel(key),
@@ -4361,12 +4600,14 @@ export default function App() {
                 color: collab.status === 'connected' || collab.status === 'synced' ? '#34d399' : '#f59e0b',
                 borderColor: collab.status === 'connected' || collab.status === 'synced' ? '#34d399' : '#f59e0b',
               }}
-              title={`End-to-end encrypted collaboration on ${collab.file} (${collab.peers} here, ${collab.status}). Click to leave.`}
+              title={`End-to-end encrypted shared project (${collab.peers} here, ${collab.status}${collab.transferring ? `, receiving ${collab.transferring} asset(s)` : ''}). Click to leave.`}
             >
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M23 21v-2a4 4 0 0 0-3-3.87" /><path d="M16 3.13a4 4 0 0 1 0 7.75" />
               </svg>
-              <span style={{ marginLeft: 4, fontSize: '0.7rem', fontWeight: 700 }}>{collab.peers}</span>
+              <span style={{ marginLeft: 4, fontSize: '0.7rem', fontWeight: 700 }}>
+                {collab.transferring ? 'receiving…' : collab.peers}
+              </span>
             </button>
           )}
           {PROOFREAD_FEATURE_ENABLED && proof.available && (
@@ -4714,7 +4955,7 @@ export default function App() {
                 // vector SVG (and SVGs often report no pixel size, breaking crop).
                 // So the editor is raster-only; SVG gets a plain preview.
                 const RASTER_EXT = ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif'];
-                const rawSrc = `${API}/workspace/raw?path=${encodeURIComponent(activeTabPath)}&v=${tabs.find(t => t.path === activeTabPath)?.content.length || 0}`;
+                const rawSrc = `${API}/workspace/raw?path=${encodeURIComponent(activeTabPath)}&v=${tabs.find(t => t.path === activeTabPath)?.binaryRevision || 0}`;
                 if (RASTER_EXT.includes(ext)) {
                   return (
                     <Suspense fallback={null}><ImageEditor
@@ -4722,8 +4963,10 @@ export default function App() {
                       initialSrc={rawSrc}
                       onSave={async (buf) => {
                          await fetch(`${API}/workspace/upload?path=${encodeURIComponent(activeTabPath)}`, { method: 'POST', body: buf, headers: { 'Content-Type': 'application/octet-stream' } });
-                         // Hack to trigger a reload of the image: update the tab's "content" string length which we use as a version cache-buster
-                         setTabs(prev => prev.map(t => t.path === activeTabPath ? { ...t, content: t.content + ' ' } : t));
+                         await mirrorLocalPath(activeTabPath);
+                         setTabs(prev => prev.map(t => t.path === activeTabPath
+                           ? { ...t, binaryRevision: (t.binaryRevision ?? 0) + 1 }
+                           : t));
                       }}
                     /></Suspense>
                   );
@@ -4763,11 +5006,13 @@ export default function App() {
                       onSave={async (jsonContent, svgBlob) => {
                         // Save the .excalidraw file
                         await fetch(`${API}/workspace/file?path=${encodeURIComponent(activeTabPath)}`, { method: 'POST', body: jsonContent });
+                        await mirrorLocalPath(activeTabPath);
                         setTabs(prev => prev.map(t => t.path === activeTabPath ? { ...t, content: jsonContent, isDirty: false } : t));
 
                         // Automatically save the .svg file next to it for embedding in Typst!
                         const svgPath = activeTabPath.replace(/\.excalidraw$/, '.svg');
                         await fetch(`${API}/workspace/upload?path=${encodeURIComponent(svgPath)}`, { method: 'POST', body: svgBlob, headers: { 'Content-Type': 'application/octet-stream' } });
+                        await mirrorLocalPath(svgPath);
                         fetchTree(); // Refresh tree so the SVG appears
                       }}
                     /></Suspense>
@@ -5006,7 +5251,11 @@ export default function App() {
       }} />}
       {showTemplateInstaller && <TemplateInstaller onClose={() => setShowTemplateInstaller(false)} onInsert={handleInitTemplate} onUseBuiltin={handleUseBuiltin} />}
       {showDiagramBuilder && <Suspense fallback={null}><DiagramBuilder onClose={() => setShowDiagramBuilder(false)} onInsert={(code) => { insertCode(code); setShowDiagramBuilder(false); }}
-        onSaveFile={async (filename, content) => { await fetch(`${API}/workspace/file?path=${encodeURIComponent(filename)}`, { method: 'POST', body: content, headers: { 'Content-Type': 'text/plain' } }); await fetchTree(); }} /></Suspense>}
+        onSaveFile={async (filename, content) => {
+          await fetch(`${API}/workspace/file?path=${encodeURIComponent(filename)}`, { method: 'POST', body: content, headers: { 'Content-Type': 'text/plain' } });
+          await mirrorLocalPath(filename, content, true);
+          await fetchTree();
+        }} /></Suspense>}
       {showSlideStudio && <Boundary name="Slide Studio" onClose={() => { slideCaptureRef.current = null; setShowSlideStudio(false); }}><Suspense fallback={null}><SlideStudio
         onClose={() => setShowSlideStudio(false)}
         existing={slideDeckToken}
@@ -5030,7 +5279,7 @@ export default function App() {
       {showHelp && <Suspense fallback={null}><HelpModal onClose={() => setShowHelp(false)} /></Suspense>}
       {showMatrixStudio && <Suspense fallback={null}><MatrixStudio onClose={() => setShowMatrixStudio(false)} onInsert={insertMatrixBody} /></Suspense>}
       {showImagePlacer && <Suspense fallback={null}><ImagePlacer onClose={() => setShowImagePlacer(false)} onEnsureImport={(imp) => { const m = editorRef.current?.getModel(); if (m && !m.getValue().includes(imp.trim())) insertAtTop(imp); }} onInsert={(code) => { if (typeof showImagePlacer === 'string') { const { editor, model, sel } = getSelectionCtx(''); if (sel && editor && model && !sel.isEmpty()) { editor.executeEdits('re-place', [{ range: sel, text: code, forceMoveMarkers: true }]); editor.focus(); } else insertCode(code); } else insertCode(code); fetchTree(); }} workspaceImages={workspaceImages} selectedCode={typeof showImagePlacer === 'string' ? showImagePlacer : undefined} /></Suspense>}
-      {showFlowchart && <Suspense fallback={null}><FlowchartCoder onClose={() => setShowFlowchart(false)} onInsert={(code) => { if (code.includes('fc-result(')) ensureSetup('#let fc-result', '#let fc-result(v) = box(inset: (x: 9pt, y: 6pt), radius: 6pt, fill: rgb(238, 242, 255), stroke: 0.6pt + rgb(165, 180, 252))[*Result:* #v]'); insertCode(`\n${code}\n`); setShowFlowchart(false); }} /></Suspense>}
+      {showFlowchart && <Suspense fallback={null}><FlowchartCoder onClose={() => setShowFlowchart(false)} onInsert={(code) => { if (code.includes('fc-result(')) ensureSetup('#let fc-result', '#let fc-result(v) = box(inset: (x: 9pt, y: 6pt), radius: 6pt, fill: rgb(238, 242, 255), stroke: 0.6pt + rgb(165, 180, 252))[*Result:* #v]'); insertCode(`\n${code}\n`); setShowFlowchart(false); }} onSaved={(path) => { void mirrorLocalPath(path); void fetchTree(); }} /></Suspense>}
       {showAbout && (
         <div className="modal-overlay" onClick={() => setShowAbout(false)}>
           <div className="modal-content about-modal" onClick={e => e.stopPropagation()}>
@@ -5097,14 +5346,14 @@ export default function App() {
           </div>
         </div>
       )}
-      {codeRunner && <Boundary name="Code Runner" onClose={() => setCodeRunner(null)}><Suspense fallback={null}><CodeRunnerModal {...codeRunner} onClose={() => setCodeRunner(null)} onInsert={(code) => { insertCode(code); setCodeRunner(null); }} onInsertEquation={(latex, codeBlock) => { insertEquationFromLatex(latex, codeBlock); setCodeRunner(null); }} onChanged={fetchTree} /></Suspense></Boundary>}
+      {codeRunner && <Boundary name="Code Runner" onClose={() => setCodeRunner(null)}><Suspense fallback={null}><CodeRunnerModal {...codeRunner} onClose={() => setCodeRunner(null)} onInsert={(code) => { insertCode(code); setCodeRunner(null); }} onInsertEquation={(latex, codeBlock) => { insertEquationFromLatex(latex, codeBlock); setCodeRunner(null); }} onChanged={(paths) => { void fetchTree(); for (const path of paths || []) void mirrorLocalPath(path); }} /></Suspense></Boundary>}
       {showSaveAs && activeTab && <Suspense fallback={null}><SaveAsModal onClose={() => setShowSaveAs(false)} fileName={activeTabPath} content={activeTab.content} pdfUrl={pdfUrl} projectName={projectName} mainFile={currentMain} /></Suspense>}
       {showHtmlPreview && <Suspense fallback={null}><HtmlPreviewModal mainFile={currentMain} onClose={() => setShowHtmlPreview(false)} /></Suspense>}
-      {showPlot3D && <Boundary name="3D Plot Studio" onClose={() => setShowPlot3D(false)}><Suspense fallback={null}><Plot3DStudio onClose={() => setShowPlot3D(false)} onInsert={(code) => { insertCode(code); setShowPlot3D(false); fetchTree(); }} /></Suspense></Boundary>}
+      {showPlot3D && <Boundary name="3D Plot Studio" onClose={() => setShowPlot3D(false)}><Suspense fallback={null}><Plot3DStudio onClose={() => setShowPlot3D(false)} onInsert={(code) => { insertCode(code); setShowPlot3D(false); fetchTree(); }} onSaved={(path) => { void mirrorLocalPath(path); void fetchTree(); }} /></Suspense></Boundary>}
       {showPlotStudio && <Boundary name="Plot Studio" onClose={() => setShowPlotStudio(false)}><Suspense fallback={null}><PlotStudio onClose={() => setShowPlotStudio(false)} onInsert={(code) => insertCode(code)} onEnsureSetup={ensureSetup} onOpenInteractive={() => setShowPlot3D(true)} onOpenPython={() => setCodeRunner({ initialLang: 'python', initialCode: SURFACE_3D_TEMPLATE })} /></Suspense></Boundary>}
       {showSymbolDraw && <Suspense fallback={null}><SymbolDraw onClose={() => setShowSymbolDraw(false)} onInsert={(name) => { insertCode(name + ' '); setShowSymbolDraw(false); }} /></Suspense>}
       {showRefManager && activeTab && <Suspense fallback={null}><RefManager content={activeTab.content} onClose={() => setShowRefManager(false)} onJump={jumpToLine} onInsertRef={(name) => insertCode(`@${name}`)} /></Suspense>}
-      {showBibManager && <Suspense fallback={null}><BibManager onClose={() => setShowBibManager(false)} onCite={(key) => { insertCode(`@${key}`); ensureBibliography(); }} onEnsureBib={ensureBibliography} onChanged={fetchTree} /></Suspense>}
+      {showBibManager && <Suspense fallback={null}><BibManager onClose={() => setShowBibManager(false)} onCite={(key) => { insertCode(`@${key}`); ensureBibliography(); }} onEnsureBib={ensureBibliography} onChanged={(paths) => { void fetchTree(); for (const path of paths || []) void mirrorLocalPath(path); }} /></Suspense>}
       
       {showHistoryModal && (
         <div className="modal-overlay" onClick={() => setShowHistoryModal(false)}>
@@ -5142,7 +5391,12 @@ export default function App() {
               <div className="dropdown-divider"></div>
               <div className="dropdown-item" onClick={async () => {
                 if (!fileClipboard) return;
-                await fetch(`${API}/workspace/${fileClipboard.type === 'cut' ? 'rename' : 'copy'}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: fileClipboard.path, to: fileClipboard.path.split('/').pop() }) });
+                const to = fileClipboard.path.split('/').pop();
+                const response = await fetch(`${API}/workspace/${fileClipboard.type === 'cut' ? 'rename' : 'copy'}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: fileClipboard.path, to }) });
+                if (response.ok && to) {
+                  if (fileClipboard.type === 'cut') await mirrorLocalRename(fileClipboard.path, to);
+                  else await mirrorLocalCopy(fileClipboard.path, to);
+                }
                 fetchTree(); setContextMenu(null);
               }}>Paste</div>
               <div className="dropdown-divider"></div>
@@ -5184,7 +5438,11 @@ export default function App() {
                 if (!fileClipboard) return;
                 const dir = contextMenu.node!.type === 'directory' ? contextMenu.node!.path : (contextMenu.node!.path.includes('/') ? contextMenu.node!.path.substring(0, contextMenu.node!.path.lastIndexOf('/')) : '');
                 const toPath = dir ? `${dir}/${fileClipboard.path.split('/').pop()}` : fileClipboard.path.split('/').pop();
-                await fetch(`${API}/workspace/${fileClipboard.type === 'cut' ? 'rename' : 'copy'}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: fileClipboard.path, to: toPath }) });
+                const response = await fetch(`${API}/workspace/${fileClipboard.type === 'cut' ? 'rename' : 'copy'}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: fileClipboard.path, to: toPath }) });
+                if (response.ok && toPath) {
+                  if (fileClipboard.type === 'cut') await mirrorLocalRename(fileClipboard.path, toPath);
+                  else await mirrorLocalCopy(fileClipboard.path, toPath);
+                }
                 fetchTree(); setContextMenu(null);
               }}>Paste</div>
               <div className="dropdown-divider"></div>
@@ -5198,7 +5456,8 @@ export default function App() {
                   onSubmit: async (v) => {
                     const name = (v.name || '').trim();
                     if (!name) return;
-                    await fetch(`${API}/workspace/compress`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths, archiveName: name }) });
+                    const response = await fetch(`${API}/workspace/compress`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths, archiveName: name }) });
+                    if (response.ok) await mirrorLocalPath(name);
                     fetchTree();
                   },
                 });
@@ -5206,7 +5465,10 @@ export default function App() {
               <div className="dropdown-divider"></div>
               <div className="dropdown-item" style={{ color: '#ef4444' }} onClick={async () => {
                 if (!await confirmDialog(`Delete ${selectedPaths.length} items?`, { danger: true, confirmLabel: 'Delete' })) return;
-                for (const p of selectedPaths) await fetch(`${API}/workspace/file?path=${encodeURIComponent(p)}`, { method: 'DELETE' });
+                for (const p of selectedPaths) {
+                  const response = await fetch(`${API}/workspace/file?path=${encodeURIComponent(p)}`, { method: 'DELETE' });
+                  if (response.ok) mirrorLocalDelete(p);
+                }
                 setSelectedPaths([]); fetchTree(); setContextMenu(null);
               }}>Delete {selectedPaths.length > 1 ? `(${selectedPaths.length})` : ''}</div>
               <div className="dropdown-divider"></div>

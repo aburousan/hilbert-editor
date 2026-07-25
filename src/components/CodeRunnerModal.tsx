@@ -95,7 +95,7 @@ const EQ_TEMPLATES: Record<Lang, { label: string; code: string }[]> = {
   ],
 };
 
-export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, onChanged, initialLang, initialCode, initialMode }: { onClose: () => void, onInsert: (code: string) => void, onInsertEquation?: (latex: string, codeBlock?: string) => void, onChanged?: () => void, initialLang?: Lang, initialCode?: string, initialMode?: 'text' | 'equation' }) {
+export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, onChanged, initialLang, initialCode, initialMode }: { onClose: () => void, onInsert: (code: string) => void, onInsertEquation?: (latex: string, codeBlock?: string) => void, onChanged?: (paths?: string[]) => void, initialLang?: Lang, initialCode?: string, initialMode?: 'text' | 'equation' }) {
   const [tools, setTools] = useState<Tools | null>(null);
   const [lang, setLang] = useState<Lang>(initialLang ?? 'python');
   const [bin, setBin] = useState<string>('');
@@ -142,7 +142,7 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
     try {
       await fetch(`${API}/workspace/file?path=${encodeURIComponent(path)}`, { method: 'POST', body: code, headers: { 'Content-Type': 'text/plain' } });
       setSavedPath(path);
-      onChanged?.();
+      onChanged?.([path]);
     } catch { /* saving is best-effort; a run should still proceed offline */ }
     try {
       const res = await fetch(`${API}/run`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lang, code, bin, outputMode }) });
@@ -172,7 +172,7 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
     let ref = img;
     try {
       const r = await fetch(`${API}/workspace/copy`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: img, to: dest }) });
-      if (r.ok) { ref = dest; onChanged?.(); }
+      if (r.ok) { ref = dest; onChanged?.([dest]); }
     } catch { /* fall back to sandbox path */ }
     let out = '\n';
     if (includeCode) out += codeBlock() + '\n';

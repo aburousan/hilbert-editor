@@ -9,6 +9,7 @@ import {
   makeCollabTicket,
   type CollabInvite,
 } from './collabProtocol';
+import { WorkspaceModel } from './workspaceSync';
 
 export type { CollabInvite } from './collabProtocol';
 export {
@@ -25,6 +26,8 @@ export type CollabHandle = {
   url: string;
   room: string;
   ticket: string;
+  workspace: WorkspaceModel;
+  bindFile: (path: string | null, model?: any, editor?: any) => void;
   stop: () => void;
   onPeers: (callback: (count: number) => void) => void;
   onStatus: (callback: (status: CollabStatus) => void) => void;
@@ -35,16 +38,19 @@ export type CollabHandle = {
 export function startCollab(opts: {
   invite: CollabInvite;
   mode: 'host' | 'join';
-  model: any;
-  editor: any;
   user: CollabUser;
-  seedContent?: string;
+  initialFile?: {
+    path: string;
+    model: any;
+    editor: any;
+    content: string;
+  };
   timeoutMs?: number;
 }): CollabHandle {
   const ydoc = new Y.Doc();
-  const ytext = ydoc.getText('content');
-  if (opts.mode === 'host') {
-    ydoc.transact(() => ytext.insert(0, opts.seedContent ?? ''));
+  const workspace = new WorkspaceModel(ydoc);
+  if (opts.mode === 'host' && opts.initialFile) {
+    workspace.setText(opts.initialFile.path, opts.initialFile.content);
   }
 
   const base = opts.invite.url.replace(/\/+$/, '') + '/collab';
@@ -64,6 +70,9 @@ export function startCollab(opts: {
   provider.awareness.setLocalStateField('user', opts.user);
 
   let binding: MonacoBinding | null = null;
+  let bindingTarget: { path: string; model: any; editor: any } | null = opts.initialFile
+    ? { path: opts.initialFile.path, model: opts.initialFile.model, editor: opts.initialFile.editor }
+    : null;
   let stopped = false;
   let ready = false;
   let errorMessage = '';
@@ -77,8 +86,10 @@ export function startCollab(opts: {
   document.head.appendChild(style);
 
   const attachBinding = () => {
-    if (binding || stopped) return;
-    binding = new MonacoBinding(ytext, opts.model, new Set([opts.editor]), provider.awareness);
+    if (!bindingTarget || stopped || (opts.mode === 'join' && !ready)) return;
+    binding?.destroy();
+    const { path, model, editor } = bindingTarget;
+    binding = new MonacoBinding(workspace.textOf(path), model, new Set([editor]), provider.awareness);
   };
 
   // A host owns the initial document and can bind immediately. A joiner must
@@ -157,9 +168,11 @@ export function startCollab(opts: {
   };
   const onSync = (synced: boolean) => {
     if (!synced || stopped || opts.mode !== 'join') return;
+    // Mark the joiner ready before attaching: attachBinding deliberately
+    // refuses to bind an empty pre-sync document.
+    emitReady();
     attachBinding();
     emitStatus('synced');
-    emitReady();
   };
   const onConnectionError = () => {
     if (!stopped && currentStatus !== 'connecting') emitStatus('connecting');
@@ -208,6 +221,17 @@ export function startCollab(opts: {
     url: opts.invite.url,
     room: opts.invite.room,
     ticket: makeCollabTicket(opts.invite.url, opts.invite.room, opts.invite.key),
+    workspace,
+    bindFile: (path, model, editor) => {
+      if (!path || !model || !editor) {
+        bindingTarget = null;
+        binding?.destroy();
+        binding = null;
+        return;
+      }
+      bindingTarget = { path, model, editor };
+      attachBinding();
+    },
     stop: () => dispose(true),
     onPeers: callback => {
       peersCallback = callback;

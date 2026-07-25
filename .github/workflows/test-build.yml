@@ -1,0 +1,87 @@
+name: Test build (no publish)
+
+# Builds installable bundles for every desktop platform and uploads them as
+# workflow artifacts only. It never creates or touches a release, so the live
+# release is untouched and nothing is published — the artifacts are meant to be
+# downloaded from the run page and handed to testers directly.
+#
+# Tauri compiles native code against each OS's system webview, so each target
+# builds on its own runner (no cross-compiling, except Intel macOS from Apple
+# Silicon, which Apple's toolchain supports).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ live-project-sync ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            args: ""
+            rust_target: ""
+            name: linux-x86_64
+          - os: macos-14
+            args: "--target aarch64-apple-darwin"
+            rust_target: "aarch64-apple-darwin"
+            name: macos-arm64
+          - os: macos-14
+            args: "--target x86_64-apple-darwin"
+            rust_target: "x86_64-apple-darwin"
+            name: macos-intel
+          - os: windows-latest
+            args: ""
+            rust_target: ""
+            name: windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf libgtk-3-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # No tagName/releaseName: tauri-action only builds and bundles, it creates
+      # no release. The signing key is still supplied so the updater artifacts
+      # (createUpdaterArtifacts) sign cleanly; they are simply collected below
+      # rather than uploaded anywhere public.
+      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        with:
+          projectPath: .
+          args: ${{ matrix.args }}
+
+      - name: Collect installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: hilbert-${{ matrix.name }}
+          path: |
+            src-tauri/target/release/bundle/**
+            src-tauri/target/*/release/bundle/**
+          if-no-files-found: error
+          retention-days: 14

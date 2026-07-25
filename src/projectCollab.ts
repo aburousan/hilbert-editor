@@ -1,0 +1,274 @@
+// Orchestrates whole-project collaboration by joining three pieces: the shared
+// Yjs model (file tree + text), the out-of-band binary transfer, and the local
+// workspace on disk. It is deliberately transport- and filesystem-agnostic:
+// callers inject a ProjectFs (the workspace endpoints in the app, an in-memory
+// map in tests) and hand it a model already syncing over some provider and a
+// transfer already bound to a channel. That keeps the whole sync flow testable
+// end to end without a network or a running editor.
+import { WorkspaceModel, normalizeWorkspacePath, type WorkspaceChange } from './workspaceSync';
+import { BinaryTransfer } from './binaryTransfer';
+import { isProjectTextPath } from './projectFileTypes';
+
+export { BinaryTransfer } from './binaryTransfer';
+
+export interface ProjectFs {
+  list(): Promise<Array<{ path: string }>>;
+  readText(path: string): Promise<string>;
+  readBinary(path: string): Promise<Uint8Array>;
+  writeText(path: string, content: string): Promise<void>;
+  writeBinary(path: string, bytes: Uint8Array): Promise<void>;
+  remove(path: string): Promise<void>;
+}
+
+// A private origin tag for every model edit this orchestrator makes locally, so
+// its own observe handler can tell those apart from edits arriving over the
+// network and avoid writing them straight back to disk.
+const LOCAL = { local: true };
+
+export type ProjectSyncOptions = {
+  model: WorkspaceModel;
+  transfer: BinaryTransfer;
+  fs: ProjectFs;
+  hashBytes: (bytes: Uint8Array) => Promise<string>;
+  isTextPath?: (path: string) => boolean;
+  onError?: (message: string) => void;
+  onApplied?: (change: WorkspaceChange) => void;
+  onBinaryTransfer?: (pending: number, path: string | null) => void;
+};
+
+export class ProjectSync {
+  private readonly model: WorkspaceModel;
+  private readonly transfer: BinaryTransfer;
+  private readonly fs: ProjectFs;
+  private readonly hashBytes: (bytes: Uint8Array) => Promise<string>;
+  private readonly isText: (path: string) => boolean;
+  private readonly onError: (message: string) => void;
+  private readonly onApplied: (change: WorkspaceChange) => void;
+  private readonly onBinaryTransfer: (pending: number, path: string | null) => void;
+  // Content hash of each binary we currently hold on disk: skips re-fetching
+  // unchanged bytes and records what we are able to serve to other peers.
+  private readonly diskHash = new Map<string, string>();
+  // More than one path can contain identical bytes. Keep reference sets so
+  // deleting one copy does not withdraw the provider needed for the others.
+  private readonly hashPaths = new Map<string, Set<string>>();
+  private off: (() => void) | null = null;
+  private applyQueue: Promise<void> = Promise.resolve();
+  private pendingBinary = 0;
+  // The file currently open in the editor. Its Y.Text is bound to Monaco, so
+  // remote edits already reach the buffer through that binding and autosave
+  // persists them. ProjectSync must NOT also write this path to disk: the open
+  // file's edits arrive on observe with the binding as origin (not LOCAL), and
+  // writing on every keystroke would race autosave and the external-change
+  // detector. Each peer skips only its OWN open file.
+  private openPath: string | null = null;
+  // Raised while writing a network change to disk, so an app that watches files
+  // does not mistake that write for a local edit and echo it back.
+  applyingRemote = false;
+
+  constructor(opts: ProjectSyncOptions) {
+    this.model = opts.model;
+    this.transfer = opts.transfer;
+    this.fs = opts.fs;
+    this.hashBytes = opts.hashBytes;
+    this.isText = opts.isTextPath ?? isProjectTextPath;
+    this.onError = opts.onError ?? (() => {});
+    this.onApplied = opts.onApplied ?? (() => {});
+    this.onBinaryTransfer = opts.onBinaryTransfer ?? (() => {});
+  }
+
+  private get doc() { return this.model.doc; }
+
+  // React to changes arriving over the network. Both host and joiner call this;
+  // each ignores the edits it made itself.
+  start(): void {
+    if (this.off) return;
+    this.off = this.model.observe((changes, origin) => {
+      if (origin === LOCAL) return;
+      void this.enqueueApply(changes);
+    });
+  }
+
+  stop(): void {
+    this.off?.();
+    this.off = null;
+  }
+
+  // Tell the sync which file is open in the editor so it leaves that file's disk
+  // state to the Monaco binding and autosave. Call on session start and on every
+  // file switch. Pass null when no file is focused.
+  setOpenPath(path: string | null): void {
+    this.openPath = path ? normalizeWorkspacePath(path) : null;
+  }
+
+  // Populate a newly selected empty workspace from the model already received
+  // during the Yjs handshake. Later model changes share the same serialized
+  // queue, so an edit arriving during the import cannot race an older write.
+  applyWorkspace(): Promise<void> {
+    const changes: WorkspaceChange[] = this.model.list().map(meta => ({
+      path: meta.path,
+      meta,
+      type: 'upserted',
+    }));
+    return this.enqueueApply(changes);
+  }
+
+  // Host action: put the entire current workspace into the shared model so a
+  // joiner receives it. Text goes into the doc; binaries are advertised by hash
+  // and offered for fetch.
+  async publishWorkspace(): Promise<void> {
+    const files = await this.fs.list();
+    for (const { path } of files) {
+      const key = normalizeWorkspacePath(path);
+      if (!key) continue;
+      try {
+        if (this.isText(key)) {
+          if (this.openPath === key && this.model.metaOf(key)?.kind === 'text') continue;
+          const content = await this.fs.readText(key);
+          this.doc.transact(() => this.model.setText(key, content), LOCAL);
+        } else {
+          await this.mirrorLocalBinary(key);
+        }
+      } catch (e) {
+        this.onError(`Could not share ${key}: ${errText(e)}`);
+      }
+    }
+  }
+
+  // ---- local edit hooks, called by the app when the user changes something ----
+
+  // A text file changed on disk (a non-focused file; the open editor merges
+  // through its own Monaco binding and must not also be pushed here).
+  onLocalText(path: string, content: string): void {
+    if (this.applyingRemote) return;
+    const key = normalizeWorkspacePath(path);
+    if (!key) return;
+    this.doc.transact(() => this.model.setText(key, content), LOCAL);
+  }
+
+  // A binary file was added or replaced on disk.
+  async onLocalBinary(path: string): Promise<void> {
+    if (this.applyingRemote) return;
+    const key = normalizeWorkspacePath(path);
+    if (!key) return;
+    try {
+      await this.mirrorLocalBinary(key);
+    } catch (e) {
+      this.onError(`Could not share ${key}: ${errText(e)}`);
+    }
+  }
+
+  // A file was deleted on disk.
+  onLocalRemove(path: string): void {
+    if (this.applyingRemote) return;
+    const key = normalizeWorkspacePath(path);
+    if (!key) return;
+    this.unregisterBinary(key);
+    this.doc.transact(() => this.model.remove(key), LOCAL);
+  }
+
+  private async mirrorLocalBinary(key: string): Promise<void> {
+    const bytes = await this.fs.readBinary(key);
+    const hash = await this.hashBytes(bytes);
+    if (this.diskHash.get(key) === hash) return;   // unchanged
+    this.registerBinary(key, hash);
+    this.doc.transact(() => this.model.setBinary(key, hash, bytes.length), LOCAL);
+  }
+
+  private async applyRemote(changes: WorkspaceChange[]): Promise<void> {
+    for (const change of changes) {
+      try {
+        await this.applyOne(change);
+      } catch (e) {
+        this.onError(`Could not apply ${change.path}: ${errText(e)}`);
+      }
+    }
+  }
+
+  private enqueueApply(changes: WorkspaceChange[]): Promise<void> {
+    const run = this.applyQueue.then(() => this.applyRemote(changes));
+    this.applyQueue = run.catch(() => {});
+    return run;
+  }
+
+  private async applyOne(change: WorkspaceChange): Promise<void> {
+    const { path, meta, type } = change;
+    if (type === 'removed') {
+      this.unregisterBinary(path);
+      this.applyingRemote = true;
+      try { await this.fs.remove(path); } finally { this.applyingRemote = false; }
+      this.onApplied(change);
+      return;
+    }
+    if (meta.kind === 'text') {
+      // The open file is owned by the Monaco binding + autosave; skip it here.
+      if (this.openPath && path === this.openPath) return;
+      const content = this.model.readText(path);
+      if (content == null) return;
+      this.applyingRemote = true;
+      try { await this.fs.writeText(path, content); } finally { this.applyingRemote = false; }
+      this.onApplied(change);
+      return;
+    }
+    // Binary: fetch the bytes by hash unless we already hold that exact content.
+    const hash = meta.hash;
+    if (!hash) return;
+    if (this.diskHash.get(path) === hash) return;
+    this.pendingBinary++;
+    this.onBinaryTransfer(this.pendingBinary, path);
+    let bytes: Uint8Array;
+    try {
+      bytes = await this.transfer.request(hash, meta.size ?? 0);
+    } finally {
+      this.pendingBinary = Math.max(0, this.pendingBinary - 1);
+      this.onBinaryTransfer(this.pendingBinary, this.pendingBinary ? path : null);
+    }
+    this.applyingRemote = true;
+    try { await this.fs.writeBinary(path, bytes); } finally { this.applyingRemote = false; }
+    // Now that we hold it, offer to serve it onward to other peers.
+    this.registerBinary(path, hash);
+    this.onApplied(change);
+  }
+
+  private registerBinary(path: string, hash: string): void {
+    const previous = this.diskHash.get(path);
+    if (previous && previous !== hash) this.unregisterBinary(path);
+    this.diskHash.set(path, hash);
+    let paths = this.hashPaths.get(hash);
+    if (!paths) {
+      paths = new Set();
+      this.hashPaths.set(hash, paths);
+    }
+    paths.add(path);
+    // Resolve a live path at request time rather than capturing whichever copy
+    // happened to register first.
+    this.transfer.provide(hash, async () => {
+      const current = this.hashPaths.get(hash);
+      if (!current?.size) throw new Error('Binary content is no longer available');
+      let lastError: unknown = null;
+      for (const candidate of current) {
+        try {
+          return await this.fs.readBinary(candidate);
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      throw lastError ?? new Error('Binary content is no longer available');
+    });
+  }
+
+  private unregisterBinary(path: string): void {
+    const hash = this.diskHash.get(path);
+    if (!hash) return;
+    this.diskHash.delete(path);
+    const paths = this.hashPaths.get(hash);
+    paths?.delete(path);
+    if (!paths?.size) {
+      this.hashPaths.delete(hash);
+      this.transfer.unprovide(hash);
+    }
+  }
+}
+
+function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}

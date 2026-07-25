@@ -12,7 +12,7 @@ function toJs(expr: string): string {
 
 import { API } from '../api';
 
-export default function Plot3DStudio({ onClose, onInsert }: { onClose: () => void, onInsert: (code: string) => void }) {
+export default function Plot3DStudio({ onClose, onInsert, onSaved }: { onClose: () => void, onInsert: (code: string) => void, onSaved?: (path: string) => void }) {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -180,6 +180,7 @@ export default function Plot3DStudio({ onClose, onInsert }: { onClose: () => voi
         body: JSON.stringify({ path: name, dataUrl })
       });
       if (!res.ok) { setErr('Could not save the image to the workspace.'); setSaving(false); return; }
+      onSaved?.(name);
       const caption = expr.replace(/np\./g, '').replace(/\*\*/g, '^');
       onInsert(`\n#figure(\n  image("${name}", width: 80%),\n  caption: [3D surface: $z = ${caption}$],\n)\n\n`);
     } catch {

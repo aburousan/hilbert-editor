@@ -37,7 +37,7 @@ export default function BibManager({ onClose, onCite, onEnsureBib, onChanged }: 
   onClose: () => void;
   onCite: (key: string) => void;
   onEnsureBib: () => void;
-  onChanged?: () => void;
+  onChanged?: (paths?: string[]) => void;
 }) {
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(false);
@@ -82,7 +82,7 @@ export default function BibManager({ onClose, onCite, onEnsureBib, onChanged }: 
       await fetch(`${API}/workspace/file?path=${BIB}`, { method: 'POST', body: next, headers: { 'Content-Type': 'text/plain' } });
       onEnsureBib();
       await loadBib();
-      onChanged?.();
+      onChanged?.([BIB]);
       setSavedMsg(`Added "${draft.key}" to ${BIB}.`);
       setDraft(null); setQuery('');
     } catch { setError('Could not write refs.bib.'); }
@@ -146,7 +146,7 @@ export default function BibManager({ onClose, onCite, onEnsureBib, onChanged }: 
       if (!ex.ok) { setError(readErr(bib, 'Zotero export failed.')); return; }
       await mergeIntoBib(bib);
       await loadBib();
-      onChanged?.();
+      onChanged?.([BIB]);
       onCite(keys.map(sanitizeKey).join(' @'));
       onClose();
     } catch { setError('Zotero pick failed.'); } finally { setZBusy(''); }
@@ -160,7 +160,7 @@ export default function BibManager({ onClose, onCite, onEnsureBib, onChanged }: 
       if (!r.ok) { setError(readErr(text, 'Library export failed.')); return; }
       const { added, total } = await mergeIntoBib(text);
       await loadBib();
-      onChanged?.();
+      onChanged?.([BIB]);
       if (added) onEnsureBib();
       setSavedMsg(added
         ? `Imported ${added} new ${added > 1 ? 'entries' : 'entry'} from Zotero (${total} in the library).`
@@ -177,7 +177,7 @@ export default function BibManager({ onClose, onCite, onEnsureBib, onChanged }: 
       const stripped = text.replace(new RegExp(`@\\w+\\s*\\{\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*,[\\s\\S]*?\\n\\}\\s*`, 'g'), '');
       await fetch(`${API}/workspace/file?path=${BIB}`, { method: 'POST', body: stripped, headers: { 'Content-Type': 'text/plain' } });
       await loadBib();
-      onChanged?.();
+      onChanged?.([BIB]);
     } catch { /* ignore */ }
   };
 

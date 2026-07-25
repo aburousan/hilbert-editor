@@ -35,4 +35,64 @@ assert.equal(protocol.parseCollabTicket('hilbert-collab://old-room@ws://10.0.0.1
 assert.equal(protocol.parseCollabTicket(ticket.replace(first.key, 'short')), null);
 assert.throws(() => protocol.encryptedWebSocketClass('short'), /Invalid collaboration key/);
 
+// The Rust relay deliberately caps a WebSocket message at 1 MiB. Large Yjs
+// state syncs are encrypted and fragmented below that ceiling, then rebuilt
+// byte-for-byte before the provider sees them.
+{
+  const nativePackets = [];
+  class LoopbackWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
+    CONNECTING = 0;
+    OPEN = 1;
+    CLOSING = 2;
+    CLOSED = 3;
+    readyState = 0;
+    bufferedAmount = 0;
+    extensions = '';
+    protocol = '';
+    binaryType = 'arraybuffer';
+    onopen = null;
+    onclose = null;
+    onerror = null;
+    onmessage = null;
+    constructor(url) {
+      this.url = String(url);
+      queueMicrotask(() => {
+        this.readyState = 1;
+        this.onopen?.(new Event('open'));
+      });
+    }
+    send(packet) {
+      nativePackets.push(packet);
+      queueMicrotask(() => this.onmessage?.(new MessageEvent('message', { data: packet })));
+    }
+    close() {
+      this.readyState = 3;
+      queueMicrotask(() => this.onclose?.(new Event('close')));
+    }
+  }
+  const originalWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = LoopbackWebSocket;
+  try {
+    const EncryptedSocket = protocol.encryptedWebSocketClass(first.key);
+    const socket = new EncryptedSocket('ws://loopback.test/collab/test');
+    await new Promise(resolve => { socket.onopen = resolve; });
+    const sourceBytes = new Uint8Array(2 * 1024 * 1024 + 777);
+    for (let i = 0; i < sourceBytes.length; i++) sourceBytes[i] = (i * 31 + 17) & 255;
+    const received = new Promise(resolve => { socket.onmessage = event => resolve(new Uint8Array(event.data)); });
+    socket.send(sourceBytes);
+    const roundTrip = await received;
+    assert.deepEqual(roundTrip, sourceBytes);
+    assert.ok(nativePackets.length > 2, 'large frame was not fragmented');
+    assert.ok(nativePackets.every(packet => packet.byteLength < 1024 * 1024),
+      'encrypted fragment exceeded the relay message limit');
+    socket.close();
+  } finally {
+    globalThis.WebSocket = originalWebSocket;
+  }
+}
+
 console.log('collaboration protocol tests passed');

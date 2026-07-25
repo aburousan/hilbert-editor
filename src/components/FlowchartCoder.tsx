@@ -245,8 +245,8 @@ function nearEdge(a: FNode, b: FNode, bend: number | undefined, p: Pt, tol = 9):
   return false;
 }
 
-export default function FlowchartCoder({ onClose, onInsert }: {
-  onClose: () => void, onInsert: (code: string) => void,
+export default function FlowchartCoder({ onClose, onInsert, onSaved }: {
+  onClose: () => void, onInsert: (code: string) => void, onSaved?: (path: string) => void,
 }) {
   // Restore the last diagram so closing/reopening (even after inserting) keeps
   // your work — you can come back and edit it.
@@ -474,6 +474,7 @@ export default function FlowchartCoder({ onClose, onInsert }: {
         const name = `images/flowchart-${Date.now().toString(36)}.png`;
         const res = await fetch(`${API}/workspace/save-image`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: name, dataUrl: png }) });
         if (res.ok) {
+          onSaved?.(name);
           const fig = `\n#figure(\n  image("${name}", width: 70%),\n  caption: [Flowchart],\n)\n\n`;
           onInsert(alsoCode ? `${fig}${code}\n\n` : fig);
         }

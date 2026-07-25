@@ -540,6 +540,17 @@ async fn workspace_root_post(State(st): St, body: Bytes) -> Response {
         Ok(_) => return json_err(StatusCode::BAD_REQUEST, format!("Not a folder: {}", resolved.display())),
         Err(_) => return json_err(StatusCode::BAD_REQUEST, format!("Not a folder: {}", resolved.display())),
     }
+    if v.get("requireEmpty").and_then(Value::as_bool).unwrap_or(false) {
+        let is_empty = fs::read_dir(&resolved)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false);
+        if !is_empty {
+            return json_err(
+                StatusCode::CONFLICT,
+                "Choose a new or empty folder for the incoming shared project.",
+            );
+        }
+    }
     let old_ws = st.ws();
     *st.workspace.write().unwrap_or_else(|e| e.into_inner()) = resolved.clone();
     stop_preview_watcher(&st).await;
@@ -672,7 +683,13 @@ async fn workspace_file_delete(State(st): St, Query(q): Q) -> Response {
         _ => fs::remove_file(&full),
     };
     match res {
-        Ok(_) => "OK".into_response(),
+        Ok(_) => {
+            st.source_generation.fetch_add(1, Ordering::AcqRel);
+            "OK".into_response()
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            text_err(StatusCode::NOT_FOUND, "Not found")
+        }
         Err(_) => text_err(StatusCode::INTERNAL_SERVER_ERROR, "Error"),
     }
 }
@@ -695,7 +712,10 @@ async fn workspace_upload(State(st): St, Query(q): Q, body: Bytes) -> Response {
         let _ = fs::create_dir_all(parent);
     }
     match fs::write(&full, body) {
-        Ok(_) => "OK".into_response(),
+        Ok(_) => {
+            st.source_generation.fetch_add(1, Ordering::AcqRel);
+            "OK".into_response()
+        }
         Err(_) => text_err(StatusCode::INTERNAL_SERVER_ERROR, "Error"),
     }
 }
