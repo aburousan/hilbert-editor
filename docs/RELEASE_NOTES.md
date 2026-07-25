@@ -4,9 +4,10 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
-## 0.1.10
+## 0.1.11
 
-A feature release, plus fixes for things people hit while editing.
+Live collaboration on a whole project, plus fixes in Slide Studio and the cetz
+canvas.
 
 ### Live collaboration (experimental)
 
@@ -14,16 +15,49 @@ Share a whole project — text, images, fonts, whiteboards, and plots your code
 generates — with someone else in real time, with no account and no server that
 anyone runs for you. Everything is encrypted before it leaves your machine; the
 relay only ever sees ciphertext, and each person keeps a real copy on their own
-disk and compiles it locally.
+disk and compiles it locally, so the preview you see is your own Typst build of
+the real document.
+
+Joining asks where to put the project and creates the folder for you. Leave and
+rejoin later and you can pick that same folder again: files the session also has
+are brought up to date, files only you have are shared back, and anything deleted
+while you were away is **listed and you are asked** before a single file on your
+disk is touched.
 
 It is **experimental**: expect the occasional reconnect or a file that lands a few
-seconds late, and keep your own backup of anything important. Nothing on your disk
-is deleted without asking you first.
+seconds late, and keep your own backup of anything important.
 
 **Read [docs/COLLABORATION.md](https://github.com/aburousan/hilbert-editor/blob/main/docs/COLLABORATION.md)
 before your first session** — it covers hosting, joining, rejoining an earlier
 project folder, the three network setups (one router, campus, dedicated relay), and
 troubleshooting.
+
+### Slide Studio
+
+Forward and Backward now work on arrows and curves. They were all drawn into one
+overlay painted above everything else, so a curve always sat on top of every box
+and label no matter how often you pressed the buttons.
+
+Text and maths elements take their own font, suggested from the font files in your
+project plus the ones Typst ships with. It applies per element, so one slide can mix
+families; leaving it blank keeps the deck default.
+
+Generated decks are also tidier to read: the numbering rules are set once at the top
+instead of inside every element, only the pinit helpers actually used are imported,
+and coordinates round to a tenth of a point.
+
+### cetz canvas
+
+Bézier curves have draggable control handles — add a Curve, press **Bend**, and pull
+the two round handles to shape it. The handles are stored relative to the curve, so a
+bent curve keeps its shape when you move or resize it. Inserting a plot from the code
+runner no longer leaves a duplicate copy of the image in the project.
+
+---
+
+## 0.1.10
+
+A feature release, plus fixes for things people hit while editing.
 
 ### Two projects at once
 

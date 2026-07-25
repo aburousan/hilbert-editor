@@ -80,7 +80,7 @@ jobs:
           # user-facing summary and refresh it for every release. The full
           # notes from docs/RELEASE_NOTES.md are pasted in at publish time.
           releaseBody: |
-            A feature release. Experimental live collaboration shares a whole project — text, images, fonts, whiteboards and generated plots — encrypted end to end, with no account and no server anyone runs for you; read docs/COLLABORATION.md before your first session. File → New Window opens a second project as one app with independent windows (one Dock icon). Code intelligence — go to definition, find references, rename, quick fixes, and F2 formatting — comes from tinymist in the Edit and right-click menus. The last good preview stays up even on a first-build error, and the cursor no longer jumps when a file reloads. Also: accessible PDF/A export with a preflight, an experimental HTML Preview, and per-element fonts in Slide Studio.
+            Experimental live collaboration shares a whole project — text, images, fonts, whiteboards and the plots your code generates — encrypted end to end, with no account and no server anyone runs for you. Joining creates the folder for you, and rejoining later picks up where you left off, asking before it removes anything. Read docs/COLLABORATION.md before your first session. In Slide Studio, Forward and Backward now work on arrows and curves, and text and maths elements take their own font. In the cetz canvas, Bézier curves have draggable control handles.
           releaseDraft: true
           prerelease: false
 
