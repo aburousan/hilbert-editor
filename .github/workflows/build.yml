@@ -80,7 +80,7 @@ jobs:
           # user-facing summary and refresh it for every release. The full
           # notes from docs/RELEASE_NOTES.md are pasted in at publish time.
           releaseBody: |
-            Experimental live collaboration shares a whole project — text, images, fonts, whiteboards and the plots your code generates — encrypted end to end, with no account and no server anyone runs for you. Joining creates the folder for you, and rejoining later picks up where you left off, asking before it removes anything. Read docs/COLLABORATION.md before your first session. In Slide Studio, Forward and Backward now work on arrows and curves, and text and maths elements take their own font. In the cetz canvas, Bézier curves have draggable control handles.
+            Fixes for live collaboration, including three that could damage files — please update if you collaborate. Leaving a project and rejoining no longer writes both people's version into the same file. A file someone deleted while you were away no longer blanks the copy you had open. Deleting a folder no longer leaves files behind that come back on the next join. Images that fail to arrive now recover automatically when someone who has them joins. Joining is also much faster: assets transfer several at a time, text arrives first so the document compiles while images are still coming in, and rejoining a folder you already have no longer re-downloads unchanged images.
           releaseDraft: true
           prerelease: false
 

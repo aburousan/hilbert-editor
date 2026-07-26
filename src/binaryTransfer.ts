@@ -116,7 +116,10 @@ export class BinaryTransfer {
       chunkSize: options.chunkSize ?? 16 * 1024,
       windowSize: options.windowSize ?? 8,
       ackTimeoutMs: options.ackTimeoutMs ?? 1500,
-      requestRetryMs: options.requestRetryMs ?? 2000,
+      // A WANT frame is ~100 bytes, so re-asking is nearly free; what it buys
+      // is a shorter stall when the provider was at its concurrency cap (busy
+      // serving other peers) and silently dropped the first ask.
+      requestRetryMs: options.requestRetryMs ?? 1000,
       overallTimeoutMs: options.overallTimeoutMs ?? 60000,
       maxTransferBytes: options.maxTransferBytes ?? DEFAULT_MAX_TRANSFER_BYTES,
       hashBytes: options.hashBytes,
@@ -209,9 +212,14 @@ export class BinaryTransfer {
   }
 
   private async onWant(hash: string): Promise<void> {
+    // Up to three loads at once so a requester fetching its pool of binaries in
+    // parallel (see ProjectSync) is served rather than told to retry. Memory
+    // stays bounded: three in-flight reads at most, and the aggregate outgoing
+    // check below still refuses to hold more than maxTransferBytes of active
+    // sends.
     if (
       !validHash(hash) || this.outgoing.has(hash) || this.loading.has(hash)
-      || this.loading.size >= 1 || this.outgoing.size >= 4
+      || this.loading.size >= 3 || this.outgoing.size >= 4
     ) return;
     const getter = this.providers.get(hash);
     if (!getter) return;
@@ -239,7 +247,9 @@ export class BinaryTransfer {
   // Send as many unacked chunks as the window allows, then arm a resend timer.
   private pump(out: Outgoing): void {
     if (this.closed || this.outgoing.get(out.hash) !== out) return;
-    let inFlight = out.next - countAcknowledgedBefore(out.acked, out.next);
+    // onAck refuses seq >= next, so every acked chunk is below next and the
+    // in-flight count is just the difference — no need to scan the set.
+    let inFlight = out.next - out.acked.size;
     while (out.next < out.total && inFlight < this.opt.windowSize) {
       this.sendChunk(out, out.next);
       out.next++;
@@ -361,12 +371,6 @@ function expectedTotal(size: number, chunkSize: number): number {
 
 function expectedChunkLength(size: number, seq: number, chunkSize: number): number {
   return Math.min(chunkSize, size - seq * chunkSize);
-}
-
-function countAcknowledgedBefore(acked: Set<number>, before: number): number {
-  let count = 0;
-  for (const seq of acked) if (seq < before) count++;
-  return count;
 }
 
 export const __test = {

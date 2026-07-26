@@ -66,8 +66,12 @@ export class ProjectSync {
   // detector. Each peer skips only its OWN open file.
   private openPath: string | null = null;
   // Raised while writing a network change to disk, so an app that watches files
-  // does not mistake that write for a local edit and echo it back.
-  applyingRemote = false;
+  // does not mistake that write for a local edit and echo it back. Counter-
+  // backed because binary fetches in one batch apply in parallel: with a plain
+  // boolean, the first write to finish would lower the flag while its siblings
+  // are still writing.
+  private applyingDepth = 0;
+  get applyingRemote(): boolean { return this.applyingDepth > 0; }
 
   constructor(opts: ProjectSyncOptions) {
     this.model = opts.model;
@@ -160,15 +164,29 @@ export class ProjectSync {
       const key = normalizeWorkspacePath(path);
       if (!key) continue;
       this.unregisterBinary(key);
-      this.applyingRemote = true;
+      this.applyingDepth++;
       try {
         await this.fs.remove(key);
       } catch (e) {
         this.onError(`Could not remove ${key}: ${errText(e)}`);
       } finally {
-        this.applyingRemote = false;
+        this.applyingDepth--;
       }
     }
+  }
+
+  // Re-request the binaries this peer is meant to have but does not hold. A
+  // fetch that fails — the only peer with those bytes dropped mid-transfer, or
+  // the request timed out — is otherwise lost for the rest of the session: the
+  // model already names the file, so no further change event ever arrives to
+  // drive a second attempt, and the image simply stays missing. Cheap to call
+  // when nothing is outstanding, so the app can run it whenever a peer arrives
+  // and might be the one able to serve them.
+  resyncMissingBinaries(): Promise<void> {
+    const changes: WorkspaceChange[] = this.model.list()
+      .filter(meta => meta.kind === 'binary' && !!meta.hash && this.diskHash.get(meta.path) !== meta.hash)
+      .map(meta => ({ path: meta.path, meta, type: 'upserted' }));
+    return changes.length ? this.enqueueApply(changes) : Promise.resolve();
   }
 
   // Host action: put the entire current workspace into the shared model so a
@@ -233,14 +251,41 @@ export class ProjectSync {
     this.doc.transact(() => this.model.setBinary(key, hash, bytes.length), LOCAL);
   }
 
+  // How many binary fetches run at once. Matches the provider's concurrent-load
+  // cap in BinaryTransfer so parallel requests are served, not dropped.
+  private static readonly BINARY_FETCH_CONCURRENCY = 3;
+
   private async applyRemote(changes: WorkspaceChange[]): Promise<void> {
-    for (const change of changes) {
+    // Text and removals first, in order — they are quick local writes and get
+    // the compilable sources onto disk before any assets stream in. Binary
+    // fetches then run through a small pool: each one pays a request round
+    // trip, two hashes, and chunked streaming, so a project full of images
+    // joins several times faster interleaved than strictly one at a time. Each
+    // path appears at most once per batch (the observer de-duplicates), and the
+    // outer queue still serializes batch against batch, so nothing here can
+    // reorder two writes to the same file.
+    const binaries: WorkspaceChange[] = [];
+    const applyOne = async (change: WorkspaceChange) => {
       try {
         await this.applyOne(change);
       } catch (e) {
         this.onError(`Could not apply ${change.path}: ${errText(e)}`);
       }
+    };
+    for (const change of changes) {
+      if (change.type === 'upserted' && change.meta.kind === 'binary') {
+        binaries.push(change);
+        continue;
+      }
+      await applyOne(change);
     }
+    if (!binaries.length) return;
+    let index = 0;
+    const worker = async () => {
+      while (index < binaries.length) await applyOne(binaries[index++]);
+    };
+    const width = Math.min(ProjectSync.BINARY_FETCH_CONCURRENCY, binaries.length);
+    await Promise.all(Array.from({ length: width }, worker));
   }
 
   private enqueueApply(changes: WorkspaceChange[]): Promise<void> {
@@ -269,8 +314,8 @@ export class ProjectSync {
     const { path, meta, type } = change;
     if (type === 'removed') {
       this.unregisterBinary(path);
-      this.applyingRemote = true;
-      try { await this.fs.remove(path); } finally { this.applyingRemote = false; }
+      this.applyingDepth++;
+      try { await this.fs.remove(path); } finally { this.applyingDepth--; }
       this.emitApplied(change);
       return;
     }
@@ -279,8 +324,8 @@ export class ProjectSync {
       if (this.openPath && path === this.openPath) return;
       const content = this.model.readText(path);
       if (content == null) return;
-      this.applyingRemote = true;
-      try { await this.fs.writeText(path, content); } finally { this.applyingRemote = false; }
+      this.applyingDepth++;
+      try { await this.fs.writeText(path, content); } finally { this.applyingDepth--; }
       this.emitApplied(change);
       return;
     }
@@ -288,6 +333,18 @@ export class ProjectSync {
     const hash = meta.hash;
     if (!hash) return;
     if (this.diskHash.get(path) === hash) return;
+    // First sight of this path in this session. A rejoin reuses a folder that
+    // usually already holds the right bytes from last time, and applyWorkspace
+    // enqueues every advertised binary — hashing the local copy is far cheaper
+    // than pulling the whole asset set back through the transfer channel.
+    // Registering also makes this peer able to serve those bytes to others.
+    if (!this.diskHash.has(path)) {
+      try {
+        const local = await this.fs.readBinary(path);
+        this.registerBinary(path, await this.hashBytes(local));
+        if (this.diskHash.get(path) === hash) return;
+      } catch { /* nothing usable on disk; fetch it */ }
+    }
     this.pendingBinary++;
     this.onBinaryTransfer(this.pendingBinary, path);
     let bytes: Uint8Array;
@@ -297,8 +354,8 @@ export class ProjectSync {
       this.pendingBinary = Math.max(0, this.pendingBinary - 1);
       this.onBinaryTransfer(this.pendingBinary, this.pendingBinary ? path : null);
     }
-    this.applyingRemote = true;
-    try { await this.fs.writeBinary(path, bytes); } finally { this.applyingRemote = false; }
+    this.applyingDepth++;
+    try { await this.fs.writeBinary(path, bytes); } finally { this.applyingDepth--; }
     // Now that we hold it, offer to serve it onward to other peers.
     this.registerBinary(path, hash);
     this.emitApplied(change);

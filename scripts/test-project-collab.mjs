@@ -291,6 +291,239 @@ try {
     }
   }
 
+  // Binding the open editor to a path the session has not published yet must not
+  // leave a shared empty Y.Text behind. Two peers each writing their own copy
+  // into one empty Y.Text insert at 0 with nothing to delete, so the CRDT keeps
+  // both and the file ends up holding each peer's version end to end — the
+  // duplication a rejoin used to cause, because rejoining keeps the tabs open
+  // and binds them the moment sync lands.
+  {
+    const HOST_TEXT = '= Shared notes\nWritten in session one.\n';
+    const GUEST_TEXT = '= Shared notes\nEdited after the session ended.\n';
+    for (const guestWinsRace of [false, true]) {
+      const aDoc = new Y.Doc();
+      const bDoc = new Y.Doc();
+      const a = new WorkspaceModel(aDoc);
+      const b = new WorkspaceModel(bDoc);
+
+      // The rejoining peer binds its still-open tab before that path arrives.
+      b.textOf('main.typ', GUEST_TEXT);
+      Y.applyUpdate(aDoc, Y.encodeStateAsUpdate(bDoc));
+
+      // Both sides then write their own full copy before hearing from the other.
+      if (guestWinsRace) {
+        a.setText('main.typ', HOST_TEXT);
+        b.setText('main.typ', GUEST_TEXT);
+      } else {
+        b.setText('main.typ', GUEST_TEXT);
+        a.setText('main.typ', HOST_TEXT);
+      }
+      const fromB = Y.encodeStateAsUpdate(bDoc, Y.encodeStateVector(aDoc));
+      const fromA = Y.encodeStateAsUpdate(aDoc, Y.encodeStateVector(bDoc));
+      Y.applyUpdate(aDoc, fromB);
+      Y.applyUpdate(bDoc, fromA);
+
+      const merged = a.textOf('main.typ').toString();
+      assert.equal(merged, b.textOf('main.typ').toString(), 'peers did not converge');
+      assert.equal(merged.split('= Shared notes').length - 1, 1,
+        `both copies survived in one file (guestWinsRace=${guestWinsRace}): ${JSON.stringify(merged)}`);
+      assert.ok(merged === HOST_TEXT || merged === GUEST_TEXT,
+        `neither peer's version survived intact: ${JSON.stringify(merged)}`);
+    }
+  }
+
+  // A binary nobody could serve fails once and then has nothing to retry from:
+  // the model already names the file, so no further change event ever arrives.
+  // A peer that turns up later has to be able to recover it.
+  {
+    const reachable = makeRelay();
+    const unreachable = makeRelay();
+    const fastFail = { ...tOpts, overallTimeoutMs: 300, requestRetryMs: 60 };
+
+    const ownerDoc = new Y.Doc();
+    const needyDoc = new Y.Doc();
+    forward(ownerDoc, needyDoc);
+    forward(needyDoc, ownerDoc);
+
+    const plot = randomBytes(3000);
+    const plotHash = await sha256(plot);
+    const ownerModel = new WorkspaceModel(ownerDoc);
+    const needyModel = new WorkspaceModel(needyDoc);
+    const needyFs = makeFs();
+
+    // The owner announces the file on a channel the needy peer cannot reach.
+    const ownerTransfer = new BinaryTransfer(unreachable.join(), { ...fastFail, peerId: 'owner' });
+    const owner = new ProjectSync({
+      model: ownerModel, transfer: ownerTransfer,
+      fs: makeFs({ 'img/plot.png': { bytes: plot } }), hashBytes: sha256,
+    });
+    const errors = [];
+    const needyTransfer = new BinaryTransfer(reachable.join(), { ...fastFail, peerId: 'needy' });
+    const needy = new ProjectSync({
+      model: needyModel, transfer: needyTransfer, fs: needyFs, hashBytes: sha256,
+      onError: message => errors.push(message),
+    });
+    try {
+      owner.start();
+      needy.start();
+      await owner.onLocalBinary('img/plot.png');
+      await needy.applyWorkspace();
+      assert.ok(!needyFs.files.has('img/plot.png'), 'test setup: the bytes were reachable after all');
+      assert.ok(errors.some(message => message.includes('img/plot.png')),
+        'a binary that could not be fetched was not reported');
+
+      // Someone able to serve those bytes joins the needy peer's channel.
+      const helper = new BinaryTransfer(reachable.join(), { ...fastFail, peerId: 'helper' });
+      helper.provide(plotHash, async () => plot);
+      try {
+        await needy.resyncMissingBinaries();
+        assert.ok(needyFs.files.has('img/plot.png'),
+          'resync did not recover a binary whose first fetch had failed');
+        assert.equal(await sha256(needyFs.files.get('img/plot.png').bytes), plotHash,
+          'the recovered binary does not match the original bytes');
+      } finally {
+        helper.close();
+      }
+    } finally {
+      owner.stop(); needy.stop();
+      ownerTransfer.close(); needyTransfer.close();
+    }
+  }
+
+  // Binding a tab the session tombstoned must not blank the user's buffer.
+  // remove() empties the entry's Y.Text, so attaching to it would setValue('')
+  // in the editor and autosave would then write that emptiness to disk — data
+  // loss even when the user answers "keep my copy". Binding revives instead,
+  // and with a FRESH entry: the old Y.Text has shared history, so two peers
+  // reviving it concurrently would otherwise double-insert.
+  {
+    const KEEP_A = '= Peer A kept these edits\n';
+    const KEEP_B = '= Peer B kept different edits\n';
+
+    const aDoc = new Y.Doc();
+    const bDoc = new Y.Doc();
+    const a = new WorkspaceModel(aDoc);
+    const b = new WorkspaceModel(bDoc);
+    a.setText('notes.typ', '= Old shared content\n');
+    a.remove('notes.typ');
+    Y.applyUpdate(bDoc, Y.encodeStateAsUpdate(aDoc));
+
+    // Both peers rejoin with the deleted file still open, and bind concurrently.
+    const textA = a.textOf('notes.typ', KEEP_A);
+    b.textOf('notes.typ', KEEP_B);
+    assert.equal(textA.toString(), KEEP_A, 'binding a tombstoned entry blanked the buffer');
+    assert.equal(a.metaOf('notes.typ').deleted, false, 'binding did not revive the tombstoned entry');
+    assert.equal(b.readText('notes.typ'), KEEP_B, 'revived entry is not readable as a live file');
+
+    const fromB = Y.encodeStateAsUpdate(bDoc, Y.encodeStateVector(aDoc));
+    const fromA = Y.encodeStateAsUpdate(aDoc, Y.encodeStateVector(bDoc));
+    Y.applyUpdate(aDoc, fromB);
+    Y.applyUpdate(bDoc, fromA);
+
+    const merged = a.readText('notes.typ');
+    assert.equal(merged, b.readText('notes.typ'), 'peers did not converge after concurrent revive');
+    assert.ok(merged === KEEP_A || merged === KEEP_B,
+      `concurrent revives merged into a corrupted file: ${JSON.stringify(merged)}`);
+  }
+
+  // A rejoin reuses a folder that already holds most binaries from last time.
+  // applyWorkspace enqueues every advertised binary, so without the local-hash
+  // short-circuit the whole asset set is pulled back through the transfer
+  // channel on every rejoin. With it, bytes already on disk never hit the
+  // network — proven here by making the network unable to serve them at all.
+  {
+    const img = randomBytes(4096);
+    const imgHash = await sha256(img);
+    const sessionDoc = new Y.Doc();
+    const model = new WorkspaceModel(sessionDoc);
+    model.setBinary('img/figure.png', imgHash, img.length);
+
+    const errors = [];
+    const deadTransfer = new BinaryTransfer(makeRelay().join(), {
+      ...tOpts, overallTimeoutMs: 250, requestRetryMs: 60, peerId: 'rejoiner',
+    });
+    const fs = makeFs({ 'img/figure.png': { bytes: img } });
+    const rejoiner = new ProjectSync({
+      model, transfer: deadTransfer, fs, hashBytes: sha256,
+      onError: message => errors.push(message),
+    });
+    try {
+      rejoiner.start();
+      await rejoiner.applyWorkspace();
+      assert.deepEqual(errors, [],
+        `a binary already on disk was fetched over the network: ${errors.join('; ')}`);
+      assert.equal(await sha256(fs.files.get('img/figure.png').bytes), imgHash);
+    } finally {
+      rejoiner.stop();
+      deadTransfer.close();
+    }
+  }
+
+  // Binary fetches in one batch must run in parallel, and the applyingRemote
+  // flag must stay raised until the LAST overlapping write finishes. The
+  // provider here refuses to serve anything until all three binaries have been
+  // asked for — a serial pipeline deadlocks on that barrier and times out, so
+  // only genuine parallelism passes. A fourth advertised binary that nobody can
+  // serve checks that one failure doesn't take down the rest of the batch.
+  {
+    const relay2 = makeRelay();
+    const fast = { ...tOpts, overallTimeoutMs: 400, requestRetryMs: 50 };
+    const blobs = new Map();
+    for (const name of ['a.png', 'b.png', 'c.png']) {
+      const bytes = randomBytes(2500);
+      blobs.set(name, { bytes, hash: await sha256(bytes) });
+    }
+
+    const asked = new Set();
+    let openBarrier;
+    const allAsked = new Promise(resolve => { openBarrier = resolve; });
+    const server = new BinaryTransfer(relay2.join(), { ...fast, peerId: 'server' });
+    for (const [name, { bytes, hash }] of blobs) {
+      server.provide(hash, async () => {
+        asked.add(name);
+        if (asked.size === blobs.size) openBarrier();
+        await allAsked;
+        return bytes;
+      });
+    }
+
+    const model = new WorkspaceModel(new Y.Doc());
+    for (const [name, { bytes, hash }] of blobs) model.setBinary('img/' + name, hash, bytes.length);
+    model.setBinary('img/zz-missing.png', await sha256(randomBytes(64)), 64);
+
+    const fs = makeFs();
+    const flagDuringWrite = [];
+    const baseWrite = fs.writeBinary.bind(fs);
+    fs.writeBinary = async (path, bytes) => {
+      await sleep(25);   // stretch the writes so they overlap
+      flagDuringWrite.push(consumer.applyingRemote);
+      return baseWrite(path, bytes);
+    };
+    const errors = [];
+    const consumerTransfer = new BinaryTransfer(relay2.join(), { ...fast, peerId: 'consumer' });
+    const consumer = new ProjectSync({
+      model, transfer: consumerTransfer, fs, hashBytes: sha256,
+      onError: message => errors.push(message),
+    });
+    try {
+      consumer.start();
+      await consumer.applyWorkspace();
+      for (const [name, { hash }] of blobs) {
+        assert.ok(fs.files.has('img/' + name), `parallel fetch did not deliver img/${name}`);
+        assert.equal(await sha256(fs.files.get('img/' + name).bytes), hash);
+      }
+      assert.equal(errors.length, 1, `expected exactly the unservable binary to fail: ${errors.join('; ')}`);
+      assert.ok(errors[0].includes('zz-missing'), `wrong failure reported: ${errors[0]}`);
+      assert.ok(flagDuringWrite.length === 3 && flagDuringWrite.every(Boolean),
+        'applyingRemote dropped while overlapping remote writes were still in flight');
+      assert.equal(consumer.applyingRemote, false, 'applyingRemote stuck raised after the batch');
+    } finally {
+      consumer.stop();
+      consumerTransfer.close();
+      server.close();
+    }
+  }
+
   console.log('project collab integration tests passed');
 } catch (e) {
   failed = true;

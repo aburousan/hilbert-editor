@@ -85,16 +85,34 @@ export class WorkspaceModel {
 
   // The Y.Text a Monaco binding attaches to for the open file. Creating it as a
   // text entry if absent lets a joiner bind before the first sync lands.
-  textOf(path: string): Y.Text {
+  //
+  // An absent path is created holding `seed` — the buffer the caller is about to
+  // bind — never an empty Y.Text. An empty one is shared state the moment it is
+  // committed, and two peers then writing their own copy into that same Y.Text
+  // both insert at 0 with nothing to delete, so the CRDT keeps both and the file
+  // ends up containing each peer's version end to end. Created with content, a
+  // concurrent create is a conflict between two different map entries instead,
+  // which resolves to exactly one surviving version.
+  //
+  // A tombstoned entry is treated the same as an absent one: binding means the
+  // user has this file open in front of them, and attaching to the tombstone's
+  // emptied Y.Text would blank their buffer (which autosave then writes to
+  // disk). Reviving replaces the whole entry rather than clearing the deleted
+  // flag in place — remove() emptied the old Y.Text, so it has shared history
+  // and two peers reviving it concurrently would double-insert; competing fresh
+  // entries resolve to one winner.
+  textOf(path: string, seed = ''): Y.Text {
     const key = normalizeWorkspacePath(path);
     if (!key) throw new Error('Invalid workspace path');
     let entry = this.entry(key);
-    if (!entry || entry.get('kind') !== 'text') {
+    if (!entry || entry.get('kind') !== 'text' || entry.get('deleted') === true) {
       this.doc.transact(() => {
-        entry = new Y.Map<any>();
-        entry.set('kind', 'text');
-        entry.set('text', new Y.Text());
-        this.files.set(key, entry);
+        const created = new Y.Map<any>();
+        created.set('kind', 'text');
+        const text = new Y.Text();
+        if (seed) text.insert(0, seed);
+        created.set('text', text);
+        this.files.set(key, created);
       });
       entry = this.entry(key)!;
     }

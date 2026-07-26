@@ -1256,14 +1256,7 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], w
         maxWidth: '97vw', maxHeight: '95vh', overflow: 'hidden', position: 'relative',
       }}>
         <div className="modal-header">
-          <h2 style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            Slide Studio
-            <span style={{
-              fontSize: '0.62rem', fontWeight: 600, padding: '2px 7px', borderRadius: 999,
-              background: 'rgba(217,119,6,0.14)', color: '#d97706', border: '1px solid rgba(217,119,6,0.4)',
-              letterSpacing: '0.04em', textTransform: 'uppercase',
-            }}>experimental</span>
-          </h2>
+          <h2>Slide Studio</h2>
           <button className="close-btn" onClick={onClose}>×</button>
         </div>
 

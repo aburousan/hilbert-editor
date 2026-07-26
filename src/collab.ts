@@ -91,7 +91,12 @@ export function startCollab(opts: {
     if (!bindingTarget || stopped || (opts.mode === 'join' && !ready)) return;
     binding?.destroy();
     const { path, model, editor } = bindingTarget;
-    binding = new MonacoBinding(workspace.textOf(path), model, new Set([editor]), provider.awareness);
+    // Seed from the buffer being bound: if the session has not got this path yet
+    // — a file only this peer holds, or one whose publish is still in flight —
+    // binding to an empty placeholder would both blank the editor and leave a
+    // shared empty Y.Text for two peers to fill at once. See WorkspaceModel.textOf.
+    binding = new MonacoBinding(
+      workspace.textOf(path, model.getValue()), model, new Set([editor]), provider.awareness);
   };
 
   // A host owns the initial document and can bind immediately. A joiner must

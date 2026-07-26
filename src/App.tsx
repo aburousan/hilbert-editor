@@ -918,17 +918,34 @@ export default function App() {
     }
   };
 
+  // Everything under `path` that a shared session would need told about. The
+  // React file tree lags behind the folder — a file a collaborator just sent, or
+  // one a code run produced a moment ago, is only there after the next fetchTree
+  // — so a folder delete driven by the tree alone quietly leaves those files live
+  // in the shared model, where they come back on the next join and cannot be
+  // deleted again. The model knows exactly what the session holds, so take both.
+  const sharedPathsUnder = (path: string): string[] => {
+    const paths = new Set(filePathsUnder(path));
+    const workspace = collabRef.current?.workspace;
+    if (workspace) {
+      for (const file of workspace.list()) {
+        if (file.path === path || file.path.startsWith(path + '/')) paths.add(file.path);
+      }
+    }
+    return [...paths];
+  };
+
   const mirrorLocalDelete = (path: string) => {
     const sync = projectSessionRef.current?.sync;
     if (!sync || sync.applyingRemote) return;
-    const files = filePathsUnder(path);
+    const files = sharedPathsUnder(path);
     for (const file of files.length ? files : [path]) sync.onLocalRemove(file);
   };
 
   const mirrorLocalRename = async (from: string, to: string) => {
     const sync = projectSessionRef.current?.sync;
     if (!sync || sync.applyingRemote) return;
-    const files = filePathsUnder(from);
+    const files = sharedPathsUnder(from);
     const moved = files.length ? files : [from];
     for (const oldPath of moved) sync.onLocalRemove(oldPath);
     for (const oldPath of moved) {
@@ -940,7 +957,7 @@ export default function App() {
   const mirrorLocalCopy = async (from: string, to: string) => {
     const sync = projectSessionRef.current?.sync;
     if (!sync || sync.applyingRemote) return;
-    const files = filePathsUnder(from);
+    const files = sharedPathsUnder(from);
     const copied = files.length ? files : [from];
     for (const oldPath of copied) {
       const newPath = oldPath === from ? to : to + oldPath.slice(from.length);
@@ -4029,8 +4046,17 @@ export default function App() {
         status: 'connecting',
         transferring: 0,
       });
-      handle.onPeers(peers => setCollab(current =>
-        current?.room === invite.room ? { ...current, peers } : current));
+      let knownPeers = 0;
+      handle.onPeers(peers => {
+        setCollab(current => current?.room === invite.room ? { ...current, peers } : current);
+        // Someone arriving may be the peer holding bytes an earlier fetch could
+        // not get. Nothing in the shared model changes when that happens, so the
+        // retry has to be asked for; it is a no-op unless something is missing.
+        if (peers > knownPeers && projectSessionRef.current?.sync === sync) {
+          void sync.resyncMissingBinaries();
+        }
+        knownPeers = peers;
+      });
       handle.onStatus(status => setCollab(current =>
         current?.room === invite.room ? { ...current, status } : current));
       handle.onReady(async () => {

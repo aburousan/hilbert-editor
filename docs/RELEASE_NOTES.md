@@ -4,6 +4,56 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.1.12
+
+Fixes for live collaboration, including three that could damage files, plus much
+faster project transfer. **If you use collaboration, please update.**
+
+### Rejoining a project no longer duplicates your text
+
+Leaving a shared project and rejoining it could end with both people's version of
+a file written into that file, one after the other — you would open it and find
+the whole document twice. Rejoining keeps your tabs open, so the editor attached
+to a file before the session had finished sending it, and both sides then wrote
+their copy into the same empty slot. Rejoining is now safe: one version survives
+and both people end up looking at the same thing.
+
+### A deleted file no longer wipes the copy you had open
+
+If someone deleted a file while you were away and you rejoined with that file
+still open, your editor was blanked and the empty buffer saved over your copy —
+even if you then chose to keep it. Your open document now survives, and the file
+is shared back as yours. Files you do not have open are unaffected: you are still
+shown the list and asked before anything is removed.
+
+### Deleting a folder no longer leaves files behind
+
+Deleting a folder missed any file that had arrived seconds earlier — one a
+collaborator had just sent, or one a code run had just produced. Those files
+stayed in the session and came back the next time anyone joined, with no way to
+delete them again. Deletes, renames and copies now cover everything the session
+actually holds.
+
+### Images that failed to arrive can now recover
+
+If the only person holding an image dropped out mid-transfer, that image stayed
+missing for the rest of the session and only a rejoin brought it back. Hilbert
+now retries automatically when someone joins who can supply it.
+
+### Faster joining
+
+Assets used to transfer strictly one at a time; several now transfer at once, and
+text arrives first so the document compiles while images are still coming in.
+Rejoining a folder you already have no longer re-downloads images that have not
+changed — it checks what is already on your disk first. Joining an asset-heavy
+project is several times quicker.
+
+### Slide Studio
+
+The experimental badge is gone from the Slide Studio window.
+
+---
+
 ## 0.1.11
 
 Live collaboration on a whole project, plus fixes in Slide Studio and the cetz
