@@ -113,7 +113,28 @@ interface FileNode {
   size?: number;
   mtime?: number;
   matches?: { lineNum: number; text: string }[];
+  // The backend stopped short of reading this folder — it holds a separate
+  // project, or the tree had already grown large. Its contents are fetched when
+  // the folder is opened.
+  truncated?: boolean;
 }
+function findNode(nodes: FileNode[], path: string): FileNode | null {
+  for (const node of nodes) {
+    if (node.path === path) return node;
+    const hit = node.children ? findNode(node.children, path) : null;
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function replaceNode(nodes: FileNode[], path: string, update: (node: FileNode) => FileNode): FileNode[] {
+  return nodes.map(node => {
+    if (node.path === path) return update(node);
+    if (!node.children) return node;
+    return { ...node, children: replaceNode(node.children, path, update) };
+  });
+}
+
 type Tab = { path: string; content: string; isDirty: boolean; diskHash?: string; binaryRevision?: number };
 const IMG_EXT = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp'];
 
@@ -306,6 +327,9 @@ export default function App() {
   const [externalConflict, setExternalConflict] = useState<ExternalConflict | null>(null);
   const [booted, setBooted] = useState(false);
   const [fileTree, setFileTree] = useState<FileNode[]>([]);
+  // Read by callbacks that outlive the render that created them.
+  const fileTreeRef = useRef<FileNode[]>(fileTree);
+  fileTreeRef.current = fileTree;
   const [treeSearch, setTreeSearch] = useState<string>('');
   const [isSearchVisible, setIsSearchVisible] = useState<boolean>(false);
   const [searchContentResults, setSearchContentResults] = useState<SearchResult[]>([]);
@@ -543,11 +567,40 @@ export default function App() {
   // Folders the user has collapsed. Kept in React state (not the DOM) so the
   // fold state survives tree re-renders triggered by selection / git updates.
   const [collapsedDirs, setCollapsedDirs] = useState<Set<string>>(new Set());
-  const toggleDir = (path: string) => setCollapsedDirs(prev => {
-    const next = new Set(prev);
-    next.has(path) ? next.delete(path) : next.add(path);
-    return next;
-  });
+  // Folders whose contents the tree walk skipped and which are now being read.
+  const [loadingDirs, setLoadingDirs] = useState<Set<string>>(new Set());
+  const loadedDirsRef = useRef(new Set<string>());
+  const toggleDir = (path: string) => {
+    let opening = false;
+    setCollapsedDirs(prev => {
+      const next = new Set(prev);
+      if (next.has(path)) { next.delete(path); opening = true; } else { next.add(path); }
+      return next;
+    });
+    if (opening) void expandTruncatedDir(path);
+  };
+
+  // Read one folder the tree walk left unopened. A project folder can sit next
+  // to unrelated checkouts, and reading those in full is what used to make the
+  // whole tree — and with it the rest of the app — crawl. Nothing is read until
+  // someone actually opens the folder, and then only that one level.
+  const expandTruncatedDir = async (path: string) => {
+    const node = findNode(fileTreeRef.current, path);
+    if (!node?.truncated || loadedDirsRef.current.has(path)) return;
+    loadedDirsRef.current.add(path);
+    setLoadingDirs(prev => new Set(prev).add(path));
+    try {
+      const response = await fetch(`${API}/workspace/subtree?path=${encodeURIComponent(path)}`);
+      if (!response.ok) throw new Error(String(response.status));
+      const children: FileNode[] = await response.json();
+      setFileTree(prev => replaceNode(prev, path, node => ({ ...node, children, truncated: false })));
+    } catch {
+      loadedDirsRef.current.delete(path);
+      notify(`Could not read ${path}.`);
+    } finally {
+      setLoadingDirs(prev => { const next = new Set(prev); next.delete(path); return next; });
+    }
+  };
   const [projectName, setProjectName] = useState('Project Report');
   const [editingTitle, setEditingTitle] = useState(false);
   const [inputModal, setInputModal] = useState<InputModalConfig | null>(null);
@@ -987,11 +1040,25 @@ export default function App() {
     return hash;
   };
 
+  // A refresh re-runs the bounded walk, so folders the user had opened come back
+  // marked unread. Carry their contents across rather than making them click
+  // again after every save.
+  const carryOpenedFolders = (next: FileNode[], previous: FileNode[]): FileNode[] =>
+    next.map(node => {
+      if (node.type !== 'directory') return node;
+      if (node.truncated && loadedDirsRef.current.has(node.path)) {
+        const before = findNode(previous, node.path);
+        if (before?.children?.length) return { ...node, children: before.children, truncated: false };
+      }
+      return node.children ? { ...node, children: carryOpenedFolders(node.children, previous) } : node;
+    });
+
   const fetchTree = async () => {
     try {
       const res = await fetch(`${API}/workspace`);
       if (res.ok) {
-        setFileTree(await res.json());
+        const next: FileNode[] = await res.json();
+        setFileTree(prev => carryOpenedFolders(next, prev));
         const w = (window as any);
         if (!w._hasLoggedBackend) {
           w._hasLoggedBackend = true;
@@ -3838,7 +3905,12 @@ export default function App() {
                 </>
               )}
             </div>
-            <div className="tree-children">{node.children && renderTree(node.children)}</div>
+            <div className="tree-children">
+              {loadingDirs.has(node.path) && (
+                <div className="form-hint" style={{ margin: '2px 0 2px 26px', opacity: 0.7 }}>Reading folder…</div>
+              )}
+              {node.children && renderTree(node.children)}
+            </div>
           </div>
         ) : (
           <div key={node.path} style={{ display: 'flex', flexDirection: 'column' }}>
@@ -3938,7 +4010,7 @@ export default function App() {
       return matches.length ? { path: tab.path, matches } : null;
     }).filter(Boolean) as SearchResult[];
   }, [tabs, treeSearch]);
-  const treeJsx = useMemo(() => renderTree(filterTree(fileTree, treeSearch, searchContentResults, dirtyTabMatches)), [fileTree, activeTabPath, renamingPath, renameValue, selectedPaths, collapsedDirs, currentMain, dirtyPathsKey, treeSearch, searchContentResults, dirtyTabMatches, filterTree]);
+  const treeJsx = useMemo(() => renderTree(filterTree(fileTree, treeSearch, searchContentResults, dirtyTabMatches)), [fileTree, activeTabPath, loadingDirs, renamingPath, renameValue, selectedPaths, collapsedDirs, currentMain, dirtyPathsKey, treeSearch, searchContentResults, dirtyTabMatches, filterTree]);
   const outline = useMemo(() => (sidebarVisible && panels.outline ? getOutline() : []), [activeTab?.content, sidebarVisible, panels.outline]);
 
   const toggleMenu = (e: React.MouseEvent, menuName: string) => {

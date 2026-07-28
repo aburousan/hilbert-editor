@@ -495,17 +495,56 @@ fn is_hidden_source_entry(name: &str) -> bool {
     is_hidden_entry(name) || name.ends_with(".pdf")
 }
 
+// A project folder often sits next to unrelated ones. Walking those in full is
+// what makes the tree slow to build — one report had an 8 GB checkout beside the
+// document — and their contents are not part of this project anyway. So the walk
+// stops at anything that looks like a separate project, and at a total entry
+// count, rather than reading every directory on the disk below the root. A
+// directory left unread is marked `truncated` and its contents are fetched only
+// if the user opens it.
+// How many entries the walk will emit before it stops going any deeper. It
+// never drops entries from a folder it has already started listing — a folder
+// always shows all of its own contents — so what this bounds is descent.
+const TREE_MAX_ENTRIES: usize = 6000;
+const TREE_MAX_DEPTH: usize = 12;
+// Backstop for a single pathological folder, so one directory holding hundreds
+// of thousands of files cannot produce an unbounded response.
+const TREE_MAX_PER_DIR: usize = 20000;
+
+// A checkout of some other project. Its own tooling manages it; it is not part
+// of the document being edited.
+fn is_separate_project(dir: &Path) -> bool {
+    ["/.git", "/.hg", "/.svn"]
+        .iter()
+        .any(|marker| dir.join(marker.trim_start_matches('/')).exists())
+}
+
+// Bulk output nobody browses in an editor. Dotted names and node_modules are
+// already excluded by is_hidden_entry.
+fn is_bulk_dir(name: &str) -> bool {
+    matches!(name, "__pycache__" | "venv" | "site-packages")
+}
+
 fn get_tree(dir: &Path, ws: &Path) -> Vec<Value> {
+    let mut budget = TREE_MAX_ENTRIES;
+    walk_tree(dir, ws, 0, &mut budget)
+}
+
+fn walk_tree(dir: &Path, ws: &Path, depth: usize, budget: &mut usize) -> Vec<Value> {
     let mut out = Vec::new();
     let Ok(rd) = fs::read_dir(dir) else { return out };
     let mut items: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
     items.sort();
     for item in items {
+        if out.len() >= TREE_MAX_PER_DIR {
+            break;
+        }
         // PDFs (both the compiled out.pdf and any the user adds) stay visible
         // here so they can be opened and downloaded from the tree.
         if is_hidden_entry(&item) {
             continue;
         }
+        *budget = budget.saturating_sub(1);
         let full = dir.join(&item);
         let Ok(kind) = fs::symlink_metadata(&full).map(|m| m.file_type()) else { continue };
         if kind.is_symlink() {
@@ -514,7 +553,21 @@ fn get_tree(dir: &Path, ws: &Path) -> Vec<Value> {
         let Ok(st) = fs::metadata(&full) else { continue };
         let rel = full.strip_prefix(ws).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
         if st.is_dir() {
-            out.push(json!({ "type": "directory", "name": item, "path": rel, "children": get_tree(&full, ws) }));
+            // Not descended into: it holds a separate project, it is bulk
+            // output, we are already deep, or the walk has emitted enough. Its
+            // contents are fetched if the user opens it, on a fresh budget, so
+            // they do arrive in full. A folder we did walk is complete and is
+            // not marked, however much of the budget it used up.
+            let stop = depth + 1 >= TREE_MAX_DEPTH
+                || *budget == 0
+                || is_bulk_dir(&item)
+                || is_separate_project(&full);
+            let children = if stop { Vec::new() } else { walk_tree(&full, ws, depth + 1, budget) };
+            let truncated = stop;
+            out.push(json!({
+                "type": "directory", "name": item, "path": rel,
+                "children": children, "truncated": truncated,
+            }));
         } else {
             let mtime = st.modified().map(epoch_ms).unwrap_or(0.0);
             out.push(json!({ "type": "file", "name": item, "path": rel, "size": st.len(), "mtime": mtime }));
@@ -523,9 +576,39 @@ fn get_tree(dir: &Path, ws: &Path) -> Vec<Value> {
     out
 }
 
+// Reading a folder tree is filesystem work, and the app asks for it after most
+// edits. Run it on the blocking pool: doing it inline stalls every other request
+// on this runtime, which is what made dragging the pane splitter stutter while a
+// large folder was open.
 async fn workspace_tree(State(st): St) -> Response {
     let ws = st.ws();
-    Json(get_tree(&ws, &ws)).into_response()
+    let tree = tokio::task::spawn_blocking(move || get_tree(&ws, &ws))
+        .await
+        .unwrap_or_default();
+    Json(tree).into_response()
+}
+
+// The children of one directory the main walk left unread, fetched when the user
+// opens it.
+async fn workspace_subtree(State(st): St, Query(q): Q) -> Response {
+    let ws = st.ws();
+    let Some(rel) = q.get("path").map(String::as_str).filter(|p| !p.is_empty()) else {
+        return json_err(StatusCode::BAD_REQUEST, "Folder path required.");
+    };
+    let Some(dir) = safe_workspace_path(&ws, rel) else {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid folder path.");
+    };
+    if !dir.is_dir() {
+        return json_err(StatusCode::NOT_FOUND, "Not a folder.");
+    }
+    let root = ws.clone();
+    let children = tokio::task::spawn_blocking(move || {
+        let mut budget = TREE_MAX_ENTRIES;
+        walk_tree(&dir, &root, 0, &mut budget)
+    })
+    .await
+    .unwrap_or_default();
+    Json(children).into_response()
 }
 
 async fn workspace_root_get(State(st): St) -> Response {
@@ -4898,6 +4981,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 
     let api = Router::new()
         .route("/workspace", get(workspace_tree))
+        .route("/workspace/subtree", get(workspace_subtree))
         .route("/workspace/root", get(workspace_root_get).post(workspace_root_post))
         .route("/workspace/clear", post(workspace_clear))
         .route("/workspace/file", get(workspace_file_get).post(workspace_file_post).delete(workspace_file_delete).layer(DefaultBodyLimit::max(16 * 1024 * 1024)))

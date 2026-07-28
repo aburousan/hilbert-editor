@@ -42,6 +42,19 @@ Opening an image showed a broken-image icon, and cropping and rotating could not
 read the picture. Assets are now loaded the way the rest of the app loads files.
 This also covers PDFs opened from the file tree and plots produced by a code run.
 
+### The file tree no longer crawls through folders that are not yours
+
+If another project sat inside the folder you opened, Hilbert read all of it —
+every subdirectory, however large. With a big checkout next door the whole app
+turned sluggish, down to dragging the divider between panes, and closing the file
+tree was the only way to get the speed back. Hilbert now stops at anything that
+is a separate project (anything with its own Git, Mercurial or Subversion
+folder), at bulk directories such as `__pycache__` and `venv`, and once the tree
+is already large. Those folders still appear, and opening one reads it then —
+so nothing is hidden from you, it is just no longer read before you ask. The
+walk also runs off the request thread now, so a slow folder cannot hold up the
+rest of the app. Thanks to @johnblommers for the report and the diagnosis.
+
 ### Faster and steadier project transfer
 
 An asset that failed to arrive is retried when someone who has it joins, several
