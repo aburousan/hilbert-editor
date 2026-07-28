@@ -525,12 +525,10 @@ fn is_bulk_dir(name: &str) -> bool {
     matches!(name, "__pycache__" | "venv" | "site-packages")
 }
 
-fn get_tree(dir: &Path, ws: &Path) -> Vec<Value> {
-    let mut budget = TREE_MAX_ENTRIES;
-    walk_tree(dir, ws, 0, &mut budget)
-}
-
-fn walk_tree(dir: &Path, ws: &Path, depth: usize, budget: &mut usize) -> Vec<Value> {
+// `unlimited` drops the depth and entry limits, for callers that need the real
+// contents of the project rather than something cheap to draw. The skips for
+// separate checkouts and bulk directories always apply.
+fn walk_tree(dir: &Path, ws: &Path, depth: usize, budget: &mut usize, unlimited: bool) -> Vec<Value> {
     let mut out = Vec::new();
     let Ok(rd) = fs::read_dir(dir) else { return out };
     let mut items: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
@@ -558,11 +556,14 @@ fn walk_tree(dir: &Path, ws: &Path, depth: usize, budget: &mut usize) -> Vec<Val
             // contents are fetched if the user opens it, on a fresh budget, so
             // they do arrive in full. A folder we did walk is complete and is
             // not marked, however much of the budget it used up.
-            let stop = depth + 1 >= TREE_MAX_DEPTH
-                || *budget == 0
-                || is_bulk_dir(&item)
-                || is_separate_project(&full);
-            let children = if stop { Vec::new() } else { walk_tree(&full, ws, depth + 1, budget) };
+            let stop = is_bulk_dir(&item)
+                || is_separate_project(&full)
+                || (!unlimited && (depth + 1 >= TREE_MAX_DEPTH || *budget == 0));
+            let children = if stop {
+                Vec::new()
+            } else {
+                walk_tree(&full, ws, depth + 1, budget, unlimited)
+            };
             let truncated = stop;
             out.push(json!({
                 "type": "directory", "name": item, "path": rel,
@@ -580,11 +581,20 @@ fn walk_tree(dir: &Path, ws: &Path, depth: usize, budget: &mut usize) -> Vec<Val
 // edits. Run it on the blocking pool: doing it inline stalls every other request
 // on this runtime, which is what made dragging the pane splitter stutter while a
 // large folder was open.
-async fn workspace_tree(State(st): St) -> Response {
+async fn workspace_tree(State(st): St, Query(q): Q) -> Response {
     let ws = st.ws();
-    let tree = tokio::task::spawn_blocking(move || get_tree(&ws, &ws))
-        .await
-        .unwrap_or_default();
+    // `full=1` lifts the limits that keep the displayed tree cheap. Sharing a
+    // project has to enumerate every file it actually contains, and a folder the
+    // sidebar has not read yet is still part of the project. Separate checkouts
+    // and bulk directories stay excluded either way — those are not the user's
+    // document and have no business being pushed through a session.
+    let full = q.get("full").map(|v| v == "1" || v == "true").unwrap_or(false);
+    let tree = tokio::task::spawn_blocking(move || {
+        let mut budget = if full { usize::MAX } else { TREE_MAX_ENTRIES };
+        walk_tree(&ws.clone(), &ws, 0, &mut budget, full)
+    })
+    .await
+    .unwrap_or_default();
     Json(tree).into_response()
 }
 
@@ -604,7 +614,7 @@ async fn workspace_subtree(State(st): St, Query(q): Q) -> Response {
     let root = ws.clone();
     let children = tokio::task::spawn_blocking(move || {
         let mut budget = TREE_MAX_ENTRIES;
-        walk_tree(&dir, &root, 0, &mut budget)
+        walk_tree(&dir, &root, 0, &mut budget, false)
     })
     .await
     .unwrap_or_default();

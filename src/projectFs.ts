@@ -27,7 +27,9 @@ async function checked(response: Response, action: string): Promise<Response> {
 export function createProjectFs(): ProjectFs {
   return {
     async list() {
-      const response = await checked(await fetch(`${API}/workspace`), 'Listing the workspace');
+      // full=1 so a shared project includes files in folders the sidebar has not
+      // read yet. Separate checkouts stay excluded by the backend either way.
+      const response = await checked(await fetch(`${API}/workspace?full=1`), 'Listing the workspace');
       return flattenFiles(await response.json());
     },
 
