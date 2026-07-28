@@ -148,9 +148,15 @@ try {
   assert.equal(await sha256(await lateFs.readBinary('img/fig.png')), await sha256(img));
   assert.equal(await sha256(await lateFs.readBinary('board.svg')), await sha256(board));
 
-  // A host text edit lands on the joiner's disk.
+  // A host text edit lands on the joiner's disk. main.typ is the host's open
+  // file, so its edits travel the way the Monaco binding makes them — through
+  // the bound Y.Text — not as a whole-file push.
+  const typeInto = (model, doc, path, content) => {
+    const text = model.textOf(path);
+    doc.transact(() => { text.delete(0, text.length); text.insert(0, content); });
+  };
   await hostFs.writeText('main.typ', '= New Title\n');
-  host.onLocalText('main.typ', '= New Title\n');
+  typeInto(hostModel, hostDoc, 'main.typ', '= New Title\n');
   assert.ok(await waitUntil(async () => (await joinFs.readText('main.typ').catch(() => '')) === '= New Title\n'),
     'text edit did not propagate');
 
@@ -198,7 +204,7 @@ try {
   // a non-open file still syncs normally.
   join.setOpenPath('main.typ');
   await hostFs.writeText('main.typ', '= Edited While Open\n');
-  host.onLocalText('main.typ', '= Edited While Open\n');
+  typeInto(hostModel, hostDoc, 'main.typ', '= Edited While Open\n');
   await hostFs.writeText('sidebar.typ', 'sidebar body');
   host.onLocalText('sidebar.typ', 'sidebar body');
   // The non-open file lands; give the open-file change the same window to (not) land.
@@ -521,6 +527,67 @@ try {
       consumer.stop();
       consumerTransfer.close();
       server.close();
+    }
+  }
+
+  // A file the editor has bound belongs to its Y.Text. Remote edits reach the
+  // buffer through that binding, which leaves the tab looking modified, so the
+  // app's autosave used to offer the whole buffer back as a local change — and
+  // that replaced the shared text with one peer's stale snapshot, wiping out
+  // everything the others had typed. Focusing an image made it certain: the
+  // editor unbinds for a non-text tab, so the file stopped counting as "open"
+  // and every compile republished it.
+  {
+    const aDoc = new Y.Doc();
+    const bDoc = new Y.Doc();
+    const a = new WorkspaceModel(aDoc);
+    const b = new WorkspaceModel(bDoc);
+    const aFs = makeFs({ 'main.typ': { text: '' } });
+    const bFs = makeFs({ 'main.typ': { text: '' } });
+    const aTransfer = new BinaryTransfer(makeRelay().join(), { ...tOpts, peerId: 'clobber-a' });
+    const bTransfer = new BinaryTransfer(makeRelay().join(), { ...tOpts, peerId: 'clobber-b' });
+    const aSync = new ProjectSync({ model: a, transfer: aTransfer, fs: aFs, hashBytes: sha256 });
+    const bSync = new ProjectSync({ model: b, transfer: bTransfer, fs: bFs, hashBytes: sha256 });
+    try {
+      a.setText('main.typ', 'line one\n');
+      Y.applyUpdate(bDoc, Y.encodeStateAsUpdate(aDoc), 'remote');
+      forward(aDoc, bDoc);
+      forward(bDoc, aDoc);
+      aSync.start();
+      bSync.start();
+      aSync.setOpenPath('main.typ');
+      bSync.setOpenPath('main.typ');
+
+      const aText = a.textOf('main.typ');
+      const bText = b.textOf('main.typ');
+      aText.insert(aText.length, 'A typed this\n');
+      bText.insert(bText.length, 'B typed this\n');
+      const merged = aText.toString();
+      assert.equal(merged, bText.toString(), 'peers did not converge before the tab switch');
+      assert.ok(merged.includes('A typed this') && merged.includes('B typed this'),
+        `both edits should be present: ${JSON.stringify(merged)}`);
+
+      // A focuses an image. The editor unbinds, so the app reports no open text
+      // file, and A's autosave then pushes the buffer it still holds — which
+      // predates B's last edit.
+      aSync.setOpenPath('images/fig.png');
+      assert.equal(aSync.applyingRemote, false);
+      aSync.onLocalText('main.typ', 'line one\nA typed this\n');
+      await sleep(20);
+
+      assert.equal(bText.toString(), merged,
+        `a stale buffer replaced the shared document: ${JSON.stringify(bText.toString())}`);
+      assert.equal(aText.toString(), merged, 'peers diverged after the stale push');
+
+      // A file the editor never bound is still shared by whole-file push — that
+      // is how an external tool's or a code cell's output reaches the session.
+      bSync.onLocalText('generated.typ', 'from a code run\n');
+      await sleep(20);
+      assert.equal(a.readText('generated.typ'), 'from a code run\n',
+        'an unbound file stopped syncing');
+    } finally {
+      aSync.stop(); bSync.stop();
+      aTransfer.close(); bTransfer.close();
     }
   }
 

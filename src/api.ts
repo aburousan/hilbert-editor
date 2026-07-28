@@ -1,3 +1,5 @@
+import { useEffect, useState } from 'react';
+
 // Base URL for the backend. When the page is served by the backend itself
 // (production build, desktop app), relative URLs reach the right server no
 // matter which port it bound — the desktop app picks a free one if 3001 is
@@ -40,3 +42,43 @@ window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Res
   headers.set('Authorization', `Bearer ${token}`);
   return originalFetch(input, { ...init, headers });
 };
+
+// A workspace asset as a URL an <img>, <embed> or PDF viewer can load.
+//
+// Pointing such an element straight at /workspace/raw does not work: the
+// browser fetches those on its own, outside the wrapper above, so the request
+// carries no Authorization header and the backend answers 401 — which is why
+// opening an image showed the broken-image glyph. Reading the bytes here and
+// handing back a blob URL also keeps the data same-origin, so a <canvas> drawn
+// from it stays untainted and crop and rotate can still read the pixels back.
+//
+// Pass a revision that changes whenever the file's contents change (a
+// collaborator's copy arriving, a crop being saved) to refetch it.
+export function useWorkspaceAsset(path: string | null, revision: unknown = 0): string | null {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    if (!path) {
+      setUrl(null);
+      return;
+    }
+    let active = true;
+    let objectUrl = '';
+    void (async () => {
+      try {
+        const response = await fetch(`${API}/workspace/raw?path=${encodeURIComponent(path)}`);
+        if (!response.ok) throw new Error(String(response.status));
+        const blob = await response.blob();
+        if (!active) return;
+        objectUrl = URL.createObjectURL(blob);
+        setUrl(objectUrl);
+      } catch {
+        if (active) setUrl(null);
+      }
+    })();
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [path, revision]);
+  return url;
+}

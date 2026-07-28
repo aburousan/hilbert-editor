@@ -4,6 +4,52 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.1.14
+
+More collaboration fixes, and images display again. **If you use collaboration,
+please update** — two of these could lose work without showing any sign of it.
+
+### Collaboration no longer stops after you open an image
+
+Opening an image or a PDF closes the text editor and builds a new one when you
+come back. The shared session stayed attached to the old one, so from that moment
+everything you typed stayed on your own machine. Nothing warned you: the
+participant count stayed up, the status still said connected, and your
+collaborator simply stopped seeing your work. The session now reattaches to the
+editor you are actually typing in.
+
+### Your text is no longer replaced by a second copy of the document
+
+While two people were writing, a file could end up holding the document twice, or
+lose a stretch of what one of you had written. When Hilbert reloaded a file from
+disk it replaced the whole editor buffer, and during a shared session that
+replacement was sent to everyone as a rewrite of the entire file. The file you
+have open in a session is now left to the session, which is the only copy that
+has everyone's edits in it.
+
+### "File changed outside Hilbert" no longer interrupts a shared session
+
+The prompt appeared at random while two people were typing, offering a choice
+between your version and the one on disk. Nothing outside Hilbert had touched the
+file: it was Hilbert's own save, and the app had lost track of what it had
+written. Saves are now tracked as they happen, and inside a session the merged
+document is kept without asking — the prompt was only ever offering to discard
+your collaborator's work.
+
+### Images, PDFs and plots display again
+
+Opening an image showed a broken-image icon, and cropping and rotating could not
+read the picture. Assets are now loaded the way the rest of the app loads files.
+This also covers PDFs opened from the file tree and plots produced by a code run.
+
+### Faster and steadier project transfer
+
+An asset that failed to arrive is retried when someone who has it joins, several
+assets transfer at once, and rejoining a folder you already have no longer
+re-downloads pictures that have not changed.
+
+---
+
 ## 0.1.12
 
 Fixes for live collaboration, including three that could damage files, plus much

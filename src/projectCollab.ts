@@ -65,6 +65,11 @@ export class ProjectSync {
   // writing on every keystroke would race autosave and the external-change
   // detector. Each peer skips only its OWN open file.
   private openPath: string | null = null;
+  // Every text path the editor has bound during this session. Their Y.Text is
+  // the authority: the binding carries each keystroke into the document, so a
+  // whole-file push for one of them can only ever be a stale echo. See
+  // onLocalText for why that echo used to destroy the session.
+  private readonly boundPaths = new Set<string>();
   // Raised while writing a network change to disk, so an app that watches files
   // does not mistake that write for a local edit and echo it back. Counter-
   // backed because binary fetches in one batch apply in parallel: with a plain
@@ -105,8 +110,14 @@ export class ProjectSync {
   // Tell the sync which file is open in the editor so it leaves that file's disk
   // state to the Monaco binding and autosave. Call on session start and on every
   // file switch. Pass null when no file is focused.
+  // Pass only a path the editor actually binds — a text file. Focusing an image
+  // or a PDF is "no text file open", not "that asset is open": naming an asset
+  // here would exempt it from the rejoin publish and pin a stale openPath while
+  // the real document is left unprotected.
   setOpenPath(path: string | null): void {
-    this.openPath = path ? normalizeWorkspacePath(path) : null;
+    const key = path ? normalizeWorkspacePath(path) : null;
+    this.openPath = key && this.isText(key) ? key : null;
+    if (this.openPath) this.boundPaths.add(this.openPath);
   }
 
   // Populate a newly selected empty workspace from the model already received
@@ -219,6 +230,14 @@ export class ProjectSync {
     if (this.applyingRemote) return;
     const key = normalizeWorkspacePath(path);
     if (!key) return;
+    // Never replace a bound file wholesale. Remote edits reach the editor
+    // through the Monaco binding, which leaves the buffer looking modified, so
+    // the app's autosave offers it back here as though the user had written it.
+    // Replacing the Y.Text with that buffer discards every keystroke the other
+    // peers made since it was last in sync — and because autosave keeps firing,
+    // it does so again and again. The session stays connected while each side
+    // watches the other's typing disappear.
+    if (this.boundPaths.has(key)) return;
     this.doc.transact(() => this.model.setText(key, content), LOCAL);
   }
 

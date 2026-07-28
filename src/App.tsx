@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo, lazy, Suspense } from 'react';
-import { API } from './api';
+import { API, useWorkspaceAsset } from './api';
 import Editor, { useMonaco } from '@monaco-editor/react';
 import { setupTypstLanguage, setWorkspaceImages } from './typstMonaco';
 import { useProofread } from './proofread';
@@ -285,6 +285,12 @@ const NO_SEARCH_RESULTS: SearchResult[] = [];
 
 export default function App() {
   const editorRef = useRef<any>(null);
+  // Bumped every time a new Monaco editor mounts. Focusing an image or a PDF
+  // unmounts the editor entirely, so coming back to a text file builds a fresh
+  // one — and anything that needs to hold on to the editor (the collaboration
+  // binding) has to be told when that happens rather than guess how long the
+  // remount takes.
+  const [editorEpoch, setEditorEpoch] = useState(0);
   const pdfRef = useRef<PdfHandle | null>(null);
   const forwardSyncRef = useRef<() => void>(() => {});
   // Start with no tabs. Seeding main.typ with DEFAULT_CODE here would build a
@@ -379,6 +385,15 @@ export default function App() {
   // read the current tab rather than the one captured when they were created.
   const activeTabRef = useRef(activeTab);
   activeTabRef.current = activeTab;
+
+  // Bytes for the open asset tab — an image, or a PDF that is not the compile
+  // output. Whiteboards are excluded: they render from the tab's JSON, not from
+  // a URL. binaryRevision advances when the file is replaced underneath (a crop
+  // saved, a collaborator's copy arriving), which refetches it.
+  const assetPath = activeTab && !isProjectTextPath(activeTabPath) && !activeTabPath.endsWith('.excalidraw')
+    ? activeTabPath
+    : null;
+  const assetUrl = useWorkspaceAsset(assetPath, activeTab?.binaryRevision ?? 0);
 
   // Where the caret last was in each file, keyed by model URI. Monaco's editor
   // component is recreated whenever the active tab briefly has no entry in
@@ -844,8 +859,72 @@ export default function App() {
     });
   };
 
-  const writeTab = async (tab: Tab, signal?: AbortSignal): Promise<string> => {
-    let expected = tab.diskHash;
+  // What this app itself last put on disk for a path, recorded the moment the
+  // write returns instead of on the next render. Tab state is too slow to be a
+  // save's precondition: a compile that starts before the previous one's hash
+  // has landed in state sends a hash the file no longer carries, and the backend
+  // answers a stale precondition with the same 409 it uses for a real outside
+  // edit. In a shared session — where arriving edits keep tabs modified and
+  // compiles frequent — that fired the "changed outside Hilbert" prompt at
+  // random while nothing outside Hilbert had touched the file.
+  const lastWrittenRef = useRef(new Map<string, { content: string; hash: string }>());
+
+  // The file the shared session has bound to the editor. Its buffer IS the
+  // merged document, so nothing may replace it from disk: the editor takes its
+  // value as a prop, and setting that value applies one edit spanning the whole
+  // model, which the binding faithfully turns into "delete everything, insert
+  // this" — the exact whole-document overwrite the rest of this file exists to
+  // prevent. Only the bookkeeping about what is on disk may be updated.
+  const isBoundToSession = (path: string) =>
+    !!collabRef.current && path === activeTabPathRef.current && isProjectTextPath(path);
+
+  // Take the copy on disk as the tab's content. Used when the version on disk is
+  // known to be the better one: the merged text a shared session just wrote, or
+  // this app's own earlier save that the tab lost track of.
+  const adoptDiskVersion = (path: string, content: string, hash: string) => {
+    lastWrittenRef.current.set(path, { content, hash });
+    setTabs(prev => prev.map(t => {
+      if (t.path !== path) return t;
+      if (isBoundToSession(path)) return { ...t, diskHash: hash };
+      return { ...t, content, diskHash: hash, isDirty: false };
+    }));
+  };
+
+  // A file open here changed on disk while its buffer had unsaved edits. Inside
+  // a shared session that is the session writing its merged version, and that
+  // version already contains this peer's own edits — they reached the document
+  // through the Monaco binding while the file was in front of them. So there are
+  // no two sides to choose between, and the prompt only ever offered to throw
+  // the collaborators' work away. Outside a session it is a real outside edit
+  // and the user decides.
+  const resolveDiskChange = (tab: Tab, disk: { content: string; hash?: string }) => {
+    const shared = collabRef.current?.workspace;
+    if (shared && disk.hash && shared.metaOf(tab.path)?.kind === 'text') {
+      adoptDiskVersion(tab.path, disk.content, disk.hash);
+      return;
+    }
+    showExternalConflict(tab, disk);
+  };
+
+  // Pull a changed file back into a tab that has no unsaved edits. The bound
+  // file is deliberately left alone — see isBoundToSession.
+  const reloadFromDisk = (path: string, disk: { content: string; hash?: string }) => {
+    if (isBoundToSession(path)) {
+      setTabs(prev => prev.map(item => item.path === path ? { ...item, diskHash: disk.hash } : item));
+      return;
+    }
+    setTabs(prev => prev.map(item => item.path === path && !item.isDirty
+      ? { ...item, content: disk.content, diskHash: disk.hash, isDirty: false }
+      : item));
+    // During a shared session a background file changes because a collaborator
+    // edited it, not because something outside Hilbert did — the reload is
+    // right, but the "external change" wording would be misleading.
+    if (!projectSessionRef.current) notify(`Reloaded ${path} after an external change.`);
+  };
+
+  const writeTab = async (tab: Tab): Promise<string> => {
+    const authored = lastWrittenRef.current.get(tab.path);
+    let expected = authored?.hash || tab.diskHash;
     if (!expected) {
       const disk = await readFileState(tab.path);
       expected = disk.hash;
@@ -854,24 +933,58 @@ export default function App() {
         throw new Error('external-conflict');
       }
     }
-    const headers: Record<string, string> = { 'Content-Type': 'text/plain' };
-    if (expected) headers['If-Match'] = expected;
-    const saved = await fetch(`${API}/workspace/file?path=${encodeURIComponent(tab.path)}`, {
-      method: 'POST', body: tab.content, headers, signal,
-    });
-    const data = await saved.json().catch(() => ({}));
-    if (saved.status === 409) {
-      showExternalConflict(tab, { content: data.content || '', hash: data.hash });
-      throw new Error('external-conflict');
+    // Deliberately not abortable. A superseded compile cancels its own typst
+    // run, but cancelling a save already in flight can leave the file written
+    // while the reply carrying its new hash is thrown away — and every later
+    // save then fails its precondition against a file we wrote ourselves.
+    const post = async (ifMatch?: string) => {
+      const headers: Record<string, string> = { 'Content-Type': 'text/plain' };
+      if (ifMatch) headers['If-Match'] = ifMatch;
+      const response = await fetch(`${API}/workspace/file?path=${encodeURIComponent(tab.path)}`, {
+        method: 'POST', body: tab.content, headers,
+      });
+      return { response, data: await response.json().catch(() => ({} as any)) };
+    };
+    let { response, data } = await post(expected);
+    if (response.status === 409 && data.hash && data.content === authored?.content) {
+      // The file holds this app's own previous save; only our note of its hash
+      // was stale. Nothing outside Hilbert happened, so save against it.
+      ({ response, data } = await post(data.hash));
     }
-    if (!saved.ok) throw new Error(`Could not save ${tab.path} (${saved.status}).`);
+    if (response.status === 409) {
+      const shared = collabRef.current?.workspace;
+      if (shared && data.hash && shared.metaOf(tab.path)?.kind === 'text') {
+        if (isBoundToSession(tab.path)) {
+          // This buffer is the session's merged document, so it is the version
+          // to keep — save it against what the file actually holds now rather
+          // than discarding either side.
+          ({ response, data } = await post(data.hash));
+        } else {
+          // A shared file this editor is not holding: what is on disk is the
+          // merged document the session wrote, and this buffer is a snapshot
+          // that fell behind it. Asking the user to pick a side would be
+          // offering to overwrite their collaborators.
+          adoptDiskVersion(tab.path, data.content || '', data.hash);
+          throw new Error('external-conflict');
+        }
+      }
+      if (response.status === 409) {
+        showExternalConflict(tab, { content: data.content || '', hash: data.hash });
+        throw new Error('external-conflict');
+      }
+    }
+    if (!response.ok) throw new Error(`Could not save ${tab.path} (${response.status}).`);
     if (!await syncToDisk(tab.path, tab.content)) {
       throw new Error(`Could not save ${tab.path} back to the opened folder. Check its write permission.`);
     }
-    if (tab.path !== activeTabPathRef.current) {
-      projectSessionRef.current?.sync.onLocalText(tab.path, tab.content);
-    }
-    return data.hash || expected || '';
+    const hash = data.hash || expected || '';
+    if (hash) lastWrittenRef.current.set(tab.path, { content: tab.content, hash });
+    // Nothing is pushed to a shared session here. Every tab this runs for is one
+    // the editor has bound, so the session already has each keystroke from the
+    // Monaco binding; a buffer holding merged remote edits looks modified too,
+    // and offering it back would replace the shared text with this peer's stale
+    // copy. See ProjectSync.onLocalText.
+    return hash;
   };
 
   const fetchTree = async () => {
@@ -980,11 +1093,14 @@ export default function App() {
     try {
       const savedHashes = new Map<string, string>();
       for (const tab of tabs) {
-        if (tab.isDirty) {
-          const hash = await writeTab(tab, ac.signal);
-          savedHashes.set(tab.path, hash);
-          setTabs(prev => prev.map(item => item.path === tab.path ? { ...item, diskHash: hash } : item));
-        }
+        if (!tab.isDirty) continue;
+        const hash = await writeTab(tab);
+        savedHashes.set(tab.path, hash);
+        setTabs(prev => prev.map(item => item.path === tab.path ? { ...item, diskHash: hash } : item));
+        // A newer compile took over. Its own pass covers the remaining tabs with
+        // fresher content, so stop here — but only between saves, never by
+        // abandoning one midway.
+        if (ac.signal.aborted) return;
       }
 
       const res = await fetch(`${API}/compile?main=${encodeURIComponent(mainFile)}`, { method: 'POST', signal: ac.signal });
@@ -1274,30 +1390,32 @@ export default function App() {
           // dirty mid-flight gets the conflict prompt on the next tick instead.
           const fresh = tabsRef.current.find(item => item.path === tab.path);
           if (!fresh) continue;
+          // The batched hashes above are a screening pass, and a save of our own
+          // can land between that request and this read. Judge the conflict on
+          // what the file holds now: if it matches the tab's baseline, or the
+          // last content this app wrote there, nothing outside Hilbert changed
+          // it and there is nothing to resolve.
+          if (disk.hash === fresh.diskHash) continue;
+          const authored = lastWrittenRef.current.get(fresh.path);
+          if (authored && disk.hash === authored.hash) {
+            setTabs(prev => prev.map(item => item.path === fresh.path
+              ? { ...item, diskHash: disk.hash } : item));
+            continue;
+          }
           if (!fresh.diskHash) {
             if (disk.content === fresh.content) {
               setTabs(prev => prev.map(item => item.path === fresh.path ? { ...item, diskHash: disk.hash } : item));
             } else if (fresh.isDirty) {
-              showExternalConflict(fresh, disk);
+              resolveDiskChange(fresh, disk);
             } else {
-              setTabs(prev => prev.map(item => item.path === fresh.path && !item.isDirty
-                ? { ...item, content: disk.content, diskHash: disk.hash, isDirty: false }
-                : item));
-              // During a shared session a background file changes because a
-              // collaborator edited it, not because something outside Hilbert
-              // did — the reload is right, but the "external change" wording is
-              // misleading, so stay quiet while a session is live.
-              if (!projectSessionRef.current) notify(`Reloaded ${fresh.path} after an external change.`);
+              reloadFromDisk(fresh.path, disk);
             }
             continue;
           }
           if (fresh.isDirty) {
-            showExternalConflict(fresh, disk);
+            resolveDiskChange(fresh, disk);
           } else {
-            setTabs(prev => prev.map(item => item.path === fresh.path && !item.isDirty
-              ? { ...item, content: disk.content, diskHash: disk.hash, isDirty: false }
-              : item));
-            if (!projectSessionRef.current) notify(`Reloaded ${fresh.path} after an external change.`);
+            reloadFromDisk(fresh.path, disk);
           }
         }
       } finally {
@@ -4018,6 +4136,16 @@ export default function App() {
               setTabs(previous => previous.map(tab =>
                 tab.path === change.path ? { ...tab, binaryRevision: (tab.binaryRevision ?? 0) + 1 } : tab));
             }
+          } else if (tabsRef.current.some(tab => tab.path === change.path)) {
+            // A text file the session just wrote from the shared document, open
+            // here in a tab that is not the focused one (the focused file is
+            // bound to Monaco and the sync leaves it alone). Take the written
+            // version: leaving the old buffer in place shows stale text, and the
+            // file watcher would go on to read the session's own write as an
+            // edit made outside Hilbert.
+            void readFileState(change.path)
+              .then(state => { if (state.hash) adoptDiskVersion(change.path, state.content, state.hash); })
+              .catch(() => {});
           }
           window.clearTimeout(refreshTimer);
           refreshTimer = window.setTimeout(() => { void fetchTree(); }, 80);
@@ -4254,10 +4382,20 @@ export default function App() {
     const frame = window.requestAnimationFrame(() => {
       const currentEditor = editorRef.current;
       const currentModel = currentEditor?.getModel();
-      if (currentEditor && currentModel) handle.bindFile(activeTabPath, currentModel, currentEditor);
+      // Bind only to the editor actually showing this file. Returning from an
+      // image tab runs this while the editor is still being rebuilt, so the ref
+      // can still hold the torn-down one — binding to that leaves the session
+      // attached to a dead model, and everything typed afterwards stays local
+      // while the app still reports a healthy connection. editorEpoch brings us
+      // back here once the real editor exists.
+      const uri = currentModel?.uri?.toString?.() || '';
+      const wanted = encodeURI(activeTabPath).replace(/#/g, '%23');
+      if (currentEditor && currentModel && (uri.endsWith(wanted) || uri.endsWith(activeTabPath))) {
+        handle.bindFile(activeTabPath, currentModel, currentEditor);
+      }
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [activeTabPath, collab?.room]);
+  }, [activeTabPath, collab?.room, editorEpoch]);
 
   const copyToClipboard = (text: string) => navigator.clipboard.writeText(text);
   const collectDirPaths = (nodes: FileNode[], acc: string[] = []): string[] => {
@@ -5155,7 +5293,10 @@ export default function App() {
                 // vector SVG (and SVGs often report no pixel size, breaking crop).
                 // So the editor is raster-only; SVG gets a plain preview.
                 const RASTER_EXT = ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif'];
-                const rawSrc = `${API}/workspace/raw?path=${encodeURIComponent(activeTabPath)}&v=${tabs.find(t => t.path === activeTabPath)?.binaryRevision || 0}`;
+                const rawSrc = assetUrl || '';
+                if ((RASTER_EXT.includes(ext) || ext === 'svg' || ext === 'pdf') && !rawSrc) {
+                  return <div className="empty-state">Loading {activeTabPath}…</div>;
+                }
                 if (RASTER_EXT.includes(ext)) {
                   return (
                     <Suspense fallback={null}><ImageEditor
@@ -5232,6 +5373,8 @@ export default function App() {
                     onMount={(e, monacoInstance) => {
                       (window as any).logTiming('Monaco ready');
                       editorRef.current = e;
+                      // Tell anything holding the old editor that this one replaced it.
+                      setEditorEpoch(n => n + 1);
                       // Remember cursor position for session restore (debounced write)
                       // and, per file, so a recreated editor lands back where it was.
                       // livePos tracks the caret through our own listener. Monaco

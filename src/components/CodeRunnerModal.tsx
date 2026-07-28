@@ -1,6 +1,15 @@
 import { useState, useEffect } from 'react';
 
-import { API } from '../api';
+import { API, useWorkspaceAsset } from '../api';
+
+// A plot a run produced. The backend needs an Authorization header the browser
+// will not attach to an <img src>, so the bytes are read through the API helper
+// and shown from a blob URL.
+function RunPlot({ path }: { path: string }) {
+  const url = useWorkspaceAsset(path);
+  if (!url) return null;
+  return <img src={url} alt={path} style={{ maxWidth: '100%', marginTop: 8, borderRadius: 4, display: 'block' }} />;
+}
 
 type Lang = 'python' | 'julia' | 'wolfram';
 type Interp = { label: string; path: string };
@@ -252,7 +261,7 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
                     {result.stdout && <pre style={{ fontSize: '0.8rem', margin: 0, whiteSpace: 'pre-wrap' }}>{result.stdout}</pre>}
                     {result.stderr && <pre style={{ color: '#fecaca', fontSize: '0.8rem', margin: result.stdout ? '6px 0 0' : 0, whiteSpace: 'pre-wrap' }}>{result.stderr}</pre>}
                     {result.images.map(img => (
-                      <img key={img} src={`${API}/workspace/raw?path=${encodeURIComponent(img)}`} alt={img} style={{ maxWidth: '100%', marginTop: 8, borderRadius: 4, display: 'block' }} />
+                      <RunPlot key={img} path={img} />
                     ))}
                     {!result.stdout && !result.stderr && !result.images.length && <span className="form-hint" style={{ margin: 0 }}>(no output)</span>}
                   </>

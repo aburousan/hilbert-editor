@@ -8,8 +8,23 @@ export default function ImageEditor({ path, initialSrc, onSave }: { path: string
   const [completedCrop, setCompletedCrop] = useState<PixelCrop>();
   const imgRef = useRef<HTMLImageElement>(null);
 
-  // When initialSrc changes (e.g. file switched), reset state
+  // URLs minted here for a rotated copy, so they can be released. The caller's
+  // initialSrc has its own owner and must never be revoked from this side.
+  const ownedUrls = useRef<string[]>([]);
+  const showRotated = (url: string) => {
+    ownedUrls.current.push(url);
+    setSrc(url);
+  };
+  const releaseRotated = () => {
+    for (const url of ownedUrls.current) URL.revokeObjectURL(url);
+    ownedUrls.current = [];
+  };
+  useEffect(() => releaseRotated, []);
+
+  // When initialSrc changes (e.g. file switched, or the file was replaced on
+  // disk), drop any rotation in progress and show the new image.
   useEffect(() => {
+    releaseRotated();
     setSrc(initialSrc);
     setCrop(undefined);
     setCompletedCrop(undefined);
@@ -39,7 +54,7 @@ export default function ImageEditor({ path, initialSrc, onSave }: { path: string
     
     const blob = await new Promise<Blob | null>(res => canvas.toBlob(res, 'image/png'));
     if (blob) {
-      setSrc(URL.createObjectURL(blob));
+      showRotated(URL.createObjectURL(blob));
       setCrop(undefined); // Reset crop box after rotation
       setCompletedCrop(undefined);
     }
