@@ -1,7 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Hilbert",
-  "version": "0.1.15",
+  "mainBinaryName": "hilbert",
+  "version": "0.1.16",
   "identifier": "com.kaziaburousan.hilbert",
   "build": {
     "beforeBuildCommand": "npm run build",
