@@ -346,7 +346,26 @@ fn arg_value(flag: &str) -> Option<String> {
     None
 }
 
+// WebKitGTK draws into a buffer it hands to the compositor over DMA-BUF. On a
+// good number of Linux setups that handoff quietly produces nothing at all and
+// the window comes up black — no error, no warning, the app otherwise running
+// fine underneath. NVIDIA's driver, nouveau, virtual machines and remote
+// desktops are the usual ones; confirmed here on a Quadro P400 on nouveau,
+// black every time until this is set and correct every time after.
+//
+// The older path it falls back to costs a little compositing performance and
+// nothing else, so the only machines that lose anything are the ones where the
+// fast path already worked. Leave it overridable for them.
+#[cfg(target_os = "linux")]
+fn avoid_blank_webkit_window() {
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+}
+
 fn main() {
+    #[cfg(target_os = "linux")]
+    avoid_blank_webkit_window();
     augment_path();
     // A window opened from "New Window" is handed its own session file, so extra
     // windows restore and persist independently and never overwrite the primary
