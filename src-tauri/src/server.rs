@@ -525,10 +525,11 @@ fn is_bulk_dir(name: &str) -> bool {
     matches!(name, "__pycache__" | "venv" | "site-packages")
 }
 
-// `unlimited` drops the depth and entry limits, for callers that need the real
-// contents of the project rather than something cheap to draw. The skips for
+// Descent stops `max_depth` levels below `dir`, and once `budget` entries have
+// been emitted. usize::MAX for either lifts that limit, for callers that need the
+// real contents of the project rather than something cheap to draw. The skips for
 // separate checkouts and bulk directories always apply.
-fn walk_tree(dir: &Path, ws: &Path, depth: usize, budget: &mut usize, unlimited: bool) -> Vec<Value> {
+fn walk_tree(dir: &Path, ws: &Path, depth: usize, budget: &mut usize, max_depth: usize) -> Vec<Value> {
     let mut out = Vec::new();
     let Ok(rd) = fs::read_dir(dir) else { return out };
     let mut items: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
@@ -558,11 +559,12 @@ fn walk_tree(dir: &Path, ws: &Path, depth: usize, budget: &mut usize, unlimited:
             // not marked, however much of the budget it used up.
             let stop = is_bulk_dir(&item)
                 || is_separate_project(&full)
-                || (!unlimited && (depth + 1 >= TREE_MAX_DEPTH || *budget == 0));
+                || depth + 1 >= max_depth
+                || *budget == 0;
             let children = if stop {
                 Vec::new()
             } else {
-                walk_tree(&full, ws, depth + 1, budget, unlimited)
+                walk_tree(&full, ws, depth + 1, budget, max_depth)
             };
             let truncated = stop;
             out.push(json!({
@@ -591,7 +593,8 @@ async fn workspace_tree(State(st): St, Query(q): Q) -> Response {
     let full = q.get("full").map(|v| v == "1" || v == "true").unwrap_or(false);
     let tree = tokio::task::spawn_blocking(move || {
         let mut budget = if full { usize::MAX } else { TREE_MAX_ENTRIES };
-        walk_tree(&ws.clone(), &ws, 0, &mut budget, full)
+        let max_depth = if full { usize::MAX } else { TREE_MAX_DEPTH };
+        walk_tree(&ws.clone(), &ws, 0, &mut budget, max_depth)
     })
     .await
     .unwrap_or_default();
@@ -600,6 +603,12 @@ async fn workspace_tree(State(st): St, Query(q): Q) -> Response {
 
 // The children of one directory the main walk left unread, fetched when the user
 // opens it.
+//
+// How far in depends on why it went unread. A folder the walk deliberately backs
+// away from — another project's checkout, a virtualenv — gives up one level at a
+// time, because descending into those is what made the tree crawl in the first
+// place. A folder it merely ran out of budget before reaching is an ordinary part
+// of this project and opens like any other, on a fresh budget.
 async fn workspace_subtree(State(st): St, Query(q): Q) -> Response {
     let ws = st.ws();
     let Some(rel) = q.get("path").map(String::as_str).filter(|p| !p.is_empty()) else {
@@ -613,8 +622,10 @@ async fn workspace_subtree(State(st): St, Query(q): Q) -> Response {
     }
     let root = ws.clone();
     let children = tokio::task::spawn_blocking(move || {
+        let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let avoided = is_separate_project(&dir) || is_bulk_dir(&name);
         let mut budget = TREE_MAX_ENTRIES;
-        walk_tree(&dir, &root, 0, &mut budget, false)
+        walk_tree(&dir, &root, 0, &mut budget, if avoided { 1 } else { TREE_MAX_DEPTH })
     })
     .await
     .unwrap_or_default();

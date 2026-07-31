@@ -75,6 +75,14 @@ export function startCollab(opts: {
   let bindingTarget: { path: string; model: any; editor: any } | null = opts.initialFile
     ? { path: opts.initialFile.path, model: opts.initialFile.model, editor: opts.initialFile.editor }
     : null;
+  // Where the caret sits, anchored to the shared text rather than to a line
+  // number. Looking at an image or a PDF tears the editor down and throws the
+  // buffer away, so coming back builds a new one — and by then collaborators
+  // have moved the text, which makes the line the caret used to be on the wrong
+  // line to return to. A position anchored to the characters themselves is
+  // still right however much was written above it in the meantime.
+  let parkedCaret: { text: Y.Text; at: Y.RelativePosition } | null = null;
+  let caretWatcher: { dispose: () => void } | null = null;
   let stopped = false;
   let ready = false;
   let errorMessage = '';
@@ -87,6 +95,38 @@ export function startCollab(opts: {
   const style = document.createElement('style');
   document.head.appendChild(style);
 
+  // Bring a buffer up to the shared text by editing only the stretch that
+  // actually differs.
+  //
+  // MonacoBinding does this for us, but it does it by replacing the buffer whole
+  // — and Monaco treats a wholesale replacement as a flush, which throws away
+  // its cursors and starts a new one at line 1. That is the caret jumping to the
+  // top of the file, and it happens on every rebind: switching tabs, coming back
+  // from an image, a session reconnecting. An ordinary edit instead carries the
+  // caret along the way any other edit does, and leaves the binding with nothing
+  // to replace.
+  const reconcile = (model: any, text: string) => {
+    const current = model.getValue();
+    if (current === text) return;
+    const shorter = Math.min(current.length, text.length);
+    let head = 0;
+    while (head < shorter && current[head] === text[head]) head++;
+    let tail = 0;
+    while (tail < shorter - head
+      && current[current.length - 1 - tail] === text[text.length - 1 - tail]) tail++;
+    const from = model.getPositionAt(head);
+    const to = model.getPositionAt(current.length - tail);
+    model.applyEdits([{
+      range: {
+        startLineNumber: from.lineNumber,
+        startColumn: from.column,
+        endLineNumber: to.lineNumber,
+        endColumn: to.column,
+      },
+      text: text.slice(head, text.length - tail),
+    }]);
+  };
+
   const attachBinding = () => {
     if (!bindingTarget || stopped || (opts.mode === 'join' && !ready)) return;
     binding?.destroy();
@@ -95,8 +135,29 @@ export function startCollab(opts: {
     // — a file only this peer holds, or one whose publish is still in flight —
     // binding to an empty placeholder would both blank the editor and leave a
     // shared empty Y.Text for two peers to fill at once. See WorkspaceModel.textOf.
-    binding = new MonacoBinding(
-      workspace.textOf(path, model.getValue()), model, new Set([editor]), provider.awareness);
+    const shared = workspace.textOf(path, model.getValue());
+    reconcile(model, shared.toString());
+    binding = new MonacoBinding(shared, model, new Set([editor]), provider.awareness);
+
+    // Put the caret back where its text ended up. Only for the file it was
+    // parked in: binding a different one leaves that file's caret alone until
+    // we come back to it.
+    if (parkedCaret?.text === shared) {
+      const at = Y.createAbsolutePositionFromRelativePosition(parkedCaret.at, ydoc);
+      if (at && at.type === shared) {
+        const position = model.getPositionAt(at.index);
+        editor.setPosition(position);
+        editor.revealPositionInCenterIfOutsideViewport(position);
+      }
+    }
+    caretWatcher?.dispose();
+    caretWatcher = editor.onDidChangeCursorPosition(() => {
+      if (editor.getModel() !== model) return;
+      parkedCaret = {
+        text: shared,
+        at: Y.createRelativePositionFromTypeIndex(shared, model.getOffsetAt(editor.getPosition())),
+      };
+    });
   };
 
   // A host owns the initial document and can bind immediately. A joiner must
@@ -204,6 +265,8 @@ export function startCollab(opts: {
     // the 30 s awareness timeout; the socket wrapper flushes queued frames
     // before the connection closes underneath it.
     try { provider.awareness.setLocalState(null); } catch { /* already closed */ }
+    caretWatcher?.dispose();
+    caretWatcher = null;
     binding?.destroy();
     provider.destroy();
     ydoc.destroy();
@@ -232,6 +295,10 @@ export function startCollab(opts: {
     bindFile: (path, model, editor) => {
       if (!path || !model || !editor) {
         bindingTarget = null;
+        // parkedCaret deliberately survives: it is what puts the caret back when
+        // this file comes into view again.
+        caretWatcher?.dispose();
+        caretWatcher = null;
         binding?.destroy();
         binding = null;
         return;

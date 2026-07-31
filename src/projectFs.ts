@@ -38,7 +38,11 @@ export function createProjectFs(): ProjectFs {
         await fetch(`${API}/workspace/file?path=${encodeURIComponent(path)}`),
         `Reading ${path}`,
       );
-      return response.text();
+      // The shared document counts a line break as one character, and so does
+      // every editor buffer (App forces LF on them). A file that reached the
+      // disk with CRLF would otherwise put two characters where the editors
+      // expect one and pull every later position out of step.
+      return (await response.text()).replace(/\r\n/g, '\n');
     },
 
     async readBinary(path) {

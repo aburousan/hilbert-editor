@@ -431,7 +431,7 @@ export default function App() {
   // off. Persisted to localStorage like the other saved settings above; no backend
   // state, so nothing to load or migrate.
   const workspacePathRef = useRef<string | null>(null);
-  const sessionRef = useRef<{ workspacePath?: string; openPaths?: string[]; activePath?: string; cursor?: { line: number; column: number }; scrollTop?: number }>({});
+  const sessionRef = useRef<{ workspacePath?: string; openPaths?: string[]; activePath?: string; cursor?: { line: number; column: number }; scrollTop?: number; expandedDirs?: string[]; mainFile?: string | null }>({});
   const sessionSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingCursorRef = useRef<{ path: string; line: number; column: number; scrollTop?: number } | null>(null);
   const restoredRef = useRef(false);
@@ -564,20 +564,34 @@ export default function App() {
   const [renameValue, setRenameValue] = useState<string>('');
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const [lastSelectedPath, setLastSelectedPath] = useState<string | null>(null);
-  // Folders the user has collapsed. Kept in React state (not the DOM) so the
-  // fold state survives tree re-renders triggered by selection / git updates.
-  const [collapsedDirs, setCollapsedDirs] = useState<Set<string>>(new Set());
+  // Folders the user has opened. Kept in React state (not the DOM) so the fold
+  // state survives tree re-renders triggered by selection / git updates, and
+  // saved with the session so a project opens the way it was left.
+  //
+  // Recording what is open, rather than what is closed, is what makes a folder
+  // that has appeared since last launch come up closed: it is simply not in the
+  // set. It also means a project nobody has expanded costs nothing to draw.
+  const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set());
   // Folders whose contents the tree walk skipped and which are now being read.
   const [loadingDirs, setLoadingDirs] = useState<Set<string>>(new Set());
   const loadedDirsRef = useRef(new Set<string>());
-  const toggleDir = (path: string) => {
-    let opening = false;
-    setCollapsedDirs(prev => {
+  // A folder the walk skipped has nothing to show yet, so it is drawn closed
+  // whatever the set says. The arrow and the click both go through here: while
+  // they disagreed, the first click on a skipped folder collapsed something that
+  // already looked closed and fetched nothing, so the folder appeared to refuse
+  // to open and only gave up its contents on a second click.
+  const isDirOpen = useCallback(
+    (node: FileNode) => !node.truncated && expandedDirs.has(node.path),
+    [expandedDirs],
+  );
+  const toggleDir = (node: FileNode) => {
+    const opening = !isDirOpen(node);
+    setExpandedDirs(prev => {
       const next = new Set(prev);
-      if (next.has(path)) { next.delete(path); opening = true; } else { next.add(path); }
+      if (opening) next.add(node.path); else next.delete(node.path);
       return next;
     });
-    if (opening) void expandTruncatedDir(path);
+    if (opening) void expandTruncatedDir(node.path);
   };
 
   // Read one folder the tree walk left unopened. A project folder can sit next
@@ -634,6 +648,16 @@ export default function App() {
     collabRef.current?.stop();
     collabRef.current = null;
     remoteApplyPendingRef.current = false;
+    // While the session ran, the buffer was ahead of the tab's copy of it — see
+    // the editor's `shared` prop. Take the buffer back before the editor becomes
+    // a controlled component again, or handing it the tab's text would undo the
+    // tail of the session.
+    const live = editorRef.current?.getModel();
+    if (live) {
+      const path = live.uri.path.replace(/^\//, '');
+      const text = live.getValue();
+      setTabs(prev => prev.map(t => (t.path === path && t.content !== text ? { ...t, content: text } : t)));
+    }
     setCollab(null);
     if (announce) notify('Left the shared project session.', 'info');
   };
@@ -771,6 +795,22 @@ export default function App() {
     window.addEventListener('hilbert:lsp-model-opened', onModelOpened);
     return () => window.removeEventListener('hilbert:lsp-model-opened', onModelOpened);
   }, []);
+  // A newline has to be the same number of characters on both machines. Monaco
+  // takes a buffer's line ending from whatever the file happened to contain, so
+  // a file written on Windows makes that editor count two characters per line
+  // break while the shared document counts one. Every position past the first
+  // line break then means something different on each side: text arrives in the
+  // wrong place and the cursors drift apart by a character per line. Put every
+  // buffer on LF.
+  useEffect(() => {
+    if (!monaco) return;
+    const toLf = (model: any) => {
+      if (model.getEOL() !== '\n') model.setEOL(monaco.editor.EndOfLineSequence.LF);
+    };
+    monaco.editor.getModels().forEach(toLf);
+    const created = monaco.editor.onDidCreateModel(toLf);
+    return () => created.dispose();
+  }, [monaco]);
   useEffect(() => {
     if (!monaco) return;
     const subscriptions = new Map<any, { dispose: () => void }>();
@@ -1262,6 +1302,28 @@ export default function App() {
     (activeTabPath && activeTabPath.endsWith('.typ') ? activeTabPath : (lastTypPath || 'main.typ')),
     [mainOverride, detectedEntry, activeTabPath, lastTypPath, treeHasPath]);
   const [lastCompiledPath, setLastCompiledPath] = useState<string>('');
+
+  // Remember how the tree was left — which folders stood open, and which file was
+  // marked as the one to compile. Both used to live only in React state, so every
+  // launch reopened the whole tree and quietly fell back to main.typ in the
+  // preview however the user had set it.
+  useEffect(() => {
+    if (!booted) return;
+    sessionRef.current.expandedDirs = [...expandedDirs];
+    sessionRef.current.mainFile = mainOverride;
+    scheduleSaveSession();
+  }, [expandedDirs, mainOverride, booted]);
+
+  // A folder that was open last time can come back from the walk unread, since the
+  // walk stops short on big or unrelated directories. Read those once so the tree
+  // really is as it was left instead of silently closed. Anything already read is
+  // skipped inside expandTruncatedDir, so this settles after one pass.
+  useEffect(() => {
+    if (!booted) return;
+    for (const path of expandedDirs) {
+      if (findNode(fileTree, path)?.truncated) void expandTruncatedDir(path);
+    }
+  }, [fileTree, expandedDirs, booted]);
 
   // Record a version-history snapshot for one file. Called only on an explicit
   // save, so each entry is an intentional version the user chose to keep — not
@@ -2045,6 +2107,12 @@ export default function App() {
   const loadWorkspace = async (projectDisplayName?: string) => {
     setTabs([]);
     setActiveTabPath('');
+    // Fold state, the chosen main file and the record of which folders have been
+    // read all describe the project being left, and paths in the new one can
+    // collide with them.
+    setExpandedDirs(new Set());
+    setMainOverride(null);
+    loadedDirsRef.current.clear();
     setHistory([]);
     setErrorLogs(null);
     setPdfUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
@@ -2116,6 +2184,12 @@ export default function App() {
   const restoreSessionOrDefault = async () => {
     let sess: any = null;
     try { sess = await (await fetch(`${API}/session`)).json(); } catch {}
+    // Before the tabs, and whether or not any of them can be reopened: the fold
+    // state and the chosen main file belong to the project, not to the tabs.
+    if (sess) {
+      if (Array.isArray(sess.expandedDirs)) setExpandedDirs(new Set(sess.expandedDirs));
+      if (typeof sess.mainFile === 'string') setMainOverride(sess.mainFile);
+    }
     if (sess && Array.isArray(sess.openPaths) && sess.openPaths.length) {
       try {
         if (sess.workspacePath) {
@@ -3891,8 +3965,8 @@ export default function App() {
     return nodes.map(node => (
       <div key={node.path} className="tree-node">
         {node.type === 'directory' ? (
-          <div className={`tree-dir-container ${collapsedDirs.has(node.path) ? '' : 'open'}`} onDragEnter={handleDragEnter} onDragOver={handleDragOver} onDrop={e => handleDrop(e, node.path)}>
-            <div data-path={node.path} draggable={true} onDragStart={e => handleDragStart(e, node.path)} className={`tree-dir ${selectedPaths.includes(node.path) ? 'selected' : ''}`} onClick={(e) => { e.preventDefault(); if (!e.ctrlKey && !e.metaKey && !e.shiftKey && renamingPath !== node.path) toggleDir(node.path); handleNodeClick(e, node.path, true); }} onContextMenu={(e) => handleNodeContextMenu(e, node, 'folder')} style={{ display: 'flex', alignItems: 'center', cursor: 'pointer' }}>
+          <div className={`tree-dir-container ${isDirOpen(node) ? 'open' : ''}`} onDragEnter={handleDragEnter} onDragOver={handleDragOver} onDrop={e => handleDrop(e, node.path)}>
+            <div data-path={node.path} draggable={true} onDragStart={e => handleDragStart(e, node.path)} className={`tree-dir ${selectedPaths.includes(node.path) ? 'selected' : ''}`} onClick={(e) => { e.preventDefault(); if (!e.ctrlKey && !e.metaKey && !e.shiftKey && renamingPath !== node.path) toggleDir(node); handleNodeClick(e, node.path, true); }} onContextMenu={(e) => handleNodeContextMenu(e, node, 'folder')} style={{ display: 'flex', alignItems: 'center', cursor: 'pointer' }}>
               <svg className="tree-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" style={{ marginRight: '2px', flexShrink: 0, transition: 'transform 0.12s ease' }}><polyline points="9 18 15 12 9 6"></polyline></svg>
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
               {renamingPath === node.path ? (
@@ -4010,7 +4084,7 @@ export default function App() {
       return matches.length ? { path: tab.path, matches } : null;
     }).filter(Boolean) as SearchResult[];
   }, [tabs, treeSearch]);
-  const treeJsx = useMemo(() => renderTree(filterTree(fileTree, treeSearch, searchContentResults, dirtyTabMatches)), [fileTree, activeTabPath, loadingDirs, renamingPath, renameValue, selectedPaths, collapsedDirs, currentMain, dirtyPathsKey, treeSearch, searchContentResults, dirtyTabMatches, filterTree]);
+  const treeJsx = useMemo(() => renderTree(filterTree(fileTree, treeSearch, searchContentResults, dirtyTabMatches)), [fileTree, activeTabPath, loadingDirs, renamingPath, renameValue, selectedPaths, expandedDirs, currentMain, dirtyPathsKey, treeSearch, searchContentResults, dirtyTabMatches, filterTree]);
   const outline = useMemo(() => (sidebarVisible && panels.outline ? getOutline() : []), [activeTab?.content, sidebarVisible, panels.outline]);
 
   const toggleMenu = (e: React.MouseEvent, menuName: string) => {
@@ -4077,6 +4151,10 @@ export default function App() {
         setDetectedEntry(null);
         setLastTypPath('');
         setLastCompiledPath('');
+        // Fold state and the record of which folders have been read belong to the
+        // project we are leaving; paths in the new one can collide with them.
+        setExpandedDirs(new Set());
+        loadedDirsRef.current.clear();
         setProjectName(folder.replace(/[/\\]+$/, '').split(/[/\\]/).pop() || 'Shared Project');
       }
       rememberSharedFolder(folder);
@@ -4126,6 +4204,8 @@ export default function App() {
         setDetectedEntry(null);
         setLastTypPath('');
         setLastCompiledPath('');
+        setExpandedDirs(new Set());
+        loadedDirsRef.current.clear();
         setProjectName(name);
         rememberSharedFolder(target);
         return true;
@@ -4476,8 +4556,11 @@ export default function App() {
     }
     return acc;
   };
-  const collapseTree = () => setCollapsedDirs(new Set(collectDirPaths(fileTree)));
-  const expandTree = () => setCollapsedDirs(new Set());
+  const collapseTree = () => setExpandedDirs(new Set());
+  // Opens every folder the tree already holds. One whose contents were never read
+  // stays shut and is fetched only when opened on its own, so this cannot drag an
+  // unrelated checkout in by accident.
+  const expandTree = () => setExpandedDirs(new Set(collectDirPaths(fileTree)));
   const copyAbsolutePath = async (path: string) => {
     try {
       const res = await fetch(`${API}/workspace/root`);
@@ -5433,13 +5516,25 @@ export default function App() {
                     </Boundary>
                   );
                 }
+                // In a shared session the merged document owns this buffer, not
+                // React. The editor takes its text as a prop and re-applies it
+                // whenever the prop and the buffer disagree — as one edit
+                // spanning the whole file, which the binding reports to everyone
+                // as "delete all of it, now insert this". React's copy is always
+                // a beat behind an edit that just arrived over the network, so
+                // the two disagree exactly while both people are typing, and a
+                // collaborator's last few keystrokes get overwritten and their
+                // text rearranged. Seed the buffer instead and let the binding
+                // be its only writer.
+                const shared = !!collab && isProjectTextPath(activeTab.path);
                 return (
                   <Editor
                     height="100%"
                     language={activeTab.path.endsWith('.typ') ? 'typst' : 'plaintext'}
                     theme={theme}
                     path={activeTab.path}
-                    value={activeTab.content}
+                    defaultValue={activeTab.content}
+                    value={shared ? undefined : activeTab.content}
                     onChange={handleEditorChange}
                     beforeMount={(monacoInstance) => setupTypstLanguage(monacoInstance)}
                     onMount={(e, monacoInstance) => {
