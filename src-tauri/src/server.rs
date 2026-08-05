@@ -161,6 +161,12 @@ pub struct AppState {
 }
 
 impl AppState {
+    // Record that the workspace changed, so a compile can tell which edit it is
+    // waiting for.
+    fn note_write(&self) {
+        self.source_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
     pub fn new(workspace: PathBuf, dist: Option<PathBuf>) -> Self {
         let mut token_bytes = [0u8; 32];
         getrandom::fill(&mut token_bytes).expect("operating-system randomness for API token");
@@ -795,7 +801,7 @@ async fn workspace_file_post(State(st): St, Query(q): Q, headers: HeaderMap, bod
     }
     match write_atomic(&full, &content) {
         Ok(_) => {
-            st.source_generation.fetch_add(1, Ordering::AcqRel);
+            st.note_write();
             let saved = fs::read_to_string(&full).unwrap_or_default();
             Json(json!({ "ok": true, "hash": format!("{:016x}", content_hash(&saved)) })).into_response()
         }
@@ -843,7 +849,7 @@ async fn workspace_file_delete(State(st): St, Query(q): Q) -> Response {
     };
     match res {
         Ok(_) => {
-            st.source_generation.fetch_add(1, Ordering::AcqRel);
+            st.note_write();
             "OK".into_response()
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -872,7 +878,7 @@ async fn workspace_upload(State(st): St, Query(q): Q, body: Bytes) -> Response {
     }
     match write_atomic(&full, &body) {
         Ok(_) => {
-            st.source_generation.fetch_add(1, Ordering::AcqRel);
+            st.note_write();
             "OK".into_response()
         }
         Err(_) => text_err(StatusCode::INTERNAL_SERVER_ERROR, "Error"),
@@ -1485,6 +1491,9 @@ async fn ensure_preview_watcher(
 enum WatchCompileResult {
     Pdf(Vec<u8>),
     CompileError(String),
+    // Compile in this process, and leave the watcher running: it is healthy, it
+    // just isn't going to produce a cycle for this particular edit.
+    Direct,
     Fallback,
 }
 
@@ -1510,22 +1519,28 @@ async fn compile_from_watcher(
         if event.generation >= target_generation && !in_flight {
             return finish(event.outcome);
         }
-        // While a cycle is compiling, wait for it to finish (typst watch queues
-        // file events, so a newer write starts the next cycle right after). When
-        // the last cycle is already complete but predates the target and no new
-        // one begins shortly, the triggering write wasn't part of the compile
-        // graph (an asset, an unreferenced .bib, ...) — the completed result is
-        // already current, so serve it instead of stalling out the preview.
+        // While a cycle is compiling, wait for it to finish — typst watch queues
+        // file events, so a newer write starts the next cycle right after.
+        //
+        // The grace for starting one is short on purpose. The watcher reacts to a
+        // write in about a hundred milliseconds, so half a second of silence means
+        // no cycle is coming for this edit, and every further millisecond spent
+        // hoping is one the preview spends behind the editor.
         let wait = if in_flight {
             deadline.saturating_duration_since(tokio::time::Instant::now())
         } else {
-            Duration::from_millis(1500)
+            Duration::from_millis(500)
         };
         match tokio::time::timeout(wait, events.changed()).await {
             Ok(Ok(())) => continue,
             Ok(Err(_)) => return WatchCompileResult::Fallback,
             Err(_) if in_flight => return WatchCompileResult::Fallback,
-            Err(_) => return finish(event.outcome),
+            // No cycle is coming. What sits in out.pdf was rendered from a read
+            // that happened before this edit, and handing it back is what left
+            // "wa" showing as "w" until the next keystroke dislodged it. Compile
+            // directly instead: a couple of hundred milliseconds for an answer
+            // that is actually current, and the watcher stays up for next time.
+            Err(_) => return WatchCompileResult::Direct,
         }
     }
 }
@@ -1571,12 +1586,16 @@ async fn compile(State(st): St, Query(q): Q, body: Bytes) -> Response {
     let output_path = hilbert_dir(&ws).join("out.pdf");
     let body_str = String::from_utf8_lossy(&body);
     if !body_str.trim().is_empty() && write_atomic(&main_path, body_str.as_bytes()).is_ok() {
-        st.source_generation.fetch_add(1, Ordering::AcqRel);
+        st.note_write();
     }
     let generation = st.source_generation.load(Ordering::Acquire);
     match compile_from_watcher(&st, &ws, &main_path, &output_path, generation).await {
         WatchCompileResult::Pdf(bytes) => ([(header::CONTENT_TYPE, "application/pdf")], bytes).into_response(),
         WatchCompileResult::CompileError(message) => json_err(StatusCode::BAD_REQUEST, message),
+        // A separate output file, so this never races the watcher writing its own.
+        WatchCompileResult::Direct => {
+            compile_once(&ws, &main_path, &hilbert_dir(&ws).join("out-direct.pdf")).await
+        }
         WatchCompileResult::Fallback => {
             stop_preview_watcher(&st).await;
             compile_once(&ws, &main_path, &output_path).await
