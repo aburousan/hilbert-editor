@@ -4450,7 +4450,18 @@ async fn ensure_lsp(ws: &Path) -> bool {
             }),
         )
         .await;
-    let init = match tokio::time::timeout(Duration::from_secs(5), rx).await {
+    // The first ever start is far slower than the ones after it: tinymist has to
+    // be paged in and scanned before it runs at all. A clean Windows runner with
+    // nothing competing for the disk took 3.3 s to answer, against 40 ms once
+    // warm, and a real machine with antivirus watching a freshly downloaded
+    // binary has every reason to take longer still. The old five second budget
+    // sat close enough to that to lose the race, and losing it killed the
+    // process — so the next attempt started cold and lost in exactly the same
+    // way, for good. Tinymist looked broken while running perfectly.
+    //
+    // Nothing waits on this but the request that triggered it, and diagnostics
+    // arriving late is a great deal better than never arriving.
+    let init = match tokio::time::timeout(Duration::from_secs(30), rx).await {
         Ok(Ok(result)) if result.is_object() => result,
         _ => {
             let _ = proxy.child.kill().await;
