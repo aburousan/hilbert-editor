@@ -4965,16 +4965,17 @@ async fn lsp_diagnostics(State(st): St, body: Bytes) -> Response {
         (version, changed, state, baseline)
     };
 
+    let latest = || {
+        let state = state.lock().unwrap();
+        state.by_uri.get(&uri).cloned().or_else(|| {
+            state.by_uri.iter()
+                .find(|(key, _)| same_file_uri(key, &full_path))
+                .map(|(_, value)| value.clone())
+        })
+    };
     let wait = async {
         loop {
-            let published = {
-                let published = state.lock().unwrap();
-                published.by_uri.get(&uri).cloned().or_else(|| {
-                    published.by_uri.iter()
-                        .find(|(key, _)| same_file_uri(key, &full_path))
-                        .map(|(_, value)| value.clone())
-                })
-            };
+            let published = latest();
             if let Some(published) = published {
                 let current_version = published.version.map(|version| version >= target_version).unwrap_or(false);
                 let fresh_unversioned = published.version.is_none() && published.revision > baseline;
@@ -4985,7 +4986,17 @@ async fn lsp_diagnostics(State(st): St, body: Bytes) -> Response {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     };
-    let published = tokio::time::timeout(Duration::from_secs(2), wait).await.ok().flatten();
+    // tinymist only republishes when a file's diagnostics actually change, so on
+    // an edit that neither introduces nor clears a problem — most of them — no
+    // message is ever coming. Waiting two seconds for one meant every keystroke
+    // in a clean document held a request open for two seconds, and the editor
+    // retries once, so a burst of typing stalled for four. It answers in about
+    // twenty milliseconds when it does have something to say; a short grace is
+    // all that buys anything.
+    let published = tokio::time::timeout(Duration::from_millis(400), wait).await.ok().flatten();
+    // Silence means the previous set still stands, so report that rather than
+    // reporting nothing and making the editor drop every marker it was showing.
+    let published = published.or_else(latest);
     let pending = published.is_none();
     let version = published.as_ref().and_then(|item| item.version);
     Json(json!({
