@@ -793,13 +793,39 @@ async fn workspace_file_post(State(st): St, Query(q): Q, headers: HeaderMap, bod
     if let Some(parent) = full.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    match fs::write(&full, content) {
+    match write_atomic(&full, &content) {
         Ok(_) => {
             st.source_generation.fetch_add(1, Ordering::AcqRel);
             let saved = fs::read_to_string(&full).unwrap_or_default();
             Json(json!({ "ok": true, "hash": format!("{:016x}", content_hash(&saved)) })).into_response()
         }
         Err(_) => text_err(StatusCode::INTERNAL_SERVER_ERROR, "Error"),
+    }
+}
+
+// Saving is not a private act: `typst watch` has the file open for changes, and
+// hears about it the moment it is truncated — well before the new text lands.
+// Whatever it manages to read at that instant is what gets compiled, which is
+// how a preview comes back missing the last characters that were typed. The
+// window is narrow on macOS and wide on Windows, where the change notification
+// arrives immediately rather than being coalesced.
+//
+// Renaming into place closes it: a reader sees either the previous file or the
+// complete new one, never a half-written one. If any of that fails we still
+// write in place, because losing someone's work to protect them from a race is
+// the worse trade.
+fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let Some(parent) = path.parent() else { return fs::write(path, contents) };
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{name}.{seq}.hilbert-tmp"));
+    match fs::write(&tmp, contents).and_then(|_| fs::rename(&tmp, path)) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&tmp);
+            fs::write(path, contents).map_err(|_| error)
+        }
     }
 }
 
@@ -844,7 +870,7 @@ async fn workspace_upload(State(st): St, Query(q): Q, body: Bytes) -> Response {
     if let Some(parent) = full.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    match fs::write(&full, body) {
+    match write_atomic(&full, &body) {
         Ok(_) => {
             st.source_generation.fetch_add(1, Ordering::AcqRel);
             "OK".into_response()
@@ -1544,7 +1570,7 @@ async fn compile(State(st): St, Query(q): Q, body: Bytes) -> Response {
     ensure_hilbert(&ws);
     let output_path = hilbert_dir(&ws).join("out.pdf");
     let body_str = String::from_utf8_lossy(&body);
-    if !body_str.trim().is_empty() && fs::write(&main_path, body_str.as_bytes()).is_ok() {
+    if !body_str.trim().is_empty() && write_atomic(&main_path, body_str.as_bytes()).is_ok() {
         st.source_generation.fetch_add(1, Ordering::AcqRel);
     }
     let generation = st.source_generation.load(Ordering::Acquire);
@@ -4482,16 +4508,45 @@ async fn lsp_document_request(
 }
 
 fn workspace_file_from_uri(ws: &Path, uri: &str) -> Option<String> {
+    let path = path_from_file_uri(uri)?;
+    path.strip_prefix(ws)
+        .ok()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+}
+
+fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
     let raw = uri.strip_prefix("file://")?;
     let decoded = percent_decode_str(raw).decode_utf8().ok()?;
     #[cfg(windows)]
     let path = decoded.strip_prefix('/').unwrap_or(decoded.as_ref());
     #[cfg(not(windows))]
     let path = decoded.as_ref();
-    Path::new(path)
-        .strip_prefix(ws)
-        .ok()
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
+    Some(PathBuf::from(path))
+}
+
+// Whether two file: URIs name the same file. tinymist doesn't echo back the URI
+// it was given — it republishes under a form of its own, and only on Unix does
+// that happen to be the string we sent. On Windows the two can differ by the
+// case of the drive letter, by `\\?\`, or by `%3A` against a literal colon, any
+// one of which turns an exact string lookup into a permanent miss: tinymist runs
+// fine, answers every request, and the editor still shows nothing. Comparing the
+// paths the URIs decode to costs nothing and doesn't care which form won.
+fn same_file_uri(a: &str, b: &Path) -> bool {
+    let Some(left) = path_from_file_uri(a) else { return false };
+    if left == b {
+        return true;
+    }
+    // Asking the filesystem settles every way the two spellings can differ at
+    // once — drive letter case, `\\?\`, symlinked parents, `.` and `..` — and
+    // both sides name a file that exists, so it nearly always answers.
+    if let (Ok(left), Ok(right)) = (fs::canonicalize(&left), fs::canonicalize(b)) {
+        return left == right;
+    }
+    if cfg!(windows) {
+        left.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+    } else {
+        false
+    }
 }
 
 fn normalize_locations(ws: &Path, result: &Value) -> Vec<Value> {
@@ -4765,6 +4820,29 @@ async fn lsp_completion(State(st): St, body: Bytes) -> Response {
     Json(json!({ "items": items })).into_response()
 }
 
+// `tinymist --version` leads with the bare name and puts the details on the
+// lines after it, so taking the first line alone leaves the settings panel
+// reading "tinymist ·" with an empty space where the version belongs. Some
+// builds don't carry a version on that line at all; the Typst version they were
+// built against is still worth showing, and is what tells two builds apart.
+fn tinymist_version(output: &str) -> String {
+    let mut lines = output.lines().map(str::trim).filter(|line| !line.is_empty());
+    let first = lines.next().unwrap_or("").to_string();
+    if first.chars().any(|c| c.is_ascii_digit()) {
+        return first;
+    }
+    let typst = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Typst Version:"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match typst {
+        Some(typst) if first.is_empty() => format!("tinymist (Typst {typst})"),
+        Some(typst) => format!("{first} (Typst {typst})"),
+        None => first,
+    }
+}
+
 async fn lsp_status(State(st): St) -> Response {
     let binary = resolve_tinymist();
     let (running, workspace, capabilities) = {
@@ -4792,7 +4870,7 @@ async fn lsp_status(State(st): St) -> Response {
         .ok()
         .map(|out| if out.stdout.trim().is_empty() { out.stderr } else { out.stdout })
         .unwrap_or_default();
-    let version = version_output.lines().find(|line| !line.trim().is_empty()).unwrap_or("").trim();
+    let version = tinymist_version(&version_output);
     Json(json!({
         "available": true,
         "running": running,
@@ -4859,7 +4937,14 @@ async fn lsp_diagnostics(State(st): St, body: Bytes) -> Response {
 
     let wait = async {
         loop {
-            let published = state.lock().unwrap().by_uri.get(&uri).cloned();
+            let published = {
+                let published = state.lock().unwrap();
+                published.by_uri.get(&uri).cloned().or_else(|| {
+                    published.by_uri.iter()
+                        .find(|(key, _)| same_file_uri(key, &full_path))
+                        .map(|(_, value)| value.clone())
+                })
+            };
             if let Some(published) = published {
                 let current_version = published.version.map(|version| version >= target_version).unwrap_or(false);
                 let fresh_unversioned = published.version.is_none() && published.revision > baseline;
