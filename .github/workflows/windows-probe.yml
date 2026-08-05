@@ -19,6 +19,7 @@ on:
 jobs:
   probe:
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
       - name: Fetch typst and tinymist
         shell: pwsh
@@ -49,7 +50,7 @@ jobs:
       - name: Probe tinymist URI handling and typst timings
         shell: python
         run: |
-          import json, os, re, subprocess, time
+          import json, os, queue, re, subprocess, threading, time
 
           TYPST = os.path.abspath(r"tools\typst.exe")
           TINYMIST = os.path.abspath(r"tools\tinymist.exe")
@@ -84,12 +85,33 @@ jobs:
           with open(main, 'w') as f:
               f.write('= Probe\n\n#definitely_not_a_real_function()\n')
 
+          # Messages are parsed on a thread and queued, so a wait can time out.
+          # Reading the pipe straight from the main loop would block forever the
+          # moment tinymist stayed quiet, which is precisely the case being
+          # tested — the probe would hang instead of reporting the failure.
           class Lsp:
               def __init__(self):
                   self.p = subprocess.Popen(
                       [TINYMIST, 'lsp'], cwd=ws,
                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                       stderr=subprocess.DEVNULL)
+                  self.q = queue.Queue()
+                  threading.Thread(target=self._pump, daemon=True).start()
+
+              def _pump(self):
+                  try:
+                      while True:
+                          hdr = b''
+                          while b'\r\n\r\n' not in hdr:
+                              c = self.p.stdout.read(1)
+                              if not c:
+                                  self.q.put(None)
+                                  return
+                              hdr += c
+                          n = int(re.search(rb'(?i)content-length:\s*(\d+)', hdr).group(1))
+                          self.q.put(json.loads(self.p.stdout.read(n)))
+                  except Exception:
+                      self.q.put(None)
 
               def send(self, obj):
                   b = json.dumps(obj).encode()
@@ -97,16 +119,10 @@ jobs:
                   self.p.stdin.flush()
 
               def read(self, deadline):
-                  hdr = b''
-                  while b'\r\n\r\n' not in hdr:
-                      if time.time() > deadline:
-                          return None
-                      c = self.p.stdout.read(1)
-                      if not c:
-                          return None
-                      hdr += c
-                  n = int(re.search(rb'(?i)content-length:\s*(\d+)', hdr).group(1))
-                  return json.loads(self.p.stdout.read(n))
+                  try:
+                      return self.q.get(timeout=max(0.05, deadline - time.time()))
+                  except queue.Empty:
+                      return None
 
               def close(self):
                   self.p.kill()
@@ -206,21 +222,40 @@ jobs:
           watch = subprocess.Popen([TYPST, 'watch', '--root', ws, main, out], cwd=ws,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    text=True, bufsize=1)
-          # Read the startup cycle out of the pipe first, otherwise the first
+          # Queued for the same reason as the LSP messages: a silent watcher must
+          # show up as a reported timeout, not as a hung job.
+          watch_lines = queue.Queue()
+
+          def pump_watch():
+              for line in watch.stdout:
+                  watch_lines.put(line)
+              watch_lines.put(None)
+
+          threading.Thread(target=pump_watch, daemon=True).start()
+
+          def next_line(deadline):
+              try:
+                  return watch_lines.get(timeout=max(0.05, deadline - time.time()))
+              except queue.Empty:
+                  return None
+
+          # Read the startup cycle out of the queue first, otherwise the first
           # timed round reads its leftovers and reports an absurdly fast time.
-          startup = time.time()
-          while time.time() - startup < 60:
-              line = watch.stdout.readline()
-              if not line or 'compiled' in line:
+          startup = time.time() + 90
+          while True:
+              line = next_line(startup)
+              if line is None or 'compiled' in line:
                   break
           for round_no in range(1, 4):
               t0 = time.time()
               with open(main, 'w') as f:
                   f.write(body.replace('A hundred rows', 'A hundred rows ' + 'x' * round_no))
               saw_compiling = None
-              while time.time() - t0 < 40:
-                  line = watch.stdout.readline()
-                  if not line:
+              deadline = t0 + 40
+              while True:
+                  line = next_line(deadline)
+                  if line is None:
+                      print('  edit %d: no compile reported within 40 s' % round_no)
                       break
                   if 'compiling ...' in line and saw_compiling is None:
                       saw_compiling = (time.time() - t0) * 1000
@@ -232,7 +267,5 @@ jobs:
                                total,
                                'OVER the 1500 ms give-up threshold' if total > 1500 else 'within budget'))
                       break
-              else:
-                  print('  edit %d: no compile reported within 40 s' % round_no)
           watch.kill()
           print('  macOS reference for the same document: ~130 ms end to end')
