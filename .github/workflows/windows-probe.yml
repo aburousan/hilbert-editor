@@ -1,0 +1,238 @@
+# Diagnostic only. Answers two questions we can't answer on a Mac:
+#
+#   1. Does tinymist publish diagnostics under the URI we send it, or under a
+#      form of its own? On Unix the two coincide, so a mismatch would only ever
+#      show up on Windows.
+#   2. How long does typst actually take to notice a write and finish a compile
+#      on Windows? The preview gives up waiting after 1500 ms and serves the
+#      previous PDF, so if the real figure is above that, the preview is always
+#      one edit behind.
+#
+# Deliberately does not build the app: both questions are about the two external
+# binaries, so probing them directly turns a 20 minute build into a 2 minute run.
+
+name: Windows probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    steps:
+      - name: Fetch typst and tinymist
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force -Path tools | Out-Null
+
+          $typstUrl = gh api repos/typst/typst/releases/latest --jq '.assets[] | select(.name | test("x86_64-pc-windows-msvc\\.zip$")) | .browser_download_url'
+          if (-not $typstUrl) { throw "no typst windows asset found" }
+          Write-Host "typst:    $typstUrl"
+          Invoke-WebRequest -Uri $typstUrl -OutFile typst.zip
+          Expand-Archive typst.zip -DestinationPath typst-unpacked
+          $typstExe = Get-ChildItem -Path typst-unpacked -Filter typst.exe -Recurse | Select-Object -First 1
+          Copy-Item $typstExe.FullName tools\typst.exe
+
+          $tinyUrl = gh api repos/Myriad-Dreamin/tinymist/releases/latest --jq '.assets[] | select(.name | test("win32-x64\\.exe$")) | .browser_download_url'
+          if (-not $tinyUrl) {
+            $tinyUrl = gh api repos/Myriad-Dreamin/tinymist/releases/latest --jq '.assets[] | select(.name | test("(?i)win.*x(86_)?64.*\\.exe$")) | .browser_download_url' | Select-Object -First 1
+          }
+          if (-not $tinyUrl) { throw "no tinymist windows asset found" }
+          Write-Host "tinymist: $tinyUrl"
+          Invoke-WebRequest -Uri $tinyUrl -OutFile tools\tinymist.exe
+
+          tools\typst.exe --version
+          tools\tinymist.exe --version
+
+      - name: Probe tinymist URI handling and typst timings
+        shell: python
+        run: |
+          import json, os, re, subprocess, time
+
+          TYPST = os.path.abspath(r"tools\typst.exe")
+          TINYMIST = os.path.abspath(r"tools\tinymist.exe")
+
+          # ---------------------------------------------------------------
+          # Exactly what src-tauri/src/server.rs:file_uri() builds: percent
+          # encode controls, space, '#', '?' and '%' and nothing else, then
+          # bolt on the right number of slashes.
+          # ---------------------------------------------------------------
+          def encode(s):
+              out = []
+              for ch in s:
+                  if ch in ' #?%' or ord(ch) < 0x20 or ord(ch) == 0x7F:
+                      out.append(''.join('%%%02X' % b for b in ch.encode()))
+                  else:
+                      out.append(ch)
+              return ''.join(out)
+
+          def hilbert_uri(path):
+              n = path.replace('\\', '/')
+              return ('file://' if n.startswith('/') else 'file:///') + encode(n)
+
+          # What VS Code sends, and therefore what tinymist is actually tested
+          # against: lower case drive letter and an encoded colon.
+          def vscode_uri(path):
+              n = path.replace('\\', '/')
+              return 'file:///' + n[0].lower() + '%3A' + encode(n[2:])
+
+          ws = os.path.abspath('probe-ws')
+          os.makedirs(ws, exist_ok=True)
+          main = os.path.join(ws, 'main.typ')
+          with open(main, 'w') as f:
+              f.write('= Probe\n\n#definitely_not_a_real_function()\n')
+
+          class Lsp:
+              def __init__(self):
+                  self.p = subprocess.Popen(
+                      [TINYMIST, 'lsp'], cwd=ws,
+                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                      stderr=subprocess.DEVNULL)
+
+              def send(self, obj):
+                  b = json.dumps(obj).encode()
+                  self.p.stdin.write(b'Content-Length: %d\r\n\r\n' % len(b) + b)
+                  self.p.stdin.flush()
+
+              def read(self, deadline):
+                  hdr = b''
+                  while b'\r\n\r\n' not in hdr:
+                      if time.time() > deadline:
+                          return None
+                      c = self.p.stdout.read(1)
+                      if not c:
+                          return None
+                      hdr += c
+                  n = int(re.search(rb'(?i)content-length:\s*(\d+)', hdr).group(1))
+                  return json.loads(self.p.stdout.read(n))
+
+              def close(self):
+                  self.p.kill()
+
+          def run_case(label, uri_fn):
+              print('=' * 70)
+              print('CASE:', label)
+              lsp = Lsp()
+              root = hilbert_uri(ws)
+              t0 = time.time()
+              lsp.send({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {
+                  'processId': os.getpid(), 'capabilities': {}, 'rootUri': root,
+                  'workspaceFolders': [{'uri': root, 'name': 'workspace'}]}})
+              deadline = time.time() + 60
+              while True:
+                  m = lsp.read(deadline)
+                  if m is None:
+                      print('  initialize: NO RESPONSE within 60 s')
+                      lsp.close()
+                      return
+                  if m.get('id') == 1:
+                      break
+              init_ms = (time.time() - t0) * 1000
+              print('  initialize: %.0f ms   (Hilbert gives up at 5000 ms)' % init_ms)
+
+              lsp.send({'jsonrpc': '2.0', 'method': 'initialized', 'params': {}})
+              sent = uri_fn(main)
+              print('  sent uri:      %s' % sent)
+              lsp.send({'jsonrpc': '2.0', 'method': 'textDocument/didOpen', 'params': {
+                  'textDocument': {'uri': sent, 'languageId': 'typst',
+                                   'version': 1, 'text': open(main).read()}}})
+
+              seen, matched = [], False
+              deadline = time.time() + 20
+              while time.time() < deadline:
+                  m = lsp.read(deadline)
+                  if m is None:
+                      break
+                  if m.get('method') == 'textDocument/publishDiagnostics':
+                      uri = m['params']['uri']
+                      seen.append((uri, len(m['params'].get('diagnostics') or [])))
+                      if uri == sent:
+                          matched = True
+                          break
+              for uri, n in seen:
+                  print('  published:     %s   (%d diagnostic(s))' % (uri, n))
+              if not seen:
+                  print('  published:     NOTHING within 20 s')
+              print('  EXACT MATCH:   %s' % matched)
+              print('  -> Hilbert looks diagnostics up by exact string, so a false here')
+              print('     means the editor never shows any, however healthy tinymist is.')
+              lsp.close()
+
+          run_case('Hilbert form  (file:///C:/...)', hilbert_uri)
+          run_case('VS Code form  (file:///c%3A/...)', vscode_uri)
+
+          # ---------------------------------------------------------------
+          # Timings, against a document the size Luca described.
+          # ---------------------------------------------------------------
+          print('=' * 70)
+          print('TYPST TIMINGS')
+          import struct, zlib
+
+          def png(path, w, h):
+              def chunk(t, d):
+                  c = t + d
+                  return struct.pack('>I', len(d)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
+              raw = b''.join(b'\x00' + bytes([(x * 7 + y * 3) % 256 for x in range(w * 3)]) for y in range(h))
+              with open(path, 'wb') as f:
+                  f.write(b'\x89PNG\r\n\x1a\n'
+                          + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+                          + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+
+          for i in range(1, 5):
+              png(os.path.join(ws, 'fig%d.png' % i), 900, 700)
+
+          lines = ['= A hundred rows and four pictures', '']
+          for i in range(1, 101):
+              if i % 25 == 0:
+                  lines.append('#figure(image("fig%d.png", width: 60%%), caption: [Figure %d])' % (i // 25, i // 25))
+              elif i % 10 == 0:
+                  lines.append('$ sum_(k=1)^%d k = %d(%d+1)/2 $' % (i, i, i))
+              else:
+                  lines.append('Row %d: ordinary prose with _emphasis_ and inline maths $x^%d$.' % (i, i % 9))
+              lines.append('')
+          body = '\n'.join(lines) + '\n'
+          with open(main, 'w') as f:
+              f.write(body)
+
+          out = os.path.join(ws, 'out.pdf')
+          t0 = time.time()
+          subprocess.run([TYPST, 'compile', '--root', ws, main, out], cwd=ws, check=True)
+          print('  cold typst compile:        %.0f ms   (macOS reference: 170 ms)' % ((time.time() - t0) * 1000))
+
+          # What the preview actually depends on: how long after a write does
+          # `typst watch` report a finished compile.
+          watch = subprocess.Popen([TYPST, 'watch', '--root', ws, main, out], cwd=ws,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, bufsize=1)
+          # Read the startup cycle out of the pipe first, otherwise the first
+          # timed round reads its leftovers and reports an absurdly fast time.
+          startup = time.time()
+          while time.time() - startup < 60:
+              line = watch.stdout.readline()
+              if not line or 'compiled' in line:
+                  break
+          for round_no in range(1, 4):
+              t0 = time.time()
+              with open(main, 'w') as f:
+                  f.write(body.replace('A hundred rows', 'A hundred rows ' + 'x' * round_no))
+              saw_compiling = None
+              while time.time() - t0 < 40:
+                  line = watch.stdout.readline()
+                  if not line:
+                      break
+                  if 'compiling ...' in line and saw_compiling is None:
+                      saw_compiling = (time.time() - t0) * 1000
+                  if 'compiled successfully' in line or 'compiled with' in line:
+                      total = (time.time() - t0) * 1000
+                      print('  edit %d: noticed after %s, finished after %.0f ms   %s'
+                            % (round_no,
+                               ('%.0f ms' % saw_compiling) if saw_compiling else 'n/a',
+                               total,
+                               'OVER the 1500 ms give-up threshold' if total > 1500 else 'within budget'))
+                      break
+              else:
+                  print('  edit %d: no compile reported within 40 s' % round_no)
+          watch.kill()
+          print('  macOS reference for the same document: ~130 ms end to end')
