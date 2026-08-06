@@ -4229,8 +4229,44 @@ fn managed_tinymist_path() -> PathBuf {
         .join(name)
 }
 
+// winget keeps a portable package's real executable under Packages/, and puts a
+// shim named after the command in Links/. The shim is a symlink, so it only gets
+// made when the install had permission to create one — without Developer Mode
+// and outside an elevated prompt it can be skipped, leaving a perfectly good
+// tinymist that nothing on PATH can reach. It also keeps the name it was
+// released under (tinymist-win32-x64.exe), so look for the package folder first
+// and take whatever executable is inside.
+// Split out from the lookup below so it can be tested anywhere: nothing about
+// walking the folder is Windows-specific except where the folder lives.
+#[cfg(any(windows, test))]
+fn tinymist_under(packages: &Path) -> Option<PathBuf> {
+    fs::read_dir(packages)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| dir_name(path).to_ascii_lowercase().contains("tinymist"))
+        .flat_map(|path| fs::read_dir(path).into_iter().flatten().flatten())
+        .map(|entry| entry.path())
+        .find(|path| {
+            let name = dir_name(path).to_ascii_lowercase();
+            name.starts_with("tinymist") && name.ends_with(".exe") && path.is_file()
+        })
+}
+
+#[cfg(windows)]
+fn winget_tinymist() -> Option<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?;
+    tinymist_under(&local.join("Microsoft").join("WinGet").join("Packages"))
+}
+
+#[cfg(not(windows))]
+fn winget_tinymist() -> Option<PathBuf> {
+    None
+}
+
 // Resolution order is deterministic: an explicit/bundled override, a binary
-// managed under Hilbert's config directory, then the user's PATH.
+// managed under Hilbert's config directory, the user's PATH, and finally the
+// place winget leaves one when it couldn't add it to PATH itself.
 fn resolve_tinymist() -> Option<TinymistBinary> {
     if let Some(path) = std::env::var("TINYMIST_BIN").ok().filter(|p| Path::new(p).is_file()) {
         let source = if std::env::var("HILBERT_TINYMIST_SOURCE").ok().as_deref() == Some("bundled") {
@@ -4244,7 +4280,10 @@ fn resolve_tinymist() -> Option<TinymistBinary> {
     if managed.is_file() {
         return Some(TinymistBinary { path: managed.to_string_lossy().into_owned(), source: "managed" });
     }
-    which("tinymist").map(|path| TinymistBinary { path, source: "path" })
+    if let Some(path) = which("tinymist") {
+        return Some(TinymistBinary { path, source: "path" });
+    }
+    winget_tinymist().map(|path| TinymistBinary { path: path.to_string_lossy().into_owned(), source: "winget" })
 }
 
 fn content_hash(s: &str) -> u64 {
@@ -5326,5 +5365,31 @@ mod tests {
         assert!(!valid_collab_room("0123456789abcde/"));
         assert!(!valid_collab_room("0123456789abcde?"));
         assert!(!valid_collab_room(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn finds_tinymist_where_winget_leaves_it() {
+        let root = temp_workspace("winget");
+        assert_eq!(tinymist_under(&root), None, "nothing installed yet");
+
+        // The names winget actually uses: the package folder carries the id and
+        // source, and the executable keeps the name it was released under.
+        let pkg = root.join("Myriad-Dreamin.Tinymist_Microsoft.Winget.Source_8wekyb3d8bbwe");
+        fs::create_dir_all(&pkg).unwrap();
+        assert_eq!(tinymist_under(&root), None, "folder alone is not an install");
+
+        let exe = pkg.join("tinymist-win32-x64.exe");
+        fs::write(&exe, b"").unwrap();
+        assert_eq!(tinymist_under(&root), Some(exe));
+
+        // A neighbouring package must not be mistaken for one.
+        let other = temp_workspace("winget-other");
+        let unrelated = other.join("Typst.Typst_Microsoft.Winget.Source_8wekyb3d8bbwe");
+        fs::create_dir_all(&unrelated).unwrap();
+        fs::write(unrelated.join("typst.exe"), b"").unwrap();
+        assert_eq!(tinymist_under(&other), None);
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&other).ok();
     }
 }

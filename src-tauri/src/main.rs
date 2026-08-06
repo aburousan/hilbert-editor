@@ -21,7 +21,19 @@ fn augment_path() {
     // runner both stop working).
     let extra: Vec<PathBuf> = if cfg!(windows) {
         let local = std::env::var("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|_| home.join("AppData/Local"));
+        let program_data =
+            std::env::var("ProgramData").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(r"C:\ProgramData"));
         vec![
+            // Where the Windows package managers put the shims they expect to be
+            // called by name. winget does add its Links folder to the stored user
+            // PATH, but a running program keeps the environment it was started
+            // with, and the desktop hands every app a copy of the one it captured
+            // at login. Install tinymist today and it answers in a new PowerShell
+            // while Hilbert, started from that older environment, reports it as
+            // missing — which is exactly what people have been seeing.
+            local.join("Microsoft/WinGet/Links"),
+            home.join("scoop/shims"),
+            program_data.join("chocolatey/bin"),
             home.join(".cargo/bin"),
             home.join(".juliaup/bin"),
             local.join("Programs/Python/Launcher"), // the `py` launcher
