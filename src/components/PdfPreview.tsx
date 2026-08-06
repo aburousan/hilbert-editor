@@ -95,6 +95,36 @@ function PdfPreview(
     if (!pages || !docCache.current.naturalW) return;
     const displayW = docCache.current.naturalW * displayScale(w, z);
     for (const el of Array.from(pages.children) as HTMLElement[]) el.style.width = `${displayW}px`;
+    // A drawn page takes its height from the bitmap and follows the width on its
+    // own; one still waiting has an explicit placeholder height that doesn't.
+    // Leaving those behind means the document only partly changes size now and
+    // lurches a second time when the re-raster settles — and on a long document
+    // almost every page is a placeholder, so that second jump is the big one.
+    for (const slot of slotsRef.current) {
+      if (!slot.rendered) slot.div.style.height = `${displayW * aspectRef.current}px`;
+    }
+  };
+
+  // Where the top of the pane sits in the document, as a page and how far into
+  // it. A pixel offset can't survive a width change: the gaps between pages are
+  // a fixed size, so the document's height doesn't scale with its width, and
+  // scaling the offset to match leaves the reader drifting further the further
+  // down they were. A page and a fraction of it means nothing to get wrong.
+  const captureAnchor = () => {
+    const scroll = scrollRef.current, slots = slotsRef.current;
+    if (!scroll || !slots.length) return null;
+    const top = scroll.scrollTop;
+    let index = 0;
+    for (let i = 0; i < slots.length; i++) if (slots[i].div.offsetTop <= top + 1) index = i;
+    const div = slots[index].div;
+    return { index, frac: div.offsetHeight ? (top - div.offsetTop) / div.offsetHeight : 0 };
+  };
+
+  const restoreAnchor = (anchor: { index: number; frac: number } | null) => {
+    const scroll = scrollRef.current;
+    const div = anchor && slotsRef.current[anchor.index]?.div;
+    if (!scroll || !div) return;
+    scroll.scrollTop = div.offsetTop + anchor.frac * div.offsetHeight;
   };
 
   const scheduleRaster = () => {
@@ -166,7 +196,13 @@ function PdfPreview(
       const w = entries[0].contentRect.width;
       if (Math.abs(w - liveWRef.current) < 1) return;
       liveWRef.current = w;
+      // Pages are laid out at a width taken from the pane, so a narrower pane
+      // shortens every page above the viewport too and the old scrollTop points
+      // somewhere else entirely — half a document away on a long one, which is
+      // what threw the reader's place away every time the window was dragged.
+      const anchor = captureAnchor();
       applyWidths(w, zoomFactorRef.current);
+      restoreAnchor(anchor);
       scheduleRaster();
     });
     ro.observe(el);
@@ -174,7 +210,17 @@ function PdfPreview(
     return () => { clearTimeout(debounceRef.current); ro.disconnect(); };
   }, []);
 
-  const setZoom = (z: number) => { setZoomFactor(z); zoomFactorRef.current = z; applyWidths(liveWRef.current, z); scheduleRaster(); };
+  // Zooming from the toolbar keeps the top of the pane where it was. The wheel
+  // handler below wants the point under the pointer instead, and sets its own
+  // offsets straight after this returns.
+  const setZoom = (z: number) => {
+    setZoomFactor(z);
+    zoomFactorRef.current = z;
+    const anchor = captureAnchor();
+    applyWidths(liveWRef.current, z);
+    restoreAnchor(anchor);
+    scheduleRaster();
+  };
 
   // Ctrl/⌘ + wheel zooms instead of scrolling, the way every PDF viewer does —
   // and a trackpad pinch reaches the page as exactly that event, so both
@@ -330,10 +376,14 @@ function PdfPreview(
     const dScale = displayScale(w, zoomFactorRef.current);
     scaleRef.current = { dScale, renderScale: Math.min(dScale * DPR, 5) };
     const displayW = docCache.current.naturalW * dScale;
+    // This rewrites every page's box, so hold the reading position across it for
+    // the same reason the resize itself does.
+    const anchor = captureAnchor();
     for (const slot of slots) {
       slot.div.style.width = `${displayW}px`;
       if (!slot.rendered) slot.div.style.height = `${displayW * aspectRef.current}px`;
     }
+    restoreAnchor(anchor);
     for (let i = 0; i < slots.length; i++) if (slots[i].rendered) drawPage(i + 1, token, true);
     renderTextLayers(token);
   }, [rasterTick, zoomFactor]);
