@@ -1198,12 +1198,22 @@ export default function App() {
     compileAbortRef.current = ac;
     setIsCompiling(true);
     try {
-      const savedHashes = new Map<string, string>();
+      const saved = new Map<string, { hash: string; content: string }>();
       for (const tab of tabs) {
         if (!tab.isDirty) continue;
         const hash = await writeTab(tab);
-        savedHashes.set(tab.path, hash);
-        setTabs(prev => prev.map(item => item.path === tab.path ? { ...item, diskHash: hash } : item));
+        saved.set(tab.path, { hash, content: tab.content });
+        // The tab is on disk now, so it is only still dirty if more was typed
+        // while we were writing. Leaving it marked dirty regardless is what made
+        // typing stop reaching the preview: this very update re-runs the
+        // compile-on-type effect, which schedules another compile, which begins
+        // by aborting this one. Whenever a round trip outlasts the debounce that
+        // repeats forever and nothing is ever finished — the reason a manual
+        // save appeared to be the only thing that worked, since saving clears
+        // the flag before it compiles.
+        setTabs(prev => prev.map(item => item.path === tab.path
+          ? { ...item, diskHash: hash, isDirty: item.content !== tab.content }
+          : item));
         // A newer compile took over. Its own pass covers the remaining tabs with
         // fresher content, so stop here — but only between saves, never by
         // abandoning one midway.
@@ -1231,11 +1241,14 @@ export default function App() {
         w.logTiming('First compile');
       }
 
-      setTabs(prev => prev.map(t => ({
-        ...t,
-        isDirty: false,
-        diskHash: savedHashes.get(t.path) || t.diskHash,
-      })));
+      // Same rule as above: what reached disk is clean, anything typed since is
+      // not, and declaring it clean would leave that text out of the preview
+      // with nothing scheduled to bring it back.
+      setTabs(prev => prev.map(t => {
+        const written = saved.get(t.path);
+        if (!written) return t;
+        return { ...t, isDirty: t.content !== written.content, diskHash: written.hash };
+      }));
       fetchTree();
     } catch (error) {
       if (ac.signal.aborted) return;   // superseded by a newer compile — stay quiet
