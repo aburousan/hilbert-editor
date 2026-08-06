@@ -359,6 +359,11 @@ export default function App() {
   const [pdfWords, setPdfWords] = useState<number | null>(null);
   const handlePdfWordCount = useCallback((n: number) => setPdfWords(n), []);
   const [isCompiling, setIsCompiling] = useState(false);
+  // Set once a single compile has been running long enough that "Compiling…" has
+  // stopped being an explanation. Nothing about the app looks different when the
+  // engine is thinking for a moment and when it is never coming back, and people
+  // have reasonably read the second as the app being broken.
+  const [compileStalled, setCompileStalled] = useState(false);
   const [errorLogs, setErrorLogs] = useState<string | null>(null);
   // Set only when a real compile fails (kept separate from errorLogs, which is
   // also reused for transient UI hints). Drives the clear preview error panel.
@@ -1192,11 +1197,26 @@ export default function App() {
   // process — no orphaned compiles racing to write out.pdf.
   const compileAbortRef = useRef<AbortController | null>(null);
 
+  // Long enough that a heavy document compiling normally never trips it, short
+  // enough to answer "is it working on it, or is it stuck?" while the person is
+  // still looking at the screen.
+  const COMPILE_SLOW_MS = 8000;
+  // The backend gives up on its own well before this; if we reach it, something
+  // below it never answered, and the editor should say so rather than sit on a
+  // spinner that also makes saving look dead.
+  const COMPILE_CEILING_MS = 180000;
+
   const compileTypst = useCallback(async (mainFile: string = 'main.typ') => {
     compileAbortRef.current?.abort();
     const ac = new AbortController();
     compileAbortRef.current = ac;
     setIsCompiling(true);
+    setCompileStalled(false);
+    let gaveUp = false;
+    const slowTimer = window.setTimeout(() => {
+      if (compileAbortRef.current === ac) setCompileStalled(true);
+    }, COMPILE_SLOW_MS);
+    const ceilingTimer = window.setTimeout(() => { gaveUp = true; ac.abort(); }, COMPILE_CEILING_MS);
     try {
       const saved = new Map<string, { hash: string; content: string }>();
       for (const tab of tabs) {
@@ -1251,6 +1271,13 @@ export default function App() {
       }));
       fetchTree();
     } catch (error) {
+      if (gaveUp) {
+        const msg = `The Typst engine hasn't answered in ${COMPILE_CEILING_MS / 1000} seconds, so this compile was abandoned. `
+          + 'Recompile to try again — and if it keeps happening, Help → Copy diagnostics has the detail worth reporting.';
+        setErrorLogs(msg);
+        setCompileError(msg);
+        return;
+      }
       if (ac.signal.aborted) return;   // superseded by a newer compile — stay quiet
       if (error instanceof Error && error.message === 'external-conflict') return;
       const msg = error instanceof Error && /fetch/i.test(error.message)
@@ -1259,8 +1286,10 @@ export default function App() {
       setErrorLogs(msg);
       setCompileError(msg);
     } finally {
+      window.clearTimeout(slowTimer);
+      window.clearTimeout(ceilingTimer);
       // Only the latest compile owns the spinner; a superseded one bows out.
-      if (compileAbortRef.current === ac) setIsCompiling(false);
+      if (compileAbortRef.current === ac) { setIsCompiling(false); setCompileStalled(false); }
     }
   }, [tabs]);
 
@@ -4563,6 +4592,20 @@ export default function App() {
   }, [activeTabPath, collab?.room, editorEpoch]);
 
   const copyToClipboard = (text: string) => navigator.clipboard.writeText(text);
+
+  // Which Typst it found, where, and the last few thousand lines of what the
+  // engine has been doing. Windows in particular gives a windowed app nowhere to
+  // print, so without this a report can only describe the symptom.
+  const copyDiagnostics = async () => {
+    try {
+      const res = await fetch(`${API}/diagnostics`);
+      if (!res.ok) throw new Error(`${res.status}`);
+      await navigator.clipboard.writeText(await res.text());
+      notify('Diagnostics copied — paste them into the issue.');
+    } catch {
+      notify('Could not collect diagnostics.');
+    }
+  };
   const collectDirPaths = (nodes: FileNode[], acc: string[] = []): string[] => {
     for (const n of nodes) {
       if (n.type === 'directory') { acc.push(n.path); if (n.children) collectDirPaths(n.children, acc); }
@@ -4765,6 +4808,7 @@ export default function App() {
     { category: 'Format', title: 'Letter Spacing...', run: insertTracking },
     { category: 'Packages', title: 'Install Typst Package...', run: () => setShowPackageInstaller(true) },
     { category: 'Help', title: 'Features & Help...', run: () => setShowHelp(true) },
+    { category: 'Help', title: 'Copy Diagnostics', run: () => copyDiagnostics() },
   ];
 
   return (
@@ -5073,6 +5117,7 @@ export default function App() {
                 <div className="dropdown">
                   <div className="dropdown-item" onClick={() => { setShowHelp(true); setActiveMenu(null); }}>Features &amp; Help...</div>
                   <div className="dropdown-item" onClick={() => { setShowPalette(true); setActiveMenu(null); }}>Command Palette... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘K</span></div>
+                  <div className="dropdown-item" onClick={() => { copyDiagnostics(); setActiveMenu(null); }}>Copy Diagnostics</div>
                 </div>
               )}
             </div>
@@ -5761,7 +5806,11 @@ export default function App() {
         </button>
         {/* Always mounted: toggling visibility instead of unmounting keeps the
             panel switches from shifting sideways on every recompile. */}
-        <span className="status-note" style={{ visibility: isCompiling ? 'visible' : 'hidden' }}>Compiling…</span>
+        <span
+          className="status-note"
+          style={{ visibility: isCompiling ? 'visible' : 'hidden' }}
+          title={compileStalled ? "Typst has been asked to compile and hasn't answered yet. Saving still works." : undefined}
+        >{compileStalled ? 'Compiling… still waiting on Typst' : 'Compiling…'}</span>
         <span className="status-sep" />
         {LEFT_PANEL_KEYS.map(renderPanelToggle)}
         <span style={{ flex: 1 }} />
