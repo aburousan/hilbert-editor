@@ -120,11 +120,14 @@ function PdfPreview(
     return { index, frac: div.offsetHeight ? (top - div.offsetTop) / div.offsetHeight : 0 };
   };
 
+  // False when the anchored page is gone, which only a rebuild can do — the
+  // caller then still has its old offset to fall back on.
   const restoreAnchor = (anchor: { index: number; frac: number } | null) => {
     const scroll = scrollRef.current;
     const div = anchor && slotsRef.current[anchor.index]?.div;
-    if (!scroll || !div) return;
+    if (!scroll || !div) return false;
     scroll.scrollTop = div.offsetTop + anchor.frac * div.offsetHeight;
+    return true;
   };
 
   const scheduleRaster = () => {
@@ -283,6 +286,7 @@ function PdfPreview(
     if (!url || !pagesEl || !scrollEl) return;
     const token = ++renderTokenRef.current;
     const prevScroll = scrollEl.scrollTop;
+    const prevAnchor = captureAnchor();
 
     (async () => {
       const prevSlots = slotsRef.current;
@@ -357,7 +361,11 @@ function PdfPreview(
       }
       pagesEl.replaceChildren(frag);
       slotsRef.current = slots;
-      scrollEl.scrollTop = prevScroll;
+      // A rebuild also happens when the page size changes, and then every page
+      // is a different height and the old offset means nothing — the same
+      // problem a resize has. Prefer the anchor; the offset is what's left when
+      // the document got shorter than the page we were on.
+      if (!restoreAnchor(prevAnchor)) scrollEl.scrollTop = prevScroll;
 
       attachObserver(token, scrollEl);
       await renderTextLayers(token);
