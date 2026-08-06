@@ -119,6 +119,16 @@ enum PreviewOutcome {
 struct PreviewEvent {
     generation: u64,
     outcome: PreviewOutcome,
+    // When this became the watcher's answer. Only meaningful for Waiting, where
+    // it is the difference between "typst is working on it" and "typst said it
+    // was working on it some time ago and has not been heard from since".
+    since: Instant,
+}
+
+impl PreviewEvent {
+    fn new(generation: u64, outcome: PreviewOutcome) -> Self {
+        PreviewEvent { generation, outcome, since: Instant::now() }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -326,6 +336,67 @@ fn strip_appimage_env(cmd: &mut Command) {
 
 #[cfg(not(target_os = "linux"))]
 fn strip_appimage_env(_cmd: &mut Command) {}
+
+// ---------------------------------------------------------------------------
+// Activity log
+// ---------------------------------------------------------------------------
+//
+// On macOS and Linux the app is usually started from somewhere that shows
+// stdout; on Windows it is a windowed process with no console attached, so
+// everything it prints goes nowhere. That has made every Windows report a
+// guessing game — the person in front of the problem can describe what they
+// see, and there is nothing to look at afterwards. So keep the last few
+// thousand lines both in memory (for /diagnostics) and in a file next to the
+// session, and write down the things a stuck compile would need to explain
+// itself: what typst was asked, what it said back, and how long each stage took.
+
+const LOG_LINES: usize = 3000;
+const LOG_BYTES: u64 = 4 * 1024 * 1024;
+
+static LOG: LazyLock<Mutex<std::collections::VecDeque<String>>> =
+    LazyLock::new(|| Mutex::new(std::collections::VecDeque::with_capacity(LOG_LINES)));
+
+fn log_path() -> PathBuf {
+    session_file().with_file_name("hilbert.log")
+}
+
+fn stamp() -> String {
+    // Seconds since the epoch split by hand rather than pulling in a date crate
+    // for the one place that needs it. Wall clock, so it lines up with when the
+    // user says the app stopped answering.
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+    let secs = now.as_secs();
+    format!("{:02}:{:02}:{:02}.{:03}", secs / 3600 % 24, secs / 60 % 60, secs % 60, now.subsec_millis())
+}
+
+pub fn note(message: impl AsRef<str>) {
+    let line = format!("[{}] {}", stamp(), message.as_ref());
+    if let Ok(mut buffer) = LOG.lock() {
+        if buffer.len() == LOG_LINES { buffer.pop_front(); }
+        buffer.push_back(line.clone());
+    }
+    eprintln!("{line}");
+
+    let path = log_path();
+    if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
+    // Start a fresh file rather than growing without bound. One generation back
+    // is kept, because the interesting run is often the one before the restart.
+    if fs::metadata(&path).map(|m| m.len() > LOG_BYTES).unwrap_or(false) {
+        let _ = fs::rename(&path, path.with_extension("log.1"));
+    }
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+macro_rules! note {
+    ($($arg:tt)*) => { crate::server::note(format!($($arg)*)) };
+}
+
+fn recent_log() -> String {
+    LOG.lock().map(|b| b.iter().cloned().collect::<Vec<_>>().join("\n")).unwrap_or_default()
+}
 
 // Cap on captured stdout/stderr. A runaway `while True: print(...)` can emit
 // gigabytes long before the wall-clock timeout fires; without a cap the backend
@@ -1381,7 +1452,7 @@ async fn collect_preview_events(
                 Ok(line) => line,
                 Err(_) => {
                     let message = if diagnostics.is_empty() { "Compilation failed.".into() } else { diagnostics.join("\n") };
-                    let _ = events.send(PreviewEvent { generation: cycle_generation, outcome: PreviewOutcome::Error(message) });
+                    let _ = events.send(PreviewEvent::new(cycle_generation, PreviewOutcome::Error(message)));
                     pending_error = false;
                     diagnostics.clear();
                     continue;
@@ -1392,26 +1463,28 @@ async fn collect_preview_events(
         };
 
         let Some(line) = next else {
+            note("watch: output ended — the watcher is gone");
             if pending_error {
                 let message = if diagnostics.is_empty() { "Compilation failed.".into() } else { diagnostics.join("\n") };
-                let _ = events.send(PreviewEvent { generation: cycle_generation, outcome: PreviewOutcome::Error(message) });
+                let _ = events.send(PreviewEvent::new(cycle_generation, PreviewOutcome::Error(message)));
             } else {
                 let generation = st.source_generation.load(Ordering::Acquire);
-                let _ = events.send(PreviewEvent { generation, outcome: PreviewOutcome::Unavailable });
+                let _ = events.send(PreviewEvent::new(generation, PreviewOutcome::Unavailable));
             }
             break;
         };
         let line = line.trim_end_matches('\r').to_string();
 
+        if !line.trim().is_empty() { note!("watch: {line}"); }
         if line.contains("compiling ...") {
             cycle_generation = st.source_generation.load(Ordering::Acquire);
             pending_error = false;
             diagnostics.clear();
             // Announce the in-flight cycle so waiters can tell "still compiling"
             // apart from "no compile is coming for this generation".
-            let _ = events.send(PreviewEvent { generation: cycle_generation, outcome: PreviewOutcome::Waiting });
+            let _ = events.send(PreviewEvent::new(cycle_generation, PreviewOutcome::Waiting));
         } else if line.contains("compiled successfully") || line.contains("compiled with warnings") {
-            let _ = events.send(PreviewEvent { generation: cycle_generation, outcome: PreviewOutcome::Success });
+            let _ = events.send(PreviewEvent::new(cycle_generation, PreviewOutcome::Success));
             pending_error = false;
             diagnostics.clear();
         } else if line.contains("compiled with errors") {
@@ -1426,6 +1499,7 @@ async fn collect_preview_events(
 async fn stop_preview_watcher(st: &Arc<AppState>) {
     let mut guard = st.preview_watcher.lock().await;
     if let Some(mut watcher) = guard.take() {
+        note("watch: stopping the watcher");
         let _ = watcher.child.start_kill();
         let _ = watcher.child.wait().await;
     }
@@ -1470,6 +1544,7 @@ async fn ensure_preview_watcher(
         .kill_on_drop(true);
     strip_appimage_env(&mut cmd);
     let mut child = cmd.spawn()?;
+    note!("watch: started typst watch on {} (pid {:?})", main_path.display(), child.id());
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let (line_tx, line_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1481,12 +1556,24 @@ async fn ensure_preview_watcher(
     }
     drop(line_tx);
 
-    let initial = PreviewEvent { generation: 0, outcome: PreviewOutcome::Waiting };
+    let initial = PreviewEvent::new(0, PreviewOutcome::Waiting);
     let (event_tx, event_rx) = tokio::sync::watch::channel(initial);
     tokio::spawn(collect_preview_events(st.clone(), line_rx, event_tx));
     *guard = Some(PreviewWatcher { key, child, events: event_rx.clone() });
     Ok(event_rx)
 }
+
+// How long to keep waiting on a cycle the watcher has announced but not
+// finished. Long enough for a genuinely heavy document, short enough that a
+// watcher which has stopped answering doesn't hold the preview hostage.
+const IN_FLIGHT_BUDGET: Duration = Duration::from_secs(30);
+
+// A direct compile is bounded too. Nothing here should ever need this long, but
+// the request used to have no ceiling at all, and one typst that never exits
+// took the compile slot with it — every later keystroke then queued behind a
+// process that was never coming back, which is indistinguishable from the app
+// having died.
+const DIRECT_COMPILE_BUDGET_MS: u64 = 90_000;
 
 enum WatchCompileResult {
     Pdf(Vec<u8>),
@@ -1497,6 +1584,41 @@ enum WatchCompileResult {
     Fallback,
 }
 
+#[derive(Debug, PartialEq)]
+enum WatchStep {
+    // The watcher's answer covers this edit — hand it over.
+    Serve,
+    // A cycle is running; this is what's left of its budget.
+    AwaitCycle(Duration),
+    // Nothing is running yet. Give the watcher a moment to notice the write.
+    AwaitStart(Duration),
+}
+
+// How long to give the watcher to react to a write before giving up on it for
+// this edit. It notices one in about a hundred milliseconds, so silence past
+// this means no cycle is coming and every further millisecond is one the
+// preview spends behind the editor.
+const START_GRACE: Duration = Duration::from_millis(500);
+
+// Whether the watcher's latest word still decides this request.
+//
+// The subtlety is Waiting. typst watch announces "compiling ..." and then says
+// how it went, and if that second line never arrives, the announcement used to
+// stay its answer for good: every later keystroke then waited out the entire
+// budget before falling back, so the preview sat on "Compiling…" for half a
+// minute at a time with a typst process idling next to it doing nothing. Dating
+// the announcement makes one lost cycle cost one wait instead of all of them,
+// while a document that genuinely takes twenty seconds still gets its twenty.
+fn watcher_step(event: &PreviewEvent, target_generation: u64, elapsed: Duration) -> WatchStep {
+    if matches!(event.outcome, PreviewOutcome::Waiting) && elapsed < IN_FLIGHT_BUDGET {
+        return WatchStep::AwaitCycle(IN_FLIGHT_BUDGET - elapsed);
+    }
+    if event.generation >= target_generation {
+        return WatchStep::Serve;
+    }
+    WatchStep::AwaitStart(START_GRACE)
+}
+
 async fn compile_from_watcher(
     st: &Arc<AppState>,
     ws: &Path,
@@ -1505,6 +1627,7 @@ async fn compile_from_watcher(
     target_generation: u64,
 ) -> WatchCompileResult {
     let Ok(mut events) = ensure_preview_watcher(st, ws, main_path, output_path).await else {
+        note("compile: could not start typst watch — compiling directly instead");
         return WatchCompileResult::Fallback;
     };
     let finish = |outcome: PreviewOutcome| match outcome {
@@ -1512,29 +1635,32 @@ async fn compile_from_watcher(
         PreviewOutcome::Error(message) => WatchCompileResult::CompileError(message),
         _ => WatchCompileResult::Fallback,
     };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let event = events.borrow().clone();
-        let in_flight = matches!(event.outcome, PreviewOutcome::Waiting);
-        if event.generation >= target_generation && !in_flight {
-            return finish(event.outcome);
-        }
-        // While a cycle is compiling, wait for it to finish — typst watch queues
-        // file events, so a newer write starts the next cycle right after.
-        //
-        // The grace for starting one is short on purpose. The watcher reacts to a
-        // write in about a hundred milliseconds, so half a second of silence means
-        // no cycle is coming for this edit, and every further millisecond spent
-        // hoping is one the preview spends behind the editor.
-        let wait = if in_flight {
-            deadline.saturating_duration_since(tokio::time::Instant::now())
-        } else {
-            Duration::from_millis(500)
+        let (in_flight, wait) = match watcher_step(&event, target_generation, event.since.elapsed()) {
+            WatchStep::Serve => return finish(event.outcome),
+            WatchStep::AwaitCycle(left) => (true, left),
+            WatchStep::AwaitStart(grace) => (false, grace),
         };
         match tokio::time::timeout(wait, events.changed()).await {
             Ok(Ok(())) => continue,
-            Ok(Err(_)) => return WatchCompileResult::Fallback,
-            Err(_) if in_flight => return WatchCompileResult::Fallback,
+            Ok(Err(_)) => {
+                note("compile: the watcher's reader is gone — compiling directly instead");
+                return WatchCompileResult::Fallback;
+            }
+            Err(_) if in_flight => {
+                // A cycle that started and never reported back. Worth naming
+                // loudly: it is the one shape of this that costs the full wait
+                // on every keystroke, and from the outside it just looks hung.
+                note!(
+                    "compile: typst watch said it was compiling and never finished within {}s \
+                     (waiting for generation {target_generation}, watcher last reported {}) \
+                     — restarting it and compiling directly",
+                    IN_FLIGHT_BUDGET.as_secs(),
+                    events.borrow().generation,
+                );
+                return WatchCompileResult::Fallback;
+            }
             // No cycle is coming. What sits in out.pdf was rendered from a read
             // that happened before this edit, and handing it back is what left
             // "wa" showing as "w" until the next keystroke dislodged it. Compile
@@ -1554,11 +1680,23 @@ async fn compile_once(ws: &Path, main_path: &Path, output_path: &Path) -> Respon
     compile_args.push(main_path.to_string_lossy().into_owned());
     compile_args.push(output_path.to_string_lossy().into_owned());
     let compile_argv: Vec<&str> = compile_args.iter().map(String::as_str).collect();
-    let out = match run_cmd("typst", &compile_argv, Some(ws), None).await {
+    let started = Instant::now();
+    let out = match run_cmd("typst", &compile_argv, Some(ws), Some(DIRECT_COMPILE_BUDGET_MS)).await {
         Ok(o) => o,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return json_err(StatusCode::INTERNAL_SERVER_ERROR, TYPST_NOT_FOUND),
         Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not run typst: {e}")),
     };
+    note!("compile: direct compile finished in {} ms (exit {:?})", started.elapsed().as_millis(), out.code);
+    if out.killed {
+        return json_err(
+            StatusCode::GATEWAY_TIMEOUT,
+            format!(
+                "typst did not finish within {} seconds and was stopped. \
+                 If it keeps happening, try compiling the same file from a terminal to see where it gets to.",
+                DIRECT_COMPILE_BUDGET_MS / 1000
+            ),
+        );
+    }
     if out.code != Some(0) {
         let msg = if out.stderr.is_empty() {
             format!("typst exited with code {}", out.code.map(|c| c.to_string()).unwrap_or_else(|| "null".into()))
@@ -1574,9 +1712,15 @@ async fn compile_once(ws: &Path, main_path: &Path, output_path: &Path) -> Respon
 }
 
 async fn compile(State(st): St, Query(q): Q, body: Bytes) -> Response {
+    let queued = Instant::now();
     let Ok(_permit) = st.compile_gate.acquire().await else {
         return json_err(StatusCode::SERVICE_UNAVAILABLE, "Compiler is shutting down.");
     };
+    // Only one compile runs at a time, so a slow one shows up here as everyone
+    // else's wait. Worth separating from the compile's own cost: they look the
+    // same from the editor and have completely different causes.
+    let waited = queued.elapsed().as_millis();
+    if waited > 200 { note!("compile: waited {waited} ms for the compile slot"); }
     let ws = st.ws();
     let main_q = q.get("main").map(String::as_str).unwrap_or("main.typ");
     let Some(main_path) = safe_workspace_path(&ws, main_q) else {
@@ -1589,9 +1733,16 @@ async fn compile(State(st): St, Query(q): Q, body: Bytes) -> Response {
         st.note_write();
     }
     let generation = st.source_generation.load(Ordering::Acquire);
-    match compile_from_watcher(&st, &ws, &main_path, &output_path, generation).await {
-        WatchCompileResult::Pdf(bytes) => ([(header::CONTENT_TYPE, "application/pdf")], bytes).into_response(),
-        WatchCompileResult::CompileError(message) => json_err(StatusCode::BAD_REQUEST, message),
+    let outcome = compile_from_watcher(&st, &ws, &main_path, &output_path, generation).await;
+    let response = match outcome {
+        WatchCompileResult::Pdf(bytes) => {
+            note!("compile: served the watcher's PDF ({} bytes) in {} ms", bytes.len(), queued.elapsed().as_millis());
+            ([(header::CONTENT_TYPE, "application/pdf")], bytes).into_response()
+        }
+        WatchCompileResult::CompileError(message) => {
+            note!("compile: typst reported errors after {} ms", queued.elapsed().as_millis());
+            json_err(StatusCode::BAD_REQUEST, message)
+        }
         // A separate output file, so this never races the watcher writing its own.
         WatchCompileResult::Direct => {
             compile_once(&ws, &main_path, &hilbert_dir(&ws).join("out-direct.pdf")).await
@@ -1600,7 +1751,12 @@ async fn compile(State(st): St, Query(q): Q, body: Bytes) -> Response {
             stop_preview_watcher(&st).await;
             compile_once(&ws, &main_path, &output_path).await
         }
-    }
+    };
+    let total = queued.elapsed().as_millis();
+    // Anything past a second is not what this is supposed to feel like, and it
+    // is the number people are actually describing when they say it hangs.
+    if total > 1000 { note!("compile: the whole request took {total} ms"); }
+    response
 }
 
 async fn init_template(State(st): St, body: Bytes) -> Response {
@@ -4912,6 +5068,29 @@ fn tinymist_version(output: &str) -> String {
     }
 }
 
+// Everything someone would otherwise have to be talked through gathering over
+// several messages, in one block they can paste into a bug report.
+async fn diagnostics(State(st): St) -> Response {
+    let mut lines = vec![
+        format!("Hilbert {} on {}", env!("CARGO_PKG_VERSION"), std::env::consts::OS),
+        format!("workspace: {}", st.ws().display()),
+        format!("log file:  {} (times below are UTC)", log_path().display()),
+    ];
+    match run_cmd("typst", &["--version"], None, Some(10_000)).await {
+        Ok(out) if out.code == Some(0) => lines.push(format!("typst:     {}", out.stdout.trim())),
+        Ok(out) => lines.push(format!("typst:     ran but exited {:?} — {}", out.code, out.stderr.trim())),
+        Err(e) => lines.push(format!("typst:     could not be run — {e}")),
+    }
+    match resolve_tinymist() {
+        Some(binary) => lines.push(format!("tinymist:  {} (found via {})", binary.path, binary.source)),
+        None => lines.push("tinymist:  not found".into()),
+    }
+    lines.push(format!("PATH:      {}", std::env::var("PATH").unwrap_or_default()));
+    lines.push(String::new());
+    lines.push(recent_log());
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], lines.join("\n")).into_response()
+}
+
 async fn lsp_status(State(st): St) -> Response {
     let binary = resolve_tinymist();
     let (running, workspace, capabilities) = {
@@ -5219,6 +5398,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/bib/fetch", post(bib_fetch))
         .route("/desktop/pick-folder", post(desktop_pick_folder))
         .route("/desktop/open", post(desktop_open))
+        .route("/diagnostics", get(diagnostics))
         .route("/lsp/status", get(lsp_status))
         .route("/lsp/restart", post(lsp_restart))
         .route("/lsp/hover", post(lsp_hover))
@@ -5365,6 +5545,38 @@ mod tests {
         assert!(!valid_collab_room("0123456789abcde/"));
         assert!(!valid_collab_room("0123456789abcde?"));
         assert!(!valid_collab_room(&"a".repeat(129)));
+    }
+
+    // The shape behind "it compiles the first few times and then sits on
+    // Compiling… forever": typst watch announced a cycle and never said how it
+    // went. The announcement must stop being the answer once it is old enough,
+    // or every keystroke after it pays the full budget.
+    #[test]
+    fn a_cycle_that_never_reports_back_stops_being_believed() {
+        let waiting = PreviewEvent::new(7, PreviewOutcome::Waiting);
+
+        assert_eq!(
+            watcher_step(&waiting, 8, Duration::from_millis(50)),
+            WatchStep::AwaitCycle(IN_FLIGHT_BUDGET - Duration::from_millis(50)),
+            "a cycle that just started deserves the wait"
+        );
+        assert_eq!(
+            watcher_step(&waiting, 8, IN_FLIGHT_BUDGET + Duration::from_secs(1)),
+            WatchStep::AwaitStart(START_GRACE),
+            "once it is past the budget it must not hold up the next edit too"
+        );
+
+        let done = PreviewEvent::new(8, PreviewOutcome::Success);
+        assert_eq!(
+            watcher_step(&done, 8, Duration::from_secs(0)),
+            WatchStep::Serve,
+            "a finished cycle at or past the edit is the answer"
+        );
+        assert_eq!(
+            watcher_step(&done, 9, Duration::from_secs(0)),
+            WatchStep::AwaitStart(START_GRACE),
+            "a finished cycle from before the edit is not"
+        );
     }
 
     #[test]

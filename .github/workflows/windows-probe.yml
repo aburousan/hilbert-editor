@@ -300,7 +300,7 @@ jobs:
                   print(log.read_text(errors="replace"))
                   raise SystemExit("backend never reported a port")
 
-              print(f"\nround trip through Hilbert (port {port}):")
+              print(f"\nround trip through Hilbert (port {port}, one edit at a time):")
               latencies = []
               for i in range(8):
                   time.sleep(0.4)
@@ -316,3 +316,18 @@ jobs:
                     f"max {round(max(latencies))} ms")
           finally:
               backend.kill()
+
+      # The measurement above is polite: it asks for one compile and waits for
+      # the answer. Nobody types like that. The editor hangs up on the compile
+      # still running every time another keystroke lands, and a compile slot that
+      # is never given back — or a watcher left behind — would only ever show up
+      # under that. It is also the shape of what people describe: fine at first,
+      # then stuck on "Compiling…" with a typst process sitting there doing
+      # nothing.
+      - name: Does hanging up on compiles wedge the compiler?
+        if: always()
+        shell: pwsh
+        run: |
+          $env:PATH = "$PWD\tools;$env:PATH"
+          python .github\probes\abort-churn.py `
+            "$PWD\churn" "$PWD\src-tauri\target\debug\typst-editor.exe" 3161
