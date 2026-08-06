@@ -1,15 +1,12 @@
-# Diagnostic only. Answers two questions we can't answer on a Mac:
+# Diagnostic only. Answers the question a Mac can't: when tinymist is installed
+# the way people actually install it on Windows — `winget install
+# Myriad-Dreamin.Tinymist` — can Hilbert find it?
 #
-#   1. Does tinymist publish diagnostics under the URI we send it, or under a
-#      form of its own? On Unix the two coincide, so a mismatch would only ever
-#      show up on Windows.
-#   2. How long does typst actually take to notice a write and finish a compile
-#      on Windows? The preview gives up waiting after 1500 ms and serves the
-#      previous PDF, so if the real figure is above that, the preview is always
-#      one edit behind.
-#
-# Deliberately does not build the app: both questions are about the two external
-# binaries, so probing them directly turns a 20 minute build into a 2 minute run.
+# winget drops the real executable in Packages/ under its release name and links
+# to it from Links/, then adds Links/ to the stored user PATH. A program already
+# running keeps the environment it started with, so an app the desktop launched
+# before that change never sees the new entry. The three cases below cover what
+# that leaves on disk, and the last one exists to prove the probe can still fail.
 
 name: Windows probe
 
@@ -17,255 +14,298 @@ on:
   workflow_dispatch:
 
 jobs:
-  probe:
+  discover:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
       - name: Fetch typst and tinymist
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          New-Item -ItemType Directory -Force -Path tools | Out-Null
+          New-Item -ItemType Directory -Force -Path stash, tools | Out-Null
 
-          $typstUrl = gh api repos/typst/typst/releases/latest --jq '.assets[] | select(.name | test("x86_64-pc-windows-msvc\\.zip$")) | .browser_download_url'
-          if (-not $typstUrl) { throw "no typst windows asset found" }
-          Write-Host "typst:    $typstUrl"
-          Invoke-WebRequest -Uri $typstUrl -OutFile typst.zip
+          $url = gh api repos/Myriad-Dreamin/tinymist/releases/latest --jq '.assets[] | select(.name | test("win32-x64\\.exe$")) | .browser_download_url'
+          if (-not $url) { throw "no tinymist windows asset found" }
+          Write-Host "tinymist: $url"
+          Invoke-WebRequest -Uri $url -OutFile stash\tinymist-win32-x64.exe
+
+          $url = gh api repos/typst/typst/releases/latest --jq '.assets[] | select(.name | test("x86_64-pc-windows-msvc\\.zip$")) | .browser_download_url'
+          if (-not $url) { throw "no typst windows asset found" }
+          Write-Host "typst:    $url"
+          Invoke-WebRequest -Uri $url -OutFile typst.zip
           Expand-Archive typst.zip -DestinationPath typst-unpacked
-          $typstExe = Get-ChildItem -Path typst-unpacked -Filter typst.exe -Recurse | Select-Object -First 1
-          Copy-Item $typstExe.FullName tools\typst.exe
+          Copy-Item (Get-ChildItem typst-unpacked -Filter typst.exe -Recurse | Select-Object -First 1).FullName tools\typst.exe
+          & tools\typst.exe --version
 
-          $tinyUrl = gh api repos/Myriad-Dreamin/tinymist/releases/latest --jq '.assets[] | select(.name | test("win32-x64\\.exe$")) | .browser_download_url'
-          if (-not $tinyUrl) {
-            $tinyUrl = gh api repos/Myriad-Dreamin/tinymist/releases/latest --jq '.assets[] | select(.name | test("(?i)win.*x(86_)?64.*\\.exe$")) | .browser_download_url' | Select-Object -First 1
+      - name: Build the backend
+        shell: pwsh
+        run: |
+          # tauri-build wants the frontend output to exist; the probe only talks
+          # to the HTTP API, so a placeholder is enough and saves an npm build.
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Set-Content dist\index.html "<!doctype html><title>probe</title>"
+          cargo build --manifest-path src-tauri\Cargo.toml --bin typst-editor
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+
+      - name: Can Hilbert find a winget-installed tinymist?
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe   = "$PWD\src-tauri\target\debug\typst-editor.exe"
+          $token = 'probe-token-long-enough-to-be-accepted-0123456789'
+          $pkg   = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Myriad-Dreamin.Tinymist_Microsoft.Winget.Source_8wekyb3d8bbwe"
+          $links = "$env:LOCALAPPDATA\Microsoft\WinGet\Links"
+
+          # Whatever winget has already done to this runner would mask the very
+          # thing being measured, so the process starts from a PATH with its
+          # folders removed and each case puts back exactly what it wants tested.
+          $basePath = ($env:PATH -split ';' | Where-Object {
+            $_ -and ($_ -notlike "*\Microsoft\WinGet\*")
+          }) -join ';'
+
+          function Reset-Layout {
+            Remove-Item -Recurse -Force $pkg, $links -ErrorAction SilentlyContinue
           }
-          if (-not $tinyUrl) { throw "no tinymist windows asset found" }
-          Write-Host "tinymist: $tinyUrl"
-          Invoke-WebRequest -Uri $tinyUrl -OutFile tools\tinymist.exe
 
-          tools\typst.exe --version
-          tools\tinymist.exe --version
+          function Get-Status([string]$name, [int]$port) {
+            $ws = "$PWD\ws-$name"
+            New-Item -ItemType Directory -Force -Path $ws | Out-Null
+            $out = "$PWD\$name.log"
 
-      - name: Probe tinymist URI handling and typst timings
+            $env:PATH             = $basePath
+            $env:HILBERT_API_TOKEN = $token
+            $env:TYPST_WORKSPACE   = $ws
+            $env:TYPST_DIST        = "$PWD\dist"
+            # A port per case, never 0: the backend echoes back the port it was
+            # asked for when the bind succeeds, so 0 would tell us nothing.
+            $env:PORT              = "$port"
+
+            $proc = Start-Process -FilePath $exe -PassThru -NoNewWindow `
+              -ArgumentList '--headless','--session-file',"$PWD\$name.session.json" `
+              -RedirectStandardOutput $out -RedirectStandardError "$PWD\$name.err.log"
+
+            try {
+              # The port it settled on is only knowable from what it prints.
+              $port = $null
+              foreach ($i in 1..60) {
+                Start-Sleep -Milliseconds 500
+                if (Test-Path $out) {
+                  $m = Select-String -Path $out -Pattern 'http://127\.0\.0\.1:(\d+)' | Select-Object -First 1
+                  if ($m) { $port = $m.Matches[0].Groups[1].Value; break }
+                }
+              }
+              if (-not $port) { Get-Content $out, "$PWD\$name.err.log" -EA SilentlyContinue; throw "backend never reported a port" }
+
+              foreach ($i in 1..30) {
+                try {
+                  return Invoke-RestMethod "http://127.0.0.1:$port/lsp/status" `
+                    -Headers @{ Authorization = "Bearer $token" }
+                } catch { Start-Sleep -Milliseconds 500 }
+              }
+              throw "backend never answered /lsp/status"
+            } finally {
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          $failures = @()
+          function Check([string]$name, [bool]$ok, [string]$detail) {
+            if ($ok) { Write-Host "PASS  $name — $detail" }
+            else { Write-Host "FAIL  $name — $detail"; $script:failures += $name }
+          }
+
+          # --- Case 1: winget made its shim, but it landed on PATH after launch.
+          Reset-Layout
+          New-Item -ItemType Directory -Force -Path $pkg, $links | Out-Null
+          Copy-Item stash\tinymist-win32-x64.exe "$pkg\tinymist-win32-x64.exe"
+          Copy-Item stash\tinymist-win32-x64.exe "$links\tinymist.exe"
+
+          # This is the old behaviour, measured rather than assumed: `where.exe`
+          # searches exactly the PATH the app used to read.
+          $env:PATH = $basePath
+          $seen = (& cmd /c "where tinymist" 2>$null)
+          Check 'control: unaugmented PATH cannot see it' ($LASTEXITCODE -ne 0) "where.exe -> $(if ($seen) { $seen } else { 'not found' })"
+
+          $s = Get-Status 'shim' 3141
+          Check 'case 1: shim in Links, absent from PATH' ([bool]$s.available) "available=$($s.available) source=$($s.source) path=$($s.path)"
+
+          # --- Case 2: no symlink privilege, so only the package folder exists.
+          Reset-Layout
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+          Copy-Item stash\tinymist-win32-x64.exe "$pkg\tinymist-win32-x64.exe"
+
+          $s = Get-Status 'packageonly' 3142
+          Check 'case 2: package folder only, no shim' ([bool]$s.available) "available=$($s.available) source=$($s.source) path=$($s.path)"
+
+          # --- Case 3: genuinely not installed. If this reports available, the
+          # probe is finding something it shouldn't and cases 1-2 prove nothing.
+          Reset-Layout
+          $s = Get-Status 'absent' 3143
+          Check 'case 3: not installed at all' (-not $s.available) "available=$($s.available) path=$($s.path)"
+
+          Write-Host ''
+          if ($failures.Count) { throw "failed: $($failures -join ', ')" }
+          Write-Host 'All cases behaved as intended.'
+
+      # Measurement, not a pass/fail gate. Windows users report that typing does
+      # not reach the preview until they press save, or until several seconds
+      # have gone by, and none of that reproduces on macOS or Linux. Two numbers
+      # separate the possible causes: how long `typst watch` itself takes to
+      # notice a write, and how long a round trip through Hilbert takes. If the
+      # watcher is slower than the half second the preview waits for it, every
+      # edit falls through to compiling directly and pays for both.
+      - name: How long does an edit take to reach the PDF?
         shell: python
         run: |
-          import json, os, queue, re, subprocess, threading, time
+          import json, os, queue, statistics, subprocess, threading, time, urllib.request
+          from pathlib import Path
 
-          TYPST = os.path.abspath(r"tools\typst.exe")
-          TINYMIST = os.path.abspath(r"tools\tinymist.exe")
+          root = Path.cwd()
+          tools = root / "tools"
+          os.environ["PATH"] = f"{tools};{os.environ['PATH']}"
 
-          # ---------------------------------------------------------------
-          # Exactly what src-tauri/src/server.rs:file_uri() builds: percent
-          # encode controls, space, '#', '?' and '%' and nothing else, then
-          # bolt on the right number of slashes.
-          # ---------------------------------------------------------------
-          def encode(s):
-              out = []
-              for ch in s:
-                  if ch in ' #?%' or ord(ch) < 0x20 or ord(ch) == 0x7F:
-                      out.append(''.join('%%%02X' % b for b in ch.encode()))
-                  else:
-                      out.append(ch)
-              return ''.join(out)
+          # Something with enough substance that compiling it is not free, in the
+          # spirit of the projects people have reported this on.
+          body = "\n".join(f"Line {i} with some text to typeset, $x_{{{i}}} = sqrt(2)$." for i in range(100))
+          def document(marker):
+              return f"= Probe {marker}\n\n{body}\n\n#rect(width: 4cm, height: 3cm)\n#rect(width: 4cm, height: 3cm)\n"
 
-          def hilbert_uri(path):
-              n = path.replace('\\', '/')
-              return ('file://' if n.startswith('/') else 'file:///') + encode(n)
+          def pump(stream, q):
+              for line in iter(stream.readline, ""):
+                  q.put(line.rstrip())
+              q.put(None)
 
-          # What VS Code sends, and therefore what tinymist is actually tested
-          # against: lower case drive letter and an encoded colon.
-          def vscode_uri(path):
-              n = path.replace('\\', '/')
-              return 'file:///' + n[0].lower() + '%3A' + encode(n[2:])
+          def write_in_place(path, text):
+              path.write_text(text, encoding="utf-8")
 
-          ws = os.path.abspath('probe-ws')
-          os.makedirs(ws, exist_ok=True)
-          main = os.path.join(ws, 'main.typ')
-          with open(main, 'w') as f:
-              f.write('= Probe\n\n#definitely_not_a_real_function()\n')
+          def write_by_rename(path, text):
+              # What the app does now, so the watcher sees exactly what it sees
+              # in real use.
+              tmp = path.with_suffix(".tmp-probe")
+              tmp.write_text(text, encoding="utf-8")
+              os.replace(tmp, path)
 
-          # Messages are parsed on a thread and queued, so a wait can time out.
-          # Reading the pipe straight from the main loop would block forever the
-          # moment tinymist stayed quiet, which is precisely the case being
-          # tested — the probe would hang instead of reporting the failure.
-          class Lsp:
-              def __init__(self):
-                  self.p = subprocess.Popen(
-                      [TINYMIST, 'lsp'], cwd=ws,
-                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                      stderr=subprocess.DEVNULL)
-                  self.q = queue.Queue()
-                  threading.Thread(target=self._pump, daemon=True).start()
+          def watch_reaction(label, writer, rounds=8):
+              ws = root / f"watch-{label}"
+              ws.mkdir(exist_ok=True)
+              main, out = ws / "main.typ", ws / "out.pdf"
+              writer(main, document("start"))
+              proc = subprocess.Popen(
+                  ["typst", "watch", "--root", str(ws), str(main), str(out)],
+                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                  text=True, encoding="utf-8", errors="replace", cwd=ws)
+              q = queue.Queue()
+              threading.Thread(target=pump, args=(proc.stdout, q), daemon=True).start()
 
-              def _pump(self):
-                  try:
-                      while True:
-                          hdr = b''
-                          while b'\r\n\r\n' not in hdr:
-                              c = self.p.stdout.read(1)
-                              if not c:
-                                  self.q.put(None)
-                                  return
-                              hdr += c
-                          n = int(re.search(rb'(?i)content-length:\s*(\d+)', hdr).group(1))
-                          self.q.put(json.loads(self.p.stdout.read(n)))
-                  except Exception:
-                      self.q.put(None)
-
-              def send(self, obj):
-                  b = json.dumps(obj).encode()
-                  self.p.stdin.write(b'Content-Length: %d\r\n\r\n' % len(b) + b)
-                  self.p.stdin.flush()
-
-              def read(self, deadline):
-                  try:
-                      return self.q.get(timeout=max(0.05, deadline - time.time()))
-                  except queue.Empty:
-                      return None
-
-              def close(self):
-                  self.p.kill()
-
-          def run_case(label, uri_fn):
-              print('=' * 70)
-              print('CASE:', label)
-              lsp = Lsp()
-              root = hilbert_uri(ws)
-              t0 = time.time()
-              lsp.send({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {
-                  'processId': os.getpid(), 'capabilities': {}, 'rootUri': root,
-                  'workspaceFolders': [{'uri': root, 'name': 'workspace'}]}})
-              deadline = time.time() + 60
-              while True:
-                  m = lsp.read(deadline)
-                  if m is None:
-                      print('  initialize: NO RESPONSE within 60 s')
-                      lsp.close()
-                      return
-                  if m.get('id') == 1:
-                      break
-              init_ms = (time.time() - t0) * 1000
-              print('  initialize: %.0f ms   (Hilbert gives up at 5000 ms)' % init_ms)
-
-              lsp.send({'jsonrpc': '2.0', 'method': 'initialized', 'params': {}})
-              sent = uri_fn(main)
-              print('  sent uri:      %s' % sent)
-              lsp.send({'jsonrpc': '2.0', 'method': 'textDocument/didOpen', 'params': {
-                  'textDocument': {'uri': sent, 'languageId': 'typst',
-                                   'version': 1, 'text': open(main).read()}}})
-
-              seen, matched = [], False
-              deadline = time.time() + 20
-              while time.time() < deadline:
-                  m = lsp.read(deadline)
-                  if m is None:
-                      break
-                  if m.get('method') == 'textDocument/publishDiagnostics':
-                      uri = m['params']['uri']
-                      seen.append((uri, len(m['params'].get('diagnostics') or [])))
-                      if uri == sent:
-                          matched = True
-                          break
-              for uri, n in seen:
-                  print('  published:     %s   (%d diagnostic(s))' % (uri, n))
-              if not seen:
-                  print('  published:     NOTHING within 20 s')
-              print('  EXACT MATCH:   %s' % matched)
-              print('  -> Hilbert looks diagnostics up by exact string, so a false here')
-              print('     means the editor never shows any, however healthy tinymist is.')
-              lsp.close()
-
-          run_case('Hilbert form  (file:///C:/...)', hilbert_uri)
-          run_case('VS Code form  (file:///c%3A/...)', vscode_uri)
-
-          # ---------------------------------------------------------------
-          # Timings, against a document the size Luca described.
-          # ---------------------------------------------------------------
-          print('=' * 70)
-          print('TYPST TIMINGS')
-          import struct, zlib
-
-          def png(path, w, h):
-              def chunk(t, d):
-                  c = t + d
-                  return struct.pack('>I', len(d)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
-              raw = b''.join(b'\x00' + bytes([(x * 7 + y * 3) % 256 for x in range(w * 3)]) for y in range(h))
-              with open(path, 'wb') as f:
-                  f.write(b'\x89PNG\r\n\x1a\n'
-                          + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
-                          + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
-
-          for i in range(1, 5):
-              png(os.path.join(ws, 'fig%d.png' % i), 900, 700)
-
-          lines = ['= A hundred rows and four pictures', '']
-          for i in range(1, 101):
-              if i % 25 == 0:
-                  lines.append('#figure(image("fig%d.png", width: 60%%), caption: [Figure %d])' % (i // 25, i // 25))
-              elif i % 10 == 0:
-                  lines.append('$ sum_(k=1)^%d k = %d(%d+1)/2 $' % (i, i, i))
-              else:
-                  lines.append('Row %d: ordinary prose with _emphasis_ and inline maths $x^%d$.' % (i, i % 9))
-              lines.append('')
-          body = '\n'.join(lines) + '\n'
-          with open(main, 'w') as f:
-              f.write(body)
-
-          out = os.path.join(ws, 'out.pdf')
-          t0 = time.time()
-          subprocess.run([TYPST, 'compile', '--root', ws, main, out], cwd=ws, check=True)
-          print('  cold typst compile:        %.0f ms   (macOS reference: 170 ms)' % ((time.time() - t0) * 1000))
-
-          # What the preview actually depends on: how long after a write does
-          # `typst watch` report a finished compile.
-          watch = subprocess.Popen([TYPST, 'watch', '--root', ws, main, out], cwd=ws,
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                   text=True, bufsize=1)
-          # Queued for the same reason as the LSP messages: a silent watcher must
-          # show up as a reported timeout, not as a hung job.
-          watch_lines = queue.Queue()
-
-          def pump_watch():
-              for line in watch.stdout:
-                  watch_lines.put(line)
-              watch_lines.put(None)
-
-          threading.Thread(target=pump_watch, daemon=True).start()
-
-          def next_line(deadline):
-              try:
-                  return watch_lines.get(timeout=max(0.05, deadline - time.time()))
-              except queue.Empty:
+              def wait_for_cycle(budget):
+                  end = time.time() + budget
+                  while time.time() < end:
+                      try:
+                          line = q.get(timeout=max(0.05, end - time.time()))
+                      except queue.Empty:
+                          return None
+                      if line is None:
+                          return None
+                      if "compiled" in line.lower():
+                          return line
                   return None
 
-          # Read the startup cycle out of the queue first, otherwise the first
-          # timed round reads its leftovers and reports an absurdly fast time.
-          startup = time.time() + 90
-          while True:
-              line = next_line(startup)
-              if line is None or 'compiled' in line:
-                  break
-          for round_no in range(1, 4):
-              t0 = time.time()
-              with open(main, 'w') as f:
-                  f.write(body.replace('A hundred rows', 'A hundred rows ' + 'x' * round_no))
-              saw_compiling = None
-              deadline = t0 + 40
-              while True:
-                  line = next_line(deadline)
-                  if line is None:
-                      print('  edit %d: no compile reported within 40 s' % round_no)
+              try:
+                  if not wait_for_cycle(60):
+                      print(f"  {label}: watcher never produced a first compile")
+                      return []
+                  times = []
+                  for i in range(rounds):
+                      time.sleep(0.4)          # let it settle between edits
+                      while not q.empty():     # drop anything left over
+                          q.get_nowait()
+                      start = time.time()
+                      writer(main, document(f"edit-{i}"))
+                      line = wait_for_cycle(10)
+                      if line is None:
+                          print(f"  {label}: edit {i} produced no cycle within 10s")
+                          times.append(None)
+                      else:
+                          times.append((time.time() - start) * 1000)
+                  return times
+              finally:
+                  proc.kill()
+
+          print("typst watch reaction, write straight to the file:")
+          in_place = watch_reaction("inplace", write_in_place)
+          print(f"  {[None if t is None else round(t) for t in in_place]}")
+
+          print("typst watch reaction, rename into place (what the app does):")
+          renamed = watch_reaction("rename", write_by_rename)
+          print(f"  {[None if t is None else round(t) for t in renamed]}")
+
+          for label, times in (("in place", in_place), ("renamed", renamed)):
+              good = [t for t in times if t is not None]
+              missed = len(times) - len(good)
+              if good:
+                  print(f"  {label}: median {round(statistics.median(good))} ms, "
+                        f"max {round(max(good))} ms, {missed} edits produced no cycle")
+              else:
+                  print(f"  {label}: no cycles at all ({missed} edits)")
+
+          # --- Now the same edits through the running app.
+          token = "probe-token-long-enough-to-be-accepted-0123456789"
+          ws = root / "ws-latency"
+          ws.mkdir(exist_ok=True)
+          (ws / "main.typ").write_text(document("start"), encoding="utf-8")
+          log = root / "latency.log"
+
+          env = dict(os.environ, HILBERT_API_TOKEN=token, TYPST_WORKSPACE=str(ws),
+                     TYPST_DIST=str(root / "dist"), PORT="3151")
+          exe = root / "src-tauri" / "target" / "debug" / "typst-editor.exe"
+          with open(log, "w") as sink:
+              backend = subprocess.Popen(
+                  [str(exe), "--headless", "--session-file", str(root / "latency.session.json")],
+                  stdout=sink, stderr=subprocess.STDOUT, env=env)
+
+          def api(path, data=None, headers=None):
+              req = urllib.request.Request(
+                  f"http://127.0.0.1:{port}{path}", data=data, method="POST" if data is not None else "GET")
+              req.add_header("Authorization", f"Bearer {token}")
+              for key, value in (headers or {}).items():
+                  req.add_header(key, value)
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return response.status, response.read()
+
+          try:
+              port = None
+              for _ in range(60):
+                  time.sleep(0.5)
+                  text = log.read_text(errors="replace")
+                  if "127.0.0.1:" in text:
+                      port = text.split("127.0.0.1:")[1].split()[0].strip()
                       break
-                  if 'compiling ...' in line and saw_compiling is None:
-                      saw_compiling = (time.time() - t0) * 1000
-                  if 'compiled successfully' in line or 'compiled with' in line:
-                      total = (time.time() - t0) * 1000
-                      print('  edit %d: noticed after %s, finished after %.0f ms   %s'
-                            % (round_no,
-                               ('%.0f ms' % saw_compiling) if saw_compiling else 'n/a',
-                               total,
-                               'OVER the 1500 ms give-up threshold' if total > 1500 else 'within budget'))
-                      break
-          watch.kill()
-          print('  macOS reference for the same document: ~130 ms end to end')
+              if not port:
+                  print(log.read_text(errors="replace"))
+                  raise SystemExit("backend never reported a port")
+
+              print(f"\nround trip through Hilbert (port {port}):")
+              latencies = []
+              for i in range(8):
+                  time.sleep(0.4)
+                  text = document(f"app-edit-{i}")
+                  start = time.time()
+                  api("/workspace/file?path=main.typ", text.encode(),
+                      {"Content-Type": "text/plain"})
+                  status, pdf = api("/compile?main=main.typ", b"")
+                  elapsed = (time.time() - start) * 1000
+                  latencies.append(elapsed)
+                  print(f"  edit {i}: {round(elapsed)} ms, {status}, {len(pdf)} bytes")
+              print(f"  median {round(statistics.median(latencies))} ms, "
+                    f"max {round(max(latencies))} ms")
+          finally:
+              backend.kill()
