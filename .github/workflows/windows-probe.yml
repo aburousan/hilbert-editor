@@ -133,7 +133,12 @@ jobs:
           # searches exactly the PATH the app used to read.
           $env:PATH = $basePath
           $seen = (& cmd /c "where tinymist" 2>$null)
-          Check 'control: unaugmented PATH cannot see it' ($LASTEXITCODE -ne 0) "where.exe -> $(if ($seen) { $seen } else { 'not found' })"
+          $found = $LASTEXITCODE -eq 0
+          # This command is meant to fail, and pwsh hands the step whatever the
+          # last native command returned. Put it back before that becomes the
+          # verdict on a run where every check passed.
+          $global:LASTEXITCODE = 0
+          Check 'control: unaugmented PATH cannot see it' (-not $found) "where.exe -> $(if ($seen) { $seen } else { 'not found' })"
 
           $s = Get-Status 'shim' 3141
           Check 'case 1: shim in Links, absent from PATH' ([bool]$s.available) "available=$($s.available) source=$($s.source) path=$($s.path)"
@@ -155,6 +160,7 @@ jobs:
           Write-Host ''
           if ($failures.Count) { throw "failed: $($failures -join ', ')" }
           Write-Host 'All cases behaved as intended.'
+          exit 0
 
       # Measurement, not a pass/fail gate. Windows users report that typing does
       # not reach the preview until they press save, or until several seconds
@@ -164,6 +170,7 @@ jobs:
       # watcher is slower than the half second the preview waits for it, every
       # edit falls through to compiling directly and pays for both.
       - name: How long does an edit take to reach the PDF?
+        if: always()
         shell: python
         run: |
           import json, os, queue, statistics, subprocess, threading, time, urllib.request
