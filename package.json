@@ -66,5 +66,8 @@
     "offline",
     "monaco",
     "cetz"
-  ]
+  ],
+  "overrides": {
+    "lodash-es": "4.18.0"
+  }
 }
