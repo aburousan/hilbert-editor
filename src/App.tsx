@@ -1505,6 +1505,15 @@ export default function App() {
 
   const saveActiveFile = useCallback(async () => {
     if (!activeTab) return;
+    // A whiteboard saves itself. Its editor holds the drawing; this tab's
+    // content is only whatever was written the last time, because moving a shape
+    // doesn't come back through React. Saving from here would write that stale
+    // copy over the file — two writes racing on one Ctrl+S, and whichever landed
+    // second decided both what was on disk and what each of them believed was
+    // there. When they disagreed the next save failed its precondition and the
+    // app reported the file as changed outside Hilbert. It could also lose the
+    // drawing outright, by putting the older copy back.
+    if (activeTab.path.toLowerCase().endsWith('.excalidraw')) return;
     try {
       const hash = await writeTab(activeTab);
       snapshotHistory(activeTab.path, activeTab.content);   // keep a version, this save only
@@ -5666,16 +5675,38 @@ export default function App() {
                       path={activeTabPath}
                       initialContent={activeTab.content}
                       onSave={async (jsonContent, svgBlob) => {
-                        // Save the .excalidraw file
-                        await fetch(`${API}/workspace/file?path=${encodeURIComponent(activeTabPath)}`, { method: 'POST', body: jsonContent });
+                        // Save the .excalidraw file, and write down the hash it
+                        // came back with. This write goes straight to the API
+                        // rather than through writeTab, so nothing else records
+                        // it — and the next save presents whatever hash the tab
+                        // was still carrying, which by then describes the file as
+                        // it was before this drawing existed. That fails its own
+                        // precondition, and the editor reports the file as having
+                        // "changed outside Hilbert" about a change it just made
+                        // itself. Choosing "keep mine" wrote again the same way,
+                        // so the dialog came straight back, every save, forever.
+                        const response = await fetch(`${API}/workspace/file?path=${encodeURIComponent(activeTabPath)}`, { method: 'POST', body: jsonContent });
+                        const saved = await response.json().catch(() => ({} as any));
+                        if (saved.hash) lastWrittenRef.current.set(activeTabPath, { content: jsonContent, hash: saved.hash });
                         await mirrorLocalPath(activeTabPath);
-                        setTabs(prev => prev.map(t => t.path === activeTabPath ? { ...t, content: jsonContent, isDirty: false } : t));
+                        setTabs(prev => prev.map(t => t.path === activeTabPath
+                          ? { ...t, content: jsonContent, isDirty: false, diskHash: saved.hash || t.diskHash }
+                          : t));
 
                         // Automatically save the .svg file next to it for embedding in Typst!
                         const svgPath = activeTabPath.replace(/\.excalidraw$/, '.svg');
                         await fetch(`${API}/workspace/upload?path=${encodeURIComponent(svgPath)}`, { method: 'POST', body: svgBlob, headers: { 'Content-Type': 'application/octet-stream' } });
                         await mirrorLocalPath(svgPath);
                         fetchTree(); // Refresh tree so the SVG appears
+                        // The document embeds that SVG, so it has to be built
+                        // again for the drawing to appear in the preview. This
+                        // used to happen by accident, because saving a whiteboard
+                        // also ran the ordinary save path and that ends with a
+                        // compile. It doesn't any more — one file, one writer —
+                        // so ask for it here, where we actually know the new SVG
+                        // is on disk.
+                        compileTypst(currentMain);
+                        webdavAutoSync();
                       }}
                     /></Suspense>
                     </Boundary>
