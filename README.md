@@ -67,7 +67,9 @@ Windows it never flashes a console window at you.
 ## Feature tour
 
 A live PDF preview recompiles as you type, with zoom, fit-to-width, and a dark mode.
-Double-click any word in the PDF to jump to it in the source.
+Double-click any word in the PDF to jump to it in the source. It keeps your place when
+you resize the window or the panes — on a fifty-page document you stay on the
+paragraph you were reading rather than being thrown half the document away.
 
 ![Live preview](docs/gifs/live-preview.gif)
 
@@ -183,6 +185,13 @@ Multi-file projects compile from the project root (`main.typ`, or the `typst.tom
 entrypoint), so `#include`d chapters that share a bibliography or labels render as a
 whole. The root file shows a MAIN badge; right-click any `.typ` and choose
 **Set as main file** to change it.
+
+Five interface themes, chosen from the sun/moon button in the header or in
+**App Settings → Interface theme**, and they dress the whole window rather than the
+editor pane alone: **Ink** (the default charcoal), **Paper**, **Sepia** for long
+low-blue sessions, **Midnight** for a dark room or an OLED panel, and **High
+Contrast**. The PDF preview keeps its own light/dark toggle, since paper is not
+always what you want the page itself to be.
 
 There's also a clickable Problems panel, a File Outline, resizable panes, a ⌘K command
 palette covering every menu action, a Help window listing the features, and a live
@@ -323,6 +332,19 @@ error in one shows a dismissible message instead of blanking the editor. A faile
 compile keeps your last good preview. On Windows, background tools never flash a
 console window. Bundled Typst packages are cached locally, so documents compile with
 no network and no downloads.
+
+What you set is what you come back to. The interface theme, editor font size,
+auto-compile delay, which panels are showing, the pane sizes, and the interpreter you
+picked for each language are all kept in a file next to the session, so they survive
+a restart, a reboot, and a second window. They used to live in the webview's storage,
+which is tied to the port the app happens to get — and losing that port meant the
+editor reopening at 14pt as though you had never told it otherwise.
+
+The app keeps an activity log, and **Help → Copy Diagnostics** puts it on the
+clipboard together with the Typst and tinymist it found and the `PATH` it searched.
+Worth reaching for before filing a bug: on Windows especially, a windowed app has no
+console to print to, so without it there is nothing to look at afterwards. The same
+content is on disk — see [Configuration](#configuration) for where.
 
 ---
 
@@ -478,6 +500,17 @@ cd hilbert-editor ; npm install ; npm run dev   # then open http://localhost:517
   using port 3001. Quit it and reopen.
 - **It opens but nothing compiles.** The Typst CLI isn't installed or on `PATH`.
   Install it and confirm `typst --version` works.
+- **Tinymist works in a terminal but the app says it isn't installed.** A running
+  program keeps the environment it started with, and the desktop hands every app the
+  one it captured at login — so a tinymist installed since then is on your `PATH` but
+  not on the app's. Hilbert looks in the places winget, scoop and chocolatey put their
+  shims, and in winget's package folder directly. If it still can't find it, send the
+  output of **Help → Copy Diagnostics**, which includes the `PATH` it searched.
+- **It sits on "Compiling…" and won't finish.** Past a few seconds the status bar says
+  *still waiting on Typst*, which means the engine has been asked and hasn't answered
+  — saving still works meanwhile. Recompile to start over. If it keeps happening,
+  **Help → Copy Diagnostics** records every line `typst watch` emitted, which is what
+  tells us where it stopped.
 - **A template fails with an error inside `@preview/…`.** That's a package
   compatibility problem, not the editor: some Typst Universe templates pull in helper
   packages written for an older Typst. Pick a different template, or match the Typst
@@ -495,9 +528,21 @@ cd hilbert-editor ; npm install ; npm run dev   # then open http://localhost:517
 | `EXEC_TIMEOUT_MS` | `45000` | Per-run wall-clock limit. |
 
 Interpreters (including conda environments) are auto-detected; choose the default per
-language in **App Settings → Interpreters**. Your documents live in
-`~/Documents/Hilbert`. Each workspace keeps its scratch files in a hidden `.hilbert/`
-folder, which is safe to delete.
+language in **App Settings → Interpreters**, and the choice is remembered. Your
+documents live in `~/Documents/Hilbert`. Each workspace keeps its scratch files in a
+hidden `.hilbert/` folder, which is safe to delete.
+
+Settings, the last session, and the activity log sit together in one folder:
+
+| Platform | Folder |
+| --- | --- |
+| macOS | `~/Library/Application Support/hilbert/` |
+| Linux | `~/.config/hilbert/` |
+| Windows | `%APPDATA%\hilbert\` |
+
+`settings.json` holds the preferences, `session.json` the project and open files you
+left behind, and `hilbert.log` the last few thousand lines of what the engine has been
+doing. Deleting any of them is safe; you get the defaults back.
 
 ---
 
