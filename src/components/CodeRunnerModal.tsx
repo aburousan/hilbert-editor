@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { getInterpreter, setInterpreter } from '../prefs';
 
 import { API, useWorkspaceAsset } from '../api';
 
@@ -124,7 +125,7 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
       setTools(t);
       let l = initialLang ?? lang;
       if (!t.available[l]) { l = (['python', 'julia', 'wolfram'] as Lang[]).find(x => t.available[x]) ?? l; setLang(l); if (!initialCode) setCode(TEMPLATES[l][0].code); }
-      const saved = localStorage.getItem(`interp_${l}`);
+      const saved = getInterpreter(l);
       const opts = t.interpreters[l] || [];
       setBin(opts.find(o => o.path === saved)?.path || opts[0]?.path || '');
     }).catch(() => {});
@@ -134,7 +135,7 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
     const mode = l === 'julia' && outputMode === 'equation' ? 'text' : outputMode;
     setLang(l); setOutputMode(mode); setCode(templatesFor(l, mode)[0].code); setResult(null);
     const opts = tools?.interpreters[l] || [];
-    const saved = localStorage.getItem(`interp_${l}`);
+    const saved = getInterpreter(l);
     setBin(opts.find(o => o.path === saved)?.path || opts[0]?.path || '');
   };
 
@@ -215,7 +216,7 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
             </label>
             <label className="form-field">
               <span>Environment</span>
-              <select value={bin} onChange={e => { setBin(e.target.value); localStorage.setItem(`interp_${lang}`, e.target.value); }}>
+              <select value={bin} onChange={e => { setBin(e.target.value); setInterpreter(lang, e.target.value); }}>
                 {interpOptions.map(o => <option key={o.path} value={o.path}>{o.label}</option>)}
                 {interpOptions.length === 0 && <option>None detected</option>}
               </select>

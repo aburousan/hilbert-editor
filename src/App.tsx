@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo, lazy, Suspense } from 'react';
 import { API, useWorkspaceAsset } from './api';
 import { THEMES, DEFAULT_THEME, isThemeId, themeInfo, themeAttribute, nextTheme, type ThemeId } from './themes';
+import { allInterpreters, applyInterpreters, getInterpreter, PREFS_CHANGED } from './prefs';
 import Editor, { useMonaco } from '@monaco-editor/react';
 import { setupTypstLanguage, setWorkspaceImages } from './typstMonaco';
 import { useProofread } from './proofread';
@@ -926,6 +927,94 @@ export default function App() {
       document.removeEventListener('mouseup', handleMouseUp);
     };
   }, [sidebarVisible, sidebarWidth]);
+
+  // Settings that should outlive the window, mirrored to a file the backend owns.
+  //
+  // localStorage stays the fast path — it is read synchronously as each piece of
+  // state is created, so the editor comes up at the size you chose instead of
+  // flashing the default first. What it cannot do is survive a change of origin,
+  // and the origin carries the port: the app asks for 3001 and takes any free
+  // port when something already holds it, so a second window, a process that
+  // outlived its window, or an unrelated program on 3001 hands the webview a
+  // different origin and an empty store. The editor then reopens at 14pt as
+  // though it had never been told otherwise. The file is the copy that survives
+  // that, so it gets the last word at startup.
+  const settingsSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const settingsLoadedRef = useRef(false);
+  // Bumped once the file has been read, so the save below runs even when reading
+  // it changed nothing. That is the case that matters for anyone upgrading: their
+  // choices are still only in localStorage, and without a write here the file
+  // stays empty until they happen to change a setting again — so the first time
+  // the port moved, the settings they had been using for months would go.
+  const [settingsLoaded, setSettingsLoaded] = useState(0);
+  const [prefsRevision, setPrefsRevision] = useState(0);
+
+  useEffect(() => {
+    let abandoned = false;
+    const clamp = (value: unknown, low: number, high: number) =>
+      typeof value === 'number' && Number.isFinite(value) ? Math.max(low, Math.min(value, high)) : null;
+    (async () => {
+      try {
+        const saved = await (await fetch(`${API}/settings`)).json();
+        if (abandoned || !saved || typeof saved !== 'object') return;
+        const size = clamp(saved.fontSize, 6, 96);
+        if (size) setEditorFontSize(size);
+        if (isThemeId(saved.theme)) setTheme(saved.theme);
+        const delay = clamp(saved.compileDelay, 0, 10000);
+        if (delay !== null) setCompileDelay(delay);
+        if (saved.panels && typeof saved.panels === 'object') setPanels(p => ({ ...p, ...saved.panels }));
+        // Sizes are clamped on the way back in as well as while dragging: a file
+        // written by a bigger screen shouldn't be able to push the preview off
+        // this one, and a hand-edited one shouldn't be able to break the layout.
+        const layout = saved.layout || {};
+        const sidebar = clamp(layout.sidebar, 150, 600);
+        if (sidebar) setSidebarWidth(sidebar);
+        const editor = clamp(layout.editor, 200, Math.max(200, window.innerWidth - 320));
+        if (editor) setEditorWidth(editor);
+        const tree = clamp(layout.tree, 80, 900);
+        if (tree) setTreeHeight(tree);
+        const problems = clamp(layout.problems, 60, 900);
+        if (problems) setProblemsHeight(problems);
+        applyInterpreters(saved.interpreters);
+      } catch {}
+      // Even when the read failed. Otherwise nothing would ever be saved and the
+      // next launch would be back to defaults for a second time.
+      if (abandoned) return;
+      settingsLoadedRef.current = true;
+      setSettingsLoaded(n => n + 1);
+    })();
+    return () => { abandoned = true; };
+  }, []);
+
+  useEffect(() => {
+    // Before the file has had its say, this state is only the defaults; writing
+    // it back would erase the very thing being restored.
+    if (!settingsLoadedRef.current) return;
+    if (settingsSaveTimer.current) clearTimeout(settingsSaveTimer.current);
+    settingsSaveTimer.current = setTimeout(() => {
+      fetch(`${API}/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fontSize: editorFontSize,
+          theme,
+          compileDelay,
+          panels,
+          layout: { sidebar: sidebarWidth, editor: editorWidth, tree: treeHeight, problems: problemsHeight },
+          interpreters: allInterpreters(),
+        }),
+      }).catch(() => {});
+    }, 400);
+  }, [settingsLoaded, prefsRevision, editorFontSize, theme, compileDelay, panels, sidebarWidth, editorWidth, treeHeight, problemsHeight]);
+
+  // Interpreter choices are made in two different dialogs and land in
+  // localStorage rather than in this component's state, so nothing above would
+  // notice them without this.
+  useEffect(() => {
+    const onChange = () => setPrefsRevision(n => n + 1);
+    window.addEventListener(PREFS_CHANGED, onChange);
+    return () => window.removeEventListener(PREFS_CHANGED, onChange);
+  }, []);
 
   // When a folder is opened in the browser via the File System Access API, this
   // holds a writable handle to the real folder on disk so edits are saved back
@@ -2524,7 +2613,7 @@ export default function App() {
         if (!group.length) continue;
         // Use the interpreter the user picked in the code runner (e.g. a conda
         // env with numpy), not just the default one the backend detected first.
-        const bin = localStorage.getItem(`interp_${lang}`) || '';
+        const bin = getInterpreter(lang);
         const res = await fetch(`${API}/notebook/run`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ lang, cells: group.map(c => c.code), bin }),

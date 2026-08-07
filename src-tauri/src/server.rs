@@ -370,7 +370,10 @@ static LOG: LazyLock<Mutex<std::collections::VecDeque<String>>> =
     LazyLock::new(|| Mutex::new(std::collections::VecDeque::with_capacity(LOG_LINES)));
 
 fn log_path() -> PathBuf {
-    session_file().with_file_name("hilbert.log")
+    if let Ok(p) = std::env::var("HILBERT_LOG_FILE") {
+        return PathBuf::from(p);
+    }
+    hilbert_config_dir().join("hilbert.log")
 }
 
 fn stamp() -> String {
@@ -5308,15 +5311,24 @@ pub fn session_file_path() -> PathBuf {
     session_file()
 }
 
+// Where the app's own files live, whatever window is asking. Deliberately not
+// derived from the session file: a second window is given a session of its own
+// under the temp directory so it starts fresh instead of clobbering the first
+// window's project, and hanging the settings and the log off that would put them
+// in /tmp — a different set per window, and on a shared machine a path that may
+// already belong to somebody else.
+fn hilbert_config_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"))
+        .join("hilbert")
+}
+
 fn session_file() -> PathBuf {
     // Overridable so headless/test runs don't touch the real user session file.
     if let Ok(p) = std::env::var("HILBERT_SESSION_FILE") {
         return PathBuf::from(p);
     }
-    dirs::config_dir()
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"))
-        .join("hilbert")
-        .join("session.json")
+    hilbert_config_dir().join("session.json")
 }
 
 // The workspace folder from the last session, if it still exists. Lets the GUI
@@ -5355,6 +5367,44 @@ async fn session_post(State(st): St, body: Bytes) -> Response {
         return json_err(StatusCode::INTERNAL_SERVER_ERROR, "Could not save session");
     }
     Json(json!({ "ok": true })).into_response()
+}
+
+// Settings, as opposed to the session. The session is what one window was in the
+// middle of; these are the choices someone made about the app and expects to
+// find again — font size, theme, how the panels are arranged.
+//
+// They used to live in the webview's localStorage, which is keyed to the origin,
+// and the origin includes the port. The app asks for 3001 and takes any free
+// port when something else already has it, so a second window, a stale process,
+// or an unrelated program on 3001 was enough to hand the webview a different
+// origin and an empty store — and the editor came back at 14pt as if it had
+// never been told otherwise. On disk, and shared by every window.
+fn settings_file() -> PathBuf {
+    if let Ok(p) = std::env::var("HILBERT_SETTINGS_FILE") {
+        return PathBuf::from(p);
+    }
+    hilbert_config_dir().join("settings.json")
+}
+
+async fn settings_get() -> Response {
+    match fs::read_to_string(settings_file()) {
+        Ok(s) if !s.trim().is_empty() => ([(header::CONTENT_TYPE, "application/json")], s).into_response(),
+        _ => Json(json!({})).into_response(),
+    }
+}
+
+async fn settings_post(body: Bytes) -> Response {
+    if serde_json::from_slice::<Value>(&body).is_err() {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid settings JSON");
+    }
+    let path = settings_file();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match write_atomic(&path, &body) {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(_) => json_err(StatusCode::INTERNAL_SERVER_ERROR, "Could not save settings"),
+    }
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -5435,6 +5485,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/lint/suggest", post(lint_suggest))
         .route("/lint/ignore", post(lint_ignore))
         .route("/session", get(session_get).post(session_post))
+        .route("/settings", get(settings_get).post(settings_post))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_guard));
 
     let app = Router::new().merge(api);

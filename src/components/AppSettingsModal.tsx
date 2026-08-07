@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { THEMES, type ThemeId } from '../themes';
+import { getInterpreter, setInterpreter } from '../prefs';
 
 import { API } from '../api';
 
@@ -67,7 +68,7 @@ export default function AppSettingsModal({ onClose, theme, onTheme, fontSize, on
         const next = { ...prev };
         for (const lang of Object.keys(t.interpreters)) {
           const list = t.interpreters[lang];
-          const saved = next[lang] || localStorage.getItem(`interp_${lang}`) || '';
+          const saved = next[lang] || getInterpreter(lang);
           // Fall back to the first entry if the remembered one has gone away
           // (environment deleted, project closed).
           next[lang] = list.some(o => o.path === saved) ? saved : (list[0]?.path || '');
@@ -85,7 +86,7 @@ export default function AppSettingsModal({ onClose, theme, onTheme, fontSize, on
 
   const chooseInterp = (lang: string, path: string) => {
     setPicked(p => ({ ...p, [lang]: path }));
-    localStorage.setItem(`interp_${lang}`, path);
+    setInterpreter(lang, path);
   };
 
   const addInterp = async (lang: string, path: string) => {
