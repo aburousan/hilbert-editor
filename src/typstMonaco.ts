@@ -113,11 +113,10 @@ export function setupTypstLanguage(monacoInstance: any) {
     }
   });
 
-  if (!themesDefined) {
-    monacoInstance.editor.defineTheme('typst-dark', {
-      base: 'vs-dark',
-      inherit: true,
-      rules: [
+  // Shared by every theme of the same lightness. Changing a room's surfaces is
+  // one thing; changing what a heading or a math delimiter looks like from one
+  // theme to the next would just make the editor harder to read.
+  const DARK_RULES = [
         { token: 'comment', foreground: '64748b', fontStyle: 'italic' },
         { token: 'heading', foreground: '60a5fa', fontStyle: 'bold' },
         { token: 'keyword', foreground: 'c084fc', fontStyle: 'bold' },
@@ -137,7 +136,34 @@ export function setupTypstLanguage(monacoInstance: any) {
         { token: 'math.var', foreground: '5eead4' },
         { token: 'math.op', foreground: 'f472b6' },
         { token: 'math', foreground: '99f6e4' }
-      ],
+      ];
+
+  const LIGHT_RULES = [
+        { token: 'comment', foreground: '94a3b8', fontStyle: 'italic' },
+        { token: 'heading', foreground: '2563eb', fontStyle: 'bold' },
+        { token: 'keyword', foreground: '9333ea', fontStyle: 'bold' },
+        { token: 'function', foreground: '0284c7' },
+        { token: 'function.call', foreground: '0369a1' },
+        { token: 'package', foreground: 'b45309' },
+        { token: 'label', foreground: 'b45309' },
+        { token: 'string', foreground: '15803d' },
+        { token: 'string.quote', foreground: '15803d' },
+        { token: 'number', foreground: 'be123c' },
+        { token: 'strong', foreground: '0f172a', fontStyle: 'bold' },
+        { token: 'emph', foreground: '334155', fontStyle: 'italic' },
+        { token: 'raw', foreground: '4f46e5' },
+        { token: 'markup.list', foreground: '9333ea' },
+        { token: 'math.delim', foreground: 'db2777', fontStyle: 'bold' },
+        { token: 'math.var', foreground: '0d9488' },
+        { token: 'math.op', foreground: 'db2777' },
+        { token: 'math', foreground: '0f766e' }
+      ];
+
+  if (!themesDefined) {
+    monacoInstance.editor.defineTheme('typst-dark', {
+      base: 'vs-dark',
+      inherit: true,
+      rules: DARK_RULES,
       colors: {
         'editor.background': '#0f172a',
         'editor.foreground': '#e2e8f0',
@@ -158,26 +184,7 @@ export function setupTypstLanguage(monacoInstance: any) {
     monacoInstance.editor.defineTheme('typst-light', {
       base: 'vs',
       inherit: true,
-      rules: [
-        { token: 'comment', foreground: '94a3b8', fontStyle: 'italic' },
-        { token: 'heading', foreground: '2563eb', fontStyle: 'bold' },
-        { token: 'keyword', foreground: '9333ea', fontStyle: 'bold' },
-        { token: 'function', foreground: '0284c7' },
-        { token: 'function.call', foreground: '0369a1' },
-        { token: 'package', foreground: 'b45309' },
-        { token: 'label', foreground: 'b45309' },
-        { token: 'string', foreground: '15803d' },
-        { token: 'string.quote', foreground: '15803d' },
-        { token: 'number', foreground: 'be123c' },
-        { token: 'strong', foreground: '0f172a', fontStyle: 'bold' },
-        { token: 'emph', foreground: '334155', fontStyle: 'italic' },
-        { token: 'raw', foreground: '4f46e5' },
-        { token: 'markup.list', foreground: '9333ea' },
-        { token: 'math.delim', foreground: 'db2777', fontStyle: 'bold' },
-        { token: 'math.var', foreground: '0d9488' },
-        { token: 'math.op', foreground: 'db2777' },
-        { token: 'math', foreground: '0f766e' }
-      ],
+      rules: LIGHT_RULES,
       colors: {
         'editor.background': '#ffffff',
         'editor.foreground': '#0f172a',
@@ -188,6 +195,83 @@ export function setupTypstLanguage(monacoInstance: any) {
         'editorHoverWidget.foreground': '#0f172a',
         'editorHoverWidget.statusBarBackground': '#f1f5f9'
       }
+    });
+
+    // The rest change only their surfaces, reusing the syntax colours above.
+    const variant = (
+      name: string,
+      base: 'vs' | 'vs-dark',
+      rules: any,
+      colors: Record<string, string>,
+    ) => monacoInstance.editor.defineTheme(name, { base, inherit: true, rules, colors });
+
+    variant('typst-sepia', 'vs', LIGHT_RULES, {
+      'editor.background': '#fdf8ee',
+      'editor.foreground': '#2a2317',
+      'editorLineNumber.foreground': '#a2977f',
+      'editorLineNumber.activeForeground': '#635742',
+      'editor.lineHighlightBackground': '#efe6d4aa',
+      'editor.selectionBackground': '#94491d33',
+      'editorCursor.foreground': '#94491d',
+      'editorIndentGuide.background1': '#e2d8c2',
+      'editorBracketMatch.border': '#94491d',
+      'editorHoverWidget.background': '#f9f3e7',
+      'editorHoverWidget.border': '#d5c9b0',
+      'editorHoverWidget.foreground': '#2a2317',
+      'editorHoverWidget.statusBarBackground': '#f3ecdd',
+    });
+
+    variant('typst-midnight', 'vs-dark', DARK_RULES, {
+      'editor.background': '#04060c',
+      'editor.foreground': '#dce5f6',
+      'editorLineNumber.foreground': '#3d4658',
+      'editorLineNumber.activeForeground': '#808da7',
+      'editor.lineHighlightBackground': '#101725aa',
+      'editor.selectionBackground': '#7c9cf540',
+      'editorCursor.foreground': '#7c9cf5',
+      'editorIndentGuide.background1': '#161e2c',
+      'editorBracketMatch.border': '#7c9cf5',
+      'editorHoverWidget.background': '#101725',
+      'editorHoverWidget.border': '#1b2434',
+      'editorHoverWidget.foreground': '#dce5f6',
+      'editorHoverWidget.statusBarBackground': '#090d16',
+    });
+
+    // Deliberately not the dark rules: several of them are mid-tone pastels that
+    // are exactly what this theme exists to avoid.
+    variant('typst-contrast', 'vs-dark', [
+      { token: 'comment', foreground: 'b0b0b0', fontStyle: 'italic' },
+      { token: 'heading', foreground: '7cc4ff', fontStyle: 'bold' },
+      { token: 'keyword', foreground: 'e79cff', fontStyle: 'bold' },
+      { token: 'function', foreground: '6fd7ff' },
+      { token: 'function.call', foreground: '9ce3ff' },
+      { token: 'package', foreground: 'ffd400' },
+      { token: 'label', foreground: 'ffd400' },
+      { token: 'string', foreground: '7bed9f' },
+      { token: 'string.quote', foreground: '7bed9f' },
+      { token: 'number', foreground: 'ffb3c1' },
+      { token: 'strong', foreground: 'ffffff', fontStyle: 'bold' },
+      { token: 'emph', foreground: 'e6e6e6', fontStyle: 'italic' },
+      { token: 'raw', foreground: 'b8b3ff' },
+      { token: 'markup.list', foreground: 'e79cff' },
+      { token: 'math.delim', foreground: 'ff8fc8', fontStyle: 'bold' },
+      { token: 'math.var', foreground: '6ff0dc' },
+      { token: 'math.op', foreground: 'ff8fc8' },
+      { token: 'math', foreground: '9df5e6' },
+    ], {
+      'editor.background': '#000000',
+      'editor.foreground': '#ffffff',
+      'editorLineNumber.foreground': '#8a8a8a',
+      'editorLineNumber.activeForeground': '#ffd400',
+      'editor.lineHighlightBackground': '#1c1c1c',
+      'editor.selectionBackground': '#ffd40040',
+      'editorCursor.foreground': '#ffd400',
+      'editorIndentGuide.background1': '#4a4a4a',
+      'editorBracketMatch.border': '#ffd400',
+      'editorHoverWidget.background': '#0f0f0f',
+      'editorHoverWidget.border': '#6e6e6e',
+      'editorHoverWidget.foreground': '#ffffff',
+      'editorHoverWidget.statusBarBackground': '#000000',
     });
 
     themesDefined = true;

@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { THEMES, type ThemeId } from '../themes';
 
 import { API } from '../api';
 
@@ -37,7 +38,7 @@ function interpPlaceholder(lang: string): string {
 
 type SettingsProps = {
   onClose: () => void,
-  theme: 'typst-dark' | 'typst-light', onTheme: (t: 'typst-dark' | 'typst-light') => void,
+  theme: ThemeId, onTheme: (t: ThemeId) => void,
   fontSize: number, onFontSize: (n: number) => void,
   compileDelay: number, onCompileDelay: (n: number) => void,
 };
@@ -237,10 +238,11 @@ export default function AppSettingsModal({ onClose, theme, onTheme, fontSize, on
               <h2 style={{ marginTop: 0 }}>General Settings</h2>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '15px', marginTop: '20px' }}>
                 <label style={labelStyle}>
-                  Editor theme
-                  <select style={inputStyle} value={theme} onChange={e => onTheme(e.target.value as 'typst-dark' | 'typst-light')}>
-                    <option value="typst-dark">Dark Mode</option>
-                    <option value="typst-light">Light Mode</option>
+                  Interface theme
+                  <select style={inputStyle} value={theme} onChange={e => onTheme(e.target.value as ThemeId)}>
+                    {THEMES.map(t => (
+                      <option key={t.id} value={t.id}>{t.label} — {t.note}</option>
+                    ))}
                   </select>
                 </label>
                 <label style={labelStyle}>

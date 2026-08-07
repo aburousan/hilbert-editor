@@ -16,11 +16,125 @@
   --border-color: #242a34;
   --border-soft: #1b2028;
   --hover-color: rgba(255, 255, 255, 0.05);
+  --header-top: #171b22;
+  --on-accent: #ffffff;
   --error-bg: #7f1d1d;
   --error-text: #fecaca;
   --shadow-lg: 0 20px 44px -14px rgba(0, 0, 0, 0.62), 0 6px 16px -8px rgba(0, 0, 0, 0.5);
   --radius: 8px;
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+  color-scheme: dark;
+}
+
+/* The same room with the lights on, rather than the dark palette inverted.
+   Elevation changes direction: in the dark theme a panel is lighter than the
+   ground it sits on, and here it is whiter, with the shadow left to do the work
+   once there is nowhere lighter to go. The violet is darkened a step because the
+   one that reads as an accent against charcoal is barely a tint against white,
+   and the greys keep a little of its blue so they look chosen rather than
+   left over. */
+:root[data-theme="light"] {
+  --bg-color: #eceef4;
+  --panel-bg: #f7f8fb;
+  --panel-lighter: #fdfdff;
+  --panel-elevated: #ffffff;
+  --text-main: #171a24;
+  --text-muted: #596074;
+  --text-faint: #868da1;
+  --accent: #6046d8;
+  --accent-color: #6046d8;
+  --accent-hover: #4f37c0;
+  --accent-soft: rgba(96, 70, 216, 0.10);
+  --accent-line: rgba(96, 70, 216, 0.38);
+  --border-color: #d7dae5;
+  --border-soft: #e5e8f0;
+  --hover-color: rgba(23, 26, 36, 0.06);
+  --header-top: #ffffff;
+  --on-accent: #ffffff;
+  --error-bg: #fde8e8;
+  --error-text: #9b1c1c;
+  --shadow-lg: 0 18px 40px -16px rgba(23, 26, 36, 0.22), 0 4px 12px -6px rgba(23, 26, 36, 0.14);
+  color-scheme: light;
+}
+
+/* Parchment. The point is the absence of blue rather than the warmth itself —
+   it is the one to write in for hours at a stretch — so the accent goes warm
+   too; a violet on this ground reads as a mistake rather than a choice. */
+:root[data-theme="sepia"] {
+  --bg-color: #e8dfcd;
+  --panel-bg: #f3ecdd;
+  --panel-lighter: #f9f3e7;
+  --panel-elevated: #fdf8ee;
+  --text-main: #2a2317;
+  --text-muted: #635742;
+  --text-faint: #8b7f68;
+  --accent: #94491d;
+  --accent-color: #94491d;
+  --accent-hover: #7a3a15;
+  --accent-soft: rgba(148, 73, 29, 0.11);
+  --accent-line: rgba(148, 73, 29, 0.38);
+  --border-color: #d5c9b0;
+  --border-soft: #e2d8c2;
+  --hover-color: rgba(42, 35, 23, 0.07);
+  --header-top: #fdf8ee;
+  --on-accent: #ffffff;
+  --error-bg: #f6ded8;
+  --error-text: #8a2c1d;
+  --shadow-lg: 0 18px 40px -16px rgba(42, 35, 23, 0.26), 0 4px 12px -6px rgba(42, 35, 23, 0.16);
+  color-scheme: light;
+}
+
+/* For a dark room and an OLED panel: further down than the default dark, and
+   cooler, with the accent moved off violet onto a blue that survives being the
+   brightest thing on a near-black screen. */
+:root[data-theme="midnight"] {
+  --bg-color: #04060c;
+  --panel-bg: #090d16;
+  --panel-lighter: #101725;
+  --panel-elevated: #182131;
+  --text-main: #dce5f6;
+  --text-muted: #808da7;
+  --text-faint: #58637c;
+  --accent: #7c9cf5;
+  --accent-color: #7c9cf5;
+  --accent-hover: #9db6f8;
+  --accent-soft: rgba(124, 156, 245, 0.14);
+  --accent-line: rgba(124, 156, 245, 0.44);
+  --border-color: #1b2434;
+  --border-soft: #101725;
+  --hover-color: rgba(255, 255, 255, 0.055);
+  --header-top: #0c121d;
+  --on-accent: #04060c;
+  --error-bg: #6d1c1c;
+  --error-text: #fecaca;
+  --shadow-lg: 0 20px 44px -14px rgba(0, 0, 0, 0.75), 0 6px 16px -8px rgba(0, 0, 0, 0.6);
+  color-scheme: dark;
+}
+
+/* Everything here is decided by contrast rather than taste: pure black, white
+   text, borders that are actually visible, and an accent bright enough to carry
+   dark text on it. It is meant to be legible first and handsome second. */
+:root[data-theme="contrast"] {
+  --bg-color: #000000;
+  --panel-bg: #000000;
+  --panel-lighter: #0f0f0f;
+  --panel-elevated: #1c1c1c;
+  --text-main: #ffffff;
+  --text-muted: #d6d6d6;
+  --text-faint: #ababab;
+  --accent: #ffd400;
+  --accent-color: #ffd400;
+  --accent-hover: #ffe45c;
+  --accent-soft: rgba(255, 212, 0, 0.18);
+  --accent-line: rgba(255, 212, 0, 0.7);
+  --border-color: #6e6e6e;
+  --border-soft: #4a4a4a;
+  --hover-color: rgba(255, 255, 255, 0.16);
+  --header-top: #0f0f0f;
+  --on-accent: #000000;
+  --error-bg: #4a0000;
+  --error-text: #ff9a9a;
+  --shadow-lg: 0 20px 44px -14px rgba(0, 0, 0, 0.9), 0 0 0 1px #6e6e6e;
   color-scheme: dark;
 }
 
@@ -46,7 +160,7 @@ body {
 /* Header */
 .header {
   height: 48px;
-  background: linear-gradient(180deg, #171b22 0%, var(--panel-bg) 100%);
+  background: linear-gradient(180deg, var(--header-top) 0%, var(--panel-bg) 100%);
   border-bottom: 1px solid var(--border-soft);
   display: grid;
   grid-template-columns: 1fr auto 1fr;
@@ -258,7 +372,7 @@ body {
   background: var(--accent);
 }
 .status-note { padding: 0 6px; opacity: 0.8; }
-.status-dot { width: 7px; height: 7px; border-radius: 50%; background: #64748b; }
+.status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); }
 .status-dot.ok { background: #4ade80; }
 .status-dot.warn { background: #f59e0b; }
 .status-dot.error { background: #f87171; }
@@ -395,7 +509,7 @@ body {
   transition: color 0.1s, background-color 0.1s;
 }
 .fontsize-item:hover { background: var(--hover-color); color: var(--accent-hover); }
-.fontsize-item.active { background: var(--accent); color: #fff; }
+.fontsize-item.active { background: var(--accent); color: var(--on-accent); }
 .fontsize-item-unit { font-size: 0.66rem; font-weight: 600; opacity: 0.5; }
 .fontsize-item.active .fontsize-item-unit { opacity: 0.8; }
 .fontsize-custom {
@@ -619,8 +733,8 @@ body {
 }
 
 .tool-btn.primary {
-  background: linear-gradient(180deg, #9a8bff 0%, var(--accent) 100%);
-  color: #fff;
+  background: linear-gradient(180deg, var(--accent-hover) 0%, var(--accent) 100%);
+  color: var(--on-accent);
   font-weight: 600;
   font-size: 0.74rem;
   letter-spacing: 0.01em;
@@ -631,8 +745,8 @@ body {
 }
 
 .tool-btn.primary:hover {
-  background: linear-gradient(180deg, #a99bff 0%, #7d6cf3 100%);
-  color: #fff;
+  background: linear-gradient(180deg, var(--accent-hover) 0%, var(--accent-hover) 100%);
+  color: var(--on-accent);
   box-shadow: 0 3px 10px -1px rgba(139, 124, 246, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.2);
 }
 .tool-btn.primary:not(:disabled):active { transform: scale(0.97); }
@@ -700,7 +814,7 @@ body.is-resizing .editor-container {
 /* Problems panel */
 .problem-badge {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   border-radius: 9px;
   font-size: 10px;
   padding: 1px 7px;
@@ -725,7 +839,7 @@ body.is-resizing .editor-container {
 .problem-dot.error { background: #ef4444; }
 .problem-dot.warning { background: #f59e0b; }
 .problem-dot.info { background: #38bdf8; }
-.problem-dot.hint { background: #94a3b8; }
+.problem-dot.hint { background: var(--text-muted); }
 .problem-msg {
   font-size: 12px;
   color: var(--text-main);
@@ -745,7 +859,7 @@ body.is-resizing .editor-container {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #94a3b8;
+  color: var(--text-muted);
   background-color: var(--panel-bg);
   font-size: 1.1rem;
 }
@@ -763,13 +877,13 @@ body.is-resizing .editor-container {
 /* Flowchart → code: setup box + generated-code preview */
 .fc-setup {
   width: 100%; resize: vertical; padding: 8px 10px;
-  background: #0f172a; color: #e2e8f0; border: 1px solid #334155; border-radius: 8px;
+  background: var(--panel-elevated); color: var(--text-main); border: 1px solid var(--border-color); border-radius: 8px;
   font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.78rem; line-height: 1.5;
 }
 .fc-setup:focus { outline: none; border-color: var(--accent); }
 .fc-code {
   margin-top: 6px; padding: 10px 12px; max-height: 260px; overflow: auto;
-  background: #0f172a; color: #e2e8f0; border-radius: 8px;
+  background: var(--panel-elevated); color: var(--text-main); border-radius: 8px;
   font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.78rem;
   line-height: 1.55; white-space: pre; tab-size: 2;
 }
@@ -797,7 +911,7 @@ body.is-resizing .editor-container {
   background: transparent; border: none; border-radius: 7px; cursor: pointer;
 }
 .eq-gallery-cats button:hover { background: var(--hover-color); color: var(--text-main); }
-.eq-gallery-cats button.active { background: var(--accent); color: #fff; font-weight: 600; }
+.eq-gallery-cats button.active { background: var(--accent); color: var(--on-accent); font-weight: 600; }
 .eq-gallery-grid {
   flex: 1; overflow-y: auto; padding: 14px;
   display: grid; grid-template-columns: repeat(auto-fill, minmax(224px, 1fr));
@@ -986,7 +1100,7 @@ body.is-resizing .editor-container {
 
 .outline-item:hover {
   background: var(--hover-color);
-  color: #fff !important;
+  color: var(--text-main) !important;
   border-radius: 4px;
 }
 
@@ -1002,7 +1116,7 @@ body.is-resizing .editor-container {
 
 .sym-code {
   font-size: 11px;
-  color: #94a3b8;
+  color: var(--text-muted);
   font-family: monospace;
 }
 
@@ -1268,7 +1382,7 @@ body.is-resizing .editor-container {
 .tree-del:hover { opacity: 1 !important; color: #f87171; background: rgba(239, 68, 68, 0.15); }
 
 .tree-dir:hover, .tree-file:hover {
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--hover-color);
 }
 
 .tree-file.active {
@@ -1310,7 +1424,7 @@ details > summary::-webkit-details-marker {
 }
 
 .tab.active {
-  color: #fff;
+  color: var(--text-main);
   background: var(--bg-color);
   border-top: 2px solid var(--accent);
 }
@@ -1330,8 +1444,8 @@ details > summary::-webkit-details-marker {
 }
 
 .tab-close:hover {
-  background: rgba(255, 255, 255, 0.1);
-  color: #fff;
+  background: var(--hover-color);
+  color: var(--text-main);
 }
 
 .editor-container {

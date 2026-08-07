@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo, lazy, Suspense } from 'react';
 import { API, useWorkspaceAsset } from './api';
+import { THEMES, DEFAULT_THEME, isThemeId, themeInfo, themeAttribute, nextTheme, type ThemeId } from './themes';
 import Editor, { useMonaco } from '@monaco-editor/react';
 import { setupTypstLanguage, setWorkspaceImages } from './typstMonaco';
 import { useProofread } from './proofread';
@@ -373,8 +374,10 @@ export default function App() {
   // in a "Problems" tab you can switch to. Reset to the preview once it's clean.
   const [previewTab, setPreviewTab] = useState<'preview' | 'problems'>('preview');
   useEffect(() => { if (!compileError) setPreviewTab('preview'); }, [compileError]);
-  const [theme, setTheme] = useState<'typst-dark' | 'typst-light'>(() =>
-    localStorage.getItem('editor_theme') === 'typst-light' ? 'typst-light' : 'typst-dark');
+  const [theme, setTheme] = useState<ThemeId>(() => {
+    const saved = localStorage.getItem('editor_theme');
+    return isThemeId(saved) ? saved : DEFAULT_THEME;
+  });
   const [editorFontSize, setEditorFontSize] = useState<number>(() => Number(localStorage.getItem('editor_font_size')) || 14);
   const [compileDelay, setCompileDelay] = useState<number>(() => {
     const saved = Number(localStorage.getItem('compile_delay'));
@@ -384,6 +387,14 @@ export default function App() {
     return saved || 100;
   });
   useEffect(() => { localStorage.setItem('editor_theme', theme); }, [theme]);
+  // The whole window follows this, not just the editor pane. Everything outside
+  // the editor is already drawn from the custom properties in index.css, so the
+  // light palette is a second set of those and this is the switch. color-scheme
+  // rides along with it, which is what gets the scrollbars and the native
+  // controls inside dialogs to change sides too.
+  useEffect(() => {
+    document.documentElement.dataset.theme = themeAttribute(theme);
+  }, [theme]);
   const [recentFolders, setRecentFolders] = useState<RecentFolder[]>(() => {
     try { return JSON.parse(localStorage.getItem('recent_folders') || '[]'); } catch { return []; }
   });
@@ -4738,7 +4749,8 @@ export default function App() {
       category: 'View', title: `Show / Hide ${PANEL_LABELS[key]}`, run: () => togglePanel(key),
     })),
     { category: 'View', title: 'Show Everything', run: () => { setPanels(DEFAULT_PANELS); setSidebarOpen(true); } },
-    { category: 'View', title: 'Toggle Editor Theme (dark / light)', run: () => setTheme(t => t === 'typst-dark' ? 'typst-light' : 'typst-dark') },
+    { category: 'View', title: 'Next Theme', run: () => setTheme(nextTheme) },
+    ...THEMES.map(t => ({ category: 'View', title: `Theme: ${t.label} — ${t.note}`, run: () => setTheme(t.id) })),
     { category: 'View', title: 'Version History...', run: () => setShowHistoryModal(true) },
     { category: 'View', title: 'Recompile Document', run: () => compileTypst(currentMain) },
     { category: 'View', title: 'Preview HTML (experimental)', run: () => setShowHtmlPreview(true) },
@@ -5185,9 +5197,9 @@ export default function App() {
               )}
             </button>
           )}
-          <button className="theme-toggle" onClick={() => setTheme(t => t === 'typst-dark' ? 'typst-light' : 'typst-dark')}
-            title={theme === 'typst-dark' ? 'Editor theme: dark — click for light (the PDF preview has its own toggle)' : 'Editor theme: light — click for dark (the PDF preview has its own toggle)'}>
-            {theme === 'typst-dark'
+          <button className="theme-toggle" onClick={() => setTheme(nextTheme)}
+            title={`Interface theme: ${themeInfo(theme).label} — click for ${themeInfo(nextTheme(theme)).label}. All five are in Settings; the PDF preview has its own toggle.`}>
+            {themeInfo(theme).dark
               ? <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
               : <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2"></path><path d="M12 20v2"></path><path d="M4.93 4.93l1.41 1.41"></path><path d="M17.66 17.66l1.41 1.41"></path><path d="M2 12h2"></path><path d="M20 12h2"></path><path d="M4.93 19.07l1.41-1.41"></path><path d="M17.66 6.34l1.41-1.41"></path></svg>}
           </button>
@@ -5401,10 +5413,10 @@ export default function App() {
                 </div>
                 <div className="outline-list" style={{ flex: 1, overflowY: 'auto', padding: '10px' }}>
                   {outline.length === 0 && (
-                    <div style={{ color: '#94a3b8', fontSize: '12px', textAlign: 'center', marginTop: '20px' }}>No headings found.</div>
+                    <div style={{ color: 'var(--text-muted)', fontSize: '12px', textAlign: 'center', marginTop: '20px' }}>No headings found.</div>
                   )}
                   {outline.map((item, i) => (
-                    <div key={i} onClick={() => jumpToLine(item.line)} style={{ padding: '4px 0', paddingLeft: `${(item.level - 1) * 12}px`, cursor: 'pointer', fontSize: '13px', color: '#e2e8f0', borderBottom: '1px solid transparent' }} className="outline-item">
+                    <div key={i} onClick={() => jumpToLine(item.line)} style={{ padding: '4px 0', paddingLeft: `${(item.level - 1) * 12}px`, cursor: 'pointer', fontSize: '13px', color: 'var(--text-main)', borderBottom: '1px solid transparent' }} className="outline-item">
                       {item.text}
                     </div>
                   ))}
@@ -5946,12 +5958,12 @@ export default function App() {
               <div style={{ color: 'var(--text-muted)', marginBottom: '15px' }}>History for {activeTabPath}</div>
               <div className="history-list" style={{ maxHeight: '400px', overflowY: 'auto' }}>
                 {history.filter(h => h.path === activeTabPath).length === 0 && (
-                  <div style={{ color: '#94a3b8', fontSize: '13px', textAlign: 'center', marginTop: '20px' }}>No history for this file yet.<br/>Save the file (⌘S) to keep a version.</div>
+                  <div style={{ color: 'var(--text-muted)', fontSize: '13px', textAlign: 'center', marginTop: '20px' }}>No history for this file yet.<br/>Save the file (⌘S) to keep a version.</div>
                 )}
                 {history.filter(h => h.path === activeTabPath).reverse().map((h, i) => (
                   <div key={h.id} className="history-item" onClick={() => { restoreHistory(h); setShowHistoryModal(false); }} style={{ padding: '12px', borderBottom: '1px solid var(--border-color)', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div style={{ fontSize: '14px', fontWeight: i === 0 ? 'bold' : 'normal' }}>{new Date(h.timestamp).toLocaleString()}</div>
-                    <div style={{ fontSize: '12px', color: '#94a3b8', background: 'rgba(255,255,255,0.1)', padding: '4px 8px', borderRadius: '4px' }}>Restore</div>
+                    <div style={{ fontSize: '12px', color: 'var(--text-muted)', background: 'var(--hover-color)', padding: '4px 8px', borderRadius: '4px' }}>Restore</div>
                   </div>
                 ))}
               </div>
