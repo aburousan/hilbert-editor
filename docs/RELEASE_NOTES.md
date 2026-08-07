@@ -4,6 +4,89 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.1.19
+
+The Windows fixes, confirmed on the machine that had the problem. Also five
+interface themes, settings that survive a restart, and a whiteboard that stops
+arguing with itself about who saved it.
+
+### Editing on Windows no longer gets stuck on "Compiling…"
+
+The compiles were never slow. A user's log showed every one of them finishing in
+about 110 ms while the preview sat there — what was failing was the save, and
+every compile starts with one.
+
+After writing a file the app read it straight back and remembered the hash of
+what it read. That looks like the careful thing to do and is exactly the bug: on
+Windows the write lands through a rename, and with a filter driver in the way —
+every antivirus is one — the read that follows can still return the previous
+contents. The editor then held a hash describing text one keystroke old, its next
+save failed its own precondition, and the app announced that the file had
+"changed outside Hilbert" about a change it had made itself. From there nothing
+could be saved and nothing reached the preview.
+
+It now records what it wrote. The follow-up log from the same user: 83 compiles,
+median 120 ms, no stalls, no fallbacks.
+
+### Projects on drives other than C: opened the wrong folder
+
+An absolute path was resolved from a bare `/`, which on Windows throws the drive
+away — opening `C:\Users\you\Documents\Hilbert` recorded the workspace as
+`\Users\you\Documents\Hilbert`. Windows reads a leading slash as "the current
+drive", so this was right by luck for anyone working on C: and quietly wrong for
+anyone on D: or a mapped network drive.
+
+### Tinymist installed by winget is found
+
+A running program keeps the environment it was launched with, and the desktop
+hands every app the copy it captured at login — so a tinymist installed since
+then is on your `PATH` and invisible to the app at the same time. Hilbert now
+looks where winget, scoop and chocolatey actually put their shims, and inside
+winget's package folder directly.
+
+### Whiteboards save once, and the preview updates
+
+Ctrl+S on a whiteboard wrote the file twice: the drawing, and the editor's own
+copy of it, which is only ever the last saved version. Whichever landed second
+decided what was on disk, so the next save could fail its precondition — the
+"changed outside Hilbert" dialog again — and it could put an older version of the
+drawing back. Saving a whiteboard now also rebuilds the document, so the drawing
+appears in the PDF straight away.
+
+### Five interface themes
+
+**Ink** (the default), **Paper**, **Sepia** for long low-blue sessions,
+**Midnight** for a dark room or an OLED panel, and **High Contrast**. The
+sun/moon button in the header cycles them and Settings lists them all. They dress
+the whole window now, not just the editor pane; the PDF preview keeps its own
+light/dark toggle.
+
+### Settings stay set
+
+Interface theme, editor font size, auto-compile delay, which panels are showing,
+the pane sizes, and the interpreter picked for each language. These lived in the
+webview's storage, which is keyed to the port the app happens to get — so a
+second window or a stale process was enough to reset all of them. They live in a
+file next to the session now.
+
+### The app keeps a log
+
+**Help → Copy Diagnostics** puts it on your clipboard along with which Typst and
+Tinymist were found and the `PATH` they were found on. On Windows especially a
+windowed app has no console to print to, which is why every report there had been
+guesswork. It is what found the save bug above.
+
+### Smaller things
+
+- The preview keeps its place when the window or the panes are resized; on a long
+  document you stay on the paragraph you were reading.
+- A compile that runs long says so instead of showing the same word for longer,
+  and gives up rather than spinning forever.
+- Disposing an editor no longer surfaces Monaco's cancellation as an error.
+- `lodash-es` moved to 4.18.1, clearing GHSA-r5fr-rjxr-66jc.
+
+---
+
 ## 0.1.14
 
 More collaboration fixes, and images display again. **If you use collaboration,
