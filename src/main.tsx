@@ -13,6 +13,24 @@ class ErrorBoundary extends React.Component<any, any> {
   }
 }
 
+// Monaco cancels whatever it had in flight when an editor is disposed, and the
+// resulting CancellationError escapes as an uncaught error — opening a
+// whiteboard, which swaps the editor out for a canvas, produces one every time.
+// Nothing has gone wrong: cancelling on teardown is the point. The whole stack
+// sits inside Monaco's own dispose chain, so there is nothing to fix upstream of
+// it, and leaving it to surface buries real errors in noise. Matched by name so
+// only cancellations are quietened, and only ever those.
+const isCancellation = (reason: unknown) => {
+  const name = (reason as { name?: string })?.name;
+  return name === 'Canceled' || name === 'CancellationError';
+};
+window.addEventListener('error', event => {
+  if (isCancellation(event.error)) event.preventDefault();
+});
+window.addEventListener('unhandledrejection', event => {
+  if (isCancellation(event.reason)) event.preventDefault();
+});
+
 (window as any).logTiming('React mounted');
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
