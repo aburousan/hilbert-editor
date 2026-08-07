@@ -10,8 +10,8 @@
 
 > **Automatic updates:** Hilbert updates itself. Install it once and every future
 > version arrives on its own (it asks before installing). Grab it from the
-> [latest release](https://github.com/aburousan/hilbert-editor/releases/latest)
-> (currently 0.1.10). On Linux the AppImage auto-updates; the `.deb` does not.
+> [latest release](https://github.com/aburousan/hilbert-editor/releases/latest).
+> On Linux the AppImage auto-updates; the `.deb` does not.
 > [What changed in each version](docs/RELEASE_NOTES.md).
 
 It started as "an offline, Overleaf-feeling place to write physics and maths," and
@@ -427,6 +427,13 @@ or use the `.dmg` from Releases and follow the first-launch note above. Update l
 Download the `.exe` (or `.msi`) from Releases and run it. It behaves like a normal
 Windows app: launching tools never flashes a console window, and a failed compile
 shows an error panel instead of closing. You still need the Typst CLI on `PATH`.
+
+Hilbert also looks where the Windows package managers actually put things —
+winget's `Links` and `Packages` folders, scoop's shims, chocolatey's `bin` — so a
+Typst or Tinymist installed after the app was last started is still found. A
+running program keeps the environment it was launched with, and the desktop hands
+every app the copy it captured at login, which is why a fresh `winget install` can
+be on your `PATH` and invisible to an app at the same time.
 
 ### Linux (Debian / Ubuntu)
 
