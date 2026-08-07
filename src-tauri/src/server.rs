@@ -254,7 +254,20 @@ fn jstr<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
 // Node's path.resolve is purely lexical (no symlink resolution) — mirror that.
 fn lexical_resolve(base: &Path, p: &str) -> PathBuf {
     let path = Path::new(p);
-    let mut result = if path.is_absolute() { PathBuf::from("/") } else { base.to_path_buf() };
+    // An absolute path keeps its own root, and on Windows the root includes the
+    // drive. Starting from a bare "/" threw the drive away: open a project at
+    // C:\Users\you\Documents\Hilbert and the workspace became \Users\you\...,
+    // which Windows then reads as that path on whatever drive the process
+    // happens to be running from. Right by luck while everything is on C:, and
+    // quietly the wrong folder the moment a project lives on D: or a mapped
+    // network drive.
+    let mut result = if path.is_absolute() {
+        path.components()
+            .take_while(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
+            .collect::<PathBuf>()
+    } else {
+        base.to_path_buf()
+    };
     for comp in path.components() {
         match comp {
             Component::RootDir | Component::Prefix(_) | Component::CurDir => {}
@@ -873,8 +886,17 @@ async fn workspace_file_post(State(st): St, Query(q): Q, headers: HeaderMap, bod
     match write_atomic(&full, &content) {
         Ok(_) => {
             st.note_write();
-            let saved = fs::read_to_string(&full).unwrap_or_default();
-            Json(json!({ "ok": true, "hash": format!("{:016x}", content_hash(&saved)) })).into_response()
+            // The hash of what we wrote, not of a read-back. Reading the file
+            // again looks more careful and is in fact the bug: on Windows the
+            // write lands through a rename, and with a filter driver in the way
+            // — every antivirus is one — the read that follows can still return
+            // the previous contents. The editor then remembers a hash for text
+            // one keystroke old, so its next save fails its own precondition and
+            // the app announces that the file "changed outside Hilbert" about a
+            // change it made itself. From there nothing can be saved and nothing
+            // reaches the preview, because every compile begins with that save.
+            let written = String::from_utf8_lossy(&content);
+            Json(json!({ "ok": true, "hash": format!("{:016x}", content_hash(&written)) })).into_response()
         }
         Err(_) => text_err(StatusCode::INTERNAL_SERVER_ERROR, "Error"),
     }
@@ -5551,6 +5573,23 @@ mod tests {
     // Compiling… forever": typst watch announced a cycle and never said how it
     // went. The announcement must stop being the answer once it is old enough,
     // or every keystroke after it pays the full budget.
+    // From a real Windows log: opening C:\Users\think\Documents\Hilbert\Sample
+    // left the workspace recorded as \Users\think\Documents\Hilbert\Sample,
+    // and every path built from it inherited the mistake.
+    #[test]
+    fn an_absolute_path_keeps_its_own_root() {
+        let base = Path::new(if cfg!(windows) { r"C:\work" } else { "/work" });
+        let absolute = if cfg!(windows) { r"C:\Users\think\Documents\Hilbert" } else { "/Users/think/Documents/Hilbert" };
+
+        let resolved = lexical_resolve(base, absolute);
+        assert_eq!(resolved, Path::new(absolute), "an absolute path must survive intact");
+        assert!(resolved.is_absolute(), "and must still be absolute");
+
+        // Relative paths still hang off the workspace, and traversal still climbs.
+        assert_eq!(lexical_resolve(base, "chapters/one.typ"), base.join("chapters").join("one.typ"));
+        assert_eq!(lexical_resolve(base, "chapters/../one.typ"), base.join("one.typ"));
+    }
+
     #[test]
     fn a_cycle_that_never_reports_back_stops_being_believed() {
         let waiting = PreviewEvent::new(7, PreviewOutcome::Waiting);

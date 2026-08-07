@@ -1477,6 +1477,12 @@ export default function App() {
 
   useEffect(() => {
     if (!backendReady) return;
+    // A conflict dialog is a question waiting on an answer, and until it gets
+    // one every save fails its precondition. Retrying on a timer just asks the
+    // same failing question forever: nothing reaches the preview, saving looks
+    // dead, and the status bar sits on "Compiling…" with no compile ever
+    // actually being sent. Wait for the person to choose.
+    if (externalConflict) return;
     const hasDirty = tabs.some(t => t.isDirty);
     if (hasDirty || currentMain !== lastCompiledPath) {
       const timeoutId = setTimeout(() => {
@@ -1485,7 +1491,7 @@ export default function App() {
       }, hasDirty ? compileDelay : 50);
       return () => clearTimeout(timeoutId);
     }
-  }, [backendReady, tabs, compileTypst, currentMain, lastCompiledPath, compileDelay]);
+  }, [backendReady, externalConflict, tabs, compileTypst, currentMain, lastCompiledPath, compileDelay]);
 
   // Recompile after a collaborator's change lands (see remoteApplyRev). Reads
   // the current main file fresh, so a late image or an edit to an included file
