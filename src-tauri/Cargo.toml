@@ -21,11 +21,16 @@ serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 regex = "1"
 base64 = "0.22"
+sha2 = "0.10"
 getrandom = "0.3"
 dirs = "6"
 mime_guess = "2"
 percent-encoding = "2"
 open = "5"
+# The system clipboard. Monaco's Cut/Copy/Paste menu entries go through
+# document.execCommand, which a webview refuses — paste in particular can never
+# work that way — so the editor's clipboard is served from here instead.
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 # Spreadsheet reading (xlsx/xls/xlsb/ods) so data import can convert Excel files
 # to CSV offline, with no runtime dependency on Excel or Python.
 calamine = "0.26"

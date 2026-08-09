@@ -591,6 +591,36 @@ try {
     }
   }
 
+  // A typing burst for a closed file must not retain one pending disk-write
+  // closure per CRDT update. The final shared text is authoritative, so the
+  // projection queue coalesces by path while a slow write is in progress.
+  {
+    const burstDoc = new Y.Doc();
+    const burstModel = new WorkspaceModel(burstDoc);
+    const burstFs = makeFs();
+    let writes = 0;
+    const originalWrite = burstFs.writeText.bind(burstFs);
+    burstFs.writeText = async (path, content) => {
+      writes++;
+      await sleep(15);
+      await originalWrite(path, content);
+    };
+    const burstSync = new ProjectSync({
+      model: burstModel,
+      transfer: { provide() {}, unprovide() {}, request() { throw new Error('not used'); } },
+      fs: burstFs,
+      hashBytes: sha256,
+    });
+    burstSync.start();
+    try {
+      for (let i = 0; i < 80; i++) burstDoc.transact(() => burstModel.setText('burst.typ', `revision ${i}`));
+      assert.ok(await waitUntil(async () => (await burstFs.readText('burst.typ').catch(() => '')) === 'revision 79'));
+      assert.ok(writes <= 3, `burst retained too many intermediate writes: ${writes}`);
+    } finally {
+      burstSync.stop();
+    }
+  }
+
   console.log('project collab integration tests passed');
 } catch (e) {
   failed = true;

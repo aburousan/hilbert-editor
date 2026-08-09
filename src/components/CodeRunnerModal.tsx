@@ -2,12 +2,14 @@ import { useState, useEffect } from 'react';
 import { getInterpreter, setInterpreter } from '../prefs';
 
 import { API, useWorkspaceAsset } from '../api';
+import { limitRunResult } from '../performanceLimits';
 
 // A plot a run produced. The backend needs an Authorization header the browser
 // will not attach to an <img src>, so the bytes are read through the API helper
 // and shown from a blob URL.
 function RunPlot({ path }: { path: string }) {
-  const url = useWorkspaceAsset(path);
+  const { url, error } = useWorkspaceAsset(path);
+  if (error) return <div className="form-hint">{error}</div>;
   if (!url) return null;
   return <img src={url} alt={path} style={{ maxWidth: '100%', marginTop: 8, borderRadius: 4, display: 'block' }} />;
 }
@@ -15,7 +17,7 @@ function RunPlot({ path }: { path: string }) {
 type Lang = 'python' | 'julia' | 'wolfram';
 type Interp = { label: string; path: string };
 type Tools = { execEnabled: boolean; interpreters: Record<Lang, Interp[]>; available: Record<Lang, boolean> };
-type RunResult = { ok: boolean; stdout: string; stderr: string; images: string[]; timedOut?: boolean; interpreter?: string };
+type RunResult = { ok: boolean; stdout: string; stderr: string; images: string[]; timedOut?: boolean; interpreter?: string; outputTruncated?: boolean };
 
 const LANG_FENCE: Record<Lang, string> = { python: 'python', julia: 'julia', wolfram: 'mathematica' };
 // File extension per language — runs are auto-saved into codes/<lang>/ so the
@@ -157,10 +159,10 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
     try {
       const res = await fetch(`${API}/run`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lang, code, bin, outputMode }) });
       const data = await res.json();
-      if (!res.ok) { setResult({ ok: false, stdout: '', stderr: data.error || 'Failed.', images: [] }); }
+      if (!res.ok) { setResult(limitRunResult({ ok: false, stdout: '', stderr: data.error || 'Failed.', images: [] })); }
       else {
         if (data.images?.length && onChanged) await onChanged(data.images);
-        setResult(data);
+        setResult(limitRunResult(data));
       }
     } catch {
       setResult({ ok: false, stdout: '', stderr: 'Could not reach the local server.', images: [] });
@@ -275,14 +277,17 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
 
           {result && (
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 4 }}>
-              {outputMode === 'equation' && onInsertEquation && result.stdout.trim() ? (
+              {result.outputTruncated && outputMode === 'equation' && (
+                <span className="form-hint">The generated equation is too large to insert safely; refine the output and run it again.</span>
+              )}
+              {outputMode === 'equation' && onInsertEquation && result.stdout.trim() && !result.outputTruncated ? (
                 <button className="btn-primary" onClick={() => { onInsertEquation(result.stdout, includeCode ? codeBlock() : undefined); onClose(); }} title="Render the output as a typeset Typst equation (with the source code if checked)">
                   Insert {includeCode ? 'code + equation' : 'equation'}
                 </button>
               ) : (
                 <>
                   {(result.stdout.trim() || includeCode) && <button className="btn-ghost" onClick={insertText}>Insert {includeCode ? 'code + output' : 'output'}</button>}
-                  {onInsertEquation && result.stdout.trim() && (
+                  {onInsertEquation && result.stdout.trim() && !result.outputTruncated && (
                     <button className="btn-primary" onClick={() => { onInsertEquation(result.stdout, includeCode ? codeBlock() : undefined); onClose(); }} title="Render the output (LaTeX) as a typeset equation via mitex">
                       Insert as equation
                     </button>

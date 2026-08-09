@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { Excalidraw, exportToSvg, convertToExcalidrawElements } from '@excalidraw/excalidraw';
+import { WHITEBOARD_HISTORY_CHECKPOINT_CHANGES } from './performanceLimits';
 import '@excalidraw/excalidraw/index.css';
 import { notify } from './notify';
 
@@ -222,11 +223,14 @@ export default function ExcalidrawEditor({ initialContent, onSave }: ExcalidrawE
   const [excalidrawAPI, setExcalidrawAPI] = useState<any>(null);
   const [paletteOpen, setPaletteOpen] = useState(true);
   const wrapperRef = useRef<HTMLDivElement>(null);
+  const historyChangesRef = useRef(0);
+  const sceneFingerprintRef = useRef('');
+  const sceneElementsRef = useRef<readonly any[] | null>(null);
 
   useEffect(() => {
     try {
       setInitialData(initialContent ? JSON.parse(initialContent) : { elements: [], appState: {} });
-    } catch (e) {
+    } catch {
       setInitialData({ elements: [], appState: {} });
     }
   }, [initialContent]);
@@ -299,6 +303,13 @@ export default function ExcalidrawEditor({ initialContent, onSave }: ExcalidrawE
         });
         const svgBlob = new Blob([svgElement.outerHTML], { type: 'image/svg+xml' });
         await onSave(jsonContent, svgBlob);
+        // The scene is now durable in both .excalidraw and SVG form. Excalidraw
+        // exposes clear(), not a stack-length cap, so checkpoint only after a
+        // successful save; an unsaved scene never loses its undo history.
+        if (historyChangesRef.current >= WHITEBOARD_HISTORY_CHECKPOINT_CHANGES) {
+          excalidrawAPI.history?.clear?.();
+          historyChangesRef.current = 0;
+        }
       }
     };
     const el = wrapperRef.current;
@@ -315,6 +326,21 @@ export default function ExcalidrawEditor({ initialContent, onSave }: ExcalidrawE
       <Excalidraw
         initialData={initialData}
         excalidrawAPI={(api) => setExcalidrawAPI(api)}
+        onChange={(elements) => {
+          // Ignore viewport/selection-only callbacks. Element versions change
+          // for drawing, moving, deleting, text editing, and palette actions.
+          if (sceneElementsRef.current === elements) return;
+          sceneElementsRef.current = elements;
+          let versions = 0;
+          let nonces = 0;
+          for (const element of elements) {
+            versions += Number(element.version) || 0;
+            nonces += Number(element.versionNonce) || 0;
+          }
+          const fingerprint = `${elements.length}:${versions}:${nonces}`;
+          if (sceneFingerprintRef.current && sceneFingerprintRef.current !== fingerprint) historyChangesRef.current++;
+          sceneFingerprintRef.current = fingerprint;
+        }}
         theme="dark"
       />
 

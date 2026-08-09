@@ -55,6 +55,7 @@ type LiveSession = {
   peers: number;
   status: string;
   transferring: number;
+  users?: { name: string; color: string }[];
 };
 
 export default function DriveSyncModal({
@@ -64,6 +65,7 @@ export default function DriveSyncModal({
   onHostLive,
   onJoinLive,
   onCopyLiveInvite,
+  onRetryLive,
   onLeaveLive,
 }: {
   onClose: () => void;
@@ -72,6 +74,7 @@ export default function DriveSyncModal({
   onHostLive: () => void;
   onJoinLive: () => void;
   onCopyLiveInvite: () => void;
+  onRetryLive: () => void;
   onLeaveLive: () => void;
 }) {
   const [mode, setMode] = useState<'live' | 'google' | 'webdav' | 'local'>('live');
@@ -179,9 +182,22 @@ export default function DriveSyncModal({
                     <b>Encrypted project sharing active</b><br />
                     Whole project · {liveSession.peers} participant{liveSession.peers === 1 ? '' : 's'} · {liveSession.status}
                     {liveSession.transferring > 0 && <><br />Receiving project assets… ({liveSession.transferring})</>}
+                    {!!liveSession.users?.length && (
+                      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
+                        {liveSession.users.map((user, index) => (
+                          <span key={`${user.name}-${index}`} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '2px 7px', borderRadius: 999, background: 'rgba(127,127,127,0.12)' }}>
+                            <span aria-hidden="true" style={{ width: 7, height: 7, borderRadius: '50%', background: user.color }} />
+                            {user.name}
+                          </span>
+                        ))}
+                      </div>
+                    )}
                   </div>
                   <div style={{ display: 'flex', gap: 8 }}>
                     <button className="btn-primary" onClick={() => { onCopyLiveInvite(); onClose(); }}>Copy invitation</button>
+                    {(liveSession.status === 'disconnected' || liveSession.status === 'error') && (
+                      <button className="btn-ghost" onClick={onRetryLive}>Retry connection</button>
+                    )}
                     <button className="btn-ghost" onClick={() => { onLeaveLive(); onClose(); }}>Leave shared project</button>
                   </div>
                 </div>

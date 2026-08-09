@@ -14,13 +14,69 @@ export type SyncPayload = {
   words: string[]; // normalized words around the focus, in reading order
   focus: number;   // index into `words` of the clicked / cursor word
   docFraction: number; // 0..1 position of the focus in its document (a prior)
+  // PDF page coordinates in Typst/PDF points, measured from the top-left.
+  // Present for reverse sync; lets the backend resolve formulas whose rendered
+  // glyph has no useful text token (fraction bars, =, delimiters, drawings).
+  documentPosition?: { page: number; x: number; y: number };
+  // True when the clicked PDF span contains a mathematical glyph/operator.
+  // Repeated formulas need their compiled coordinate to break text-match ties.
+  mathHint?: boolean;
 };
 
 const WORD_RE = /[\p{L}\p{N}][\p{L}\p{N}\p{M}_'’-]*/gu;
 
+// Typst's PDF contains the glyph the reader sees, while the source contains a
+// symbol name. It also uses Mathematical Alphanumeric Unicode for variables
+// (`𝑥`, `𝜋`, …), and pdf.js may put several formula atoms in one text span.
+// Keep this table intentionally small and semantic: these are stable Typst math
+// spellings, not a second parser or a large symbol database in the main bundle.
+const MATH_GLYPH_NAMES: Record<string, string> = {
+  '∞': 'infinity', '∫': 'integral', '∬': 'integral double', '∭': 'integral triple',
+  '∑': 'sum', '∏': 'product', '√': 'sqrt', '∂': 'partial', '∇': 'nabla',
+  'α': 'alpha', 'β': 'beta', 'γ': 'gamma', 'δ': 'delta', 'ε': 'epsilon',
+  'ζ': 'zeta', 'η': 'eta', 'θ': 'theta', 'ι': 'iota', 'κ': 'kappa',
+  'λ': 'lambda', 'μ': 'mu', 'ν': 'nu', 'ξ': 'xi', 'ο': 'omicron',
+  'π': 'pi', 'ρ': 'rho', 'σ': 'sigma', 'τ': 'tau', 'υ': 'upsilon',
+  'φ': 'phi', 'χ': 'chi', 'ψ': 'psi', 'ω': 'omega',
+  'Γ': 'Gamma', 'Δ': 'Delta', 'Θ': 'Theta', 'Λ': 'Lambda', 'Ξ': 'Xi',
+  'Π': 'Pi', 'Σ': 'Sigma', 'Υ': 'Upsilon', 'Φ': 'Phi', 'Ψ': 'Psi', 'Ω': 'Omega',
+};
+
+/**
+ * Tokenize text extracted from a rendered PDF. NFKC turns mathematical italic
+ * letters into their source letters; named glyph expansion lets a click on ∑,
+ * π, √, etc. find `sum`, `pi`, `sqrt` in Typst. WORD_RE then splits compact
+ * pdf.js spans such as `𝑘=1` or `𝑛(𝑛+1)` into the same atoms as the source.
+ */
+export function tokenizeRenderedText(text: string): string[] {
+  let expanded = '';
+  for (const char of text.normalize('NFKC')) {
+    const name = MATH_GLYPH_NAMES[char];
+    expanded += name ? ` ${name} ` : char;
+  }
+  const words: string[] = [];
+  let match: RegExpExecArray | null;
+  WORD_RE.lastIndex = 0;
+  while ((match = WORD_RE.exec(expanded))) words.push(match[0].toLowerCase());
+  return words;
+}
+
+/**
+ * Tokenize a Typst math source fragment into the atoms the compiled PDF emits.
+ * Source syntax joins names to scripts (`integral_0`) and coefficients to
+ * variables (`2x`), while pdf.js exposes those as independent glyph runs.
+ */
+export function tokenizeTypstMathSource(text: string): string[] {
+  const withoutComments = text.replace(/\/\/.*$/, '');
+  const separated = withoutComments
+    .replace(/[_^()[\]{}=+\-*/,$#]/g, ' ')
+    .replace(/([\p{L}\p{M}])(?=\p{N})|([\p{N}])(?=[\p{L}\p{M}])/gu, '$1$2 ');
+  return tokenizeRenderedText(separated);
+}
+
 /** Lowercase and strip edge punctuation, keeping intra-word marks (’, -, _). */
 export function normalizeWord(w: string): string {
-  return w.toLowerCase().replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
+  return tokenizeRenderedText(w)[0] || '';
 }
 
 /** Split a line of text into normalized words, keeping each word's 0-based offset. */

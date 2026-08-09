@@ -54,8 +54,8 @@ export class ProjectSync {
   // deleting one copy does not withdraw the provider needed for the others.
   private readonly hashPaths = new Map<string, Set<string>>();
   private off: (() => void) | null = null;
-  private applyQueue: Promise<void> = Promise.resolve();
-  private applyEpoch = 0;
+  private applyQueue: Promise<void> | null = null;
+  private readonly pendingApply = new Map<string, WorkspaceChange>();
   private appliedRevision = 0;
   private pendingBinary = 0;
   // The file currently open in the editor. Its Y.Text is bound to Monaco, so
@@ -308,20 +308,35 @@ export class ProjectSync {
   }
 
   private enqueueApply(changes: WorkspaceChange[]): Promise<void> {
-    const epoch = ++this.applyEpoch;
+    // The shared model is canonical. If ten remote edits to one closed file
+    // arrive while its first disk write is still running, only the latest disk
+    // projection matters; retaining nine intermediate arrays just grows RAM.
+    for (const change of changes) this.pendingApply.set(change.path, change);
+    if (this.applyQueue) return this.applyQueue;
     const revisionBefore = this.appliedRevision;
-    const run = this.applyQueue.then(() => this.applyRemote(changes));
-    this.applyQueue = run.catch(() => {});
-    void this.applyQueue.then(() => {
-      if (this.off && epoch === this.applyEpoch && this.appliedRevision !== revisionBefore) {
-        try {
-          this.onApplyIdle();
-        } catch (e) {
-          this.onError(`Could not finish applying remote changes: ${errText(e)}`);
-        }
+    const drain = async () => {
+      while (this.pendingApply.size) {
+        const batch = [...this.pendingApply.values()];
+        this.pendingApply.clear();
+        await this.applyRemote(batch);
       }
-    });
-    return run;
+    };
+    const queue = drain()
+      .catch(error => this.onError(`Could not apply remote changes: ${errText(error)}`))
+      .finally(() => {
+        this.applyQueue = null;
+        if (this.off && this.appliedRevision !== revisionBefore) {
+          try {
+            this.onApplyIdle();
+          } catch (e) {
+            this.onError(`Could not finish applying remote changes: ${errText(e)}`);
+          }
+        }
+        // Defensive restart for a change enqueued by an idle callback.
+        if (this.pendingApply.size) void this.enqueueApply([]);
+      });
+    this.applyQueue = queue;
+    return queue;
   }
 
   private emitApplied(change: WorkspaceChange): void {

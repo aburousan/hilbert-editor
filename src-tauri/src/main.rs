@@ -9,6 +9,7 @@ use std::fs;
 use std::net::{TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use serde::{Deserialize, Serialize};
 
 // A GUI-launched app inherits a bare PATH (roughly /usr/bin:/bin on macOS/Linux),
 // so it can't find typst/python/julia installed via Homebrew, cargo, etc. Prepend
@@ -132,6 +133,9 @@ fn start_embedded_sync_server() {
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)?.flatten() {
+        if package_metadata(&entry.path()) {
+            continue;
+        }
         let ty = entry.file_type()?;
         let to = dst.join(entry.file_name());
         if ty.is_dir() {
@@ -141,6 +145,19 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+// macOS archive tools can materialize Finder metadata as AppleDouble files
+// when a source bundle is unpacked on Linux. They are not Typst package data,
+// and trying to treat `._<version>` as a version directory creates a noisy
+// startup error for every bundled package.
+fn package_metadata(path: &Path) -> bool {
+    path.file_name()
+        .map(|name| {
+            let name = name.to_string_lossy();
+            name == ".DS_Store" || name.starts_with("._")
+        })
+        .unwrap_or(false)
 }
 
 // Copy the Typst packages bundled with the app into a writable cache dir and
@@ -157,6 +174,9 @@ fn seed_packages(bundled_preview: &Path, cache_root: &Path) {
         }
         let Ok(vd) = fs::read_dir(name.path()) else { continue };
         for ver in vd.flatten() {
+            if !ver.path().is_dir() || package_metadata(&ver.path()) {
+                continue;
+            }
             let dst = cache_root.join("preview").join(name.file_name()).join(ver.file_name());
             if !dst.exists() {
                 if let Some(parent) = dst.parent() {
@@ -167,6 +187,20 @@ fn seed_packages(bundled_preview: &Path, cache_root: &Path) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod package_seed_tests {
+    use super::package_metadata;
+    use std::path::Path;
+
+    #[test]
+    fn package_seed_ignores_platform_metadata() {
+        assert!(package_metadata(Path::new("._0.1.1")));
+        assert!(package_metadata(Path::new(".DS_Store")));
+        assert!(!package_metadata(Path::new("0.1.1")));
+        assert!(!package_metadata(Path::new("src")));
     }
 }
 
@@ -256,6 +290,66 @@ fn sync_server_main() {
     });
 }
 
+fn hosted_server_main() {
+    let Some(access_token) = std::env::var("HILBERT_SERVER_TOKEN")
+        .ok()
+        .filter(|token| token.len() >= 32)
+    else {
+        eprintln!("Hosted mode requires HILBERT_SERVER_TOKEN with at least 32 characters.");
+        eprintln!("Set a long random token in the environment; it is the browser sign-in secret.");
+        std::process::exit(2);
+    };
+    let bind = arg_value("--bind").unwrap_or_else(|| "127.0.0.1".into());
+    let port: u16 = arg_value("--port").and_then(|value| value.parse().ok()).unwrap_or(3001);
+    let workspace = arg_value("--workspace")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var("TYPST_WORKSPACE").ok().map(PathBuf::from))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("workspace"));
+    if let Err(error) = fs::create_dir_all(&workspace) {
+        eprintln!("Could not create hosted workspace {}: {error}", workspace.display());
+        std::process::exit(2);
+    }
+    let dist = std::env::var("TYPST_DIST")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            let beside_binary = std::env::current_exe().ok()?.parent()?.join("dist");
+            beside_binary.exists().then_some(beside_binary)
+        })
+        .or_else(|| {
+            let development = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dist");
+            development.exists().then_some(development)
+        })
+        .filter(|path| path.join("index.html").is_file());
+    let Some(dist) = dist else {
+        eprintln!("Hosted mode needs the built web app. Run npm run build or set TYPST_DIST.");
+        std::process::exit(2);
+    };
+    if std::env::var_os("HILBERT_SESSION_FILE").is_none() {
+        std::env::set_var("HILBERT_SESSION_FILE", workspace.join(".hilbert/server-session.json"));
+    }
+    set_bundled_tinymist(None);
+    let listener = TcpListener::bind((bind.as_str(), port)).unwrap_or_else(|error| {
+        eprintln!("Could not bind hosted Hilbert on {bind}:{port}: {error}");
+        std::process::exit(2);
+    });
+    let state = Arc::new(server::AppState::new_remote(workspace.clone(), Some(dist), access_token));
+    println!("Hilbert hosted workspace: http://{bind}:{port}");
+    println!("Workspace: {}", workspace.display());
+    println!("Collaboration relay: ws://{bind}:{port}/collab/<room>");
+    println!("Use HTTPS through a reverse proxy before exposing this service to the public internet.");
+    println!("Code execution: {}", if state.allow_exec { "ENABLED for signed-in users" } else { "disabled" });
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async move {
+        let shutdown_state = state.clone();
+        tokio::spawn(async move {
+            wait_for_process_signal().await;
+            server::shutdown_children(&shutdown_state).await;
+        });
+        server::serve(listener, state).await;
+    });
+}
+
 fn headless_main() {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
@@ -275,8 +369,41 @@ fn headless_main() {
         println!("Typst compiler server running on http://127.0.0.1:{port}");
         println!("  code execution: {}", if state.allow_exec { "ENABLED (sandbox/)" } else { "disabled" });
         start_embedded_sync_server();
+        let shutdown_state = state.clone();
+        tokio::spawn(async move {
+            wait_for_process_signal().await;
+            server::shutdown_children(&shutdown_state).await;
+        });
         server::serve(listener, state).await;
     });
+}
+
+#[cfg(unix)]
+async fn wait_for_process_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut interrupt = signal(SignalKind::interrupt()).ok();
+    let mut terminate = signal(SignalKind::terminate()).ok();
+    match (&mut interrupt, &mut terminate) {
+        (Some(interrupt), Some(terminate)) => {
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+            }
+        }
+        (Some(interrupt), None) => {
+            interrupt.recv().await;
+        }
+        (None, Some(terminate)) => {
+            terminate.recv().await;
+        }
+        (None, None) => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_process_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 // Every window's backend, by window label, for the close/exit hooks: the
@@ -284,6 +411,138 @@ fn headless_main() {
 // the app. Several windows can live in this one process.
 static BACKENDS: std::sync::Mutex<Vec<(String, Arc<server::AppState>)>> = std::sync::Mutex::new(Vec::new());
 static NEXT_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+struct WindowGeometry {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    maximized: bool,
+}
+
+fn window_geometry_path(session: &Path) -> PathBuf {
+    session.with_extension("window.json")
+}
+
+fn read_window_geometry(session: &Path) -> Option<WindowGeometry> {
+    let raw = fs::read_to_string(window_geometry_path(session)).ok()?;
+    let geometry: WindowGeometry = serde_json::from_str(&raw).ok()?;
+    (geometry.width >= 900 && geometry.height >= 600 && geometry.width <= 32_768 && geometry.height <= 32_768)
+        .then_some(geometry)
+}
+
+fn write_window_geometry(session: &Path, geometry: WindowGeometry) {
+    let path = window_geometry_path(session);
+    if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
+    let Ok(bytes) = serde_json::to_vec(&geometry) else { return };
+    let tmp = path.with_extension(format!("window.json.tmp.{}", std::process::id()));
+    if fs::write(&tmp, bytes).and_then(|_| fs::rename(&tmp, &path)).is_err() {
+        let _ = fs::remove_file(tmp);
+    }
+}
+
+// Keep enough of the title bar on a current display to recover the window by
+// dragging it. A monitor unplugged between launches must not strand Hilbert at
+// its old coordinates; size can still be restored while the OS chooses a safe
+// position on the remaining display.
+fn geometry_visible_on(geometry: WindowGeometry, monitors: &[(i32, i32, u32, u32)]) -> bool {
+    monitors.iter().any(|&(x, y, width, height)| {
+        let left = geometry.x.max(x) as i64;
+        let right = (geometry.x as i64 + geometry.width as i64).min(x as i64 + width as i64);
+        let top = geometry.y.max(y) as i64;
+        let bottom = (geometry.y as i64 + geometry.height as i64).min(y as i64 + height as i64);
+        right - left >= 120 && bottom - top >= 48
+    })
+}
+
+fn session_for_window(label: &str) -> Option<PathBuf> {
+    BACKENDS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .find(|(registered, _)| registered == label)
+        .map(|(_, state)| state.session_file.clone())
+}
+
+fn capture_window_geometry(app: &tauri::AppHandle, label: &str, session: &Path) {
+    use tauri::Manager;
+    let Some(window) = app.get_webview_window(label) else { return };
+    let maximized = window.is_maximized().unwrap_or(false);
+    // Maximized bounds are the monitor, not the size/position to return to after
+    // unmaximizing. Preserve the last normal rectangle and change only the flag.
+    if maximized {
+        if let Some(mut previous) = read_window_geometry(session) {
+            previous.maximized = true;
+            write_window_geometry(session, previous);
+            return;
+        }
+    }
+    let Ok(size) = window.inner_size() else { return };
+    if size.width < 900 || size.height < 600 { return; }
+    // Wayland deliberately withholds absolute window coordinates from clients.
+    // Still remember size/maximized state there; X11, Windows and macOS also
+    // provide outer_position and therefore restore the exact display placement.
+    let previous = read_window_geometry(session);
+    let (x, y) = window.outer_position()
+        .map(|position| (position.x, position.y))
+        .ok()
+        .or_else(|| previous.map(|geometry| (geometry.x, geometry.y)))
+        .unwrap_or((0, 0));
+    write_window_geometry(session, WindowGeometry {
+        x,
+        y,
+        width: size.width,
+        height: size.height,
+        maximized,
+    });
+}
+
+static WINDOW_GEOMETRY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static WINDOW_GEOMETRY_PENDING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn schedule_window_geometry(app: tauri::AppHandle, label: String, session: PathBuf) {
+    let sequence = WINDOW_GEOMETRY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    WINDOW_GEOMETRY_PENDING.lock().unwrap_or_else(|error| error.into_inner()).insert(label.clone(), sequence);
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let current = {
+            let mut pending = WINDOW_GEOMETRY_PENDING.lock().unwrap_or_else(|error| error.into_inner());
+            let current = pending.get(&label).copied();
+            if current == Some(sequence) { pending.remove(&label); }
+            current
+        };
+        if current == Some(sequence) {
+            capture_window_geometry(&app, &label, &session);
+        }
+    });
+}
+
+#[cfg(test)]
+mod window_geometry_tests {
+    use super::{geometry_visible_on, window_geometry_path, WindowGeometry};
+    use std::path::Path;
+
+    #[test]
+    fn window_geometry_has_an_independent_sidecar() {
+        assert_eq!(window_geometry_path(Path::new("/tmp/session.json")), Path::new("/tmp/session.window.json"));
+    }
+
+    #[test]
+    fn window_restore_accepts_multimonitor_coordinates_but_rejects_stranded_windows() {
+        let monitors = [(-1920, 0, 1920, 1080), (0, 0, 2560, 1440)];
+        let mut geometry = WindowGeometry { x: -1700, y: 80, width: 1200, height: 800, maximized: false };
+        assert!(geometry_visible_on(geometry, &monitors));
+        geometry.x = 2400; // enough of the title bar remains on the right display
+        assert!(geometry_visible_on(geometry, &monitors));
+        geometry.x = 4000;
+        assert!(!geometry_visible_on(geometry, &monitors));
+        geometry.x = 100;
+        geometry.y = 2000;
+        assert!(!geometry_visible_on(geometry, &monitors));
+    }
+}
 
 // One window = its own port + backend + session, hosted in this process so the
 // OS shows a single running app however many windows are open.
@@ -297,6 +556,7 @@ fn open_instance_window(
     let _ = fs::create_dir_all(&ws);
     let (listener, port) = bind_free_port(3001);
     let mut st = server::AppState::new(ws, dist.clone());
+    let window_session = session.clone();
     st.session_file = session;
     let state = Arc::new(st);
     *state.app.lock().unwrap() = Some(handle.clone());
@@ -319,10 +579,13 @@ fn open_instance_window(
     tauri::async_runtime::spawn(server::serve(listener, state));
 
     let url: tauri::Url = format!("http://127.0.0.1:{port}").parse().unwrap();
-    tauri::WebviewWindowBuilder::new(handle, &label, tauri::WebviewUrl::External(url))
+    let window = tauri::WebviewWindowBuilder::new(handle, &label, tauri::WebviewUrl::External(url))
         .title("Hilbert")
         .inner_size(1440.0, 920.0)
         .min_inner_size(900.0, 600.0)
+        // Avoid showing a default-sized window for one frame before its saved
+        // rectangle is applied — especially visible when restoring maximized.
+        .visible(false)
         // Let OS file drops reach the webview instead of being swallowed
         // by Tauri's native handler, so dragging files onto the file tree
         // fires the app's own drop upload.
@@ -342,6 +605,21 @@ fn open_instance_window(
             true
         })
         .build()?;
+    if let Some(geometry) = read_window_geometry(&window_session) {
+        let monitors: Vec<_> = window.available_monitors().unwrap_or_default().into_iter().map(|monitor| {
+            let position = monitor.position();
+            let size = monitor.size();
+            (position.x, position.y, size.width, size.height)
+        }).collect();
+        let _ = window.set_size(tauri::PhysicalSize::new(geometry.width, geometry.height));
+        if geometry_visible_on(geometry, &monitors) {
+            let _ = window.set_position(tauri::PhysicalPosition::new(geometry.x, geometry.y));
+        } else {
+            let _ = window.center();
+        }
+        if geometry.maximized { let _ = window.maximize(); }
+    }
+    window.show()?;
     Ok(())
 }
 
@@ -384,6 +662,10 @@ fn main() {
     // window's remembered project. Set before anything reads the session path.
     if let Some(path) = arg_value("--session-file") {
         std::env::set_var("HILBERT_SESSION_FILE", path);
+    }
+    if std::env::args().any(|a| a == "--hosted-server" || a == "--serve") {
+        hosted_server_main();
+        return;
     }
     if std::env::args().any(|a| a == "--headless") {
         headless_main();
@@ -474,27 +756,67 @@ fn main() {
                 .unwrap_or_else(|| workspace_dir(app.path().document_dir().ok()));
             // Dictionaries load on the first /lint call; see the note in headless_main.
             open_instance_window(app.handle(), "main".into(), ws, server::session_file_path(), dist)?;
+            #[cfg(unix)]
+            {
+                // Service managers and terminal launches stop the app with
+                // SIGTERM/SIGINT. Turn that into a normal Tauri exit so every
+                // window can release its listener, Typst watcher, and shared
+                // language-server reference instead of orphaning children.
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    wait_for_process_signal().await;
+                    handle.exit(0);
+                });
+            }
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
-        .run(|_app, event| match event {
+        .run(|app, event| match event {
+            // Move/resize can fire dozens of times during one gesture. Debounce
+            // the tiny sidecar write so remembering the window has no visible
+            // CPU or disk cost.
+            tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_),
+                ..
+            } => {
+                if let Some(session) = session_for_window(&label) {
+                    schedule_window_geometry(app.clone(), label, session);
+                }
+            }
+            // Flush immediately at stable lifecycle edges; the delayed resize
+            // task may not get another 300 ms if the user closes right away.
+            tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::Focused(false) | tauri::WindowEvent::CloseRequested { .. },
+                ..
+            } => {
+                if let Some(session) = session_for_window(&label) {
+                    capture_window_geometry(app, &label, &session);
+                }
+            }
             // A closed window takes its preview watcher with it; the shared
             // per-workspace language servers stay for the remaining windows.
             tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::Destroyed, .. } => {
-                let state = BACKENDS
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .find(|(l, _)| *l == label)
-                    .map(|(_, s)| s.clone());
+                // Remove the registry's Arc as well as shutting down the
+                // watcher. Keeping it here used to keep every closed window's
+                // backend state and port alive until the entire app exited.
+                let state = {
+                    let mut backends = BACKENDS.lock().unwrap_or_else(|e| e.into_inner());
+                    backends
+                        .iter()
+                        .position(|(registered, _)| *registered == label)
+                        .map(|index| backends.remove(index).1)
+                };
                 if let Some(state) = state {
                     tauri::async_runtime::block_on(server::shutdown_window(&state));
                 }
             }
             tauri::RunEvent::Exit => {
-                let states: Vec<_> = BACKENDS.lock().unwrap().iter().map(|(_, s)| s.clone()).collect();
-                for state in states {
+                let states: Vec<_> = BACKENDS.lock().unwrap().iter().map(|(label, state)| (label.clone(), state.clone())).collect();
+                for (label, state) in states {
+                    capture_window_geometry(app, &label, &state.session_file);
                     tauri::async_runtime::block_on(server::shutdown_children(&state));
                 }
             }

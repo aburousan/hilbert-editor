@@ -292,8 +292,9 @@ plot with the columns you choose, or a variable. JSON, YAML, and TOML come in wi
 matching Typst reader wired up. Import your own fonts (`.ttf` / `.otf`) via
 File → Import Font.
 
-Templates come from Typst Universe with a rendered preview, and five ship with the app
-for offline use, including a two-column journal paper. Export goes to PDF (with page
+Templates come from Typst Universe with a rendered preview, and six ship with the app
+for offline use, including a two-column journal paper and a LaPreprint-style preprint
+with margin notes, ORCID links and a running footer. Export goes to PDF (with page
 ranges, PDF/A standards, tagging, and pretty-printing), PNG, SVG, HTML, plain `.typ`,
 or the whole project folder, through your system's save dialog. Git support covers
 init, commit, and push to GitHub. There's also sync to a local folder, Google Drive,
@@ -317,6 +318,34 @@ invitation. A user-operated relay can be selected instead by setting its `ws://`
 hilbert --sync-server --port 3020
 ```
 
+For an Overleaf-like browser workspace, the same binary can serve the built Hilbert UI,
+one fixed server-side project, the compiler, and automatic live collaboration:
+
+```sh
+HILBERT_SERVER_TOKEN="a-random-secret-of-at-least-32-characters" \
+  TYPST_DIST=/path/to/dist \
+  hilbert --hosted-server --bind 127.0.0.1 --port 3001 \
+  --workspace /srv/hilbert/project
+```
+
+Use `--bind 0.0.0.0` for network access. Encrypted browser collaboration requires HTTPS
+(including on a LAN) or a localhost SSH tunnel; plain LAN HTTP can edit and compile but
+browsers withhold the encryption API there. In this mode the server workspace is
+authoritative, so browser visitors do not silently get an offline folder on their own
+device. Code running is available to signed-in users, or can be disabled with
+`ALLOW_CODE_EXECUTION=0`. See the hosted-workspace section in
+[docs/COLLABORATION.md](docs/COLLABORATION.md) for the security and backup details.
+Keeping the same server token and workspace path also keeps authenticated sessions and
+the encrypted live room stable through an ordinary hosted-server restart.
+Unsaved text is additionally kept in device-local browser recovery storage until the
+server confirms it. After an outage Hilbert safely replays a draft whose base is still
+current, or asks before replacing a server copy that changed separately. This protects
+in-flight edits but does not replace normal server backups or create a full offline
+project clone.
+For a routed campus connection, keep the server on loopback and forward it with
+`ssh -N -L 3001:127.0.0.1:3001 user@server`, then browse to
+`http://127.0.0.1:3001`.
+
 The host must remain online for a direct session. Everyone's ordinary project file
 continues to save locally, and reconnection merges live CRDT updates while the session
 is active. For step-by-step setup, including the single-router, campus, and dedicated
@@ -330,8 +359,10 @@ check can't run, the app still starts normally.
 Heavy tools (3D studio, Plot Studio, whiteboard, code runner) are isolated, so an
 error in one shows a dismissible message instead of blanking the editor. A failed
 compile keeps your last good preview. On Windows, background tools never flash a
-console window. Bundled Typst packages are cached locally, so documents compile with
-no network and no downloads.
+console window. Closing a secondary window also stops its private local server and
+preview watcher; language-server processes shared with another open window remain alive
+until the last window using that project closes. Bundled Typst packages are cached
+locally, so documents compile with no network and no downloads.
 
 What you set is what you come back to. The interface theme, editor font size,
 auto-compile delay, which panels are showing, the pane sizes, and the interpreter you
@@ -533,6 +564,8 @@ cd hilbert-editor ; npm install ; npm run dev   # then open http://localhost:517
 | --- | --- | --- |
 | `ALLOW_CODE_EXECUTION` | `1` | Set to `0` to disable all code execution. |
 | `EXEC_TIMEOUT_MS` | `45000` | Per-run wall-clock limit. |
+| `HILBERT_SERVER_TOKEN` | none | Required 32+ character browser sign-in secret for `--hosted-server`. |
+| `HILBERT_API_TOKEN` | generated | Optional 32+ character API-token override. Hosted mode otherwise derives a stable, separate session token from its server token and workspace. |
 
 Interpreters (including conda environments) are auto-detected; choose the default per
 language in **App Settings → Interpreters**, and the choice is remembered. Your

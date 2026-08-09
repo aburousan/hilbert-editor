@@ -7,15 +7,34 @@ import { setupTypstLanguage, setWorkspaceImages } from './typstMonaco';
 import { useProofread } from './proofread';
 import { useTinymistDiagnostics, type EditorProblem } from './tinymistDiagnostics';
 import ProofreadPanel from './components/ProofreadPanel';
-import { tokenizeLine, bestMatch, type SyncPayload } from './syncMatch';
+import { tokenizeLine, tokenizeRenderedText, tokenizeTypstMathSource, bestMatch, type SyncPayload } from './syncMatch';
 import { commentEdits, commentTokenFor } from './commentLines';
 import { snapUtf16OffsetToGrapheme, snapUtf16RangeToGraphemes } from './unicodeRanges';
-import type { PdfHandle } from './components/PdfPreview';
+import type { PdfHandle, PdfViewState } from './components/PdfPreview';
 import { PackageInstaller } from './PackageInstaller';
 import { TemplateInstaller } from './TemplateInstaller';
 import type { BuiltinTemplate } from './builtinTemplates';
 import InputModal, { type InputModalConfig } from './components/InputModal';
 import CommandPalette, { type PaletteCommand } from './components/CommandPalette';
+import EditorContextMenu from './components/EditorContextMenu';
+import { writeClipboard } from './clipboard';
+import { copyEditorSelection, cutEditorSelection, pasteEditorClipboard } from './editorClipboard';
+import {
+  loadHiddenToolbarTools,
+  normalizeHiddenToolbarTools,
+  TOOLBAR_GROUPS,
+  TOOLBAR_STORAGE_KEY,
+  type ToolbarToolId,
+} from './toolbarPreferences';
+import {
+  classifyEmergencyDraft,
+  createEmergencyDraft,
+  listEmergencyDrafts,
+  putEmergencyDraft,
+  removeEmergencyDraft,
+  type EmergencyDraft,
+} from './emergencyDrafts';
+import type { RecoveryConflict } from './components/RecoveryDraftModal';
 import PdfPreview from './components/PdfPreview';
 // Loaded on demand: pulls in all of three.js, which nothing else needs.
 const Plot3DStudio = lazy(() => import('./components/Plot3DStudio'));
@@ -45,15 +64,19 @@ const SymbolDraw = lazy(() => import('./components/SymbolDraw'));
 const DataImportModal = lazy(() => import('./components/DataImportModal'));
 const RefManager = lazy(() => import('./components/RefManager'));
 const BibManager = lazy(() => import('./components/BibManager'));
+const ToolbarPreferencesModal = lazy(() => import('./components/ToolbarPreferencesModal'));
+const RecoveryDraftModal = lazy(() => import('./components/RecoveryDraftModal'));
 import Boundary from './components/Boundary';
 import Toaster from './components/Toaster';
 import ExternalChangeModal, { type ExternalConflict } from './components/ExternalChangeModal';
 import { notify } from './notify';
-import type { CollabHandle, CollabStatus } from './collab';
+import type { CollabHandle, CollabStatus, CollabUser } from './collab';
 import type { BinaryTransfer } from './binaryTransfer';
 import type { SocketTransferChannel } from './binarySocketChannel';
 import type { ProjectSync } from './projectCollab';
 import { isProjectTextPath } from './projectFileTypes';
+import { deriveWorkspaceStatus } from './workspaceStatus';
+import { inactiveModelsToDiscard, limitNotebookResults } from './performanceLimits';
 import './index.css';
 
 const SURFACE_3D_TEMPLATE = `import matplotlib
@@ -190,6 +213,7 @@ const NOOP_REVERSE_SYNC = () => {};
 // Proofreading (spelling + grammar) is finished. This flag exposes it in the UI;
 // it remains off per-user until toggled on (persisted in localStorage).
 const PROOFREAD_FEATURE_ENABLED = true;
+const IS_NATIVE_APP = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
 interface HistoryEntry {
   id: string;
@@ -305,6 +329,130 @@ const PHYSICS_EQS: { group: string, name: string, physica?: boolean, code: strin
 type SearchSnippet = { lineNum: number; text: string };
 type SearchResult = { path: string; matches: SearchSnippet[] };
 const NO_SEARCH_RESULTS: SearchResult[] = [];
+type DocumentPosition = NonNullable<SyncPayload['documentPosition']>;
+type CompiledEquation = {
+  position: DocumentPosition;
+  words: string[];
+  equationIndex: number;
+};
+
+function collectCompiledMathGlyphs(node: any, glyphs: string[]) {
+  if (!node) return;
+  if (Array.isArray(node)) { node.forEach(child => collectCompiledMathGlyphs(child, glyphs)); return; }
+  if (typeof node !== 'object') return;
+  if ((node.func === 'text' || node.func === 'symbol') && typeof node.text === 'string') {
+    glyphs.push(node.text);
+    return;
+  }
+  const ordered: Record<string, string[]> = {
+    sequence: ['children'], attach: ['base', 'b', 't'], frac: ['num', 'denom'],
+    root: ['radicand', 'index'], lr: ['body'], class: ['body'], styled: ['child'],
+    box: ['body'], block: ['body'], hide: ['body'], move: ['body'], place: ['body'],
+  };
+  for (const key of ordered[node.func] || ['body', 'children', 'child']) collectCompiledMathGlyphs(node[key], glyphs);
+}
+
+// Small formula sequences make a dynamic-programming LCS inexpensive and more
+// reliable than unordered word overlap (`x + y` is not `x y +`).
+function orderedWordScore(a: string[], b: string[]): number {
+  if (!a.length || !b.length) return 0;
+  const row = new Uint16Array(b.length + 1);
+  for (const aw of a) {
+    let diagonal = 0;
+    for (let j = 1; j <= b.length; j++) {
+      const above = row[j];
+      row[j] = aw === b[j - 1] ? diagonal + 1 : Math.max(row[j], row[j - 1]);
+      diagonal = above;
+    }
+  }
+  return row[b.length] / Math.max(a.length, b.length);
+}
+
+function mathEquationOrdinal(model: any, targetLine: number): number {
+  let dollarPairs = 0;
+  let explicitEquations = 0;
+  let open = false;
+  for (let line = 1; line <= targetLine; line++) {
+    const raw = model.getLineContent(line).replace(/\/\/.*$/, '');
+    explicitEquations += (raw.match(/#(?:math\.)?equation\s*\(/g) || []).length;
+    for (let i = 0; i < raw.length; i++) {
+      if (raw[i] !== '$' || raw[i - 1] === '\\') continue;
+      if (open) dollarPairs += 1;
+      open = !open;
+    }
+  }
+  return Math.max(0, dollarPairs + explicitEquations - (open ? 0 : 1));
+}
+
+function cursorIsInMath(model: any, line: number, column: number): boolean {
+  let open = false;
+  for (let current = 1; current <= line; current++) {
+    const raw = model.getLineContent(current).replace(/\/\/.*$/, '');
+    const limit = current === line ? Math.max(0, column - 1) : raw.length;
+    for (let i = 0; i < limit; i++) {
+      if (raw[i] === '$' && raw[i - 1] !== '\\') open = !open;
+    }
+  }
+  if (open) return true;
+  const current = model.getLineContent(line).trim();
+  if (current.startsWith('$') && current.endsWith('$') && current.length > 1) return true;
+  const start = Math.max(1, line - 24);
+  const prefix: string[] = [];
+  for (let currentLine = start; currentLine <= line; currentLine++) {
+    const raw = model.getLineContent(currentLine).replace(/\/\/.*$/, '');
+    prefix.push(currentLine === line ? raw.slice(0, Math.max(0, column - 1)) : raw);
+  }
+  const joined = prefix.join('\n');
+  const normal = joined.lastIndexOf('#equation(');
+  const qualified = joined.lastIndexOf('#math.equation(');
+  const equationStart = Math.max(normal, qualified);
+  if (equationStart < 0) return false;
+  let depth = 0;
+  for (const char of joined.slice(equationStart)) {
+    if (char === '(') depth += 1;
+    else if (char === ')') depth -= 1;
+  }
+  return depth > 0;
+}
+
+function mathSourceFragment(model: any, targetLine: number): string {
+  let start = targetLine;
+  for (let line = targetLine; line >= Math.max(1, targetLine - 24); line--) {
+    const raw = model.getLineContent(line).replace(/\/\/.*$/, '');
+    if (/\$|#(?:math\.)?equation\s*\(/.test(raw)) { start = line; break; }
+  }
+  let openDollar = false;
+  let sawDollar = false;
+  let parenDepth = 0;
+  let sawEquation = false;
+  const lines: string[] = [];
+  for (let line = start; line <= Math.min(model.getLineCount(), targetLine + 24); line++) {
+    const raw = model.getLineContent(line).replace(/\/\/.*$/, '');
+    lines.push(raw);
+    if (/#(?:math\.)?equation\s*\(/.test(raw)) sawEquation = true;
+    for (let i = 0; i < raw.length; i++) {
+      if (raw[i] === '$' && raw[i - 1] !== '\\') { openDollar = !openDollar; sawDollar = true; }
+      if (sawEquation) {
+        if (raw[i] === '(') parenDepth += 1;
+        else if (raw[i] === ')') parenDepth -= 1;
+      }
+    }
+    if (line >= targetLine && ((sawDollar && !openDollar) || (sawEquation && parenDepth <= 0))) break;
+  }
+  return lines.join('\n');
+}
+
+type SessionState = {
+  workspacePath?: string;
+  openPaths?: string[];
+  activePath?: string;
+  cursor?: { line: number; column: number };
+  scrollTop?: number;
+  expandedDirs?: string[];
+  mainFile?: string | null;
+  treeScrollTop?: number;
+  pdfView?: PdfViewState;
+};
 
 export default function App() {
   const editorRef = useRef<any>(null);
@@ -326,9 +474,14 @@ export default function App() {
   const [activeTabPath, setActiveTabPath] = useState<string>('');
   const activeTabPathRef = useRef('');
   activeTabPathRef.current = activeTabPath;
+  const modelUseClockRef = useRef(0);
+  const modelLastUsedRef = useRef(new Map<string, number>());
   const [externalConflict, setExternalConflict] = useState<ExternalConflict | null>(null);
   const [booted, setBooted] = useState(false);
   const [fileTree, setFileTree] = useState<FileNode[]>([]);
+  const fileTreeElRef = useRef<HTMLDivElement | null>(null);
+  const pendingTreeRestoreRef = useRef<{ scrollTop?: number; activePath?: string; attempts: number } | null>(null);
+  const lastTreeActiveRef = useRef('');
   // Read by callbacks that outlive the render that created them.
   const fileTreeRef = useRef<FileNode[]>(fileTree);
   fileTreeRef.current = fileTree;
@@ -356,11 +509,15 @@ export default function App() {
   }, [treeSearch]);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
+  const compiledMathCacheRef = useRef<{ revision: string; promise: Promise<CompiledEquation[]> } | null>(null);
+  const [restoredPdfView, setRestoredPdfView] = useState<PdfViewState | undefined>();
   // Word count of the RENDERED document (reported by PdfPreview from the PDF's
   // text), so the header reflects the reader-facing prose — not the Typst source.
   const [pdfWords, setPdfWords] = useState<number | null>(null);
   const handlePdfWordCount = useCallback((n: number) => setPdfWords(n), []);
   const [isCompiling, setIsCompiling] = useState(false);
+  const [activeSaves, setActiveSaves] = useState(0);
+  const [saveError, setSaveError] = useState<string | null>(null);
   // Set once a single compile has been running long enough that "Compiling…" has
   // stopped being an explanation. Nothing about the app looks different when the
   // engine is thinking for a moment and when it is never coming back, and people
@@ -420,6 +577,25 @@ export default function App() {
     localStorage.setItem('compile_delay', String(compileDelay));
     localStorage.setItem('compile_delay_version', '3');
   }, [compileDelay]);
+  const [hiddenToolbarTools, setHiddenToolbarTools] = useState<ToolbarToolId[]>(loadHiddenToolbarTools);
+  const [showToolbarPreferences, setShowToolbarPreferences] = useState(false);
+  const hiddenToolbarSet = useMemo(() => new Set<ToolbarToolId>(hiddenToolbarTools), [hiddenToolbarTools]);
+  const toolbarGroupVisible = useMemo(() => Object.fromEntries(
+    TOOLBAR_GROUPS.map(group => [group.id, group.tools.some(tool => !hiddenToolbarSet.has(tool.id))]),
+  ) as Record<(typeof TOOLBAR_GROUPS)[number]['id'], boolean>, [hiddenToolbarSet]);
+  const toolbarToolVisible = (id: ToolbarToolId) => !hiddenToolbarSet.has(id);
+  const toolbarDividerBefore = (id: 'text' | 'math' | 'structure' | 'objects' | 'code') => {
+    const order = ['navigation', 'text', 'math', 'structure', 'objects', 'code'] as const;
+    const index = order.indexOf(id);
+    return toolbarGroupVisible[id] && order.slice(0, index).some(group => toolbarGroupVisible[group]);
+  };
+  useEffect(() => {
+    localStorage.setItem(TOOLBAR_STORAGE_KEY, JSON.stringify(hiddenToolbarTools));
+    // A popover cannot remain anchored to a button that was just hidden.
+    if (hiddenToolbarSet.has('font-size')) setFontSizePopAt(null);
+    if (hiddenToolbarSet.has('text-color')) setColorPopAt(null);
+    if (hiddenToolbarSet.has('highlight')) setHighlightPopAt(null);
+  }, [hiddenToolbarTools, hiddenToolbarSet]);
 
   const activeTab = tabs.find(t => t.path === activeTabPath);
   // Mirrored so callbacks that outlive a render (the editor's mount handler)
@@ -434,7 +610,7 @@ export default function App() {
   const assetPath = activeTab && !isProjectTextPath(activeTabPath) && !activeTabPath.endsWith('.excalidraw')
     ? activeTabPath
     : null;
-  const assetUrl = useWorkspaceAsset(assetPath, activeTab?.binaryRevision ?? 0);
+  const { url: assetUrl, error: assetPreviewError } = useWorkspaceAsset(assetPath, activeTab?.binaryRevision ?? 0);
 
   // Where the caret last was in each file, keyed by model URI. Monaco's editor
   // component is recreated whenever the active tab briefly has no entry in
@@ -448,7 +624,24 @@ export default function App() {
   // off. Persisted to localStorage like the other saved settings above; no backend
   // state, so nothing to load or migrate.
   const workspacePathRef = useRef<string | null>(null);
-  const sessionRef = useRef<{ workspacePath?: string; openPaths?: string[]; activePath?: string; cursor?: { line: number; column: number }; scrollTop?: number; expandedDirs?: string[]; mainFile?: string | null }>({});
+  const [workspaceRecoveryKey, setWorkspaceRecoveryKey] = useState('');
+  const workspaceRecoveryKeyRef = useRef('');
+  workspaceRecoveryKeyRef.current = workspaceRecoveryKey;
+  const recoveredWorkspaceRef = useRef('');
+  const [draftRecoveryReady, setDraftRecoveryReady] = useState(false);
+  const [recoveryConflicts, setRecoveryConflicts] = useState<RecoveryConflict[]>([]);
+  const [showRecoveryDrafts, setShowRecoveryDrafts] = useState(false);
+  const [recoverySaveState, setRecoverySaveState] = useState<'idle' | 'saving' | 'saved' | 'failed'>('idle');
+  const selectRecoveryWorkspace = useCallback((key: string) => {
+    if (!key || workspaceRecoveryKeyRef.current === key) return;
+    // Disable draft writes in the same event that switches identity. Otherwise
+    // a dirty tab from the project being left can briefly be stored under the
+    // new project's key while its files are still loading.
+    workspaceRecoveryKeyRef.current = key;
+    setDraftRecoveryReady(false);
+    setWorkspaceRecoveryKey(key);
+  }, []);
+  const sessionRef = useRef<SessionState>({});
   const sessionSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingCursorRef = useRef<{ path: string; line: number; column: number; scrollTop?: number } | null>(null);
   const restoredRef = useRef(false);
@@ -456,14 +649,30 @@ export default function App() {
   // first compile would hit a dead port and the error would stick until a
   // manual refresh. Compiles hold until the backend answers once.
   const [backendReady, setBackendReady] = useState(false);
-  const scheduleSaveSession = () => {
+  const saveSessionNow = useCallback(() => {
+    fetch(`${API}/session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(sessionRef.current),
+      keepalive: true,
+    }).catch(() => {});
+  }, []);
+  const scheduleSaveSession = useCallback(() => {
     if (sessionSaveTimer.current) clearTimeout(sessionSaveTimer.current);
     sessionSaveTimer.current = setTimeout(() => {
       // Persist to the backend's on-disk session store (survives reboots and port
       // changes, unlike localStorage which is keyed to the webview origin).
-      fetch(`${API}/session`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(sessionRef.current) }).catch(() => {});
+      saveSessionNow();
     }, 500);
-  };
+  }, [saveSessionNow]);
+  useEffect(() => {
+    const flush = () => {
+      if (sessionSaveTimer.current) clearTimeout(sessionSaveTimer.current);
+      saveSessionNow();
+    };
+    window.addEventListener('pagehide', flush);
+    return () => window.removeEventListener('pagehide', flush);
+  }, [saveSessionNow]);
   // Track the open tabs / active tab / workspace so the next launch can restore them.
   useEffect(() => {
     // Startup restores the backend session asynchronously. Saving the initial
@@ -473,7 +682,11 @@ export default function App() {
     sessionRef.current.openPaths = tabs.map(t => t.path);
     sessionRef.current.activePath = activeTabPath;
     scheduleSaveSession();
-  }, [tabs, activeTabPath, booted]);
+  }, [tabs, activeTabPath, booted, scheduleSaveSession]);
+  const handlePdfViewState = useCallback((view: PdfViewState) => {
+    sessionRef.current.pdfView = view;
+    scheduleSaveSession();
+  }, [scheduleSaveSession]);
   // Put the cursor back where the last session left it, once the restored tab's
   // content is in the editor.
   //
@@ -557,6 +770,7 @@ export default function App() {
   const [showAppSettings, setShowAppSettings] = useState(false);
   const [activeMenu, setActiveMenu] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, node?: FileNode, type: 'file' | 'folder' | 'empty' } | null>(null);
+  const [editorMenu, setEditorMenu] = useState<{ x: number, y: number } | null>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
   // The menu opens at the click point and grows down and to the right, so a
   // right-click low in the file tree or near the right edge would run it off
@@ -576,7 +790,10 @@ export default function App() {
     window.addEventListener('resize', position);
     return () => window.removeEventListener('resize', position);
   }, [contextMenu]);
-  const [fileClipboard, setFileClipboard] = useState<{ path: string, type: 'copy' | 'cut' } | null>(null);
+  const [fileClipboard, setFileClipboard] = useState<{
+    entries: { path: string; isDir: boolean }[];
+    type: 'copy' | 'cut';
+  } | null>(null);
   const [renamingPath, setRenamingPath] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState<string>('');
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
@@ -637,6 +854,7 @@ export default function App() {
   const [inputModal, setInputModal] = useState<InputModalConfig | null>(null);
   // Live collaboration for the whole project. Dormant until Host/Join is used.
   const collabRef = useRef<CollabHandle | null>(null);
+  const hostedCollabStartedRef = useRef(false);
   const projectSessionRef = useRef<{
     sync: ProjectSync;
     transfer: BinaryTransfer;
@@ -649,6 +867,7 @@ export default function App() {
     peers: number;
     status: CollabStatus;
     transferring: number;
+    users: CollabUser[];
   } | null>(null);
   // Bumped whenever a change arrives from a collaborator. A late-arriving image
   // (its bytes come over the asset channel after the text that references it)
@@ -724,6 +943,9 @@ export default function App() {
     autoClosingQuotes: 'always' as const,
     bracketPairColorization: { enabled: true },
     hover: { enabled: true, delay: 300 },
+    // Hilbert draws the right-click menu itself; Monaco's cannot cut or paste
+    // inside a webview. EditorContextMenu carries the same entries.
+    contextmenu: false,
   }), [editorFontSize]);
   const [codeRunner, setCodeRunner] = useState<null | { initialLang?: 'python' | 'julia' | 'wolfram'; initialCode?: string; initialMode?: 'text' | 'equation' }>(null);
   const [showSaveAs, setShowSaveAs] = useState(false);
@@ -790,6 +1012,8 @@ export default function App() {
   const isResizingProblems = useRef(false);
   const problemsResizeStart = useRef({ y: 0, height: 0 });
   const sidebarRef = useRef<HTMLDivElement | null>(null);
+  const resizeLayoutRef = useRef({ sidebarVisible, sidebarWidth });
+  resizeLayoutRef.current = { sidebarVisible, sidebarWidth };
   const toggleNumberingRef = useRef<() => void>(() => {});
   const toggleCommentRef = useRef<() => void>(() => {});
 
@@ -869,12 +1093,24 @@ export default function App() {
         // In the desktop app the page is served by the backend itself, so the
         // first probe succeeds immediately. Give a slow dev boot up to 30s,
         // then proceed anyway so a genuinely dead backend still surfaces.
+        let recoveryKey = '';
         for (let i = 0; i < 60; i++) {
-          try { await fetch(`${API}/workspace/root`); break; }
+          try {
+            const response = await fetch(`${API}/workspace/root`);
+            if (response.ok) {
+              const data = await response.json();
+              recoveryKey = typeof data.root === 'string' && data.root ? data.root : window.location.origin;
+              break;
+            }
+          }
           catch { await new Promise(r => setTimeout(r, 500)); }
         }
+        selectRecoveryWorkspace(recoveryKey || window.location.origin);
+        await restoreSessionOrDefault();
+        // Publish readiness after the session's pane positions are in state.
+        // Otherwise the cached PDF can mount at page one in the render between
+        // these two operations and consume an empty one-shot view restore.
         setBackendReady(true);
-        restoreSessionOrDefault();
       })();
     }
     fetch(`${API}/lsp/status`)
@@ -888,31 +1124,47 @@ export default function App() {
         }
       })
       .catch(() => {});
-  }, []);
+  }, [selectRecoveryWorkspace]);
 
   useEffect(() => {
-    const handleMouseMove = (e: MouseEvent) => {
+    let frame: number | null = null;
+    let point = { x: 0, y: 0 };
+    const applyResize = () => {
+      frame = null;
       if (isResizingSidebar.current) {
-        setSidebarWidth(Math.max(150, Math.min(e.clientX, 600)));
+        setSidebarWidth(Math.max(150, Math.min(point.x, 600)));
       } else if (isResizingEditor.current) {
-        const offset = (sidebarVisible ? sidebarWidth : 0) + 5;
+        const { sidebarVisible: sidebarIsVisible, sidebarWidth: currentSidebarWidth } = resizeLayoutRef.current;
+        const offset = (sidebarIsVisible ? currentSidebarWidth : 0) + 5;
         // Leave room for the sidebar, both resizers and a minimum preview width so
         // the PDF pane (and its toolbar) never gets pushed off-screen.
         const maxEditor = window.innerWidth - offset - 5 - 320;
-        setEditorWidth(Math.max(200, Math.min(e.clientX - offset, maxEditor)));
+        setEditorWidth(Math.max(200, Math.min(point.x - offset, maxEditor)));
       } else if (isResizingTree.current) {
         const top = sidebarRef.current?.getBoundingClientRect().top ?? 0;
         const total = sidebarRef.current?.clientHeight ?? 600;
-        setTreeHeight(Math.max(80, Math.min(e.clientY - top, total - 140)));
+        setTreeHeight(Math.max(80, Math.min(point.y - top, total - 140)));
       } else if (isResizingProblems.current) {
         // Drag the handle up → the Problems panel grows (it's anchored to the
         // bottom); delta-based so it works regardless of the panels below it.
-        const dy = problemsResizeStart.current.y - e.clientY;
+        const dy = problemsResizeStart.current.y - point.y;
         const total = sidebarRef.current?.clientHeight ?? 600;
         setProblemsHeight(Math.max(60, Math.min(problemsResizeStart.current.height + dy, total - 200)));
       }
     };
-    const handleMouseUp = () => {
+    const handlePointerMove = (e: PointerEvent) => {
+      if (!isResizingSidebar.current && !isResizingEditor.current
+          && !isResizingTree.current && !isResizingProblems.current) return;
+      point = { x: e.clientX, y: e.clientY };
+      // Pen/touch hardware can report far more moves than the screen can draw.
+      // One layout update per animation frame is both smoother and much cheaper.
+      if (frame === null) frame = window.requestAnimationFrame(applyResize);
+    };
+    const finishResize = () => {
+      if (frame !== null) {
+        window.cancelAnimationFrame(frame);
+        applyResize();
+      }
       isResizingSidebar.current = false;
       isResizingEditor.current = false;
       isResizingTree.current = false;
@@ -920,13 +1172,18 @@ export default function App() {
       document.body.style.cursor = 'default';
       document.body.classList.remove('is-resizing');
     };
-    document.addEventListener('mousemove', handleMouseMove);
-    document.addEventListener('mouseup', handleMouseUp);
+    document.addEventListener('pointermove', handlePointerMove);
+    document.addEventListener('pointerup', finishResize);
+    document.addEventListener('pointercancel', finishResize);
+    window.addEventListener('blur', finishResize);
     return () => {
-      document.removeEventListener('mousemove', handleMouseMove);
-      document.removeEventListener('mouseup', handleMouseUp);
+      if (frame !== null) window.cancelAnimationFrame(frame);
+      document.removeEventListener('pointermove', handlePointerMove);
+      document.removeEventListener('pointerup', finishResize);
+      document.removeEventListener('pointercancel', finishResize);
+      window.removeEventListener('blur', finishResize);
     };
-  }, [sidebarVisible, sidebarWidth]);
+  }, []);
 
   // Settings that should outlive the window, mirrored to a file the backend owns.
   //
@@ -976,6 +1233,13 @@ export default function App() {
         const problems = clamp(layout.problems, 60, 900);
         if (problems) setProblemsHeight(problems);
         applyInterpreters(saved.interpreters);
+        // Native windows can have different loopback ports, so carry this
+        // preference through the shared settings file there. Browser-hosted
+        // visitors keep their own local toolbar instead of changing everyone
+        // else's controls on the central server.
+        if (IS_NATIVE_APP && Array.isArray(saved.toolbarHidden)) {
+          setHiddenToolbarTools(normalizeHiddenToolbarTools(saved.toolbarHidden));
+        }
       } catch {}
       // Even when the read failed. Otherwise nothing would ever be saved and the
       // next launch would be back to defaults for a second time.
@@ -1002,10 +1266,11 @@ export default function App() {
           panels,
           layout: { sidebar: sidebarWidth, editor: editorWidth, tree: treeHeight, problems: problemsHeight },
           interpreters: allInterpreters(),
+          ...(IS_NATIVE_APP ? { toolbarHidden: hiddenToolbarTools } : {}),
         }),
       }).catch(() => {});
     }, 400);
-  }, [settingsLoaded, prefsRevision, editorFontSize, theme, compileDelay, panels, sidebarWidth, editorWidth, treeHeight, problemsHeight]);
+  }, [settingsLoaded, prefsRevision, editorFontSize, theme, compileDelay, panels, sidebarWidth, editorWidth, treeHeight, problemsHeight, hiddenToolbarTools]);
 
   // Interpreter choices are made in two different dialogs and land in
   // localStorage rather than in this component's state, so nothing above would
@@ -1057,6 +1322,83 @@ export default function App() {
     });
   };
 
+  const openRecoveredDraft = useCallback((draft: EmergencyDraft, diskHash?: string) => {
+    setTabs(prev => prev.some(tab => tab.path === draft.path)
+      ? prev.map(tab => tab.path === draft.path
+        ? { ...tab, content: draft.content, diskHash, isDirty: true }
+        : tab)
+      : [...prev, { path: draft.path, content: draft.content, diskHash, isDirty: true }]);
+    setActiveTabPath(draft.path);
+  }, []);
+
+  // Recover only when the server still carries the exact base the local draft
+  // was written from. A separately changed server file is presented for an
+  // explicit decision and is never silently overwritten.
+  useEffect(() => {
+    if (!booted || !workspaceRecoveryKey || recoveredWorkspaceRef.current === workspaceRecoveryKey) return;
+    recoveredWorkspaceRef.current = workspaceRecoveryKey;
+    setDraftRecoveryReady(false);
+    let cancelled = false;
+    void (async () => {
+      const conflicts: RecoveryConflict[] = [];
+      try {
+        const drafts = await listEmergencyDrafts(workspaceRecoveryKey);
+        for (const draft of drafts) {
+          if (cancelled || !isProjectTextPath(draft.path)) continue;
+          let disk: { content: string; hash?: string };
+          try {
+            disk = await readFileState(draft.path);
+          } catch {
+            // Keep the local copy untouched. A later reload when the server is
+            // reachable will inspect it before anything can be replayed.
+            continue;
+          }
+          const disposition = classifyEmergencyDraft(draft, disk);
+          if (disposition === 'already-saved') {
+            await removeEmergencyDraft(workspaceRecoveryKey, draft.path, draft.content);
+          } else if (disposition === 'safe-to-replay') {
+            openRecoveredDraft(draft, disk.hash);
+          } else {
+            conflicts.push({ draft, disk });
+          }
+        }
+      } finally {
+        if (!cancelled) {
+          setRecoveryConflicts(conflicts);
+          setShowRecoveryDrafts(conflicts.length > 0);
+          setDraftRecoveryReady(true);
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [booted, workspaceRecoveryKey, openRecoveredDraft]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Every unsaved text buffer gets an independent device-local recovery copy.
+  // IndexedDB is the normal store; emergencyDrafts.ts falls back to localStorage
+  // where IndexedDB is disabled. Writes are debounced and bounded to dirty text
+  // tabs, so a large project does not cause a periodic full-workspace snapshot.
+  useEffect(() => {
+    if (!draftRecoveryReady || !workspaceRecoveryKey) return;
+    const dirty = tabs.filter(tab => tab.isDirty && isProjectTextPath(tab.path));
+    if (!dirty.length) {
+      setRecoverySaveState('idle');
+      return;
+    }
+    setRecoverySaveState('saving');
+    const timer = window.setTimeout(() => {
+      void Promise.all(dirty.map(tab => putEmergencyDraft(createEmergencyDraft(
+        workspaceRecoveryKey,
+        tab.path,
+        tab.content,
+        tab.diskHash,
+      )))).then(() => setRecoverySaveState('saved')).catch(() => {
+        setRecoverySaveState('failed');
+        notify('Could not create a local recovery copy. Keep this page open and copy important text elsewhere.');
+      });
+    }, 180);
+    return () => window.clearTimeout(timer);
+  }, [draftRecoveryReady, workspaceRecoveryKey, tabs]);
+
   // What this app itself last put on disk for a path, recorded the moment the
   // write returns instead of on the next render. Tab state is too slow to be a
   // save's precondition: a compile that starts before the previous one's hash
@@ -1097,7 +1439,12 @@ export default function App() {
   // and the user decides.
   const resolveDiskChange = (tab: Tab, disk: { content: string; hash?: string }) => {
     const shared = collabRef.current?.workspace;
-    if (shared && disk.hash && shared.metaOf(tab.path)?.kind === 'text') {
+    // The active Monaco buffer is already the CRDT document. Hosted browsers
+    // also share one physical server workspace, so another participant's
+    // autosave can reach the disk watcher before the workspace metadata event.
+    // Treat the binding itself as sufficient proof instead of opening a false
+    // "changed outside" conflict during that startup-sized race.
+    if (disk.hash && (isBoundToSession(tab.path) || shared?.metaOf(tab.path)?.kind === 'text')) {
       adoptDiskVersion(tab.path, disk.content, disk.hash);
       return;
     }
@@ -1120,15 +1467,20 @@ export default function App() {
     if (!projectSessionRef.current) notify(`Reloaded ${path} after an external change.`);
   };
 
-  const writeTab = async (tab: Tab): Promise<string> => {
+  const writeTabNow = async (tab: Tab): Promise<string> => {
     const authored = lastWrittenRef.current.get(tab.path);
     let expected = authored?.hash || tab.diskHash;
     if (!expected) {
       const disk = await readFileState(tab.path);
       expected = disk.hash;
       if (disk.hash && disk.content !== tab.content) {
-        showExternalConflict(tab, disk);
-        throw new Error('external-conflict');
+        if (!isBoundToSession(tab.path)) {
+          showExternalConflict(tab, disk);
+          throw new Error('external-conflict');
+        }
+        // A collaborator may have autosaved the same hosted workspace before
+        // this tab learned its initial disk hash. The bound CRDT buffer is the
+        // merged source of truth; use the observed hash as the save precondition.
       }
     }
     // Deliberately not abortable. A superseded compile cancels its own typst
@@ -1151,7 +1503,7 @@ export default function App() {
     }
     if (response.status === 409) {
       const shared = collabRef.current?.workspace;
-      if (shared && data.hash && shared.metaOf(tab.path)?.kind === 'text') {
+      if (data.hash && (isBoundToSession(tab.path) || shared?.metaOf(tab.path)?.kind === 'text')) {
         if (isBoundToSession(tab.path)) {
           // This buffer is the session's merged document, so it is the version
           // to keep — save it against what the file actually holds now rather
@@ -1177,12 +1529,30 @@ export default function App() {
     }
     const hash = data.hash || expected || '';
     if (hash) lastWrittenRef.current.set(tab.path, { content: tab.content, hash });
+    const recoveryKey = workspaceRecoveryKeyRef.current;
+    if (recoveryKey) void removeEmergencyDraft(recoveryKey, tab.path, tab.content);
     // Nothing is pushed to a shared session here. Every tab this runs for is one
     // the editor has bound, so the session already has each keystroke from the
     // Monaco binding; a buffer holding merged remote edits looks modified too,
     // and offering it back would replace the shared text with this peer's stale
     // copy. See ProjectSync.onLocalText.
     return hash;
+  };
+
+  const writeTab = async (tab: Tab): Promise<string> => {
+    setActiveSaves(count => count + 1);
+    try {
+      const hash = await writeTabNow(tab);
+      setSaveError(null);
+      return hash;
+    } catch (error) {
+      if (!(error instanceof Error && error.message === 'external-conflict')) {
+        setSaveError(error instanceof Error ? error.message : 'Could not save the file.');
+      }
+      throw error;
+    } finally {
+      setActiveSaves(count => Math.max(0, count - 1));
+    }
   };
 
   // A refresh re-runs the bounded walk, so folders the user had opened come back
@@ -1380,8 +1750,10 @@ export default function App() {
       }
       if (ac.signal.aborted) return;   // superseded by a newer compile — stay quiet
       if (error instanceof Error && error.message === 'external-conflict') return;
-      const msg = error instanceof Error && /fetch/i.test(error.message)
-        ? "Couldn't reach the local Typst engine. Make sure the app's backend is running, then recompile."
+      const networkFailure = error instanceof TypeError
+        || (error instanceof Error && /fetch|network|load failed|connection/i.test(error.message));
+      const msg = networkFailure
+        ? "Couldn't reach Hilbert's document service. Your text remains in the editor; Hilbert will retry when the connection returns."
         : String(error);
       setErrorLogs(msg);
       setCompileError(msg);
@@ -1585,7 +1957,7 @@ export default function App() {
   }, [saveActiveFile]);
 
   useEffect(() => {
-    if (!backendReady) return;
+    if (!backendReady || !draftRecoveryReady) return;
     // A conflict dialog is a question waiting on an answer, and until it gets
     // one every save fails its precondition. Retrying on a timer just asks the
     // same failing question forever: nothing reaches the preview, saving looks
@@ -1600,7 +1972,20 @@ export default function App() {
       }, hasDirty ? compileDelay : 50);
       return () => clearTimeout(timeoutId);
     }
-  }, [backendReady, externalConflict, tabs, compileTypst, currentMain, lastCompiledPath, compileDelay]);
+  }, [backendReady, draftRecoveryReady, externalConflict, tabs, compileTypst, currentMain, lastCompiledPath, compileDelay]);
+
+  // A failed network save leaves the tab dirty. That state used to remain
+  // unchanged, so the normal change-driven autosave had nothing to wake it when
+  // the hosted server returned. Retry only after an actual backend-reachability
+  // failure, only while no compile is running, and never while a conflict waits
+  // for a person's decision.
+  useEffect(() => {
+    const hasDirty = tabs.some(tab => tab.isDirty);
+    const backendFailure = !!compileError && /couldn.t reach|failed to fetch|networkerror|load failed/i.test(compileError);
+    if (!backendReady || !draftRecoveryReady || !hasDirty || !backendFailure || isCompiling || externalConflict) return;
+    const timer = window.setTimeout(() => compileTypst(currentMain), 5000);
+    return () => window.clearTimeout(timer);
+  }, [backendReady, draftRecoveryReady, tabs, compileError, isCompiling, externalConflict, compileTypst, currentMain]);
 
   // Recompile after a collaborator's change lands (see remoteApplyRev). Reads
   // the current main file fresh, so a late image or an edit to an included file
@@ -1743,6 +2128,7 @@ export default function App() {
 
   const closeTab = (e: React.MouseEvent, path: string) => {
     e.stopPropagation();
+    modelLastUsedRef.current.delete(path);
     // Dispose the Monaco model for this file. @monaco-editor/react keeps every
     // model it creates in Monaco's global registry, so without this each
     // opened-then-closed file leaves a model holding the whole document behind —
@@ -1821,11 +2207,109 @@ export default function App() {
   const handleNodeContextMenu = (e: React.MouseEvent, node: FileNode, type: 'file' | 'folder') => {
     e.preventDefault();
     e.stopPropagation();
+    setActiveMenu(null);
+    setEditorMenu(null);
     if (!selectedPaths.includes(node.path)) {
       setSelectedPaths([node.path]);
       setLastSelectedPath(node.path);
     }
     setContextMenu({ x: e.clientX, y: e.clientY, node, type });
+  };
+
+  const findTreeNode = (path: string, nodes: FileNode[] = fileTree): FileNode | null => {
+    for (const node of nodes) {
+      if (node.path === path) return node;
+      if (node.children) {
+        const found = findTreeNode(path, node.children);
+        if (found) return found;
+      }
+    }
+    return null;
+  };
+
+  const stageFileClipboard = (type: 'copy' | 'cut') => {
+    // If both a folder and something inside it are selected, copying the folder
+    // already includes the child. Staging both produces a duplicate request and
+    // can make a successful multi-item operation look half-failed.
+    const roots = selectedPaths.filter(path =>
+      !selectedPaths.some(other => other !== path && path.startsWith(other + '/')));
+    const entries = roots.map(path => ({ path, isDir: findTreeNode(path)?.type === 'directory' }));
+    if (entries.length) setFileClipboard({ entries, type });
+  };
+
+  const copiedEntryName = (name: string, isDir: boolean, attempt: number) => {
+    const dot = isDir ? -1 : name.lastIndexOf('.');
+    const stem = dot > 0 ? name.slice(0, dot) : name;
+    const ext = dot > 0 ? name.slice(dot) : '';
+    return `${stem}_copy${attempt > 1 ? `_${attempt}` : ''}${ext}`;
+  };
+
+  const pasteFileClipboard = async (targetDir: string) => {
+    const staged = fileClipboard;
+    if (!staged?.entries.length) return;
+    const failed: typeof staged.entries = [];
+    const pasted: string[] = [];
+
+    for (const entry of staged.entries) {
+      if (entry.isDir && (targetDir === entry.path || targetDir.startsWith(entry.path + '/'))) {
+        notify(`Cannot ${staged.type} “${entry.path}” inside itself.`);
+        failed.push(entry);
+        continue;
+      }
+
+      const name = entry.path.split('/').pop() || '';
+      const destination = (candidate: string) => targetDir ? `${targetDir}/${candidate}` : candidate;
+      let toPath = destination(name);
+      let response: Response | null = null;
+      let copyAttempt = toPath === entry.path ? 1 : 0;
+
+      // Copying beside the source should create a sibling rather than asking
+      // the backend to overwrite the source. A pre-existing name gets the same
+      // bounded, deterministic treatment. Cut keeps collision semantics strict:
+      // silently renaming a move would be surprising.
+      for (;;) {
+        if (copyAttempt > 0) {
+          if (staged.type !== 'copy' || copyAttempt > 100) break;
+          toPath = destination(copiedEntryName(name, entry.isDir, copyAttempt));
+        }
+        response = await fetch(`${API}/workspace/${staged.type === 'cut' ? 'rename' : 'copy'}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ from: entry.path, to: toPath }),
+        }).catch(() => null);
+        if (!response) break;
+        if (response.ok || response.status !== 409) break;
+        copyAttempt++;
+      }
+
+      if (!response?.ok) {
+        const detail = await response?.json().catch(() => ({}));
+        notify(`Could not ${staged.type} “${entry.path}”: ${detail?.error || 'destination unavailable'}`);
+        failed.push(entry);
+        continue;
+      }
+
+      if (staged.type === 'cut') {
+        await mirrorLocalRename(entry.path, toPath);
+        setTabs(prev => prev.map(tab => {
+          if (tab.path === entry.path) return { ...tab, path: toPath };
+          if (tab.path.startsWith(entry.path + '/')) return { ...tab, path: toPath + tab.path.slice(entry.path.length) };
+          return tab;
+        }));
+        if (activeTabPath === entry.path) setActiveTabPath(toPath);
+        else if (activeTabPath.startsWith(entry.path + '/')) setActiveTabPath(toPath + activeTabPath.slice(entry.path.length));
+      } else {
+        await mirrorLocalCopy(entry.path, toPath);
+      }
+      pasted.push(toPath);
+    }
+
+    if (staged.type === 'cut') setFileClipboard(failed.length ? { ...staged, entries: failed } : null);
+    if (pasted.length) {
+      setSelectedPaths(pasted);
+      setLastSelectedPath(pasted[pasted.length - 1]);
+    }
+    fetchTree();
   };
 
   const handleDragStart = (e: React.DragEvent, path: string) => {
@@ -1836,7 +2320,8 @@ export default function App() {
   };
 
   const handleFileTreeKeyDown = async (e: React.KeyboardEvent) => {
-    if (selectedPaths.length === 0) return;
+    const pasteShortcut = e.key.toLowerCase() === 'v' && (e.metaKey || e.ctrlKey);
+    if (selectedPaths.length === 0 && !pasteShortcut) return;
 
     if (e.key === 'Backspace' || e.key === 'Delete') {
       e.preventDefault();
@@ -1849,42 +2334,23 @@ export default function App() {
     } else if (e.key === 'Enter') {
       e.preventDefault();
       handleRename();
-    } else if (e.key === 'c' && (e.metaKey || e.ctrlKey)) {
+    } else if (e.key.toLowerCase() === 'c' && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
-      setFileClipboard({ path: selectedPaths[0], type: 'copy' });
-    } else if (e.key === 'x' && (e.metaKey || e.ctrlKey)) {
+      stageFileClipboard('copy');
+    } else if (e.key.toLowerCase() === 'x' && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
-      setFileClipboard({ path: selectedPaths[0], type: 'cut' });
-    } else if (e.key === 'v' && (e.metaKey || e.ctrlKey)) {
+      stageFileClipboard('cut');
+    } else if (e.key.toLowerCase() === 'v' && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       if (!fileClipboard) return;
       // Paste into the first selected folder, or the parent of the first selected file
       let targetDir = '';
       if (selectedPaths.length > 0) {
         const first = selectedPaths[0];
-        // We don't have the node type easily here without searching the tree, but we can guess or just fetch
-        const isSelectedDir = fileTree.some(n => {
-           const search = (nodes: FileNode[]): boolean => {
-             for (const no of nodes) {
-               if (no.path === first) return no.type === 'directory';
-               if (no.children) {
-                 const res = search(no.children);
-                 if (res) return true;
-               }
-             }
-             return false;
-           };
-           return search([n]);
-        });
+        const isSelectedDir = findTreeNode(first)?.type === 'directory';
         targetDir = isSelectedDir ? first : (first.includes('/') ? first.substring(0, first.lastIndexOf('/')) : '');
       }
-      const toPath = targetDir ? `${targetDir}/${fileClipboard.path.split('/').pop()}` : fileClipboard.path.split('/').pop();
-      const response = await fetch(`${API}/workspace/${fileClipboard.type === 'cut' ? 'rename' : 'copy'}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: fileClipboard.path, to: toPath }) });
-      if (response.ok && toPath) {
-        if (fileClipboard.type === 'cut') await mirrorLocalRename(fileClipboard.path, toPath);
-        else await mirrorLocalCopy(fileClipboard.path, toPath);
-      }
-      fetchTree();
+      await pasteFileClipboard(targetDir);
     }
   };
 
@@ -2269,6 +2735,10 @@ export default function App() {
     // collide with them.
     setExpandedDirs(new Set());
     setMainOverride(null);
+    setRestoredPdfView(undefined);
+    pendingTreeRestoreRef.current = { scrollTop: 0, attempts: 0 };
+    delete sessionRef.current.pdfView;
+    sessionRef.current.treeScrollTop = 0;
     loadedDirsRef.current.clear();
     setHistory([]);
     setErrorLogs(null);
@@ -2344,6 +2814,32 @@ export default function App() {
     // Before the tabs, and whether or not any of them can be reopened: the fold
     // state and the chosen main file belong to the project, not to the tabs.
     if (sess) {
+      // Copy only validated view fields into the live object that later session
+      // writes replace. Without this, the first cursor/tab save after startup
+      // drops PDF/tree positions before those panes have mounted to report them.
+      if (Number.isFinite(sess.treeScrollTop) && sess.treeScrollTop >= 0) {
+        sessionRef.current.treeScrollTop = sess.treeScrollTop;
+        pendingTreeRestoreRef.current = {
+          scrollTop: sess.treeScrollTop,
+          activePath: typeof sess.activePath === 'string' ? sess.activePath : undefined,
+          attempts: 0,
+        };
+      } else if (typeof sess.activePath === 'string') {
+        pendingTreeRestoreRef.current = { activePath: sess.activePath, attempts: 0 };
+      }
+      const pdf = sess.pdfView;
+      if (pdf && Number.isFinite(pdf.page) && Number.isFinite(pdf.fraction)
+        && Number.isFinite(pdf.horizontal) && Number.isFinite(pdf.zoom)) {
+        const view: PdfViewState = {
+          page: Math.max(0, Math.floor(pdf.page)),
+          fraction: Math.max(0, Math.min(1, pdf.fraction)),
+          horizontal: Math.max(0, Math.min(1, pdf.horizontal)),
+          zoom: Math.max(0.25, Math.min(8, pdf.zoom)),
+          dark: !!pdf.dark,
+        };
+        sessionRef.current.pdfView = view;
+        setRestoredPdfView(view);
+      }
       if (Array.isArray(sess.expandedDirs)) setExpandedDirs(new Set(sess.expandedDirs));
       if (typeof sess.mainFile === 'string') setMainOverride(sess.mainFile);
     }
@@ -2353,6 +2849,7 @@ export default function App() {
           const res = await fetch(`${API}/workspace/root`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: sess.workspacePath }) });
           if (res.ok) {
             workspacePathRef.current = sess.workspacePath;
+            selectRecoveryWorkspace(sess.workspacePath);
             setProjectName(sess.workspacePath.replace(/[/\\]+$/, '').split(/[/\\]/).pop() || 'Project');
           }
         }
@@ -2399,6 +2896,7 @@ export default function App() {
       if (!res.ok) { notify(data.error || 'Could not open that folder.'); return; }
       dirHandleRef.current = null;   // desktop backend edits the folder directly
       workspacePathRef.current = folder;   // remember this project for session restore
+      selectRecoveryWorkspace(folder);
       const name = folder.replace(/[/\\]+$/, '').split(/[/\\]/).pop() || 'Project';
       await loadWorkspace(name);
       addRecentFolder({ name, path: folder });
@@ -2416,6 +2914,7 @@ export default function App() {
       if (collabRef.current) disposeProjectSession();
       await fetch(`${API}/workspace/clear`, { method: 'POST' });
       workspacePathRef.current = null;   // web-imported working copy: no native path to reopen
+      selectRecoveryWorkspace(`${window.location.origin}::folder:${dir.name}`);
       dirHandleRef.current = dir;
       await importDirHandle(dir, '');
       await loadWorkspace(dir.name);
@@ -2634,6 +3133,11 @@ export default function App() {
         }
         group.forEach((c, i) => { c.result = data.results[i]; });
       }
+
+      // Keep one bounded, reproducible output snapshot across the whole run.
+      // Cell source and all pre-existing document content remain untouched.
+      const retainedResults = limitNotebookResults(cells.map(cell => cell.result || {}));
+      cells.forEach((cell, index) => { cell.result = retainedResults[index]; });
 
       // The backend promotes generated plots into the project. Publish every
       // image before inserting Typst references to it, so collaborators never
@@ -4017,25 +4521,119 @@ export default function App() {
     return out;
   };
 
+  // One Typst query per successful PDF revision, shared by both navigation
+  // directions. A blob URL is unique to a compile, so it is a natural cache key
+  // and stale equation coordinates cannot survive a recompile or workspace swap.
+  const getCompiledMathMap = useCallback((): Promise<CompiledEquation[]> => {
+    if (!pdfUrl) return Promise.resolve([]);
+    const revision = `${currentMain}\0${pdfUrl}`;
+    const cached = compiledMathCacheRef.current;
+    if (cached?.revision === revision) return cached.promise;
+    const promise = (async () => {
+      const response = await fetch(`${API}/workspace/math-locations?main=${encodeURIComponent(currentMain)}`);
+      if (!response.ok) throw new Error(`math locations ${response.status}`);
+      const data = await response.json();
+      const raw: any[] = Array.isArray(data?.equations) ? data.equations : [];
+      return raw.flatMap((entry, equationIndex): CompiledEquation[] => {
+        if (!Array.isArray(entry) || entry.length < 2) return [];
+        const page = Number(entry[0]?.page);
+        const x = Number.parseFloat(String(entry[0]?.x));
+        const y = Number.parseFloat(String(entry[0]?.y));
+        if (!Number.isFinite(page) || !Number.isFinite(x) || !Number.isFinite(y)) return [];
+        const glyphs: string[] = [];
+        collectCompiledMathGlyphs(entry[1], glyphs);
+        return [{
+          position: { page, x, y },
+          words: tokenizeRenderedText(glyphs.join(' ')),
+          equationIndex,
+        }];
+      });
+    })().catch(() => {
+      // Do not poison this PDF revision after a transient process/startup error.
+      if (compiledMathCacheRef.current?.promise === promise) compiledMathCacheRef.current = null;
+      return [];
+    });
+    compiledMathCacheRef.current = { revision, promise };
+    return promise;
+  }, [currentMain, pdfUrl]);
+
   // Reverse: a PDF word (with its neighbours) → the exact source location.
   const reverseSync = useCallback(async (p: SyncPayload) => {
     const editor = editorRef.current; const model = editor?.getModel();
     if (!editor || !model) return;
-    const focusWord = p.words[p.focus];
-    if (!focusWord) return;
+    let focusWord = p.words[p.focus] || '';
 
     const src = tokenizeSourceModel(model);
-    const res = bestMatch(src.map(s => s.w), p.words, p.focus, Math.round(p.docFraction * src.length));
-    if (res) {
+    const prior = Math.round(p.docFraction * src.length);
+    const res = focusWord ? bestMatch(src.map(s => s.w), p.words, p.focus, prior) : null;
+    const repeatedMathFocus = !!(p.mathHint && focusWord
+      && src.reduce((count, token) => count + Number(token.w === focusWord), 0) > 1);
+    if (res && !repeatedMathFocus) {
       const tok = src[res.index];
       flashSourceRange(tok.line, tok.col, tok.w.length);
       return;
     }
 
+    // Overleaf can ask `synctex edit` for a source span at a PDF coordinate.
+    // Typst has no SyncTeX file, but its evaluator can query the real positions
+    // and structured bodies of compiled equation elements. Use that precise
+    // document map only after the zero-latency text matcher misses. It handles
+    // operators/fraction bars with no PDF text and imported math glyphs without
+    // keeping a second preview process alive.
+    let compiledMathWords: string[] = [];
+    if (p.documentPosition) {
+      const equations = await getCompiledMathMap();
+      const point = p.documentPosition;
+      const candidates = equations
+          .filter(equation => equation.position.page === point.page)
+          // A block equation's reported x is its containing block's left edge,
+          // while the formula itself may be centred. Vertical distance is the
+          // reliable discriminator; x only breaks close inline-equation ties.
+          .sort((a, b) => (Math.abs(a.position.y - point.y) + Math.abs(a.position.x - point.x) * 0.04)
+            - (Math.abs(b.position.y - point.y) + Math.abs(b.position.x - point.x) * 0.04));
+        const nearest = candidates[0];
+        if (nearest && Math.abs(nearest.position.y - point.y) <= 52) {
+          compiledMathWords = nearest.words;
+          if (compiledMathWords.length) {
+            const srcWords = src.map(token => token.w);
+            // PDF query results are in document order. When two formulas have
+            // nearly identical text, use that ordinal to choose the matching
+            // source occurrence; a whole-document PDF fraction is too coarse
+            // for two adjacent equations near the top of a long document.
+            const equationPrior = equations.length > 1
+              ? Math.round(nearest.equationIndex / (equations.length - 1) * Math.max(0, src.length - 1))
+              : prior;
+            const preferred = focusWord ? compiledMathWords.indexOf(focusWord) : -1;
+            const focuses = preferred >= 0
+              ? [preferred, ...compiledMathWords.map((_, index) => index).filter(index => index !== preferred)]
+              : compiledMathWords.map((_, index) => index);
+            let winner: { index: number; score: number; distance: number } | null = null;
+            for (const formulaFocus of focuses) {
+              const match = bestMatch(srcWords, compiledMathWords, formulaFocus, equationPrior);
+              if (!match) continue;
+              const candidate = { index: match.index, score: match.score, distance: Math.abs(match.index - equationPrior) };
+              if (!winner || candidate.score > winner.score
+                || (candidate.score === winner.score && candidate.distance < winner.distance)) winner = candidate;
+            }
+            if (winner && (winner.score > 0 || compiledMathWords.length === 1)) {
+              const token = src[winner.index];
+              flashSourceRange(token.line, token.col, token.w.length);
+              return;
+            }
+            if (!focusWord) {
+              focusWord = compiledMathWords.find(word => /\p{L}/u.test(word) && word.length > 1)
+                || compiledMathWords[0]
+                || '';
+            }
+          }
+        }
+    }
+
     // Not in the active file — search the workspace, disambiguating by the
     // surrounding PDF words, and open the best-scoring file/line.
-    try {
-      const ctx = p.words.filter((_, i) => i !== p.focus);
+    if (focusWord) try {
+      const contextWords = compiledMathWords.length ? compiledMathWords : p.words;
+      const ctx = contextWords.filter(word => word !== focusWord);
       const resp = await fetch(`${API}/workspace/search?q=${encodeURIComponent(focusWord)}`);
       const hits = await resp.json();
       if (Array.isArray(hits) && hits.length) {
@@ -4053,17 +4651,55 @@ export default function App() {
       }
     } catch {}
     // Genuinely couldn't locate it (e.g. rendered math) — say so, don't guess.
-    setErrorLogs(`Couldn't locate “${focusWord}” in the source (rendered math or symbols may differ from the markup).`);
-  }, []);
+    setErrorLogs(focusWord
+      ? `Couldn't locate “${focusWord}” in the source. The rendered content may come from a package or generated value.`
+      : "Couldn't map that rendered object to source. Recompile and try the centre of the formula.");
+  }, [getCompiledMathMap]);
 
-  // Forward: the editor cursor → reveal & flash the matching word in the PDF.
-  const forwardSync = useCallback(() => {
+  // Forward: the editor cursor → reveal & flash the matching word/equation in
+  // the PDF. Prose stays synchronous; math shares the revision-cached compiled
+  // equation map used by reverse sync.
+  const forwardSync = useCallback(async () => {
     const ed = editorRef.current; const model = ed?.getModel();
     if (!ed || !model || !pdfRef.current) return;
     const pos = ed.getPosition(); if (!pos) return;
     const total = model.getLineCount();
+    const cursorLineText = model.getLineContent(pos.lineNumber);
+    const mathAtCursor = cursorIsInMath(model, pos.lineNumber, pos.column)
+      || /#(?:math\.)?equation\s*\(/.test(cursorLineText);
 
-    // Find prose at/near the cursor (math and blank lines carry no words).
+    if (mathAtCursor) {
+      const sourceWords = tokenizeTypstMathSource(mathSourceFragment(model, pos.lineNumber));
+      const equations = await getCompiledMathMap();
+      if (sourceWords.length && equations.length) {
+        const ordinal = mathEquationOrdinal(model, pos.lineNumber);
+        let best: { equation: CompiledEquation; score: number; ordinalDistance: number } | null = null;
+        for (const equation of equations) {
+          const score = orderedWordScore(sourceWords, equation.words);
+          const candidate = { equation, score, ordinalDistance: Math.abs(equation.equationIndex - ordinal) };
+          if (!best || candidate.score > best.score + 0.0001
+            || (Math.abs(candidate.score - best.score) <= 0.0001 && candidate.ordinalDistance < best.ordinalDistance)) {
+            best = candidate;
+          }
+        }
+        if (best && best.score >= 0.35 && pdfRef.current?.revealPosition(best.equation.position)) return;
+      }
+      // If Typst could not query a temporarily invalid document, the cached PDF
+      // text can still resolve simple math names and variables.
+      if (sourceWords.length) {
+        const ok = pdfRef.current?.revealSource({
+          words: sourceWords,
+          focus: Math.min(sourceWords.length - 1, Math.floor(sourceWords.length / 2)),
+          docFraction: (pos.lineNumber - 0.5) / total,
+          mathHint: true,
+        });
+        if (ok) return;
+      }
+      setErrorLogs('Couldn’t locate this equation in the current PDF. Recompile if the preview is stale.');
+      return;
+    }
+
+    // Find prose at/near the cursor.
     let line = pos.lineNumber;
     let toks = tokenizeLine(model.getLineContent(line));
     for (let d = 1; !toks.length && d <= 6; d++) {
@@ -4076,8 +4712,8 @@ export default function App() {
     const anchorCol = line === pos.lineNumber ? pos.column : 1;
     toks.forEach((t, i) => { const d = Math.abs(t.offset + 1 - anchorCol); if (d < bestD) { bestD = d; focus = i; } });
     const ok = pdfRef.current.revealSource({ words: toks.map(t => t.w), focus, docFraction: (line - 0.5) / total });
-    if (!ok) setErrorLogs('Couldn’t find this line in the PDF (recompile if the preview is stale, or the text may be inside math).');
-  }, []);
+    if (!ok) setErrorLogs('Couldn’t find this line in the current PDF. Recompile if the preview is stale.');
+  }, [getCompiledMathMap]);
 
   useEffect(() => { forwardSyncRef.current = forwardSync; }, [forwardSync]);
 
@@ -4230,6 +4866,36 @@ export default function App() {
   // The tree reads tabs only for the dirty markers, so key it on the set of
   // dirty paths — not the tabs array, whose identity changes on every keystroke.
   const dirtyPathsKey = useMemo(() => tabs.filter(t => t.isDirty).map(t => t.path).sort().join('\u0001'), [tabs]);
+  useEffect(() => {
+    if (!monaco || !activeTabPath) return;
+    modelLastUsedRef.current.set(activeTabPath, ++modelUseClockRef.current);
+    // Let Monaco finish switching before releasing old clean models. Dirty
+    // buffers are never candidates, even when they exceed the normal limit.
+    const timer = setTimeout(() => {
+      const activeModel = editorRef.current?.getModel();
+      const dirty = new Set(tabsRef.current.filter(tab => tab.isDirty).map(tab => tab.path));
+      const open = new Set(tabsRef.current.map(tab => tab.path));
+      for (const path of modelLastUsedRef.current.keys()) {
+        if (!open.has(path)) modelLastUsedRef.current.delete(path);
+      }
+      const models = monaco.editor.getModels().filter((model: any) => open.has(model.uri.path.replace(/^\//, '')));
+      const discard = new Set(inactiveModelsToDiscard(models.map((model: any) => {
+        const path = model.uri.path.replace(/^\//, '');
+        return {
+          path,
+          dirty: dirty.has(path),
+          active: model === activeModel || path === activeTabPathRef.current,
+          lastUsed: modelLastUsedRef.current.get(path) ?? 0,
+        };
+      })));
+      for (const model of models) {
+        const path = model.uri.path.replace(/^\//, '');
+        if (!discard.has(path) || model === editorRef.current?.getModel() || dirty.has(path)) continue;
+        try { model.dispose(); } catch {}
+      }
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [monaco, activeTabPath, dirtyPathsKey]);
   const dirtyTabMatches = useMemo<SearchResult[]>(() => {
     if (!treeSearch) return NO_SEARCH_RESULTS;
     const query = treeSearch.toLowerCase();
@@ -4242,6 +4908,79 @@ export default function App() {
     }).filter(Boolean) as SearchResult[];
   }, [tabs, treeSearch]);
   const treeJsx = useMemo(() => renderTree(filterTree(fileTree, treeSearch, searchContentResults, dirtyTabMatches)), [fileTree, activeTabPath, loadingDirs, renamingPath, renameValue, selectedPaths, expandedDirs, currentMain, dirtyPathsKey, treeSearch, searchContentResults, dirtyTabMatches, filterTree]);
+  // Restore the tree only after its folders/files have rendered. A saved pixel
+  // offset preserves the exact browsing place; if the tree shape changed, keep
+  // the active file visible. Retry while lazily expanded directories arrive so
+  // an early short tree cannot clamp a deep saved offset permanently to zero.
+  useLayoutEffect(() => {
+    if (!booted) return;
+    const tree = fileTreeElRef.current;
+    if (!tree) return;
+    let frame = 0;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let cancelled = false;
+    const restore = () => {
+      if (cancelled) return;
+      const pending = pendingTreeRestoreRef.current;
+      const activePath = pending?.activePath || activeTabPath;
+      let shouldRevealActive = pending
+        ? pending.scrollTop == null
+        : lastTreeActiveRef.current !== activeTabPath;
+      if (pending?.scrollTop != null) {
+        const maximum = Math.max(0, tree.scrollHeight - tree.clientHeight);
+        tree.scrollTop = Math.min(pending.scrollTop, maximum);
+        pending.attempts += 1;
+        if (pending.scrollTop <= maximum + 1) {
+          // The exact saved browsing position wins over revealing the active
+          // file again; revealing it here would immediately scroll back to the
+          // top and overwrite the restored value in the next session save.
+          pendingTreeRestoreRef.current = null;
+        } else if (pending.attempts >= 8) {
+          // The tree genuinely became shorter. Its clamped position is no
+          // longer meaningful, so falling back to the active file is useful.
+          pendingTreeRestoreRef.current = null;
+          shouldRevealActive = true;
+        } else {
+          // Folder expansion and file enumeration are asynchronous. Give the
+          // tree a few short chances to reach its full height even when no
+          // React render happens between two directory responses.
+          retryTimer = setTimeout(() => {
+            frame = requestAnimationFrame(restore);
+          }, 80);
+        }
+      }
+      const activeElement = activePath
+        ? Array.from(tree.querySelectorAll<HTMLElement>('[data-path]')).find(el => el.dataset.path === activePath)
+        : undefined;
+      if (activeElement && shouldRevealActive) {
+        const item = activeElement.getBoundingClientRect();
+        const viewport = tree.getBoundingClientRect();
+        if (item.top < viewport.top || item.bottom > viewport.bottom) {
+          activeElement.scrollIntoView({ block: 'center', inline: 'nearest' });
+        }
+      }
+      // Sessions written before tree offsets existed still carry an active
+      // path. Once it has been revealed, there is no offset work left pending;
+      // retaining this marker would suppress every future onScroll save.
+      if (pending && pending.scrollTop == null) {
+        pending.attempts += 1;
+        if (activeElement || pending.attempts >= 8) {
+          pendingTreeRestoreRef.current = null;
+        } else {
+          retryTimer = setTimeout(() => {
+            frame = requestAnimationFrame(restore);
+          }, 80);
+        }
+      }
+      lastTreeActiveRef.current = activeTabPath;
+    };
+    frame = requestAnimationFrame(restore);
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(frame);
+      if (retryTimer) clearTimeout(retryTimer);
+    };
+  }, [booted, fileTree, expandedDirs, loadingDirs, activeTabPath]);
   const outline = useMemo(() => (sidebarVisible && panels.outline ? getOutline() : []), [activeTab?.content, sidebarVisible, panels.outline]);
 
   const toggleMenu = (e: React.MouseEvent, menuName: string) => {
@@ -4301,6 +5040,7 @@ export default function App() {
       if (workspacePathRef.current !== folder) {
         dirHandleRef.current = null;
         workspacePathRef.current = folder;
+        selectRecoveryWorkspace(folder);
         setTabs([]);
         setActiveTabPath('');
         setFileTree([]);
@@ -4354,6 +5094,7 @@ export default function App() {
         }
         dirHandleRef.current = null;
         workspacePathRef.current = target;
+        selectRecoveryWorkspace(target);
         setTabs([]);
         setActiveTabPath('');
         setFileTree([]);
@@ -4378,6 +5119,7 @@ export default function App() {
   const beginCollab = async (
     invite: { url: string; room: string; key: string },
     mode: 'host' | 'join',
+    hosted = false,
   ) => {
     const editor = editorRef.current;
     const model = editor?.getModel();
@@ -4482,6 +5224,7 @@ export default function App() {
         peers: 1,
         status: 'connecting',
         transferring: 0,
+        users: [],
       });
       let knownPeers = 0;
       handle.onPeers(peers => {
@@ -4494,6 +5237,8 @@ export default function App() {
         }
         knownPeers = peers;
       });
+      handle.onUsers(users => setCollab(current =>
+        current?.room === invite.room ? { ...current, users } : current));
       handle.onStatus(status => setCollab(current =>
         current?.room === invite.room ? { ...current, status } : current));
       handle.onReady(async () => {
@@ -4505,9 +5250,13 @@ export default function App() {
             await sync.publishWorkspace();
             if (collabRef.current !== handle) return;
             void fetchTree();
-            navigator.clipboard.writeText(handle.ticket)
-              .then(() => notify('Encrypted project sharing started — invitation copied to the clipboard.', 'success'))
-              .catch(() => notify('Encrypted project sharing started. Use “Copy collaboration invitation” to share it.', 'success'));
+            if (!hosted) {
+              if (await writeClipboard(handle.ticket)) {
+                notify('Encrypted project sharing started — invitation copied to the clipboard.', 'success');
+              } else {
+                notify('Encrypted project sharing started. Use “Copy collaboration invitation” to share it.', 'success');
+              }
+            }
           } else {
             setCollab(current => current?.room === invite.room ? { ...current, transferring: Math.max(1, current.transferring) } : current);
             await sync.applyWorkspace();
@@ -4550,8 +5299,7 @@ export default function App() {
         }
       });
       handle.onError(message => {
-        if (collabRef.current === handle) disposeProjectSession();
-        notify(message);
+        if (collabRef.current === handle) notify(message);
       });
     } catch (error) {
       disposeProjectSession();
@@ -4670,6 +5418,45 @@ export default function App() {
     disposeProjectSession(true);
   };
 
+  const retryCollab = () => {
+    const handle = collabRef.current;
+    const sync = projectSessionRef.current?.sync;
+    if (!handle || !sync) return;
+    handle.reconnect();
+    void sync.resyncMissingBinaries();
+    notify('Retrying the collaboration connection…', 'info');
+  };
+
+  // `--hosted-server` serves one persistent workspace and an authenticated
+  // collaboration room on the same port. Every signed-in browser joins that
+  // room automatically, so two people opening the server get live CRDT edits,
+  // presence and shared generated assets instead of racing through plain disk
+  // writes. The room key is returned only by the authenticated API.
+  useEffect(() => {
+    if (!booted || hostedCollabStartedRef.current || collabRef.current) return;
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    if (!editor || !model || !activeTabPath || !isProjectTextPath(activeTabPath)) return;
+    hostedCollabStartedRef.current = true;
+    void fetch(`${API}/hosted/info`)
+      .then(async response => response.ok ? response.json() : null)
+      .then(async info => {
+        if (!info?.hosted || typeof info.room !== 'string' || typeof info.key !== 'string') return;
+        const url = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`;
+        await beginCollab(
+          { url, room: info.room, key: info.key },
+          info.mode === 'join' ? 'join' : 'host',
+          true,
+        );
+      })
+      .catch(() => {
+        // Ordinary desktop mode has no hosted session; a failed probe must not
+        // affect local editing. Permit a later editor mount to retry only when
+        // no collaboration was created.
+        if (!collabRef.current) hostedCollabStartedRef.current = false;
+      });
+  }, [booted, activeTabPath, editorEpoch]); // eslint-disable-line react-hooks/exhaustive-deps
+
   useEffect(() => () => {
     projectSessionRef.current?.sync.stop();
     projectSessionRef.current?.transfer.close();
@@ -4706,7 +5493,9 @@ export default function App() {
     return () => window.cancelAnimationFrame(frame);
   }, [activeTabPath, collab?.room, editorEpoch]);
 
-  const copyToClipboard = (text: string) => navigator.clipboard.writeText(text);
+  const copyToClipboard = async (text: string) => {
+    if (!await writeClipboard(text)) notify('Could not reach the system clipboard.');
+  };
 
   // Which Typst it found, where, and the last few thousand lines of what the
   // engine has been doing. Windows in particular gives a windowed app nowhere to
@@ -4715,10 +5504,12 @@ export default function App() {
     try {
       const res = await fetch(`${API}/diagnostics`);
       if (!res.ok) throw new Error(`${res.status}`);
-      await navigator.clipboard.writeText(await res.text());
+      if (!await writeClipboard(await res.text())) throw new Error('clipboard-unavailable');
       notify('Diagnostics copied — paste them into the issue.');
-    } catch {
-      notify('Could not collect diagnostics.');
+    } catch (error) {
+      notify(error instanceof Error && error.message === 'clipboard-unavailable'
+        ? 'Diagnostics were collected, but the system clipboard was unavailable.'
+        : 'Could not collect diagnostics.');
     }
   };
   const collectDirPaths = (nodes: FileNode[], acc: string[] = []): string[] => {
@@ -4736,8 +5527,13 @@ export default function App() {
     try {
       const res = await fetch(`${API}/workspace/root`);
       const { root } = await res.json();
-      navigator.clipboard.writeText(`${root}/${path}`);
-    } catch {}
+      const separator = String(root).includes('\\') ? '\\' : '/';
+      const cleanRoot = String(root).replace(/[\\/]+$/, '');
+      const displayPath = separator === '\\' ? path.replaceAll('/', '\\') : path;
+      if (!await writeClipboard(`${cleanRoot}${separator}${displayPath}`)) {
+        notify('Could not reach the system clipboard.');
+      }
+    } catch { notify('Could not copy the absolute path.'); }
   };
 
   const formatActiveDocument = async () => {
@@ -4779,6 +5575,53 @@ export default function App() {
     }
   };
 
+  const finishRecoveryConflict = (key: string) => {
+    setRecoveryConflicts(prev => {
+      const next = prev.filter(conflict => conflict.draft.key !== key);
+      if (!next.length) setShowRecoveryDrafts(false);
+      return next;
+    });
+  };
+
+  const recoverLocalDraft = (conflict: RecoveryConflict) => {
+    openRecoveredDraft(conflict.draft, conflict.disk.hash);
+    finishRecoveryConflict(conflict.draft.key);
+    notify(`Opened the local recovery copy of ${conflict.draft.path}. Save to replace the server version.`, 'info');
+  };
+
+  const useServerInsteadOfDraft = (conflict: RecoveryConflict) => {
+    void removeEmergencyDraft(conflict.draft.workspace, conflict.draft.path, conflict.draft.content);
+    finishRecoveryConflict(conflict.draft.key);
+    notify(`Kept the server copy of ${conflict.draft.path}.`, 'success');
+  };
+
+  const hasUnsavedChanges = tabs.some(tab => tab.isDirty);
+  const workspaceStatus = useMemo(() => deriveWorkspaceStatus({
+    backendReady,
+    hasDirty: hasUnsavedChanges,
+    activeSaves,
+    recovery: recoverySaveState,
+    saveError,
+    externalConflict: !!externalConflict,
+    isCompiling,
+    compileStalled,
+    compileError,
+    collaboration: collab ? {
+      status: collab.status,
+      peers: collab.peers,
+      transferring: collab.transferring,
+    } : null,
+  }), [backendReady, hasUnsavedChanges, activeSaves, recoverySaveState, saveError,
+    externalConflict, isCompiling, compileStalled, compileError, collab]);
+
+  const openWorkspaceStatus = () => {
+    if (workspaceStatus.action === 'collaboration') setShowDriveSync(true);
+    if (workspaceStatus.action === 'problems') {
+      setPanels(current => ({ ...current, preview: true }));
+      setPreviewTab('problems');
+    }
+  };
+
   // Everything reachable from the menus, exposed to the ⌘K palette. Built on
   // open (not memoised) so each command closes over current state.
   const paletteCommands = (): PaletteCommand[] => [
@@ -4803,6 +5646,8 @@ export default function App() {
     { category: 'Edit', title: 'Comment / Uncomment Lines', hint: IS_MAC ? '⌘/' : 'Ctrl+/', run: toggleComment },
     { category: 'Edit', title: 'Toggle Numbering (at cursor)', hint: '⌘⇧N', run: toggleNumbering },
     { category: 'Edit', title: 'Toggle Equation Numbering (all)', run: toggleEquationNumbering },
+    { category: 'Edit', title: 'Customize Toolbar...', run: () => setShowToolbarPreferences(true) },
+    ...(recoveryConflicts.length ? [{ category: 'Edit', title: `Review Local Recovery Copies (${recoveryConflicts.length})...`, run: () => setShowRecoveryDrafts(true) }] : []),
     { category: 'Edit', title: 'Document Settings...', run: () => setShowEditSettings(true) },
     { category: 'File', title: 'New Window', run: openNewWindow },
     { category: 'Collaborate', title: 'Share this project live (experimental)…', run: hostCollab },
@@ -4837,9 +5682,10 @@ export default function App() {
     ...(collab ? [{
       category: 'Collaborate',
       title: 'Copy collaboration invitation',
-      run: () => navigator.clipboard.writeText(collab.ticket)
-        .then(() => notify('Collaboration invitation copied.', 'success'))
-        .catch(() => notify('Could not copy the collaboration invitation.')),
+      run: async () => {
+        const copied = await writeClipboard(collab.ticket);
+        notify(copied ? 'Collaboration invitation copied.' : 'Could not copy the collaboration invitation.', copied ? 'success' : 'error');
+      },
     }] : []),
     ...(collab ? [{ category: 'Collaborate', title: 'Leave the shared project', run: stopCollab }] : []),
     { category: 'View', title: 'Toggle Sidebar', run: toggleSidebar },
@@ -4928,7 +5774,7 @@ export default function App() {
   ];
 
   return (
-    <div className="app-container" onClick={() => { setActiveMenu(null); setColorPopAt(null); setHighlightPopAt(null); setFontSizePopAt(null); setContextMenu(null); }} onContextMenu={() => setContextMenu(null)}>
+    <div className="app-container" onClick={() => { setActiveMenu(null); setColorPopAt(null); setHighlightPopAt(null); setFontSizePopAt(null); setContextMenu(null); setEditorMenu(null); }} onContextMenu={() => { setActiveMenu(null); setColorPopAt(null); setHighlightPopAt(null); setFontSizePopAt(null); setContextMenu(null); setEditorMenu(null); }}>
       <Toaster />
       {externalConflict && (
         <ExternalChangeModal
@@ -4998,6 +5844,10 @@ export default function App() {
                   <div className="dropdown-item" onClick={() => { editorRef.current?.trigger('menu', 'undo', null); setActiveMenu(null); }}>Undo</div>
                   <div className="dropdown-item" onClick={() => { editorRef.current?.trigger('menu', 'redo', null); setActiveMenu(null); }}>Redo</div>
                   <div className="dropdown-divider"></div>
+                  <div className="dropdown-item" onClick={() => { if (editorRef.current) void cutEditorSelection(editorRef.current); setActiveMenu(null); }}>Cut <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{IS_MAC ? '⌘X' : 'Ctrl+X'}</span></div>
+                  <div className="dropdown-item" onClick={() => { if (editorRef.current) void copyEditorSelection(editorRef.current); setActiveMenu(null); }}>Copy <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{IS_MAC ? '⌘C' : 'Ctrl+C'}</span></div>
+                  <div className="dropdown-item" onClick={() => { if (editorRef.current) void pasteEditorClipboard(editorRef.current); setActiveMenu(null); }}>Paste <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{IS_MAC ? '⌘V' : 'Ctrl+V'}</span></div>
+                  <div className="dropdown-divider"></div>
                   <div className="dropdown-item" onClick={() => { editorRef.current?.getAction('actions.find')?.run(); setActiveMenu(null); }}>Find...</div>
                   <div className="dropdown-item" onClick={() => { editorRef.current?.getAction('editor.action.startFindReplaceAction')?.run(); setActiveMenu(null); }}>Find &amp; Replace...</div>
                   <div className="dropdown-divider"></div>
@@ -5012,6 +5862,13 @@ export default function App() {
                   <div className="dropdown-divider"></div>
                   <div className="dropdown-item" onClick={() => { toggleNumbering(); setActiveMenu(null); }}>Toggle Numbering (at cursor) <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧N</span></div>
                   <div className="dropdown-item" onClick={() => { toggleEquationNumbering(); setActiveMenu(null); }}>Toggle Equation Numbering (all)</div>
+                  <div className="dropdown-divider"></div>
+                  <div className="dropdown-item" onClick={() => { setShowToolbarPreferences(true); setActiveMenu(null); }}>Customize Toolbar...</div>
+                  {recoveryConflicts.length > 0 && (
+                    <div className="dropdown-item" onClick={() => { setShowRecoveryDrafts(true); setActiveMenu(null); }}>
+                      Review Local Recovery Copies <span style={{ marginLeft: 'auto', opacity: 0.65 }}>{recoveryConflicts.length}</span>
+                    </div>
+                  )}
                   <div className="dropdown-item" onClick={() => { setShowEditSettings(true); setActiveMenu(null); }}>Document Settings...</div>
                 </div>
               )}
@@ -5240,23 +6097,49 @@ export default function App() {
           </div>
         </div>
 
-        {editingTitle ? (
-          <input
-            className="project-title-input"
-            autoFocus
-            defaultValue={projectName}
-            onClick={(e) => e.stopPropagation()}
-            onBlur={(e) => { const v = e.target.value.trim(); if (v) setProjectName(v); setEditingTitle(false); }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') { const v = (e.target as HTMLInputElement).value.trim(); if (v) setProjectName(v); setEditingTitle(false); }
-              if (e.key === 'Escape') setEditingTitle(false);
-            }}
-          />
-        ) : (
-          <div className="project-title" title="Click to rename project" onClick={(e) => { e.stopPropagation(); setEditingTitle(true); }}>
-            {projectName} <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
-          </div>
-        )}
+        <div className="project-center">
+          {editingTitle ? (
+            <input
+              className="project-title-input"
+              autoFocus
+              defaultValue={projectName}
+              onClick={(e) => e.stopPropagation()}
+              onBlur={(e) => { const v = e.target.value.trim(); if (v) setProjectName(v); setEditingTitle(false); }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') { const v = (e.target as HTMLInputElement).value.trim(); if (v) setProjectName(v); setEditingTitle(false); }
+                if (e.key === 'Escape') setEditingTitle(false);
+              }}
+            />
+          ) : (
+            <div className="project-title" title="Click to rename project" onClick={(e) => { e.stopPropagation(); setEditingTitle(true); }}>
+              {projectName} <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+            </div>
+          )}
+          {workspaceStatus.action ? (
+            <button
+              type="button"
+              className={`workspace-status ${workspaceStatus.tone} actionable`}
+              title={`${workspaceStatus.label}. ${workspaceStatus.detail}`}
+              aria-label={`${workspaceStatus.label}. ${workspaceStatus.detail}`}
+              aria-busy={workspaceStatus.busy}
+              onClick={(event) => { event.stopPropagation(); openWorkspaceStatus(); }}
+            >
+              <span className="workspace-status-dot" aria-hidden="true" />
+              <span className="workspace-status-label">{workspaceStatus.label}</span>
+            </button>
+          ) : (
+            <span
+              className={`workspace-status ${workspaceStatus.tone}`}
+              title={`${workspaceStatus.label}. ${workspaceStatus.detail}`}
+              aria-label={`${workspaceStatus.label}. ${workspaceStatus.detail}`}
+              aria-live="polite"
+              aria-busy={workspaceStatus.busy}
+            >
+              <span className="workspace-status-dot" aria-hidden="true" />
+              <span className="workspace-status-label">{workspaceStatus.label}</span>
+            </span>
+          )}
+        </div>
 
         <div className="header-right">
           {collab && (
@@ -5320,17 +6203,17 @@ export default function App() {
 
       <div className="toolbar">
         <div className="toolbar-group">
-          <button className="tool-btn" onClick={toggleSidebar} title="Toggle Sidebar">
+          {toolbarToolVisible('sidebar') && <button className="tool-btn" onClick={toggleSidebar} title="Toggle Sidebar">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="9" y1="3" x2="9" y2="21"></line></svg>
-          </button>
+          </button>}
           
-          <button className="tool-btn" onClick={() => editorRef.current?.trigger('source', 'undo', null)} title="Undo"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="9 14 4 9 9 4"></polyline><path d="M20 20v-7a4 4 0 0 0-4-4H4"></path></svg></button>
-          <button className="tool-btn" onClick={() => editorRef.current?.trigger('source', 'redo', null)} title="Redo"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="15 14 20 9 15 4"></polyline><path d="M4 20v-7a4 4 0 0 1 4-4h12"></path></svg></button>
-          <div className="toolbar-divider"></div>
-          <button className="tool-btn" onClick={() => wrapSelection('*', '*')} title="Bold  (⌘B)"><b>B</b></button>
-          <button className="tool-btn" onClick={() => wrapSelection('_', '_')} title="Italic  (⌘I)"><i>I</i></button>
-          <button className="tool-btn" onClick={() => wrapSelection('#underline[', ']')} title="Underline — for a coloured/offset underline use Formatting ▸ Underline…"><span style={{ textDecoration: 'underline' }}>U</span></button>
-          <button className="tool-btn" title="Text size — resize the selected text"
+          {toolbarToolVisible('undo') && <button className="tool-btn" onClick={() => editorRef.current?.trigger('source', 'undo', null)} title="Undo"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="9 14 4 9 9 4"></polyline><path d="M20 20v-7a4 4 0 0 0-4-4H4"></path></svg></button>}
+          {toolbarToolVisible('redo') && <button className="tool-btn" onClick={() => editorRef.current?.trigger('source', 'redo', null)} title="Redo"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="15 14 20 9 15 4"></polyline><path d="M4 20v-7a4 4 0 0 1 4-4h12"></path></svg></button>}
+          {toolbarDividerBefore('text') && <div className="toolbar-divider"></div>}
+          {toolbarToolVisible('bold') && <button className="tool-btn" onClick={() => wrapSelection('*', '*')} title="Bold  (⌘B)"><b>B</b></button>}
+          {toolbarToolVisible('italic') && <button className="tool-btn" onClick={() => wrapSelection('_', '_')} title="Italic  (⌘I)"><i>I</i></button>}
+          {toolbarToolVisible('underline') && <button className="tool-btn" onClick={() => wrapSelection('#underline[', ']')} title="Underline — for a coloured/offset underline use Formatting ▸ Underline…"><span style={{ textDecoration: 'underline' }}>U</span></button>}
+          {toolbarToolVisible('font-size') && <button className="tool-btn" title="Text size — resize the selected text"
             onClick={(e) => {
               e.stopPropagation();
               const r = e.currentTarget.getBoundingClientRect();
@@ -5339,8 +6222,8 @@ export default function App() {
             }}>
             <span style={{ fontWeight: 700, letterSpacing: '-1px' }}><span style={{ fontSize: 15 }}>A</span><span style={{ fontSize: 10 }}>A</span></span>
             <span style={{ fontSize: 8, opacity: 0.7, marginLeft: 1 }}>▾</span>
-          </button>
-          {fontSizePopAt && (
+          </button>}
+          {toolbarToolVisible('font-size') && fontSizePopAt && (
             <div className="fontsize-menu" style={{ position: 'fixed', left: fontSizePopAt.x, top: fontSizePopAt.y }} onClick={e => e.stopPropagation()}>
               <div className="fontsize-menu-scroll">
                 {FONT_SIZE_PRESETS.map(s => (
@@ -5354,7 +6237,7 @@ export default function App() {
                 onClick={() => { setFontSizePopAt(null); setSelectionFontSizePrompt(); }}>Custom…</button>
             </div>
           )}
-          <button className="tool-btn" title="Text colour — pick a colour to apply to the selection"
+          {toolbarToolVisible('text-color') && <button className="tool-btn" title="Text colour — pick a colour to apply to the selection"
             onClick={(e) => {
               e.stopPropagation();
               const r = e.currentTarget.getBoundingClientRect();
@@ -5362,8 +6245,8 @@ export default function App() {
             }}>
             <span style={{ color: textColor, borderBottom: `2.5px solid ${textColor}`, lineHeight: 1.05 }}>A</span>
             <span style={{ fontSize: 8, opacity: 0.7, marginLeft: 1 }}>▾</span>
-          </button>
-          {colorPopAt && (
+          </button>}
+          {toolbarToolVisible('text-color') && colorPopAt && (
             <div className="color-pop" style={{ position: 'fixed', left: colorPopAt.x, top: colorPopAt.y }} onClick={e => e.stopPropagation()}>
               {TEXT_COLORS.map(c => (
                 <button key={c} className="color-swatch" style={{ background: c, boxShadow: c === textColor ? '0 0 0 2px var(--accent)' : 'none' }}
@@ -5380,7 +6263,7 @@ export default function App() {
               <button className="color-more" onClick={() => { setColorPopAt(null); insertTextColor(); }}>Full colour grid…</button>
             </div>
           )}
-          <button className="tool-btn" title="Highlight — mark the selection with a background colour"
+          {toolbarToolVisible('highlight') && <button className="tool-btn" title="Highlight — mark the selection with a background colour"
             onClick={(e) => {
               e.stopPropagation();
               const r = e.currentTarget.getBoundingClientRect();
@@ -5389,8 +6272,8 @@ export default function App() {
             }}>
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="M9 11l-6 6v3h3l6-6"></path><path d="M22 6l-4-4-9 9 4 4z"></path></svg>
             <span style={{ display: 'inline-block', width: 9, height: 9, borderRadius: 2, background: highlightColor, marginLeft: 2, border: '1px solid rgba(0,0,0,0.15)' }}></span>
-          </button>
-          {highlightPopAt && (
+          </button>}
+          {toolbarToolVisible('highlight') && highlightPopAt && (
             <div className="color-pop" style={{ position: 'fixed', left: highlightPopAt.x, top: highlightPopAt.y }} onClick={e => e.stopPropagation()}>
               {HIGHLIGHT_COLORS.map(c => (
                 <button key={c} className="color-swatch" style={{ background: c, boxShadow: c === highlightColor ? '0 0 0 2px var(--accent)' : 'none' }}
@@ -5407,41 +6290,37 @@ export default function App() {
               <button className="color-more" onClick={() => { setHighlightPopAt(null); insertHighlight(); }}>Full colour grid…</button>
             </div>
           )}
-          <div className="toolbar-divider"></div>
+          {toolbarDividerBefore('math') && <div className="toolbar-divider"></div>}
           {/* Math — the core of physics/maths note-taking */}
-          <button className="tool-btn" onClick={() => wrapSelection('$', '$')} title="Inline math — a symbol in running text   $x$   (⌘E)"><span style={{ fontFamily: "'iA Writer Mono', ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12.5, fontWeight: 600, letterSpacing: '-0.5px' }}>$x$</span></button>
-          <button className="tool-btn" onClick={insertMultilineEquation} title="Display / aligned equation (its own line)"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><rect x="3" y="5" width="18" height="14" rx="2.5"></rect><line x1="8" y1="10.5" x2="16" y2="10.5" strokeWidth="2"></line><line x1="8" y1="13.5" x2="16" y2="13.5" strokeWidth="2"></line></svg></button>
-          <button className="tool-btn" onClick={toggleEquationNumbering} title="Toggle equation numbering for the whole document  (1), (2), … on/off"><span style={{ fontWeight: 700, fontSize: 12.5, letterSpacing: '-0.5px' }}>(1)</span></button>
-          <button className="tool-btn" onClick={toggleThisEquationNumber} title="Number / un-number THIS equation (the selection or current line)"><span style={{ fontWeight: 700, fontSize: 14 }}>№</span></button>
-          <button className="tool-btn" onClick={() => wrapSelection('#align(center)[', ']')} title="Center the selection on the page"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="6"></line><line x1="21" y1="12" x2="3" y2="12"></line><line x1="18" y1="18" x2="6" y2="18"></line></svg></button>
-          <button className="tool-btn" onClick={() => setShowMatrixStudio(true)} title="Matrix — visual grid editor  (⌘⇧M)"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9"><path d="M7 3H4v18h3"></path><path d="M17 3h3v18h-3"></path><circle cx="9.5" cy="9" r="1.15" fill="currentColor" stroke="none"></circle><circle cx="14.5" cy="9" r="1.15" fill="currentColor" stroke="none"></circle><circle cx="9.5" cy="15" r="1.15" fill="currentColor" stroke="none"></circle><circle cx="14.5" cy="15" r="1.15" fill="currentColor" stroke="none"></circle></svg></button>
-          <button className="tool-btn" onClick={() => setShowSymbolPicker(true)} title="Greek &amp; physics symbols  (⌘⇧P)"><b style={{ fontSize: 15 }}>Ω</b></button>
-          <button className="tool-btn" onClick={() => setShowSymbolDraw(true)} title="Draw a symbol → find its Typst name (sketch it with the mouse)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 19l7-7 3 3-7 7-3-3z"></path><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"></path><path d="M2 2l7.586 7.586"></path><circle cx="11" cy="11" r="2"></circle></svg></button>
-          <div className="toolbar-divider"></div>
+          {toolbarToolVisible('inline-math') && <button className="tool-btn" onClick={() => wrapSelection('$', '$')} title="Inline math — a symbol in running text   $x$   (⌘E)"><span style={{ fontFamily: "'iA Writer Mono', ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12.5, fontWeight: 600, letterSpacing: '-0.5px' }}>$x$</span></button>}
+          {toolbarToolVisible('display-equation') && <button className="tool-btn" onClick={insertMultilineEquation} title="Display / aligned equation (its own line)"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><rect x="3" y="5" width="18" height="14" rx="2.5"></rect><line x1="8" y1="10.5" x2="16" y2="10.5" strokeWidth="2"></line><line x1="8" y1="13.5" x2="16" y2="13.5" strokeWidth="2"></line></svg></button>}
+          {toolbarToolVisible('equation-numbering') && <button className="tool-btn" onClick={toggleEquationNumbering} title="Toggle equation numbering for the whole document  (1), (2), … on/off"><span style={{ fontWeight: 700, fontSize: 12.5, letterSpacing: '-0.5px' }}>(1)</span></button>}
+          {toolbarToolVisible('single-equation-number') && <button className="tool-btn" onClick={toggleThisEquationNumber} title="Number / un-number THIS equation (the selection or current line)"><span style={{ fontWeight: 700, fontSize: 14 }}>№</span></button>}
+          {toolbarToolVisible('center') && <button className="tool-btn" onClick={() => wrapSelection('#align(center)[', ']')} title="Center the selection on the page"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="6"></line><line x1="21" y1="12" x2="3" y2="12"></line><line x1="18" y1="18" x2="6" y2="18"></line></svg></button>}
+          {toolbarToolVisible('matrix') && <button className="tool-btn" onClick={() => setShowMatrixStudio(true)} title="Matrix — visual grid editor  (⌘⇧M)"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9"><path d="M7 3H4v18h3"></path><path d="M17 3h3v18h-3"></path><circle cx="9.5" cy="9" r="1.15" fill="currentColor" stroke="none"></circle><circle cx="14.5" cy="9" r="1.15" fill="currentColor" stroke="none"></circle><circle cx="9.5" cy="15" r="1.15" fill="currentColor" stroke="none"></circle><circle cx="14.5" cy="15" r="1.15" fill="currentColor" stroke="none"></circle></svg></button>}
+          {toolbarToolVisible('symbols') && <button className="tool-btn" onClick={() => setShowSymbolPicker(true)} title="Greek &amp; physics symbols  (⌘⇧P)"><b style={{ fontSize: 15 }}>Ω</b></button>}
+          {toolbarToolVisible('draw-symbol') && <button className="tool-btn" onClick={() => setShowSymbolDraw(true)} title="Draw a symbol → find its Typst name (sketch it with the mouse)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 19l7-7 3 3-7 7-3-3z"></path><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"></path><path d="M2 2l7.586 7.586"></path><circle cx="11" cy="11" r="2"></circle></svg></button>}
+          {toolbarDividerBefore('structure') && <div className="toolbar-divider"></div>}
           {/* Structure */}
-          <button className="tool-btn" onClick={insertHeading} title="Heading / section"><b style={{ fontSize: 14 }}>H</b></button>
-          <button className="tool-btn" onClick={() => makeList('-')} title="Bullet list"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><circle cx="3.5" cy="6" r="1.2" fill="currentColor"></circle><circle cx="3.5" cy="12" r="1.2" fill="currentColor"></circle><circle cx="3.5" cy="18" r="1.2" fill="currentColor"></circle></svg></button>
-          <button className="tool-btn" onClick={() => makeList('+')} title="Numbered list"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="10" y1="6" x2="21" y2="6"></line><line x1="10" y1="12" x2="21" y2="12"></line><line x1="10" y1="18" x2="21" y2="18"></line><text x="2" y="8" fontSize="7" fill="currentColor" stroke="none">1</text><text x="2" y="14" fontSize="7" fill="currentColor" stroke="none">2</text><text x="2" y="20" fontSize="7" fill="currentColor" stroke="none">3</text></svg></button>
-          <div className="toolbar-divider"></div>
+          {toolbarToolVisible('heading') && <button className="tool-btn" onClick={insertHeading} title="Heading / section"><b style={{ fontSize: 14 }}>H</b></button>}
+          {toolbarToolVisible('bullet-list') && <button className="tool-btn" onClick={() => makeList('-')} title="Bullet list"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><circle cx="3.5" cy="6" r="1.2" fill="currentColor"></circle><circle cx="3.5" cy="12" r="1.2" fill="currentColor"></circle><circle cx="3.5" cy="18" r="1.2" fill="currentColor"></circle></svg></button>}
+          {toolbarToolVisible('numbered-list') && <button className="tool-btn" onClick={() => makeList('+')} title="Numbered list"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="10" y1="6" x2="21" y2="6"></line><line x1="10" y1="12" x2="21" y2="12"></line><line x1="10" y1="18" x2="21" y2="18"></line><text x="2" y="8" fontSize="7" fill="currentColor" stroke="none">1</text><text x="2" y="14" fontSize="7" fill="currentColor" stroke="none">2</text><text x="2" y="20" fontSize="7" fill="currentColor" stroke="none">3</text></svg></button>}
+          {toolbarDividerBefore('objects') && <div className="toolbar-divider"></div>}
           {/* Figures, tables, references */}
-          <button className="tool-btn" onClick={wrapInFigure} title="Figure — image with caption &amp; number"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="14" rx="1"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 13 16 9 5 17"></polyline><line x1="7" y1="21" x2="17" y2="21"></line></svg></button>
-          <button className="tool-btn" onClick={insertTable} title="Table"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="1"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="3" y1="15" x2="21" y2="15"></line><line x1="9" y1="3" x2="9" y2="21"></line></svg></button>
-          <button className="tool-btn" onClick={insertLabel} title="Add label / tag (anchor) — reference it later with @name"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"></path><line x1="7" y1="7" x2="7.01" y2="7"></line></svg></button>
-          <button className="tool-btn" onClick={insertCrossRef} title="Cross-reference a labelled equation / figure / section  (@)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg></button>
-          <div className="toolbar-divider"></div>
-          <button className="tool-btn" onClick={insertCodeBlock} title="Code block — insert a fenced ``` code block"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg></button>
-          <button className="tool-btn" onClick={() => runNotebook()} disabled={notebookRunning} title="Run Notebook — execute every ```python / ```julia block in this file as one session (variables persist), output written below each block"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="8 6 3 12 8 18"></polyline><polyline points="16 6 21 12 16 18"></polyline><line x1="13" y1="4" x2="11" y2="20"></line></svg>{notebookRunning && <span className="spinner" style={{ marginLeft: 4 }} />}</button>
+          {toolbarToolVisible('figure') && <button className="tool-btn" onClick={wrapInFigure} title="Figure — image with caption &amp; number"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="14" rx="1"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 13 16 9 5 17"></polyline><line x1="7" y1="21" x2="17" y2="21"></line></svg></button>}
+          {toolbarToolVisible('table') && <button className="tool-btn" onClick={insertTable} title="Table"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="1"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="3" y1="15" x2="21" y2="15"></line><line x1="9" y1="3" x2="9" y2="21"></line></svg></button>}
+          {toolbarToolVisible('label') && <button className="tool-btn" onClick={insertLabel} title="Add label / tag (anchor) — reference it later with @name"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"></path><line x1="7" y1="7" x2="7.01" y2="7"></line></svg></button>}
+          {toolbarToolVisible('cross-reference') && <button className="tool-btn" onClick={insertCrossRef} title="Cross-reference a labelled equation / figure / section  (@)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg></button>}
+          {toolbarDividerBefore('code') && <div className="toolbar-divider"></div>}
+          {toolbarToolVisible('code-block') && <button className="tool-btn" onClick={insertCodeBlock} title="Code block — insert a fenced ``` code block"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg></button>}
+          {toolbarToolVisible('run-notebook') && <button className="tool-btn" onClick={() => runNotebook()} disabled={notebookRunning} title="Run Notebook — execute every ```python / ```julia block in this file as one session (variables persist), output written below each block"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="8 6 3 12 8 18"></polyline><polyline points="16 6 21 12 16 18"></polyline><line x1="13" y1="4" x2="11" y2="20"></line></svg>{notebookRunning && <span className="spinner" style={{ marginLeft: 4 }} />}</button>}
         </div>
 
         <div className="toolbar-group">
-          <button className="tool-btn" onClick={saveActiveFile} title="Save (⌘S)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg></button>
-          <div style={{ display: 'flex', alignItems: 'center', marginLeft: '4px', marginRight: '8px' }} title={isCompiling ? 'Compiling…' : problems.some(p => p.severity === 'error') ? `${problems.filter(p => p.severity === 'error').length} error(s)` : 'No problems'}>
-            {isCompiling ? <div className="status-dot compiling"></div> : problems.some(p => p.severity === 'error') ? <div className="status-dot error"></div> : <div className="status-dot"></div>}
-          </div>
-
-          <button className="tool-btn primary" title={`Force Compile ${currentMain}`} onClick={() => compileTypst(currentMain)}>
+          {toolbarToolVisible('save') && <button className="tool-btn" onClick={saveActiveFile} title="Save (⌘S)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg></button>}
+          {toolbarToolVisible('recompile') && <button className="tool-btn primary" title={`Force Compile ${currentMain}`} onClick={() => compileTypst(currentMain)}>
              Recompile
-          </button>
+          </button>}
         </div>
       </div>
 
@@ -5487,7 +6366,13 @@ export default function App() {
                     />
                   </div>
                 )}
-                <div className="file-tree" tabIndex={0} style={{ flex: 1, overflowY: 'auto', outline: 'none' }} onKeyDown={handleFileTreeKeyDown} onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setContextMenu({ x: e.clientX, y: e.clientY, type: 'empty' }); }} onClick={() => { setSelectedPaths([]); setLastSelectedPath(null); }} onDragEnter={handleDragEnter} onDragOver={handleDragOver} onDrop={e => handleDrop(e, '')}>
+                <div className="file-tree" ref={fileTreeElRef} tabIndex={0} style={{ flex: 1, overflowY: 'auto', outline: 'none' }} onScroll={(event) => {
+                  // A direct DOM read avoids a React state update on every wheel
+                  // tick. The existing 500 ms session debounce collapses writes.
+                  if (pendingTreeRestoreRef.current) return;
+                  sessionRef.current.treeScrollTop = event.currentTarget.scrollTop;
+                  scheduleSaveSession();
+                }} onKeyDown={handleFileTreeKeyDown} onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setActiveMenu(null); setEditorMenu(null); setContextMenu({ x: e.clientX, y: e.clientY, type: 'empty' }); }} onClick={() => { setSelectedPaths([]); setLastSelectedPath(null); }} onDragEnter={handleDragEnter} onDragOver={handleDragOver} onDrop={e => handleDrop(e, '')}>
                   {treeJsx}
                 </div>
               </div>
@@ -5496,7 +6381,7 @@ export default function App() {
               {/* A divider only earns its place between two visible sections,
                   and only when the one above it is the fixed-height one. */}
               {panels.tree && stretchSection !== 'tree' && (panels.outline || panels.problems) && (
-              <div className="resizer-h" onMouseDown={(e) => {
+              <div className="resizer-h" onPointerDown={(e) => {
                 e.preventDefault();
                 isResizingTree.current = true;
                 document.body.style.cursor = 'row-resize';
@@ -5523,7 +6408,7 @@ export default function App() {
               )}
 
               {panels.problems && (panels.tree || panels.outline) && (
-              <div className="resizer-h" onMouseDown={(e) => {
+              <div className="resizer-h" onPointerDown={(e) => {
                 e.preventDefault();
                 isResizingProblems.current = true;
                 problemsResizeStart.current = { y: e.clientY, height: problemsHeight };
@@ -5573,7 +6458,7 @@ export default function App() {
                 App Settings
               </div>
             </div>
-            <div className="resizer" onMouseDown={(e) => {
+            <div className="resizer" onPointerDown={(e) => {
               e.preventDefault();
               isResizingSidebar.current = true;
               document.body.style.cursor = 'col-resize';
@@ -5624,7 +6509,7 @@ export default function App() {
                 const RASTER_EXT = ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif'];
                 const rawSrc = assetUrl || '';
                 if ((RASTER_EXT.includes(ext) || ext === 'svg' || ext === 'pdf') && !rawSrc) {
-                  return <div className="empty-state">Loading {activeTabPath}…</div>;
+                  return <div className="empty-state">{assetPreviewError || `Loading ${activeTabPath}…`}</div>;
                 }
                 if (RASTER_EXT.includes(ext)) {
                   return (
@@ -5687,6 +6572,7 @@ export default function App() {
                         // so the dialog came straight back, every save, forever.
                         const response = await fetch(`${API}/workspace/file?path=${encodeURIComponent(activeTabPath)}`, { method: 'POST', body: jsonContent });
                         const saved = await response.json().catch(() => ({} as any));
+                        if (!response.ok) throw new Error(saved.error || `Could not save ${activeTabPath}`);
                         if (saved.hash) lastWrittenRef.current.set(activeTabPath, { content: jsonContent, hash: saved.hash });
                         await mirrorLocalPath(activeTabPath);
                         setTabs(prev => prev.map(t => t.path === activeTabPath
@@ -5695,7 +6581,8 @@ export default function App() {
 
                         // Automatically save the .svg file next to it for embedding in Typst!
                         const svgPath = activeTabPath.replace(/\.excalidraw$/, '.svg');
-                        await fetch(`${API}/workspace/upload?path=${encodeURIComponent(svgPath)}`, { method: 'POST', body: svgBlob, headers: { 'Content-Type': 'application/octet-stream' } });
+                        const svgResponse = await fetch(`${API}/workspace/upload?path=${encodeURIComponent(svgPath)}`, { method: 'POST', body: svgBlob, headers: { 'Content-Type': 'application/octet-stream' } });
+                        if (!svgResponse.ok) throw new Error(`Could not save ${svgPath}`);
                         await mirrorLocalPath(svgPath);
                         fetchTree(); // Refresh tree so the SVG appears
                         // The document embeds that SVG, so it has to be built
@@ -5736,6 +6623,29 @@ export default function App() {
                     onMount={(e, monacoInstance) => {
                       (window as any).logTiming('Monaco ready');
                       editorRef.current = e;
+                      // Right-click opens Hilbert's own editor menu. Clicking
+                      // outside the selection moves the caret first, the way
+                      // every editor does, so Cut and Copy act on the line the
+                      // menu was opened over rather than wherever the caret
+                      // happened to be.
+                      const editorDom = e.getDomNode();
+                      const openEditorMenu = (ev: MouseEvent) => {
+                        ev.preventDefault();
+                        ev.stopPropagation();
+                        setActiveMenu(null);
+                        setContextMenu(null);
+                        const position = e.getTargetAtClientPoint(ev.clientX, ev.clientY)?.position;
+                        const inSelection = position && (e.getSelections() || [])
+                          .some(s => !s.isEmpty() && s.containsPosition(position));
+                        if (position && !inSelection) e.setPosition(position);
+                        e.focus();
+                        setEditorMenu({ x: ev.clientX, y: ev.clientY });
+                      };
+                      editorDom?.addEventListener('contextmenu', openEditorMenu);
+                      e.onDidDispose(() => {
+                        editorDom?.removeEventListener('contextmenu', openEditorMenu);
+                        if (editorRef.current === e) editorRef.current = null;
+                      });
                       // Tell anything holding the old editor that this one replaced it.
                       setEditorEpoch(n => n + 1);
                       // Remember cursor position for session restore (debounced write)
@@ -5840,7 +6750,7 @@ export default function App() {
           </div>
         </div>
         {panels.editor && panels.preview && (
-        <div className="resizer" onMouseDown={(e) => {
+        <div className="resizer" onPointerDown={(e) => {
           e.preventDefault();
           isResizingEditor.current = true;
           document.body.style.cursor = 'col-resize';
@@ -5852,7 +6762,15 @@ export default function App() {
             {/* PDF stays mounted whenever it exists, so its scroll/zoom survive
                 switching to the Problems view and back. */}
             {pdfUrl && (
-              <PdfPreview ref={pdfRef} url={pdfUrl} onReverseSync={reverseSync} onWordCount={handlePdfWordCount} downloadName={`${(projectName || 'document').replace(/\s+/g, '_')}.pdf`} />
+              <PdfPreview
+                ref={pdfRef}
+                url={pdfUrl}
+                onReverseSync={reverseSync}
+                onWordCount={handlePdfWordCount}
+                downloadName={`${(projectName || 'document').replace(/\s+/g, '_')}.pdf`}
+                initialViewState={restoredPdfView}
+                onViewStateChange={handlePdfViewState}
+              />
             )}
             {!pdfUrl && !compileError && (
               <div className="empty-preview">{isCompiling ? 'Generating PDF…' : 'Nothing to preview yet — write some Typst and it renders here.'}</div>
@@ -5942,13 +6860,6 @@ export default function App() {
             return `${errs} error${errs === 1 ? '' : 's'}${rest ? `, ${rest} other${rest === 1 ? '' : 's'}` : ''}`;
           })()}
         </button>
-        {/* Always mounted: toggling visibility instead of unmounting keeps the
-            panel switches from shifting sideways on every recompile. */}
-        <span
-          className="status-note"
-          style={{ visibility: isCompiling ? 'visible' : 'hidden' }}
-          title={compileStalled ? "Typst has been asked to compile and hasn't answered yet. Saving still works." : undefined}
-        >{compileStalled ? 'Compiling… still waiting on Typst' : 'Compiling…'}</span>
         <span className="status-sep" />
         {LEFT_PANEL_KEYS.map(renderPanelToggle)}
         <span style={{ flex: 1 }} />
@@ -5989,6 +6900,17 @@ export default function App() {
       {showEqGallery && <Suspense fallback={null}><EquationGallery onClose={() => setShowEqGallery(false)} onInsert={insertEqTemplate} /></Suspense>}
       {showPhysics && <Suspense fallback={null}><PhysicsGallery onClose={() => setShowPhysics(false)} onInsert={insertPhysicsTemplate} /></Suspense>}
       {showHelp && <Suspense fallback={null}><HelpModal onClose={() => setShowHelp(false)} /></Suspense>}
+      {showToolbarPreferences && <Suspense fallback={null}><ToolbarPreferencesModal
+        hidden={hiddenToolbarTools}
+        onChange={hidden => setHiddenToolbarTools(normalizeHiddenToolbarTools(hidden))}
+        onClose={() => setShowToolbarPreferences(false)}
+      /></Suspense>}
+      {showRecoveryDrafts && recoveryConflicts.length > 0 && <Suspense fallback={null}><RecoveryDraftModal
+        conflicts={recoveryConflicts}
+        onRecover={recoverLocalDraft}
+        onUseServer={useServerInsteadOfDraft}
+        onClose={() => setShowRecoveryDrafts(false)}
+      /></Suspense>}
       {showMatrixStudio && <Suspense fallback={null}><MatrixStudio onClose={() => setShowMatrixStudio(false)} onInsert={insertMatrixBody} /></Suspense>}
       {showImagePlacer && <Suspense fallback={null}><ImagePlacer onClose={() => setShowImagePlacer(false)} onEnsureImport={(imp) => { const m = editorRef.current?.getModel(); if (m && !m.getValue().includes(imp.trim())) insertAtTop(imp); }} onInsert={(code) => { if (typeof showImagePlacer === 'string') { const { editor, model, sel } = getSelectionCtx(''); if (sel && editor && model && !sel.isEmpty()) { editor.executeEdits('re-place', [{ range: sel, text: code, forceMoveMarkers: true }]); editor.focus(); } else insertCode(code); } else insertCode(code); fetchTree(); }} workspaceImages={workspaceImages} selectedCode={typeof showImagePlacer === 'string' ? showImagePlacer : undefined} /></Suspense>}
       {showFlowchart && <Suspense fallback={null}><FlowchartCoder onClose={() => setShowFlowchart(false)} onInsert={(code) => { if (code.includes('fc-result(')) ensureSetup('#let fc-result', '#let fc-result(v) = box(inset: (x: 9pt, y: 6pt), radius: 6pt, fill: rgb(238, 242, 255), stroke: 0.6pt + rgb(165, 180, 252))[*Result:* #v]'); insertCode(`\n${code}\n`); setShowFlowchart(false); }} onSaved={(path) => { void mirrorLocalPath(path); void fetchTree(); }} /></Suspense>}
@@ -6025,10 +6947,12 @@ export default function App() {
         onJoinLive={joinCollab}
         onCopyLiveInvite={() => {
           if (!collab) return;
-          navigator.clipboard.writeText(collab.ticket)
-            .then(() => notify('Collaboration invitation copied.', 'success'))
-            .catch(() => notify('Could not copy the collaboration invitation.'));
+          void writeClipboard(collab.ticket).then(ok => notify(
+            ok ? 'Collaboration invitation copied.' : 'Could not copy the collaboration invitation.',
+            ok ? 'success' : 'error',
+          ));
         }}
+        onRetryLive={retryCollab}
         onLeaveLive={stopCollab}
       /></Suspense>}
       {showAppSettings && <Suspense fallback={null}><AppSettingsModal onClose={() => setShowAppSettings(false)}
@@ -6094,6 +7018,10 @@ export default function App() {
 
       {showSymbolPicker && <Suspense fallback={null}><SymbolPicker onClose={() => setShowSymbolPicker(false)} onInsert={(code) => { insertCode(code + ' '); setShowSymbolPicker(false); }} /></Suspense>}
 
+      {editorMenu && editorRef.current && (
+        <EditorContextMenu at={editorMenu} editor={editorRef.current} onClose={() => setEditorMenu(null)} />
+      )}
+
       {contextMenu && (
         <div ref={contextMenuRef} className="context-menu dropdown" style={{ position: 'fixed', top: contextMenu.y, left: contextMenu.x, zIndex: 9999, display: 'block', maxHeight: 'calc(100vh - 12px)', overflowY: 'auto' }} onClick={e => e.stopPropagation()}>
           {contextMenu.type === 'empty' ? (
@@ -6103,13 +7031,8 @@ export default function App() {
               <div className="dropdown-divider"></div>
               <div className="dropdown-item" onClick={async () => {
                 if (!fileClipboard) return;
-                const to = fileClipboard.path.split('/').pop();
-                const response = await fetch(`${API}/workspace/${fileClipboard.type === 'cut' ? 'rename' : 'copy'}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: fileClipboard.path, to }) });
-                if (response.ok && to) {
-                  if (fileClipboard.type === 'cut') await mirrorLocalRename(fileClipboard.path, to);
-                  else await mirrorLocalCopy(fileClipboard.path, to);
-                }
-                fetchTree(); setContextMenu(null);
+                await pasteFileClipboard('');
+                setContextMenu(null);
               }}>Paste</div>
               <div className="dropdown-divider"></div>
               <div className="dropdown-item" onClick={() => { fetchTree(); setContextMenu(null); }}>Refresh</div>
@@ -6144,18 +7067,13 @@ export default function App() {
               <div className="dropdown-item" onClick={() => { handleRename(contextMenu.node!); setContextMenu(null); }}>Rename {selectedPaths.length > 1 ? `(${selectedPaths.length})` : ''}</div>
               <div className="dropdown-item" onClick={() => { handleDuplicate(contextMenu.node!); setContextMenu(null); }}>Duplicate {selectedPaths.length > 1 ? `(${selectedPaths.length})` : ''}</div>
               <div className="dropdown-divider"></div>
-              <div className="dropdown-item" onClick={() => { setFileClipboard({ path: selectedPaths[0], type: 'copy' }); setContextMenu(null); }}>Copy</div>
-              <div className="dropdown-item" onClick={() => { setFileClipboard({ path: selectedPaths[0], type: 'cut' }); setContextMenu(null); }}>Cut</div>
+              <div className="dropdown-item" onClick={() => { stageFileClipboard('copy'); setContextMenu(null); }}>Copy {selectedPaths.length > 1 ? `(${selectedPaths.length})` : ''}</div>
+              <div className="dropdown-item" onClick={() => { stageFileClipboard('cut'); setContextMenu(null); }}>Cut {selectedPaths.length > 1 ? `(${selectedPaths.length})` : ''}</div>
               <div className="dropdown-item" onClick={async () => {
                 if (!fileClipboard) return;
                 const dir = contextMenu.node!.type === 'directory' ? contextMenu.node!.path : (contextMenu.node!.path.includes('/') ? contextMenu.node!.path.substring(0, contextMenu.node!.path.lastIndexOf('/')) : '');
-                const toPath = dir ? `${dir}/${fileClipboard.path.split('/').pop()}` : fileClipboard.path.split('/').pop();
-                const response = await fetch(`${API}/workspace/${fileClipboard.type === 'cut' ? 'rename' : 'copy'}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: fileClipboard.path, to: toPath }) });
-                if (response.ok && toPath) {
-                  if (fileClipboard.type === 'cut') await mirrorLocalRename(fileClipboard.path, toPath);
-                  else await mirrorLocalCopy(fileClipboard.path, toPath);
-                }
-                fetchTree(); setContextMenu(null);
+                await pasteFileClipboard(dir);
+                setContextMenu(null);
               }}>Paste</div>
               <div className="dropdown-divider"></div>
               <div className="dropdown-item" onClick={() => {

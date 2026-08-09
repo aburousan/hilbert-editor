@@ -1,11 +1,23 @@
 import { memo, forwardRef, useEffect, useImperativeHandle, useRef, useState, type Ref } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 import { TextLayer } from 'pdfjs-dist';
-import { normalizeWord, bestMatch, type SyncPayload } from '../syncMatch';
+import { bestMatch, tokenizeRenderedText, type SyncPayload } from '../syncMatch';
+import { MAX_PDF_PAGE_WORD_INDEXES } from '../performanceLimits';
 
-export type PdfHandle = { revealSource(p: SyncPayload): boolean };
+export type PdfHandle = {
+  revealSource(p: SyncPayload): boolean;
+  revealPosition(position: NonNullable<SyncPayload['documentPosition']>): boolean;
+};
+export type PdfViewState = {
+  page: number;
+  fraction: number;
+  horizontal: number;
+  zoom: number;
+  dark: boolean;
+};
 
 type Slot = { div: HTMLDivElement; textDiv: HTMLDivElement; rendered: boolean };
+type WordIndex = { words: string[]; spans: HTMLElement[] };
 
 // Walk a text-layer subtree (a page, or the whole document) into a flat list of
 // normalized words in reading order, each paired with the span that holds it.
@@ -14,9 +26,9 @@ function collectSpanWords(root: ParentNode): { words: string[]; spans: HTMLEleme
   const spans: HTMLElement[] = [];
   root.querySelectorAll('.textLayer span').forEach((el) => {
     const txt = el.textContent || '';
-    for (const raw of txt.split(/\s+/)) {
-      const w = normalizeWord(raw);
-      if (w) { words.push(w); spans.push(el as HTMLElement); }
+    for (const word of tokenizeRenderedText(txt)) {
+      words.push(word);
+      spans.push(el as HTMLElement);
     }
   });
   return { words, spans };
@@ -26,6 +38,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.mi
 
 const DPR = Math.min(typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1, 2);
 const PRESETS = [50, 75, 90, 100, 110, 125, 150, 200, 300];
+const MAX_CACHED_SYNC_WORDS = 120_000;
 
 // Named paper sizes, in PDF points (1pt = 1/72"). Typst's built-in papers plus
 // the common US ones, matched orientation-independently so a landscape page
@@ -62,7 +75,14 @@ function paperLabel(w: number, h: number): string {
 // memo: the app re-renders on every keystroke; the preview only cares about `url`
 // (and onWordClick is a stable useCallback), so skip those renders entirely.
 function PdfPreview(
-  { url, onReverseSync, onWordCount, downloadName }: { url: string, onReverseSync: (p: SyncPayload) => void, onWordCount?: (n: number) => void, downloadName?: string },
+  { url, onReverseSync, onWordCount, downloadName, initialViewState, onViewStateChange }: {
+    url: string,
+    onReverseSync: (p: SyncPayload) => void,
+    onWordCount?: (n: number) => void,
+    downloadName?: string,
+    initialViewState?: PdfViewState,
+    onViewStateChange?: (state: PdfViewState) => void,
+  },
   ref: Ref<PdfHandle>,
 ) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -76,15 +96,28 @@ function PdfPreview(
   const slotsRef = useRef<Slot[]>([]);
   const scaleRef = useRef({ dScale: 1, renderScale: DPR });
   const aspectRef = useRef(1.414);
+  const reportViewStateRef = useRef<() => void>(() => {});
+  const setZoomRef = useRef<(zoom: number) => void>(() => {});
+  const documentWordIndexRef = useRef<{ pass: number; root: ParentNode; index: WordIndex } | null>(null);
+  // A small LRU. Page indexes are rebuilt from the text layer on demand, so
+  // retaining every page of a book only wastes memory.
+  const pageWordIndexesRef = useRef(new Map<ParentNode, { pass: number; index: WordIndex }>());
 
   // zoomFactor is relative to fit-width: 1 = fit, 1.2 = 120% of fit. Mirrored in a
   // ref so the (once-created) ResizeObserver reads the live value, not the zoom
   // captured when the effect first ran.
-  const [zoomFactor, setZoomFactor] = useState(1);
-  const zoomFactorRef = useRef(1);
+  const initialZoom = Number.isFinite(initialViewState?.zoom) && initialViewState!.zoom >= 0.25 && initialViewState!.zoom <= 8
+    ? initialViewState!.zoom
+    : 1;
+  const [zoomFactor, setZoomFactor] = useState(initialZoom);
+  const zoomFactorRef = useRef(initialZoom);
   const [rasterTick, setRasterTick] = useState(0);
-  const [dark, setDark] = useState(false);
+  const [dark, setDark] = useState(!!initialViewState?.dark);
+  const darkRef = useRef(!!initialViewState?.dark);
+  const initialViewRef = useRef(initialViewState);
+  const initialViewRestoredRef = useRef(false);
   const [pageInfo, setPageInfo] = useState<{ w: number; h: number } | null>(null);
+  const pageInfoRef = useRef<{ w: number; h: number } | null>(null);
 
   const displayScale = (w: number, z: number) => Math.max(0.15, Math.min(((w - 28) / docCache.current.naturalW) * z, 8));
 
@@ -130,6 +163,65 @@ function PdfPreview(
     return true;
   };
 
+  const captureViewState = (): PdfViewState | null => {
+    const scroll = scrollRef.current;
+    const anchor = captureAnchor();
+    if (!scroll || !anchor) return null;
+    const maxHorizontal = Math.max(0, scroll.scrollWidth - scroll.clientWidth);
+    return {
+      page: anchor.index,
+      fraction: Math.max(0, Math.min(1, anchor.frac)),
+      horizontal: maxHorizontal ? Math.max(0, Math.min(1, scroll.scrollLeft / maxHorizontal)) : 0,
+      zoom: zoomFactorRef.current,
+      dark: darkRef.current,
+    };
+  };
+
+  const reportViewState = () => {
+    if (!initialViewRestoredRef.current) return;
+    const state = captureViewState();
+    if (state) onViewStateChange?.(state);
+  };
+  reportViewStateRef.current = reportViewState;
+
+  // Apply the saved page-relative position once, after the first PDF has page
+  // boxes. A raw scrollTop is not durable: changing pane width changes every
+  // page height above it. Page + fraction survives window and monitor changes.
+  const restoreInitialView = () => {
+    if (initialViewRestoredRef.current) return false;
+    initialViewRestoredRef.current = true;
+    const saved = initialViewRef.current;
+    const scroll = scrollRef.current;
+    if (!saved || !scroll || !Number.isFinite(saved.page) || !Number.isFinite(saved.fraction)) return false;
+    const restored = restoreAnchor({
+      index: Math.max(0, Math.floor(saved.page)),
+      frac: Math.max(0, Math.min(1, saved.fraction)),
+    });
+    if (restored && Number.isFinite(saved.horizontal)) {
+      const maxHorizontal = Math.max(0, scroll.scrollWidth - scroll.clientWidth);
+      scroll.scrollLeft = Math.max(0, Math.min(1, saved.horizontal)) * maxHorizontal;
+    }
+    return restored;
+  };
+
+  // Scroll events are frequent; collapse them into one small session update
+  // after the gesture settles rather than making React render or writing on
+  // every trackpad tick.
+  useEffect(() => {
+    const scroll = scrollRef.current;
+    if (!scroll) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const changed = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => reportViewStateRef.current(), 140);
+    };
+    scroll.addEventListener('scroll', changed, { passive: true });
+    return () => {
+      clearTimeout(timer);
+      scroll.removeEventListener('scroll', changed);
+    };
+  }, []);
+
   const scheduleRaster = () => {
     clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => setRasterTick(t => t + 1), 160);
@@ -173,11 +265,14 @@ function PdfPreview(
     const doc = docCache.current.doc, slots = slotsRef.current;
     if (!doc) return;
     const pass = ++textPassRef.current;
+    documentWordIndexRef.current = null;
+    pageWordIndexesRef.current.clear();
     const dScale = scaleRef.current.dScale;
     for (let i = 1; i <= slots.length; i++) {
       const page = await doc.getPage(i);
       if (token !== renderTokenRef.current || pass !== textPassRef.current) return;
       const td = slots[i - 1].textDiv;
+      pageWordIndexesRef.current.delete(td);
       td.replaceChildren();
       td.style.setProperty('--scale-factor', String(dScale));
       const tl = new TextLayer({ textContentSource: page.streamTextContent(), container: td, viewport: page.getViewport({ scale: dScale }) });
@@ -188,7 +283,40 @@ function PdfPreview(
       // one is invisible but still widens the scroll area.
       td.style.width = '';
       td.style.height = '';
+      documentWordIndexRef.current = null;
     }
+  };
+
+  // Tokenizing every transparent PDF span on every navigation is unnecessary
+  // work on long documents. The text pass is the revision: zoom/recompile starts
+  // a new pass and therefore invalidates both whole-document and page indexes.
+  const wordIndexFor = (root: ParentNode): WordIndex => {
+    const pass = textPassRef.current;
+    if (root === pagesRef.current) {
+      const cached = documentWordIndexRef.current;
+      if (cached && cached.pass === pass && cached.root === root) return cached.index;
+      const index = collectSpanWords(root);
+      // Typical papers benefit from instant repeated navigation. Avoid pinning
+      // another large pair of arrays for book-sized/generated PDFs; those still
+      // work, but their uncommon navigation calls rebuild a transient index.
+      if (index.words.length <= MAX_CACHED_SYNC_WORDS) documentWordIndexRef.current = { pass, root, index };
+      return index;
+    }
+    const cached = pageWordIndexesRef.current.get(root);
+    if (cached?.pass === pass) {
+      pageWordIndexesRef.current.delete(root);
+      pageWordIndexesRef.current.set(root, cached);
+      return cached.index;
+    }
+    const index = collectSpanWords(root);
+    pageWordIndexesRef.current.delete(root);
+    pageWordIndexesRef.current.set(root, { pass, index });
+    while (pageWordIndexesRef.current.size > MAX_PDF_PAGE_WORD_INDEXES) {
+      const oldest = pageWordIndexesRef.current.keys().next().value;
+      if (!oldest) break;
+      pageWordIndexesRef.current.delete(oldest);
+    }
+    return index;
   };
 
   // Track pane width: apply instant CSS width, debounce the crisp re-render.
@@ -223,7 +351,9 @@ function PdfPreview(
     applyWidths(liveWRef.current, z);
     restoreAnchor(anchor);
     scheduleRaster();
+    requestAnimationFrame(() => reportViewStateRef.current());
   };
+  setZoomRef.current = setZoom;
 
   // Ctrl/⌘ + wheel zooms instead of scrolling, the way every PDF viewer does —
   // and a trackpad pinch reaches the page as exactly that event, so both
@@ -247,7 +377,7 @@ function PdfPreview(
       const rect = el.getBoundingClientRect();
       const ox = ev.clientX - rect.left, oy = ev.clientY - rect.top;
       const x = el.scrollLeft + ox, y = el.scrollTop + oy;
-      setZoom(next);
+      setZoomRef.current(next);
       const ratio = next / prev;
       el.scrollLeft = x * ratio - ox;
       el.scrollTop = y * ratio - oy;
@@ -301,7 +431,8 @@ function PdfPreview(
         const pg = await loaded.getPage(1);
         const vp1 = pg.getViewport({ scale: 1 });
         docCache.current = { url, doc: loaded, naturalW: vp1.width };
-        setPageInfo({ w: vp1.width, h: vp1.height });
+        pageInfoRef.current = { w: vp1.width, h: vp1.height };
+        setPageInfo(pageInfoRef.current);
         // Free the previously-loaded PDF (parsed data + its worker transport) —
         // the document recompiles on every edit, so without this each compile
         // orphans a whole pdf.js document and the memory climbs steadily.
@@ -341,6 +472,7 @@ function PdfPreview(
           if (prevSlots[i].rendered) drawPage(i + 1, token, true);
         }
         await renderTextLayers(token);
+        if (restoreInitialView()) requestAnimationFrame(() => reportViewStateRef.current());
         return;
       }
 
@@ -365,7 +497,7 @@ function PdfPreview(
       // is a different height and the old offset means nothing — the same
       // problem a resize has. Prefer the anchor; the offset is what's left when
       // the document got shorter than the page we were on.
-      if (!restoreAnchor(prevAnchor)) scrollEl.scrollTop = prevScroll;
+      if (!restoreInitialView() && !restoreAnchor(prevAnchor)) scrollEl.scrollTop = prevScroll;
 
       attachObserver(token, scrollEl);
       await renderTextLayers(token);
@@ -434,6 +566,8 @@ function PdfPreview(
   useEffect(() => () => {
     const d = docCache.current.doc;
     docCache.current = { url: null, doc: null, naturalW: docCache.current.naturalW };
+    documentWordIndexRef.current = null;
+    pageWordIndexesRef.current.clear();
     if (d) { try { d.destroy(); } catch {} }
   }, []);
 
@@ -463,7 +597,7 @@ function PdfPreview(
     revealSource(p: SyncPayload): boolean {
       const pages = pagesRef.current;
       if (!pages) return false;
-      const { words, spans } = collectSpanWords(pages);
+      const { words, spans } = wordIndexFor(pages);
       if (!words.length) return false;
       const prior = Math.round(p.docFraction * words.length);
       const res = bestMatch(words, p.words, p.focus, prior);
@@ -474,28 +608,107 @@ function PdfPreview(
       flashSpan(span);
       return true;
     },
+    revealPosition(position): boolean {
+      const slot = slotsRef.current[position.page - 1];
+      const dimensions = pageInfoRef.current;
+      if (!slot || !dimensions) return false;
+      const pageRect = slot.div.getBoundingClientRect();
+      let nearest: { span: HTMLElement; score: number; vertical: number } | null = null;
+      for (const span of Array.from(slot.textDiv.querySelectorAll<HTMLElement>('span'))) {
+        const rect = span.getBoundingClientRect();
+        if (!rect.width && !rect.height) continue;
+        const x = (rect.left - pageRect.left + rect.width / 2) / pageRect.width * dimensions.w;
+        const y = (rect.top - pageRect.top + rect.height / 2) / pageRect.height * dimensions.h;
+        const vertical = Math.abs(y - position.y);
+        // Block equation locations use the containing block's left edge rather
+        // than the centred glyph x, so vertical distance is authoritative.
+        const score = vertical + Math.abs(x - position.x) * 0.04;
+        if (!nearest || score < nearest.score) nearest = { span, score, vertical };
+      }
+      if (nearest && nearest.vertical <= 56) {
+        nearest.span.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' });
+        flashSpan(nearest.span);
+      } else {
+        slot.div.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' });
+      }
+      return true;
+    },
   }), []);
 
   // Reverse sync (PDF → source): a double-click selects a word; gather a window
   // of neighbouring words (in reading order) plus a positional prior, and let
   // the editor resolve the exact source location.
-  const handleDblClick = () => {
+  const handleDblClick = (event: React.MouseEvent<HTMLDivElement>) => {
     const sel = window.getSelection();
-    const selWord = normalizeWord((sel?.toString() ?? '').trim());
-    if (!selWord) return;
+    const selectedWords = tokenizeRenderedText((sel?.toString() ?? '').trim());
+    // The event target is more dependable than selection.anchorNode for a math
+    // glyph. WebKit and Chromium can anchor a double-click selection on the text
+    // layer container even though the pointer was over a child span.
+    const target = event.target instanceof Element ? event.target : null;
     const node = sel?.anchorNode;
-    const clickedSpan = (node && (node.nodeType === 3 ? node.parentElement : (node as HTMLElement))) as HTMLElement | null;
-    const layer = clickedSpan?.closest('.textLayer');
-    if (!clickedSpan || !layer) return;
+    const selectionElement = node && (node.nodeType === 3 ? node.parentElement : node as HTMLElement);
+    // pdf.js positions many transparent text runs independently. Browser word
+    // selection can bridge two of those runs (especially diagram labels), which
+    // paints what looks like a blue page-sized rectangle. We have already read
+    // the selected word and anchor; discard the native selection on the next
+    // frame while retaining Hilbert's short source-location flash.
+    requestAnimationFrame(() => {
+      const current = window.getSelection();
+      if (current?.anchorNode && pagesRef.current?.contains(current.anchorNode)) current.removeAllRanges();
+    });
+    const clickedSpan = (target?.closest('.textLayer span') || selectionElement?.closest?.('.textLayer span')) as HTMLElement | null;
+    const clickedText = clickedSpan?.textContent || '';
+    const mathHint = /[=+−*/^_<>∞∫∬∭∑∏√∂∇α-ωΑ-Ω\u{1D400}-\u{1D7FF}]/u.test(clickedText);
+    const layer = (clickedSpan?.closest('.textLayer') || target?.closest('.textLayer')) as HTMLElement | null;
+    const pageElement = (clickedSpan?.closest('.pdf-page') || target?.closest('.pdf-page')) as HTMLElement | null;
+    const pageIndex = pageElement ? slotsRef.current.findIndex(slot => slot.div === pageElement) : -1;
+    const pageRect = pageElement?.getBoundingClientRect();
+    const documentPosition = pageInfo && pageRect && pageRect.width > 0 && pageRect.height > 0 && pageIndex >= 0
+      ? {
+          page: pageIndex + 1,
+          x: Math.max(0, Math.min(pageInfo.w, (event.clientX - pageRect.left) / pageRect.width * pageInfo.w)),
+          y: Math.max(0, Math.min(pageInfo.h, (event.clientY - pageRect.top) / pageRect.height * pageInfo.h)),
+        }
+      : undefined;
+    const pagesRect = pagesRef.current?.getBoundingClientRect();
+    const clickedFraction = pagesRect?.height
+      ? Math.max(0, Math.min(1, (event.clientY - pagesRect.top) / pagesRect.height))
+      : 0;
+    if (!clickedSpan || !layer) {
+      if (documentPosition) onReverseSync({ words: [], focus: 0, docFraction: clickedFraction, documentPosition, mathHint });
+      return;
+    }
 
-    const { words, spans } = collectSpanWords(layer);
-    let focus = spans.findIndex((s, i) => s === clickedSpan && words[i] === selWord);
-    if (focus < 0) focus = spans.findIndex((s) => s === clickedSpan);
+    const { words, spans } = wordIndexFor(layer);
+    const spanIndexes = spans.map((span, index) => span === clickedSpan ? index : -1).filter(index => index >= 0);
+    // Operators and fraction/radical geometry may have no word token at all.
+    // The compiled equation-location resolver can still map their coordinates.
+    if (!spanIndexes.length) {
+      if (documentPosition) onReverseSync({ words: [], focus: 0, docFraction: docFractionOf(clickedSpan), documentPosition, mathHint });
+      return;
+    }
+    const selectedWord = selectedWords.find(word => spanIndexes.some(index => words[index] === word)) || selectedWords[0];
+    let focus = selectedWord ? spanIndexes.find(index => words[index] === selectedWord) ?? -1 : -1;
+    // One pdf.js span can contain several formula atoms. If selection did not
+    // identify one (notably for operators), use the pointer's horizontal place
+    // inside the span instead of always choosing its first atom.
+    if (focus < 0) {
+      const rect = clickedSpan.getBoundingClientRect();
+      const ratio = rect.width > 0 ? Math.max(0, Math.min(0.999, (event.clientX - rect.left) / rect.width)) : 0;
+      focus = spanIndexes[Math.floor(ratio * spanIndexes.length)];
+    }
     if (focus < 0) return;
-
     const from = Math.max(0, focus - 8);
     const to = Math.min(words.length, focus + 9);
-    onReverseSync({ words: words.slice(from, to), focus: focus - from, docFraction: docFractionOf(clickedSpan) });
+    // A double-click can isolate `𝑥` from a span whose full PDF text is `d𝑥`.
+    // Preserve the surrounding span tokens but make the selected atom the focus
+    // so it aligns with `x` rather than the synthetic combined token `dx`. This
+    // edits the outgoing copy: `words` is the retained index for this revision,
+    // and writing through it would leave every later click matching against a
+    // word this one click happened to select.
+    const context = words.slice(from, to);
+    if (selectedWord) context[focus - from] = selectedWord;
+    onReverseSync({ words: context, focus: focus - from, docFraction: docFractionOf(clickedSpan), documentPosition, mathHint });
   };
 
   // Save the currently shown PDF to disk. Works for both the compile preview
@@ -533,7 +746,12 @@ function PdfPreview(
             {paperLabel(pageInfo.w, pageInfo.h)}
           </span>
         )}
-        <button className={`pdf-btn ${dark ? 'active' : ''}`} onClick={() => setDark(d => !d)} title="Toggle dark PDF" style={{ marginRight: 'auto' }}>
+        <button className={`pdf-btn ${dark ? 'active' : ''}`} onClick={() => setDark(d => {
+          const next = !d;
+          darkRef.current = next;
+          requestAnimationFrame(() => reportViewStateRef.current());
+          return next;
+        })} title="Toggle dark PDF" style={{ marginRight: 'auto' }}>
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
         </button>
         <button className="pdf-btn" onClick={() => setZoom(Math.max(zoomFactor / 1.15, 0.25))} title="Zoom out">−</button>

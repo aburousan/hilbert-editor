@@ -54,11 +54,13 @@ window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Res
 //
 // Pass a revision that changes whenever the file's contents change (a
 // collaborator's copy arriving, a crop being saved) to refetch it.
-export function useWorkspaceAsset(path: string | null, revision: unknown = 0): string | null {
+export function useWorkspaceAsset(path: string | null, revision: unknown = 0): { url: string | null; error: string | null } {
   const [url, setUrl] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
   useEffect(() => {
+    setUrl(null);
+    setError(null);
     if (!path) {
-      setUrl(null);
       return;
     }
     let active = true;
@@ -66,13 +68,19 @@ export function useWorkspaceAsset(path: string | null, revision: unknown = 0): s
     void (async () => {
       try {
         const response = await fetch(`${API}/workspace/raw?path=${encodeURIComponent(path)}`);
-        if (!response.ok) throw new Error(String(response.status));
+        if (!response.ok) {
+          const detail = (await response.text()).trim();
+          throw new Error(detail || `Preview failed (${response.status})`);
+        }
         const blob = await response.blob();
         if (!active) return;
         objectUrl = URL.createObjectURL(blob);
         setUrl(objectUrl);
-      } catch {
-        if (active) setUrl(null);
+      } catch (cause) {
+        if (active) {
+          setUrl(null);
+          setError(cause instanceof Error ? cause.message : 'Could not load this preview.');
+        }
       }
     })();
     return () => {
@@ -80,5 +88,5 @@ export function useWorkspaceAsset(path: string | null, revision: unknown = 0): s
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [path, revision]);
-  return url;
+  return { url, error };
 }

@@ -40,4 +40,17 @@ assert.deepEqual(sync.tokenizeLine('Cafe\u0301 noir'), [
 assert.deepEqual(sync.tokenizeLine('ភាសាខ្មែរ'), [{ w: 'ភាសាខ្មែរ', offset: 0 }]);
 assert.deepEqual(sync.tokenizeLine('हिन्दी भाषा').map(({ w }) => w), ['हिन्दी', 'भाषा']);
 
+// PDF math uses presentation glyphs rather than Typst's source spellings.
+assert.deepEqual(sync.tokenizeRenderedText('−𝑥²'), ['x2']);
+assert.deepEqual(sync.tokenizeRenderedText('𝑘=1'), ['k', '1']);
+assert.deepEqual(sync.tokenizeRenderedText('𝑛(𝑛+1)'), ['n', 'n', '1']);
+assert.deepEqual(sync.tokenizeRenderedText('∑'), ['sum']);
+assert.deepEqual(sync.tokenizeRenderedText('∫₀∞'), ['integral', '0', 'infinity']);
+assert.deepEqual(sync.tokenizeRenderedText('√𝜋'), ['sqrt', 'pi']);
+assert.deepEqual(sync.tokenizeRenderedText('α + β = γ'), ['alpha', 'beta', 'gamma']);
+assert.deepEqual(
+  sync.tokenizeTypstMathSource('$ integral_0^infinity e^(-2x^2) dif x = sqrt(pi) / 2 $'),
+  ['integral', '0', 'infinity', 'e', '2', 'x', '2', 'dif', 'x', 'sqrt', 'pi', '2'],
+);
+
 console.log('unicode range tests: passed');

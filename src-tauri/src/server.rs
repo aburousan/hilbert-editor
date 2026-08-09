@@ -16,6 +16,7 @@ use base64::Engine;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS, NON_ALPHANUMERIC};
 use regex::Regex;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs,
@@ -148,6 +149,15 @@ pub struct AppState {
     pub workspace: RwLock<PathBuf>,
     pub dist: Option<PathBuf>,
     api_token: String,
+    // Present only for the explicitly requested hosted-workspace mode. The
+    // normal desktop/headless backend remains loopback-only and never accepts
+    // a browser login. A successful login receives an HttpOnly cookie carrying
+    // a domain-separated derivative of the configured access token, so the
+    // sign-in token itself is never stored in the browser and sessions remain
+    // valid through an ordinary server restart.
+    remote_access_token: Option<String>,
+    remote_collab_room: Option<String>,
+    remote_collab_key: Option<String>,
     // Interpreters found by scanning the usual install locations, plus the ones
     // the user added by hand (persisted, so they survive a restart).
     pub detected: Interpreters,
@@ -168,6 +178,64 @@ pub struct AppState {
     // Set by the GUI shell: opens another window IN THIS process (one Dock
     // icon). When absent — headless — /app/new-window spawns a process instead.
     pub open_window: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    workspace_released: std::sync::atomic::AtomicBool,
+}
+
+static WORKSPACE_USERS: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn register_workspace_user(path: &Path) {
+    let mut users = WORKSPACE_USERS.lock().unwrap_or_else(|e| e.into_inner());
+    *users.entry(path.to_path_buf()).or_insert(0) += 1;
+}
+
+// Move one live backend between projects. Returns true when nothing else still
+// uses the old project's shared language server.
+fn move_workspace_user(old: &Path, new: &Path) -> bool {
+    if old == new {
+        return false;
+    }
+    let mut users = WORKSPACE_USERS.lock().unwrap_or_else(|e| e.into_inner());
+    let old_unused = if let Some(count) = users.get_mut(old) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            users.remove(old);
+            true
+        } else {
+            false
+        }
+    } else {
+        true
+    };
+    *users.entry(new.to_path_buf()).or_insert(0) += 1;
+    old_unused
+}
+
+fn release_workspace_user(path: &Path) -> bool {
+    let mut users = WORKSPACE_USERS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(count) = users.get_mut(path) else { return true };
+    *count = count.saturating_sub(1);
+    if *count == 0 {
+        users.remove(path);
+        true
+    } else {
+        false
+    }
+}
+
+fn hosted_secret(label: &str, access_token: &str, workspace: &Path) -> [u8; 32] {
+    let identity = fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let identity = identity.to_string_lossy();
+    let mut digest = Sha256::new();
+    // Length prefixes keep the three fields unambiguous even if an operator's
+    // token or path happens to contain the separator bytes.
+    digest.update(b"hilbert-hosted-secret-v1");
+    for field in [label.as_bytes(), access_token.as_bytes(), identity.as_bytes()] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    digest.finalize().into()
 }
 
 impl AppState {
@@ -185,10 +253,15 @@ impl AppState {
             .ok()
             .filter(|token| token.len() >= 32)
             .unwrap_or(generated_token);
+        register_workspace_user(&workspace);
+        let (shutdown, _) = tokio::sync::watch::channel(false);
         AppState {
             workspace: RwLock::new(workspace),
             dist,
             api_token,
+            remote_access_token: None,
+            remote_collab_room: None,
+            remote_collab_key: None,
             detected: detect_interpreters(),
             custom: RwLock::new(load_custom_interpreters()),
             allow_exec: std::env::var("ALLOW_CODE_EXECUTION").ok().as_deref() != Some("0"),
@@ -203,7 +276,38 @@ impl AppState {
             app: Mutex::new(None),
             session_file: session_file(),
             open_window: Mutex::new(None),
+            shutdown,
+            workspace_released: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    pub fn new_remote(workspace: PathBuf, dist: Option<PathBuf>, access_token: String) -> Self {
+        let explicit_api_token = std::env::var("HILBERT_API_TOKEN")
+            .ok()
+            .filter(|token| token.len() >= 32)
+            .is_some();
+        let session_secret = hosted_secret("session", &access_token, &workspace);
+        let room_secret = hosted_secret("room", &access_token, &workspace);
+        let key_secret = hosted_secret("key", &access_token, &workspace);
+        let mut state = Self::new(workspace, dist);
+        // An explicit API token remains an operator override. Without one,
+        // derive a strong, stable cookie value from the hosted sign-in secret.
+        // This is what lets an already-open browser retry its emergency draft
+        // after the process comes back instead of receiving a surprise 401.
+        if !explicit_api_token {
+            state.api_token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(session_secret);
+        }
+        state.remote_access_token = Some(access_token);
+        // Keep the encrypted hosted room stable too. Otherwise existing pages
+        // reconnect to their pre-restart room while a newly opened page is sent
+        // to a newly randomized room, silently splitting one document's users.
+        state.remote_collab_room = Some(room_secret.iter().map(|byte| format!("{byte:02x}")).collect());
+        state.remote_collab_key = Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_secret));
+        state
+    }
+
+    fn remote_mode(&self) -> bool {
+        self.remote_access_token.is_some()
     }
 
     fn ws(&self) -> PathBuf {
@@ -571,6 +675,60 @@ async fn toolchain_status() -> Response {
     .into_response()
 }
 
+// Typst's PDF format has no SyncTeX sidecar. The compiler does, however, retain
+// source spans while evaluating the paged document: querying equation elements
+// gives their real page positions and structured rendered bodies. Reverse sync
+// uses this only when ordinary text matching cannot resolve a PDF click, so no
+// extra preview daemon or idle memory is required.
+async fn workspace_math_locations(State(st): St, Query(q): Q) -> Response {
+    let main = q.get("main").map(String::as_str).unwrap_or("main.typ");
+    let ws = st.ws();
+    let Some(main_path) = safe_workspace_path(&ws, main) else {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid main file");
+    };
+    if main_path.extension().and_then(|extension| extension.to_str()) != Some("typ") || !main_path.is_file() {
+        return json_err(StatusCode::BAD_REQUEST, "Main file must be an existing .typ file");
+    }
+    let Some(typst) = which("typst") else {
+        return json_err(StatusCode::SERVICE_UNAVAILABLE, TYPST_NOT_FOUND_SHORT);
+    };
+    let expression = "query(math.equation).map(it => (it.location().position(), it.body))";
+    let main_arg = main_path.to_string_lossy().into_owned();
+    let root_arg = ws.to_string_lossy().into_owned();
+    let mut owned = vec![
+        "eval".to_string(),
+        expression.to_string(),
+        "--in".to_string(),
+        main_arg,
+        "--root".to_string(),
+        root_arg,
+    ];
+    let fonts = ws.join("fonts");
+    if fonts.is_dir() {
+        owned.push("--font-path".to_string());
+        owned.push(fonts.to_string_lossy().into_owned());
+    }
+    let args: Vec<&str> = owned.iter().map(String::as_str).collect();
+    // One short-lived query at a time alongside normal compile requests. This
+    // avoids a burst of compiler processes if someone double-clicks repeatedly.
+    let _permit = st.compile_gate.acquire().await.unwrap();
+    let output = match run_cmd(&typst, &args, Some(&ws), Some(15_000)).await {
+        Ok(output) => output,
+        Err(error) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not query Typst: {error}")),
+    };
+    if output.killed {
+        return json_err(StatusCode::GATEWAY_TIMEOUT, "Typst equation query timed out");
+    }
+    if output.code != Some(0) {
+        let message = output.stderr.lines().find(|line| !line.trim().is_empty()).unwrap_or("Typst could not resolve equation positions");
+        return json_err(StatusCode::UNPROCESSABLE_ENTITY, message);
+    }
+    match serde_json::from_str::<Value>(&output.stdout) {
+        Ok(Value::Array(equations)) => Json(json!({ "equations": equations })).into_response(),
+        _ => json_err(StatusCode::BAD_GATEWAY, "Typst returned an invalid equation map"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Workspace file tree + files
 // ---------------------------------------------------------------------------
@@ -730,6 +888,12 @@ async fn workspace_root_get(State(st): St) -> Response {
 }
 
 async fn workspace_root_post(State(st): St, body: Bytes) -> Response {
+    if st.remote_mode() {
+        return json_err(
+            StatusCode::FORBIDDEN,
+            "A hosted workspace is locked to the server's configured project folder.",
+        );
+    }
     let v = parse_json(&body);
     let Some(raw) = jstr(&v, "path").map(str::trim).filter(|s| !s.is_empty()) else {
         return json_err(StatusCode::BAD_REQUEST, "Folder path required.");
@@ -778,11 +942,14 @@ async fn workspace_root_post(State(st): St, body: Bytes) -> Response {
         }
     }
     let old_ws = st.ws();
+    let stop_old_lsp = move_workspace_user(&old_ws, &resolved);
     *st.workspace.write().unwrap_or_else(|e| e.into_inner()) = resolved.clone();
     stop_preview_watcher(&st).await;
-    // The old project's language server is no longer needed here. If another
-    // window still shows that project it simply respawns on its next request.
-    stop_lsp_for(&old_ws).await;
+    // Tinymist is shared per workspace. Moving one of two windows away must not
+    // interrupt completion/diagnostics in the window that stayed behind.
+    if stop_old_lsp {
+        stop_lsp_for(&old_ws).await;
+    }
     Json(json!({ "ok": true, "root": resolved.to_string_lossy() })).into_response()
 }
 
@@ -1039,7 +1206,69 @@ async fn workspace_save_image(State(st): St, body: Bytes) -> Response {
     }
 }
 
-// Copy a file within the workspace (e.g. promote a sandbox plot into images/).
+// Copy one workspace entry without ever opening an existing destination for
+// writing. `fs::copy(src, src)` is not a harmless no-op on every platform: it
+// may truncate the source before it starts reading. The UI can produce exactly
+// that pair when Copy/Paste is used in the same folder, so exclusivity belongs
+// here at the filesystem boundary, not only in a caller that may be bypassed.
+//
+// Directories are handled too because the file-tree advertises Duplicate and
+// Copy for folders. Symlinks are rejected rather than followed; the workspace
+// tree hides them for the same confinement reason.
+fn copy_workspace_entry(src: &Path, dst: &Path) -> std::io::Result<u64> {
+    use std::io::{Error, ErrorKind};
+
+    if src == dst || dst.exists() {
+        return Err(Error::new(ErrorKind::AlreadyExists, "Destination already exists"));
+    }
+    let metadata = fs::symlink_metadata(src)?;
+    if metadata.file_type().is_symlink() {
+        return Err(Error::new(ErrorKind::InvalidInput, "Symbolic links cannot be copied"));
+    }
+
+    if metadata.is_file() {
+        use std::io::copy;
+        let mut input = fs::File::open(src)?;
+        let mut output = fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
+        let result = copy(&mut input, &mut output)
+            .and_then(|bytes| {
+                output.sync_all()?;
+                fs::set_permissions(dst, metadata.permissions())?;
+                Ok(bytes)
+            });
+        if result.is_err() {
+            let _ = fs::remove_file(dst);
+        }
+        return result;
+    }
+
+    if !metadata.is_dir() {
+        return Err(Error::new(ErrorKind::InvalidInput, "Unsupported file type"));
+    }
+    // A recursive copy into one of its own descendants would never finish.
+    if dst.starts_with(src) {
+        return Err(Error::new(ErrorKind::InvalidInput, "A folder cannot be copied inside itself"));
+    }
+
+    fs::create_dir(dst)?;
+    let result = (|| {
+        let mut total = 0u64;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            total = total.saturating_add(copy_workspace_entry(&entry.path(), &dst.join(entry.file_name()))?);
+        }
+        fs::set_permissions(dst, metadata.permissions())?;
+        Ok(total)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(dst);
+    }
+    result
+}
+
+// Copy a file or folder within the workspace (e.g. duplicate a tree entry or
+// promote a sandbox plot into images/). Large copies stay off Tokio's async
+// workers, keeping the editor and preview responsive while the disk is busy.
 async fn workspace_copy(State(st): St, body: Bytes) -> Response {
     let v = parse_json(&body);
     let ws = st.ws();
@@ -1052,11 +1281,30 @@ async fn workspace_copy(State(st): St, body: Bytes) -> Response {
     if !src.exists() {
         return json_err(StatusCode::NOT_FOUND, "Source not found.");
     }
-    if let Some(parent) = dst.parent() {
-        let _ = fs::create_dir_all(parent);
+    if src == dst || dst.exists() {
+        return json_err(StatusCode::CONFLICT, "Destination already exists.");
     }
-    match fs::copy(&src, &dst) {
-        Ok(_) => Json(json!({ "ok": true, "path": jstr(&v, "to").unwrap_or("") })).into_response(),
+    if src.is_dir() && dst.starts_with(&src) {
+        return json_err(StatusCode::BAD_REQUEST, "A folder cannot be copied inside itself.");
+    }
+    if let Some(parent) = dst.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
+    }
+    let to = jstr(&v, "to").unwrap_or("").to_string();
+    match tokio::task::spawn_blocking(move || copy_workspace_entry(&src, &dst)).await {
+        Ok(Ok(_)) => {
+            st.note_write();
+            Json(json!({ "ok": true, "path": to })).into_response()
+        }
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            json_err(StatusCode::CONFLICT, "Destination already exists.")
+        }
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            json_err(StatusCode::BAD_REQUEST, e.to_string())
+        }
+        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -1088,6 +1336,9 @@ async fn workspace_rename(State(st): St, body: Bytes) -> Response {
 
 // Reveal a file or folder in the native OS file manager.
 async fn workspace_reveal(State(st): St, body: Bytes) -> Response {
+    if st.remote_mode() {
+        return json_err(StatusCode::NOT_IMPLEMENTED, "Reveal is unavailable in a hosted browser session.");
+    }
     let v = parse_json(&body);
     let ws = st.ws();
     let target = jstr(&v, "path").and_then(|p| safe_workspace_path(&ws, p)).unwrap_or_else(|| ws.clone());
@@ -1112,8 +1363,20 @@ async fn workspace_reveal(State(st): St, body: Bytes) -> Response {
 struct CollabRooms {
     rooms: HashMap<String, (tokio::sync::broadcast::Sender<(u64, Bytes)>, usize)>,
 }
+struct HostedClaim {
+    claimed_at: Instant,
+    active: bool,
+}
 static COLLAB: LazyLock<Mutex<CollabRooms>> =
     LazyLock::new(|| Mutex::new(CollabRooms { rooms: HashMap::new() }));
+// Hosted browsers all open the same on-server workspace. Exactly one must seed
+// its Yjs room; if two independently create the same path, Y.Map conflict
+// resolution can leave one editor bound to an object that lost the map key.
+// The short pre-connection lease recovers if a browser asks for host duty and
+// crashes before opening its socket. Once any room socket arrives the claim is
+// active until the last peer leaves.
+static HOSTED_CLAIMS: LazyLock<Mutex<HashMap<String, HostedClaim>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 static COLLAB_CLIENT: AtomicU64 = AtomicU64::new(1);
 
 const COLLAB_MAX_ROOMS: usize = 256;
@@ -1149,8 +1412,37 @@ pub fn set_embedded_collab_server(port: u16, addresses: Vec<String>) {
     };
 }
 
-async fn collab_server_info() -> Response {
-    Json(EMBEDDED_COLLAB.read().unwrap().clone()).into_response()
+async fn collab_server_info(State(st): St, headers: HeaderMap) -> Response {
+    let mut info = EMBEDDED_COLLAB.read().unwrap_or_else(|e| e.into_inner()).clone();
+    // Hosted workspaces carry the relay on the same HTTP(S) port. Deriving the
+    // suggestion from the already-validated same-origin Host makes it work both
+    // directly and behind a TLS reverse proxy without another exposed port.
+    if st.remote_mode() {
+        if let Some(host) = headers.get(header::HOST).and_then(|value| value.to_str().ok()) {
+            let tls = headers
+                .get("x-forwarded-proto")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.eq_ignore_ascii_case("https"))
+                .unwrap_or(false);
+            info.urls.insert(0, format!("{}://{host}", if tls { "wss" } else { "ws" }));
+            info.urls.dedup();
+            info.available = true;
+        }
+    }
+    Json(info).into_response()
+}
+
+async fn collab_health() -> Response {
+    let rooms = COLLAB.lock().unwrap_or_else(|e| e.into_inner());
+    let peers: usize = rooms.rooms.values().map(|(_, count)| *count).sum();
+    Json(json!({
+        "ok": true,
+        "rooms": rooms.rooms.len(),
+        "peers": peers,
+        "maxRooms": COLLAB_MAX_ROOMS,
+        "maxPeersPerRoom": COLLAB_MAX_PEERS_PER_ROOM,
+    }))
+    .into_response()
 }
 
 fn valid_collab_room(room: &str) -> bool {
@@ -1167,6 +1459,9 @@ fn collab_join(room: &str) -> Option<tokio::sync::broadcast::Sender<(u64, Bytes)
             return None;
         }
         *peers += 1;
+        if let Some(claim) = HOSTED_CLAIMS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(room) {
+            claim.active = true;
+        }
         return Some(sender.clone());
     }
     if g.rooms.len() >= COLLAB_MAX_ROOMS {
@@ -1180,6 +1475,9 @@ fn collab_join(room: &str) -> Option<tokio::sync::broadcast::Sender<(u64, Bytes)
         (tokio::sync::broadcast::channel(128).0, 0)
     });
     entry.1 += 1;
+    if let Some(claim) = HOSTED_CLAIMS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(room) {
+        claim.active = true;
+    }
     Some(entry.0.clone())
 }
 
@@ -1191,21 +1489,64 @@ fn collab_leave(room: &str) {
             g.rooms.remove(room);
         }
     }
+    let base = room.strip_suffix("-bin").unwrap_or(room);
+    let binary = format!("{base}-bin");
+    let any_hosted_socket = g.rooms.get(base).map(|(_, peers)| *peers > 0).unwrap_or(false)
+        || g.rooms.get(&binary).map(|(_, peers)| *peers > 0).unwrap_or(false);
+    if !any_hosted_socket {
+        HOSTED_CLAIMS.lock().unwrap_or_else(|e| e.into_inner()).remove(base);
+    }
 }
 
-async fn collab_ws(ws: WebSocketUpgrade, axum::extract::Path(room): axum::extract::Path<String>) -> Response {
+fn activate_hosted_claim(room: &str) {
+    HOSTED_CLAIMS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(room.to_string(), HostedClaim { claimed_at: Instant::now(), active: true });
+}
+
+fn collab_upgrade(ws: WebSocketUpgrade, room: String, hosted_room: Option<String>) -> Response {
     if !valid_collab_room(&room) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     ws.max_message_size(COLLAB_MAX_MESSAGE_BYTES)
         .max_frame_size(COLLAB_MAX_MESSAGE_BYTES)
-        .on_upgrade(move |socket| collab_socket(socket, room))
+        .on_upgrade(move |socket| collab_socket(socket, room, hosted_room))
 }
 
-async fn collab_socket(mut socket: WebSocket, room: String) {
+async fn hosted_collab_ws(
+    State(st): St,
+    ws: WebSocketUpgrade,
+    axum::extract::Path(room): axum::extract::Path<String>,
+) -> Response {
+    let hosted_room = st.remote_collab_room.as_ref().and_then(|hosted| {
+        (room == *hosted || room == format!("{hosted}-bin")).then(|| hosted.clone())
+    });
+    collab_upgrade(ws, room, hosted_room)
+}
+
+async fn collab_ws(
+    ws: WebSocketUpgrade,
+    axum::extract::Path(room): axum::extract::Path<String>,
+) -> Response {
+    collab_upgrade(ws, room, None)
+}
+
+async fn collab_socket(mut socket: WebSocket, room: String, hosted_room: Option<String>) {
     let Some(tx) = collab_join(&room) else {
         return;
     };
+    // The process may have restarted while browsers kept their pages open.
+    // Their stable hosted-room socket is the evidence that a host already
+    // exists. Rebuild the in-memory claim before a newly opened browser calls
+    // /hosted/info, or that browser would also seed as a host and both Monaco
+    // bindings could attach to different concurrently-created Y.Text objects.
+    // A refused join must not do this: only collab_leave clears the claim, so a
+    // claim with no peer behind it would send every later browser to join a
+    // document nobody had seeded.
+    if let Some(hosted_room) = hosted_room.as_deref() {
+        activate_hosted_claim(hosted_room);
+    }
     let mut rx = tx.subscribe();
     let id = COLLAB_CLIENT.fetch_add(1, Ordering::Relaxed);
     let mut rate_window = Instant::now();
@@ -1244,6 +1585,9 @@ async fn collab_socket(mut socket: WebSocket, room: String) {
 }
 
 async fn app_new_window(State(st): St) -> Response {
+    if st.remote_mode() {
+        return json_err(StatusCode::NOT_IMPLEMENTED, "Open this hosted workspace in another browser tab instead.");
+    }
     // In the GUI the shell registers an opener that creates the window inside
     // this process, so the OS shows one app with several windows rather than a
     // second Dock icon per window.
@@ -1329,16 +1673,36 @@ fn search_walk(dir: &Path, ws: &Path, q: &str, out: &mut Vec<Value>) {
     }
 }
 
+// Preview bytes are deliberately smaller than the workspace upload limit. The
+// file stays on disk and can still be edited/downloaded externally; only the
+// disposable in-memory browser preview is refused.
+const MAX_WORKSPACE_PREVIEW_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PDF_PREVIEW_BYTES: u64 = 96 * 1024 * 1024;
+
+fn read_file_limited(path: &Path, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len > limit { return Ok(None); }
+    let mut bytes = Vec::with_capacity(len.min(limit) as usize);
+    let mut limited = std::io::Read::take(file, limit + 1);
+    std::io::Read::read_to_end(&mut limited, &mut bytes)?;
+    if bytes.len() as u64 > limit { Ok(None) } else { Ok(Some(bytes)) }
+}
+
 // Serve a raw workspace file (e.g. image / file preview) with a guessed MIME type.
 async fn workspace_raw(State(st): St, Query(q): Q) -> Response {
     let Some(full) = q.get("path").and_then(|p| safe_workspace_path(&st.ws(), p)) else {
         return text_err(StatusCode::BAD_REQUEST, "Invalid path");
     };
-    match fs::read(&full) {
-        Ok(bytes) => {
+    match read_file_limited(&full, MAX_WORKSPACE_PREVIEW_BYTES) {
+        Ok(Some(bytes)) => {
             let mime = mime_guess::from_path(&full).first_or_octet_stream();
             ([(header::CONTENT_TYPE, mime.as_ref())], bytes).into_response()
         }
+        Ok(None) => text_err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Preview not loaded: this file is larger than Hilbert's 64 MiB preview limit. The file is unchanged on disk.",
+        ),
         Err(_) => text_err(StatusCode::NOT_FOUND, "Not found"),
     }
 }
@@ -1656,7 +2020,13 @@ async fn compile_from_watcher(
         return WatchCompileResult::Fallback;
     };
     let finish = |outcome: PreviewOutcome| match outcome {
-        PreviewOutcome::Success => fs::read(output_path).map(WatchCompileResult::Pdf).unwrap_or(WatchCompileResult::Fallback),
+        PreviewOutcome::Success => match read_file_limited(output_path, MAX_PDF_PREVIEW_BYTES) {
+            Ok(Some(bytes)) => WatchCompileResult::Pdf(bytes),
+            Ok(None) => WatchCompileResult::CompileError(
+                "The PDF compiled successfully but is larger than Hilbert's 96 MiB preview limit. The source and compiled file remain saved on disk.".into(),
+            ),
+            Err(_) => WatchCompileResult::Fallback,
+        },
         PreviewOutcome::Error(message) => WatchCompileResult::CompileError(message),
         _ => WatchCompileResult::Fallback,
     };
@@ -1730,8 +2100,12 @@ async fn compile_once(ws: &Path, main_path: &Path, output_path: &Path) -> Respon
         };
         return json_err(StatusCode::BAD_REQUEST, msg);
     }
-    match fs::read(output_path) {
-        Ok(bytes) => ([(header::CONTENT_TYPE, "application/pdf")], bytes).into_response(),
+    match read_file_limited(output_path, MAX_PDF_PREVIEW_BYTES) {
+        Ok(Some(bytes)) => ([(header::CONTENT_TYPE, "application/pdf")], bytes).into_response(),
+        Ok(None) => json_err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "The PDF compiled successfully but is larger than Hilbert's 96 MiB preview limit. The source and compiled file remain saved on disk.",
+        ),
         Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -4250,7 +4624,25 @@ async fn desktop_open(body: Bytes) -> Response {
 // Static file serving (built UI) with SPA fallback
 // ---------------------------------------------------------------------------
 
-async fn static_fallback(State(st): St, method: Method, uri: Uri) -> Response {
+fn login_page() -> Response {
+    const PAGE: &str = r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hilbert server sign in</title><style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f1117;color:#e6e9ef;font:15px/1.5 system-ui,sans-serif}.card{width:min(420px,calc(100vw - 32px));padding:28px;border:1px solid #303642;border-radius:12px;background:#171a22;box-shadow:0 18px 60px #0006}h1{margin:0 0 8px;font-size:21px}p{margin:0 0 20px;color:#aab2c0}label{display:block;margin-bottom:7px;font-weight:600}input{width:100%;padding:11px 12px;border:1px solid #3b4352;border-radius:7px;background:#0f1117;color:inherit;font:inherit}button{width:100%;margin-top:14px;padding:11px;border:0;border-radius:7px;background:#7c6df2;color:white;font:700 14px system-ui;cursor:pointer}small{display:block;margin-top:16px;color:#778092}
+</style></head><body><main class="card"><h1>Hilbert hosted workspace</h1><p>Enter the access token configured on this server.</p><form method="post" action="/auth/login"><input name="username" value="hilbert" autocomplete="username" hidden><label for="token">Access token</label><input id="token" name="token" type="password" minlength="32" required autofocus autocomplete="current-password"><button type="submit">Open workspace</button></form><small>The token stays in this sign-in request. The browser receives a private session cookie.</small></main></body></html>"#;
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::CONTENT_SECURITY_POLICY, "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"),
+            (header::REFERRER_POLICY, "no-referrer"),
+        ],
+        PAGE,
+    )
+        .into_response()
+}
+
+async fn static_fallback(State(st): St, headers: HeaderMap, method: Method, uri: Uri) -> Response {
     let Some(dist) = st.dist.as_ref().filter(|d| d.exists()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -4273,8 +4665,13 @@ async fn static_fallback(State(st): St, method: Method, uri: Uri) -> Response {
             }
         }
     }
-    // SPA fallback: any GET path without a dot serves the app shell.
+    // SPA fallback: any GET path without a dot serves the app shell. Hosted
+    // mode never sends the application shell until the browser has signed in;
+    // static hashed assets contain no workspace data and may remain cacheable.
     if !decoded.contains('.') {
+        if st.remote_mode() && !valid_request_auth(&headers, &st.api_token) {
+            return login_page();
+        }
         if let Ok(bytes) = fs::read(dist.join("index.html")) {
             return (
                 [(header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()), (header::CACHE_CONTROL, "no-cache".to_string())],
@@ -4298,7 +4695,9 @@ fn local_host(host: &str) -> bool {
 }
 
 fn origin_allowed(host: &str, origin: &str) -> bool {
-    origin == format!("http://{host}") || (cfg!(debug_assertions) && DEV_ORIGIN_RE.is_match(origin))
+    origin == format!("http://{host}")
+        || origin == format!("https://{host}")
+        || (cfg!(debug_assertions) && DEV_ORIGIN_RE.is_match(origin))
 }
 
 // Defence beyond binding to loopback: reject requests whose Host header isn't
@@ -4306,28 +4705,30 @@ fn origin_allowed(host: &str, origin: &str) -> bool {
 // server from a victim's browser) and any browser request carrying a foreign
 // Origin (drive-by websites POSTing to localhost; browsers always attach
 // Origin to cross-site POSTs, and "simple" ones skip the CORS preflight).
-async fn local_guard(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+async fn request_guard(State(st): St, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let Some(host) = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()) else {
         return (StatusCode::FORBIDDEN, "Forbidden: missing Host").into_response();
     };
-    if !local_host(host) {
+    if !st.remote_mode() && !local_host(host) {
         return (StatusCode::FORBIDDEN, "Forbidden: non-local Host").into_response();
     }
     if let Some(origin) = req.headers().get(header::ORIGIN).and_then(|h| h.to_str().ok()) {
-        if !origin_allowed(host, origin) {
+        // Chromium can give a no-script password form an opaque `null` origin
+        // under a restrictive CSP. Permit that only for the hosted sign-in
+        // endpoint; the 32+ character secret is still checked, and the session
+        // cookie is SameSite=Strict. Every workspace/API request continues to
+        // require an exact same-origin value.
+        let opaque_hosted_login = st.remote_mode()
+            && origin == "null"
+            && req.uri().path() == "/auth/login";
+        if !opaque_hosted_login && !origin_allowed(host, origin) {
             return (StatusCode::FORBIDDEN, "Forbidden: cross-site request").into_response();
         }
     }
     next.run(req).await
 }
 
-fn valid_bearer(headers: &HeaderMap, expected: &str) -> bool {
-    let Some(value) = headers.get(header::AUTHORIZATION).and_then(|h| h.to_str().ok()) else {
-        return false;
-    };
-    let Some(candidate) = value.strip_prefix("Bearer ") else {
-        return false;
-    };
+fn constant_time_eq(candidate: &str, expected: &str) -> bool {
     let candidate = candidate.as_bytes();
     let expected = expected.as_bytes();
     let mut difference = candidate.len() ^ expected.len();
@@ -4337,11 +4738,86 @@ fn valid_bearer(headers: &HeaderMap, expected: &str) -> bool {
     difference == 0
 }
 
+fn valid_request_auth(headers: &HeaderMap, expected: &str) -> bool {
+    if let Some(candidate) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    {
+        if constant_time_eq(candidate, expected) {
+            return true;
+        }
+    }
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| cookies.split(';').map(str::trim).find_map(|cookie| cookie.strip_prefix("hilbert_session=")))
+        .map(|candidate| constant_time_eq(candidate, expected))
+        .unwrap_or(false)
+}
+
 async fn auth_guard(State(st): St, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
-    if !valid_bearer(req.headers(), &st.api_token) {
+    if !valid_request_auth(req.headers(), &st.api_token) {
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
     next.run(req).await
+}
+
+async fn remote_login(State(st): St, headers: HeaderMap, body: Bytes) -> Response {
+    let Some(expected) = st.remote_access_token.as_deref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let encoded = String::from_utf8_lossy(&body);
+    let candidate = encoded
+        .split('&')
+        .find_map(|field| field.strip_prefix("token="))
+        .map(|value| percent_decode_str(&value.replace('+', " ")).decode_utf8_lossy().into_owned())
+        .unwrap_or_default();
+    if !constant_time_eq(&candidate, expected) {
+        return (StatusCode::UNAUTHORIZED, "Invalid access token").into_response();
+    }
+    let secure = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.eq_ignore_ascii_case("https"))
+        .unwrap_or(false);
+    let cookie = format!(
+        "hilbert_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400{}",
+        st.api_token,
+        if secure { "; Secure" } else { "" },
+    );
+    (
+        StatusCode::SEE_OTHER,
+        [(header::SET_COOKIE, cookie), (header::LOCATION, "/".to_string())],
+    )
+        .into_response()
+}
+
+async fn hosted_info(State(st): St) -> Response {
+    match (&st.remote_collab_room, &st.remote_collab_key) {
+        (Some(room), Some(key)) => {
+            let mut claims = HOSTED_CLAIMS.lock().unwrap_or_else(|e| e.into_inner());
+            let expired = claims
+                .get(room)
+                .map(|claim| !claim.active && claim.claimed_at.elapsed() >= Duration::from_secs(15))
+                .unwrap_or(true);
+            let mode = if expired {
+                claims.insert(room.clone(), HostedClaim { claimed_at: Instant::now(), active: false });
+                "host"
+            } else {
+                "join"
+            };
+            Json(json!({
+                "hosted": true,
+                "mode": mode,
+                "room": room,
+                "key": key,
+                "workspace": st.ws().file_name().map(|name| name.to_string_lossy().into_owned()),
+            }))
+            .into_response()
+        }
+        _ => Json(json!({ "hosted": false })).into_response(),
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -5407,6 +5883,64 @@ async fn settings_post(body: Bytes) -> Response {
     }
 }
 
+// One clipboard handle for the life of the process. On X11 the clipboard is a
+// protocol rather than a place: whoever copied is asked for the text again each
+// time someone pastes. Opening a handle per request and dropping it hands that
+// ownership straight back, so the copy evaporates before anyone can use it.
+static CLIPBOARD: LazyLock<Mutex<Option<arboard::Clipboard>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+fn locked_clipboard() -> std::sync::MutexGuard<'static, Option<arboard::Clipboard>> {
+    let mut held = CLIPBOARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Clipboard initialization may fail temporarily while a Linux desktop is
+    // still starting. Do not turn that one failure into a broken menu for the
+    // rest of the process; retry on the next real clipboard operation.
+    if held.is_none() {
+        *held = arboard::Clipboard::new().ok();
+    }
+    held
+}
+
+async fn clipboard_get(State(st): St) -> Response {
+    if st.remote_mode() {
+        return json_err(
+            StatusCode::NOT_IMPLEMENTED,
+            "The hosted editor uses the browser device's clipboard.",
+        );
+    }
+    let text = tokio::task::spawn_blocking(|| {
+        let mut held = locked_clipboard();
+        held.as_mut().and_then(|c| c.get_text().ok()).unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
+    Json(json!({ "text": text })).into_response()
+}
+
+async fn clipboard_post(State(st): St, body: Bytes) -> Response {
+    if st.remote_mode() {
+        return json_err(
+            StatusCode::NOT_IMPLEMENTED,
+            "The hosted editor uses the browser device's clipboard.",
+        );
+    }
+    let text = String::from_utf8_lossy(&body).into_owned();
+    let ok = tokio::task::spawn_blocking(move || {
+        let mut held = locked_clipboard();
+        match held.as_mut() {
+            Some(c) => c.set_text(text).is_ok(),
+            None => false,
+        }
+    })
+    .await
+    .unwrap_or(false);
+    if ok {
+        Json(json!({ "ok": true })).into_response()
+    } else {
+        json_err(StatusCode::INTERNAL_SERVER_ERROR, "Could not reach the system clipboard")
+    }
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     use tower_http::cors::{AllowOrigin, Any, CorsLayer};
     let cors = CorsLayer::new()
@@ -5432,7 +5966,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/workspace/reveal", post(workspace_reveal))
         .route("/app/new-window", post(app_new_window))
         .route("/collab/info", get(collab_server_info))
+        .route("/hosted/info", get(hosted_info))
         .route("/workspace/search", get(workspace_search))
+        .route("/workspace/math-locations", get(workspace_math_locations))
         .route("/workspace/raw", get(workspace_raw))
         .route("/workspace/compress", post(workspace_compress))
         .route("/data/xlsx", post(data_xlsx).layer(DefaultBodyLimit::max(50 * 1024 * 1024)))
@@ -5486,13 +6022,20 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/lint/ignore", post(lint_ignore))
         .route("/session", get(session_get).post(session_post))
         .route("/settings", get(settings_get).post(settings_post))
+        .route("/clipboard", get(clipboard_get).post(clipboard_post).layer(DefaultBodyLimit::max(16 * 1024 * 1024)))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_guard));
 
     let app = Router::new().merge(api);
     // Collaboration relay: outside the bearer-token guard, because a peer joining
     // from another window or machine has no copy of this backend's token — the
     // secret room id gates access instead.
-    let app = app.route("/collab/{room}", get(collab_ws));
+    let app = app
+        .route("/collab/{room}", get(hosted_collab_ws))
+        .route("/healthz", get(collab_health))
+        .route(
+            "/auth/login",
+            post(remote_login).layer(DefaultBodyLimit::max(4096)),
+        );
     #[cfg(debug_assertions)]
     let app = app.route("/auth/dev-token", get(dev_api_token));
 
@@ -5500,7 +6043,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .fallback(static_fallback)
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(cors)
-        .layer(axum::middleware::from_fn(local_guard))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), request_guard))
         .with_state(state)
 }
 
@@ -5510,7 +6053,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 // Full shutdown at app exit: every watcher owner calls this and the last one
 // also reaps every language server.
 pub async fn shutdown_children(state: &Arc<AppState>) {
-    stop_preview_watcher(state).await;
+    shutdown_window(state).await;
     stop_all_lsps().await;
 }
 
@@ -5518,6 +6061,13 @@ pub async fn shutdown_children(state: &Arc<AppState>) {
 // are shared per-workspace across windows and stay for the survivors.
 pub async fn shutdown_window(state: &Arc<AppState>) {
     stop_preview_watcher(state).await;
+    if !state.workspace_released.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        let workspace = state.ws();
+        if release_workspace_user(&workspace) {
+            stop_lsp_for(&workspace).await;
+        }
+    }
+    let _ = state.shutdown.send(true);
 }
 
 // A Hilbert run purely as a collaboration server: just the relay, bound to all
@@ -5526,7 +6076,9 @@ pub async fn shutdown_window(state: &Arc<AppState>) {
 pub async fn serve_sync_server(listener: std::net::TcpListener) {
     listener.set_nonblocking(true).expect("nonblocking");
     let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
-    let app = Router::new().route("/collab/{room}", get(collab_ws));
+    let app = Router::new()
+        .route("/collab/{room}", get(collab_ws))
+        .route("/healthz", get(collab_health));
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("[hilbert-sync] server error: {e}");
     }
@@ -5535,8 +6087,22 @@ pub async fn serve_sync_server(listener: std::net::TcpListener) {
 pub async fn serve(listener: std::net::TcpListener, state: Arc<AppState>) {
     listener.set_nonblocking(true).expect("nonblocking");
     let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+    let mut shutdown = state.shutdown.subscribe();
     let app = router(state);
-    if let Err(e) = axum::serve(listener, app).await {
+    let wait_for_shutdown = async move {
+        if *shutdown.borrow() {
+            return;
+        }
+        while shutdown.changed().await.is_ok() {
+            if *shutdown.borrow() {
+                return;
+            }
+        }
+    };
+    if let Err(e) = axum::serve(listener, app)
+        .with_graceful_shutdown(wait_for_shutdown)
+        .await
+    {
         eprintln!("[typst-editor] server error: {e}");
     }
 }
@@ -5561,6 +6127,37 @@ mod tests {
         fs::create_dir(ws.join("chapters")).unwrap();
         assert_eq!(safe_workspace_path(&ws, "chapters/new.typ"), Some(ws.join("chapters/new.typ")));
         assert!(safe_workspace_path(&ws, "../outside.typ").is_none());
+        fs::remove_dir_all(ws).unwrap();
+    }
+
+    #[test]
+    fn workspace_copy_is_exclusive_and_copies_directories() {
+        let ws = temp_workspace("copy");
+        let source = ws.join("source.typ");
+        fs::write(&source, "irreplaceable").unwrap();
+
+        let error = copy_workspace_entry(&source, &source).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&source).unwrap(), "irreplaceable");
+
+        let occupied = ws.join("occupied.typ");
+        fs::write(&occupied, "keep me").unwrap();
+        let error = copy_workspace_entry(&source, &occupied).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&occupied).unwrap(), "keep me");
+
+        let folder = ws.join("figures");
+        fs::create_dir_all(folder.join("nested")).unwrap();
+        fs::write(folder.join("one.txt"), "one").unwrap();
+        fs::write(folder.join("nested/two.txt"), "two").unwrap();
+        let copied = ws.join("figures_copy");
+        copy_workspace_entry(&folder, &copied).unwrap();
+        assert_eq!(fs::read_to_string(copied.join("one.txt")).unwrap(), "one");
+        assert_eq!(fs::read_to_string(copied.join("nested/two.txt")).unwrap(), "two");
+
+        let error = copy_workspace_entry(&folder, &folder.join("inside")).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!folder.join("inside").exists());
         fs::remove_dir_all(ws).unwrap();
     }
 
@@ -5601,11 +6198,112 @@ mod tests {
     #[test]
     fn api_bearer_token_must_match_exactly() {
         let mut headers = HeaderMap::new();
-        assert!(!valid_bearer(&headers, "fixed-token"));
+        assert!(!valid_request_auth(&headers, "fixed-token"));
         headers.insert(header::AUTHORIZATION, "Bearer wrong-token".parse().unwrap());
-        assert!(!valid_bearer(&headers, "fixed-token"));
+        assert!(!valid_request_auth(&headers, "fixed-token"));
         headers.insert(header::AUTHORIZATION, "Bearer fixed-token".parse().unwrap());
-        assert!(valid_bearer(&headers, "fixed-token"));
+        assert!(valid_request_auth(&headers, "fixed-token"));
+    }
+
+    #[test]
+    fn hosted_auth_accepts_only_an_exact_bearer_or_session_cookie() {
+        let expected = "hosted-session-token-0123456789abcdef";
+        let mut headers = HeaderMap::new();
+        assert!(!valid_request_auth(&headers, expected));
+
+        headers.insert(header::AUTHORIZATION, format!("Bearer {expected}-extra").parse().unwrap());
+        assert!(!valid_request_auth(&headers, expected));
+        headers.insert(header::AUTHORIZATION, format!("Bearer {expected}").parse().unwrap());
+        assert!(valid_request_auth(&headers, expected));
+
+        headers.remove(header::AUTHORIZATION);
+        headers.insert(
+            header::COOKIE,
+            format!("theme=ink; hilbert_session={expected}; another=value").parse().unwrap(),
+        );
+        assert!(valid_request_auth(&headers, expected));
+        headers.insert(
+            header::COOKIE,
+            format!("hilbert_session={expected}-extra").parse().unwrap(),
+        );
+        assert!(!valid_request_auth(&headers, expected));
+    }
+
+    #[test]
+    fn hosted_secrets_survive_restart_but_are_domain_and_workspace_scoped() {
+        let first_workspace = temp_workspace("hosted-secret-first");
+        let second_workspace = temp_workspace("hosted-secret-second");
+        let access = "hosted-access-token-0123456789abcdef";
+
+        let session = hosted_secret("session", access, &first_workspace);
+        assert_eq!(session, hosted_secret("session", access, &first_workspace));
+        assert_ne!(session, hosted_secret("room", access, &first_workspace));
+        assert_ne!(session, hosted_secret("session", "different-hosted-access-token", &first_workspace));
+        assert_ne!(session, hosted_secret("session", access, &second_workspace));
+
+        fs::remove_dir_all(first_workspace).unwrap();
+        fs::remove_dir_all(second_workspace).unwrap();
+    }
+
+    #[test]
+    fn workspace_reference_counts_keep_shared_language_servers_alive() {
+        let first = temp_workspace("workspace-users-first");
+        let second = temp_workspace("workspace-users-second");
+
+        register_workspace_user(&first);
+        register_workspace_user(&first);
+        assert!(!release_workspace_user(&first));
+        assert!(move_workspace_user(&first, &second));
+        assert!(release_workspace_user(&second));
+
+        fs::remove_dir_all(first).unwrap();
+        fs::remove_dir_all(second).unwrap();
+    }
+
+    #[test]
+    fn hosted_claim_survives_until_both_room_channels_disconnect() {
+        let room = format!(
+            "hostedclaim{}{}",
+            std::process::id(),
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+        );
+        HOSTED_CLAIMS.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            room.clone(),
+            HostedClaim { claimed_at: Instant::now(), active: false },
+        );
+
+        let base = collab_join(&room).expect("base room should open");
+        let binary_room = format!("{room}-bin");
+        let binary = collab_join(&binary_room).expect("binary room should open");
+        assert!(HOSTED_CLAIMS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&room)
+            .is_some_and(|claim| claim.active));
+
+        collab_leave(&room);
+        assert!(HOSTED_CLAIMS.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&room));
+        collab_leave(&binary_room);
+        assert!(!HOSTED_CLAIMS.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&room));
+        drop(base);
+        drop(binary);
+    }
+
+    #[test]
+    fn hosted_socket_rebuilds_the_active_claim_after_a_process_restart() {
+        let room = format!(
+            "hostedreconnect{}{}",
+            std::process::id(),
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+        );
+        HOSTED_CLAIMS.lock().unwrap_or_else(|error| error.into_inner()).remove(&room);
+        activate_hosted_claim(&room);
+        assert!(HOSTED_CLAIMS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&room)
+            .is_some_and(|claim| claim.active));
+        HOSTED_CLAIMS.lock().unwrap_or_else(|error| error.into_inner()).remove(&room);
     }
 
     #[test]
@@ -5667,6 +6365,17 @@ mod tests {
             WatchStep::AwaitStart(START_GRACE),
             "a finished cycle from before the edit is not"
         );
+    }
+
+    #[test]
+    fn preview_reader_stops_at_its_memory_limit_without_changing_the_file() {
+        let root = temp_workspace("preview-limit");
+        let file = root.join("large.bin");
+        fs::write(&file, b"123456789").unwrap();
+        assert_eq!(read_file_limited(&file, 8).unwrap(), None);
+        assert_eq!(fs::read(&file).unwrap(), b"123456789");
+        assert_eq!(read_file_limited(&file, 9).unwrap(), Some(b"123456789".to_vec()));
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

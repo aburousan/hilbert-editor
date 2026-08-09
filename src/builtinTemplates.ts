@@ -1,3 +1,9 @@
+// The preprint layout and the document that uses it live as real .typ files
+// under src/templates, so the vendored one stays readable next to upstream
+// rather than turning into an escaped string.
+import LAPREPRINT_LIB from './templates/lapreprint.typ?raw';
+import LAPREPRINT_DRAFT from './templates/lapreprint-draft.typ?raw';
+
 // Starter templates that ship inside the app. Unlike "New from Template",
 // which pulls a package from Typst Universe over the network, these are baked
 // into the bundle and write straight into the open folder, so they work
@@ -23,7 +29,7 @@ export interface BuiltinTemplate {
   downloadsOnce?: boolean;
 }
 
-const SLIDES = `#import "@preview/touying:0.6.1": *
+const SLIDES = `#import "@preview/touying:0.7.4": *
 #import themes.university: *
 #import "@preview/subpar:0.2.2"
 #import "@preview/fletcher:0.5.8" as fletcher: node, edge
@@ -393,6 +399,17 @@ export const BUILTIN_TEMPLATES: BuiltinTemplate[] = [
     entry: 'report.typ',
     files: [
       { path: 'report.typ', content: REPORT },
+      { path: 'refs.bib', content: REFS, keepExisting: true },
+    ],
+  },
+  {
+    id: 'lapreprint',
+    name: 'Preprint (LaPreprint)',
+    description: 'Preprint layout with a wide margin for notes and dates, ORCID links, an Open Access badge and a running footer.',
+    entry: 'preprint.typ',
+    files: [
+      { path: 'preprint.typ', content: LAPREPRINT_DRAFT },
+      { path: 'lapreprint.typ', content: LAPREPRINT_LIB },
       { path: 'refs.bib', content: REFS, keepExisting: true },
     ],
   },

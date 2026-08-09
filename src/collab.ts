@@ -28,8 +28,10 @@ export type CollabHandle = {
   ticket: string;
   workspace: WorkspaceModel;
   bindFile: (path: string | null, model?: any, editor?: any) => void;
+  reconnect: () => void;
   stop: () => void;
   onPeers: (callback: (count: number) => void) => void;
+  onUsers: (callback: (users: CollabUser[]) => void) => void;
   onStatus: (callback: (status: CollabStatus) => void) => void;
   onReady: (callback: () => void) => void;
   onError: (callback: (message: string) => void) => void;
@@ -88,6 +90,7 @@ export function startCollab(opts: {
   let errorMessage = '';
   let currentStatus: CollabStatus = 'connecting';
   let peersCallback: ((count: number) => void) | null = null;
+  let usersCallback: ((users: CollabUser[]) => void) | null = null;
   let statusCallback: ((status: CollabStatus) => void) | null = null;
   let readyCallback: (() => void) | null = null;
   let errorCallback: ((message: string) => void) | null = null;
@@ -170,17 +173,17 @@ export function startCollab(opts: {
     statusCallback?.(status);
   };
   const emitReady = () => {
-    if (ready || stopped) return;
-    ready = true;
+    if (stopped) return;
     window.clearTimeout(connectTimer);
+    if (ready) return;
+    ready = true;
     readyCallback?.();
   };
   const emitError = (message: string) => {
-    if (stopped || errorMessage) return;
+    if (stopped) return;
     errorMessage = message;
     emitStatus('error');
     errorCallback?.(message);
-    dispose(false);
   };
 
   const paintCursors = () => {
@@ -201,9 +204,23 @@ export function startCollab(opts: {
     style.textContent = css;
   };
 
-  const emitPeers = () => peersCallback?.(provider.awareness.getStates().size);
+  const currentUsers = (): CollabUser[] => {
+    const users: CollabUser[] = [];
+    provider.awareness.getStates().forEach((state: any) => {
+      if (!state?.user || users.length >= 32) return;
+      const name = String(state.user.name || 'Guest').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 48) || 'Guest';
+      const claimed = String(state.user.color || '');
+      const color = /^#[0-9a-f]{6}$/i.test(claimed) ? claimed : '#f59e0b';
+      users.push({ name, color });
+    });
+    return users;
+  };
+  const emitPresence = () => {
+    peersCallback?.(provider.awareness.getStates().size);
+    usersCallback?.(currentUsers());
+  };
   const onAwareness = ({ added = [] }: { added?: number[] } = {}) => {
-    emitPeers();
+    emitPresence();
     paintCursors();
     // The content-blind relay retains no awareness state. Everyone replies
     // once when a collaborator appears, so a newcomer sees every existing
@@ -218,6 +235,8 @@ export function startCollab(opts: {
   const onStatus = (event: { status: 'connecting' | 'connected' | 'disconnected' }) => {
     if (stopped) return;
     if (event.status === 'connected') {
+      errorMessage = '';
+      if (ready || opts.mode === 'host') window.clearTimeout(connectTimer);
       window.clearTimeout(downgradeTimer);
       emitStatus(opts.mode === 'host' ? 'connected' : 'syncing');
       if (opts.mode === 'host') emitReady();
@@ -278,13 +297,20 @@ export function startCollab(opts: {
   };
 
   const timeoutMs = opts.timeoutMs ?? (opts.mode === 'host' ? 8000 : 12000);
-  const connectTimer = window.setTimeout(() => {
-    emitError(
-      opts.mode === 'host'
-        ? 'Could not reach the collaboration listener. Check the advertised address and firewall.'
-        : 'The host was reached but no document synchronized. Check the invitation or ask the host to restart the session.',
-    );
-  }, timeoutMs);
+  let connectTimer = 0;
+  const armConnectTimer = () => {
+    window.clearTimeout(connectTimer);
+    connectTimer = window.setTimeout(() => {
+      emitError(
+        ready
+          ? 'The collaboration connection is still unavailable. Hilbert will keep trying; you can also retry now.'
+          : opts.mode === 'host'
+            ? 'Could not reach the collaboration listener. Check the advertised address and firewall, then retry.'
+            : 'The server was reached but no project synchronized. Check the invitation or ask the host, then retry.',
+      );
+    }, timeoutMs);
+  };
+  armConnectTimer();
   provider.connect();
 
   return {
@@ -306,10 +332,22 @@ export function startCollab(opts: {
       bindingTarget = { path, model, editor };
       attachBinding();
     },
+    reconnect: () => {
+      if (stopped) return;
+      errorMessage = '';
+      emitStatus('connecting');
+      armConnectTimer();
+      provider.disconnect();
+      provider.connect();
+    },
     stop: () => dispose(true),
     onPeers: callback => {
       peersCallback = callback;
-      emitPeers();
+      emitPresence();
+    },
+    onUsers: callback => {
+      usersCallback = callback;
+      callback(currentUsers());
     },
     onStatus: callback => {
       statusCallback = callback;

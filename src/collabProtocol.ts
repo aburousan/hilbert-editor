@@ -125,6 +125,11 @@ async function decryptedFrame(key: CryptoKey, packet: ArrayBuffer): Promise<{ ve
 // network frame before the relay sees it and decrypts it before Yjs receives it.
 // The relay therefore needs no document key and can remain content-blind.
 export function encryptedWebSocketClass(encodedKey: string): typeof WebSocket {
+  if (!globalThis.crypto?.subtle) {
+    throw new Error(
+      'Encrypted live collaboration needs HTTPS, or localhost through an SSH tunnel. Plain LAN HTTP can still edit and compile, but browsers do not expose the encryption API there.',
+    );
+  }
   const rawKey = base64UrlToBytes(encodedKey);
   if (!rawKey || rawKey.length !== KEY_BYTES) throw new Error('Invalid collaboration key.');
   const keyMaterial = rawKey.slice().buffer as ArrayBuffer;

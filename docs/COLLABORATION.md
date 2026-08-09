@@ -167,6 +167,80 @@ If the relay sits on the public internet rather than a private network, put it b
 and use a `wss://` address, or tunnel it, so the transport is protected on top of the
 per-session encryption.
 
+### A complete browser-hosted workspace
+
+The relay above only forwards encrypted collaboration traffic: everyone still runs the
+desktop app and keeps their own project copy. Hilbert can instead host the editor, files,
+compiler, preview, and collaboration together, for an Overleaf-like setup in a browser:
+
+```sh
+npm run build
+cd src-tauri
+cargo build --release
+HILBERT_SERVER_TOKEN="replace-with-a-random-secret-of-at-least-32-characters" \
+  TYPST_DIST=../dist \
+  ./target/release/typst-editor --hosted-server \
+  --bind 127.0.0.1 --port 3001 --workspace /srv/hilbert/project
+```
+
+Open `http://127.0.0.1:3001` and sign in with the value of
+`HILBERT_SERVER_TOKEN`. The token is accepted only by the sign-in form; Hilbert then
+uses an HttpOnly session cookie, so the secret is not placed in the URL or browser
+storage. The first signed-in browser becomes the collaboration host and later browsers
+join it automatically. Edits, cursors, the PDF preview, generated plots, whiteboards,
+and saved files update through the same server.
+
+The authenticated browser session and encrypted hosted collaboration room are stable
+across an ordinary process restart as long as the same `HILBERT_SERVER_TOKEN` and
+workspace path are used. Changing either intentionally rotates those derived secrets
+and asks browsers to sign in to the new hosted workspace identity.
+
+Use `--bind 0.0.0.0` only when other machines need to reach it. Encrypted browser
+collaboration requires a secure browser context: use an HTTPS reverse proxy even on a
+LAN, or reach the loopback listener through an SSH tunnel. Browsers deliberately do not
+expose Web Crypto to a page opened as plain `http://<LAN address>`, so that address can
+still edit and compile but cannot start the encrypted live channel. With HTTPS the app
+uses secure `https://` and `wss://` connections. `/healthz` is an unauthenticated health
+endpoint suitable for a process monitor. The workspace path is fixed at startup and
+signed-in browsers cannot change it.
+
+For example, if the server is reachable by SSH through a campus network but is not on
+the same Wi-Fi, leave Hilbert bound to loopback and run this on each client:
+
+```sh
+ssh -N -L 3001:127.0.0.1:3001 user@server.example.edu
+```
+
+Then open `http://127.0.0.1:3001` locally. The browser treats loopback as a secure
+context for Web Crypto, while SSH encrypts the campus-network hop and avoids exposing
+the Hilbert port to other campus users. Choose another unused local port on the left
+side of `-L` when port 3001 is already occupied.
+
+Unlike invitation-based desktop collaboration, browser-hosted mode does **not** create
+an automatic offline project folder on each visitor's device. The server workspace is
+the authoritative copy. Use project export or another backup/sync method when someone
+needs a separate local copy.
+
+Unsaved text has an additional outage safety net. While the hosted page is open,
+Hilbert writes each dirty text buffer to IndexedDB on that device (with a smaller
+localStorage fallback) until the server confirms the save. It retries a failed save
+after the server returns. On the next load at the same browser origin, a draft whose
+server base is unchanged is replayed automatically; if the server copy changed too,
+Hilbert preserves both and asks which one to open instead of overwriting either.
+
+This recovery store is not a replacement for server backups or a complete offline
+installation: a browser cannot freshly load the hosted UI while the server is down,
+clearing site data removes that browser's recovery drafts, and using a different
+hostname or SSH local port creates a different browser origin. Keep the same tunnel
+port/URL and browser profile when recovering, and back up the authoritative server
+workspace normally.
+
+Signed-in users can run the workspace's Python, Julia, or Wolfram code when code
+execution is enabled. Those runners have time and resource guardrails, but they are not
+a hardened security boundary. Set `ALLOW_CODE_EXECUTION=0` if collaborators should not
+run code, and use a dedicated OS account, container, or VM when hosting documents you do
+not fully trust.
+
 ## Running from source
 
 You need [Rust](https://www.rust-lang.org/tools/install) and
