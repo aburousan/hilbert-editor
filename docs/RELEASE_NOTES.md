@@ -6,56 +6,87 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ## 0.1.20
 
-The right-click menu can finally cut and paste, Hilbert can serve a project to a
-browser, and double-clicking the second of two similar formulas takes you to the
-second one.
+Cut and paste work from the mouse. Hilbert can serve a whole project to a browser
+over one port. Double-clicking the second of two near-identical formulas finally
+takes you to the second one.
 
-### Cut, Copy and Paste from the mouse
+### The right-click menu can cut, copy and paste
 
-Monaco's clipboard entries go through `document.execCommand`, which a webview
-refuses. Paste could never work that way, and on macOS Cut was worse than broken:
-the copy was refused, the delete went ahead, and the text was gone. The editor now
-draws its own right-click menu and reads and writes the real system clipboard
-through the app, so an empty selection still takes the whole line and several
-cursors still cut in one undo step. On Linux the app holds the X11 selection
-rather than handing ownership straight back, which is why the copy used to vanish
+Monaco's clipboard entries call `document.execCommand`, which a webview will not
+run on a page's behalf. Paste was the worst of it. The entry sat there in the
+menu and did nothing at all when clicked. On macOS, Cut was worse than useless:
+WebKit refused the copy, the delete still ran, and the text was simply gone.
+
+The editor now draws its own menu and moves text through the app to the real
+system clipboard. An empty selection still takes the whole line. Several cursors
+still cut in one undo step. On Linux the app keeps hold of the X11 selection
+instead of handing ownership straight back, which is why a copy used to evaporate
 before another window could ask for it.
 
-The file tree learned the same three operations, for files and for whole folders,
-with the copy refusing to run when the source and destination are the same file.
+The file tree does the same three operations, for single files and for whole
+folders. Copying a file onto itself is refused rather than attempted, because
+`fs::copy(src, src)` is not a harmless no-op everywhere: it can truncate the
+source before it starts reading.
 
 ### A project you can open in a browser
 
 `hilbert --serve` runs one workspace, its compiler, the PDF preview and the
-encrypted relay on a single port. Sign in with a token and you get an HttpOnly
-cookie; the room, its key and the session are derived from that token and the
-workspace, so restarting the server leaves an open browser signed in and does not
-split one document across two rooms. The first browser hosts, later ones join, and
-nobody has to prepare an empty folder.
+encrypted relay on a single port. You sign in with a token and the browser gets
+an HttpOnly cookie back. The room, its key and the session are all derived from
+that token and the workspace, so restarting the server leaves an already-open
+browser signed in and does not scatter one document across two rooms. The first
+browser to arrive hosts, the rest join, and nobody has to prepare an empty folder
+first.
 
-The server workspace is the real one. A browser visitor does not get a durable
-copy on their own machine, so keep normal backups. Set `ALLOW_CODE_EXECUTION=0`
-when the people joining should not be running Python or Julia on your machine.
+The server's copy is the real one. A visitor's browser does not keep a durable
+copy on their own machine, so that server still needs ordinary backups. Set
+`ALLOW_CODE_EXECUTION=0` when the people joining should not be running Python or
+Julia on your machine.
+
+One thing to know before sharing a LAN address: browsers only expose Web Crypto
+on HTTPS or localhost, so a plain `http://<address>` page can sign in, edit and
+compile but cannot start the encrypted channel. Put it behind a reverse proxy, or
+forward the port over SSH and visit `127.0.0.1`.
 
 ### Two similar equations no longer both jump to the first
 
-Typst has no SyncTeX file, so reverse sync used to match the words it could read
-out of the PDF — which is no help when two integrals differ by one character.
-Hilbert now asks the compiler where each equation actually landed and uses that
-coordinate, in both directions, with one query per compile.
+Typst writes no SyncTeX file, so reverse sync matched the words it could read out
+of the rendered PDF. That is no help at all when two integrals differ by one
+character. Hilbert now asks the compiler where each equation actually landed on
+the page and uses that coordinate, in both directions. It asks once per compile,
+and not at all while you are moving around ordinary prose.
 
-### While you were away
+### Closing a window shuts down what it started
 
-- The toolbar is yours: hide any of 28 buttons, or a whole group, without losing
-  the menu command or the shortcut.
-- If the server goes away mid-sentence, the dirty buffer is kept in the browser
-  and replayed when it comes back. If the file changed underneath in the meantime,
-  both copies are kept and you choose.
-- Windows reopen where you left them, on the monitor you left them on.
-- A preprint template with margin notes and ORCID links, and the slide deck no
-  longer warns about not converging.
-- Memory that can be rebuilt is now bounded — editor models, PDF word indexes, run
-  output, previews — so a long session stops growing.
+Every window has its own backend listener and preview watcher, and closing one
+used to leave both alive until the whole app exited. Now they go with it. Two
+windows on the same project share a single Tinymist, and closing either one does
+not kill the language server the other is still using.
+
+Windows also come back where you left them: same size, same position, same
+monitor. Wayland does not let an application place itself, so there you get the
+size back but not the position. The PDF returns to its page and zoom, the file
+tree to its scroll position, and the editor to the line you were on.
+
+SIGINT and SIGTERM now go through the same shutdown path, which matters if you
+run Hilbert from a terminal or under systemd.
+
+### Smaller things
+
+- Twenty-eight toolbar buttons can be hidden one at a time or by group. Hiding a
+  button does not disable its menu command or its keyboard shortcut.
+- If the backend disappears mid-sentence, the unsaved buffer is kept in the
+  browser and replayed when it comes back. If the file changed underneath in the
+  meantime, both copies are kept and you decide which one wins.
+- A LaPreprint-style template with margin notes, ORCID links and a running
+  footer. Six templates now ship with the app, and all six compile without a
+  single warning.
+- Anything that can be recomputed now has a ceiling: inactive editor models, PDF
+  word indexes, program output, file previews. Unsaved work is never what gets
+  dropped to stay under one.
+- On Linux the bundled Typst packages no longer trip over the `._name` files that
+  macOS archive tools leave behind, which used to print an error for every
+  package at startup.
 
 ---
 
