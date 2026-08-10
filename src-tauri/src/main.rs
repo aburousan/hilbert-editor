@@ -290,6 +290,46 @@ fn sync_server_main() {
     });
 }
 
+// Where an installed build keeps the built UI. The windowed app asks Tauri for
+// its resource directory, but hosted mode runs before any Tauri app exists, so
+// the same layouts are derived from the executable: resources sit beside the
+// binary on Windows, in Contents/Resources inside a .app, and under
+// /usr/lib/Hilbert for a .deb or AppImage whose binary lives in /usr/bin.
+fn dist_candidates(exe_dir: &Path) -> Vec<PathBuf> {
+    let mut candidates = vec![exe_dir.join("dist")];
+    if let Some(parent) = exe_dir.parent() {
+        candidates.push(parent.join("Resources").join("dist"));
+        candidates.push(parent.join("lib").join("Hilbert").join("dist"));
+    }
+    candidates
+}
+
+fn packaged_dist() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    dist_candidates(exe.parent()?)
+        .into_iter()
+        .find(|candidate| candidate.join("index.html").is_file())
+}
+
+#[cfg(test)]
+mod packaged_dist_tests {
+    use super::dist_candidates;
+    use std::path::Path;
+
+    #[test]
+    fn hosted_mode_finds_the_ui_in_every_packaged_layout() {
+        // Windows keeps resources beside the executable.
+        let windows = dist_candidates(Path::new("/opt/Hilbert"));
+        assert!(windows.contains(&Path::new("/opt/Hilbert/dist").to_path_buf()));
+        // A macOS bundle: Contents/MacOS/hilbert -> Contents/Resources/dist.
+        let macos = dist_candidates(Path::new("/Applications/Hilbert.app/Contents/MacOS"));
+        assert!(macos.contains(&Path::new("/Applications/Hilbert.app/Contents/Resources/dist").to_path_buf()));
+        // A .deb or AppImage: usr/bin/hilbert -> usr/lib/Hilbert/dist.
+        let linux = dist_candidates(Path::new("/usr/bin"));
+        assert!(linux.contains(&Path::new("/usr/lib/Hilbert/dist").to_path_buf()));
+    }
+}
+
 fn hosted_server_main() {
     let Some(access_token) = std::env::var("HILBERT_SERVER_TOKEN")
         .ok()
@@ -312,10 +352,7 @@ fn hosted_server_main() {
     let dist = std::env::var("TYPST_DIST")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| {
-            let beside_binary = std::env::current_exe().ok()?.parent()?.join("dist");
-            beside_binary.exists().then_some(beside_binary)
-        })
+        .or_else(packaged_dist)
         .or_else(|| {
             let development = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dist");
             development.exists().then_some(development)

@@ -4,6 +4,61 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.1.20
+
+The right-click menu can finally cut and paste, Hilbert can serve a project to a
+browser, and double-clicking the second of two similar formulas takes you to the
+second one.
+
+### Cut, Copy and Paste from the mouse
+
+Monaco's clipboard entries go through `document.execCommand`, which a webview
+refuses. Paste could never work that way, and on macOS Cut was worse than broken:
+the copy was refused, the delete went ahead, and the text was gone. The editor now
+draws its own right-click menu and reads and writes the real system clipboard
+through the app, so an empty selection still takes the whole line and several
+cursors still cut in one undo step. On Linux the app holds the X11 selection
+rather than handing ownership straight back, which is why the copy used to vanish
+before another window could ask for it.
+
+The file tree learned the same three operations, for files and for whole folders,
+with the copy refusing to run when the source and destination are the same file.
+
+### A project you can open in a browser
+
+`hilbert --serve` runs one workspace, its compiler, the PDF preview and the
+encrypted relay on a single port. Sign in with a token and you get an HttpOnly
+cookie; the room, its key and the session are derived from that token and the
+workspace, so restarting the server leaves an open browser signed in and does not
+split one document across two rooms. The first browser hosts, later ones join, and
+nobody has to prepare an empty folder.
+
+The server workspace is the real one. A browser visitor does not get a durable
+copy on their own machine, so keep normal backups. Set `ALLOW_CODE_EXECUTION=0`
+when the people joining should not be running Python or Julia on your machine.
+
+### Two similar equations no longer both jump to the first
+
+Typst has no SyncTeX file, so reverse sync used to match the words it could read
+out of the PDF — which is no help when two integrals differ by one character.
+Hilbert now asks the compiler where each equation actually landed and uses that
+coordinate, in both directions, with one query per compile.
+
+### While you were away
+
+- The toolbar is yours: hide any of 28 buttons, or a whole group, without losing
+  the menu command or the shortcut.
+- If the server goes away mid-sentence, the dirty buffer is kept in the browser
+  and replayed when it comes back. If the file changed underneath in the meantime,
+  both copies are kept and you choose.
+- Windows reopen where you left them, on the monitor you left them on.
+- A preprint template with margin notes and ORCID links, and the slide deck no
+  longer warns about not converging.
+- Memory that can be rebuilt is now bounded — editor models, PDF word indexes, run
+  output, previews — so a long session stops growing.
+
+---
+
 ## 0.1.19
 
 The Windows fixes, confirmed on the machine that had the problem. Also five
