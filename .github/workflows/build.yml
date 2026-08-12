@@ -61,6 +61,34 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # The update dialog's message comes from latest.json, which is written at
+      # build time. Reading it from the notes file rather than repeating it here
+      # keeps the two from drifting: 0.1.20 shipped advertising 0.1.17's changes
+      # because this was a hand-maintained string that nobody remembered to edit.
+      - name: Summary for the update dialog
+        id: summary
+        shell: bash
+        run: |
+          summary=$(python3 - <<'PY'
+          import re
+          text = open('docs/RELEASE_NOTES.md', encoding='utf-8').read()
+          sections = re.split(r'^## ', text, flags=re.M)[1:]
+          body = sections[0].split('\n', 1)[1] if sections else ''
+          para = next((p.strip() for p in body.split('\n\n') if p.strip() and not p.startswith('#')), '')
+          print(' '.join(para.split()))
+          PY
+          )
+          if [ -z "$summary" ]; then
+            echo "Could not read a summary from docs/RELEASE_NOTES.md" >&2
+            exit 1
+          fi
+          {
+            echo "text<<HILBERT_EOF"
+            echo "$summary"
+            echo "HILBERT_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Update dialog will say: $summary"
+
       # Pinned to a commit SHA (not the mutable @v0 tag) so a compromise of the
       # action's tag can't run with the signing key. SHA is action-v1.0.0.
       - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
@@ -75,12 +103,12 @@ jobs:
           args: ${{ matrix.args }}
           tagName: tauri-v__VERSION__
           releaseName: "Hilbert (Tauri) v__VERSION__"
-          # This text is baked into latest.json as the update-dialog message
-          # (the app shows its first 300 characters), so keep it a short,
-          # user-facing summary and refresh it for every release. The full
-          # notes from docs/RELEASE_NOTES.md are pasted in at publish time.
-          releaseBody: |
-            More collaboration fixes, and images display again — please update if you collaborate, because two of these could lose work without showing any sign of it. Opening an image or a PDF used to leave the session attached to the closed editor, so everything you typed afterwards stayed on your own machine while the app still said it was connected. A file could also end up holding the document twice, or lose a stretch of what one of you wrote, because reloading a file replaced the whole buffer and sent that to everyone as a rewrite. The "File changed outside Hilbert" prompt no longer interrupts a shared session to offer a choice that would have discarded your collaborator's work. Images, PDFs and code-run plots display again, and cropping and rotating work. The file tree no longer reads through other projects that happen to sit inside your folder, which used to make the whole app sluggish — those folders still appear and are read when you open them. Project transfer is steadier too: a missing asset is retried when someone who has it joins.
+          # Baked into latest.json as the update-dialog message, of which the app
+          # shows the first 300 characters. This is the opening paragraph of the
+          # newest section of docs/RELEASE_NOTES.md; write that paragraph as the
+          # summary you want an existing user to read. The full notes go on the
+          # release itself at publish time.
+          releaseBody: ${{ steps.summary.outputs.text }}
           releaseDraft: true
           prerelease: false
 
