@@ -3,6 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod proofread;
+mod sandbox;
 mod server;
 
 use std::fs;
@@ -339,6 +340,14 @@ fn hosted_server_main() {
         eprintln!("Set a long random token in the environment; it is the browser sign-in secret.");
         std::process::exit(2);
     };
+    // A hosted workspace runs whatever its users write, and nobody is standing
+    // over it. Unless the operator says otherwise, that means no sandbox, no
+    // code — decided here, before anything is bound, so the banner below can
+    // say what the answer turned out to be.
+    sandbox::set_policy(sandbox::parse_policy(
+        std::env::var("HILBERT_SANDBOX").ok().as_deref(),
+        true,
+    ));
     let bind = arg_value("--bind").unwrap_or_else(|| "127.0.0.1".into());
     let port: u16 = arg_value("--port").and_then(|value| value.parse().ok()).unwrap_or(3001);
     let workspace = arg_value("--workspace")
@@ -375,7 +384,16 @@ fn hosted_server_main() {
     println!("Workspace: {}", workspace.display());
     println!("Collaboration relay: ws://{bind}:{port}/collab/<room>");
     println!("Use HTTPS through a reverse proxy before exposing this service to the public internet.");
-    println!("Code execution: {}", if state.allow_exec { "ENABLED for signed-in users" } else { "disabled" });
+    println!("Sandbox: {}", sandbox::describe());
+    server::note(format!("sandbox: {}", sandbox::describe()));
+    match (state.allow_exec, sandbox::refusal()) {
+        (false, _) => println!("Code execution: disabled (ALLOW_CODE_EXECUTION=0)"),
+        (true, Some(reason)) => {
+            println!("Code execution: REFUSED");
+            println!("  {reason}");
+        }
+        (true, None) => println!("Code execution: ENABLED for signed-in users"),
+    }
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async move {
         let shutdown_state = state.clone();
@@ -404,7 +422,9 @@ fn headless_main() {
         // The spell/grammar dictionaries cost ~150 MB resident and proofreading is
         // off by default, so they load on the first /lint call instead of at boot.
         println!("Typst compiler server running on http://127.0.0.1:{port}");
-        println!("  code execution: {}", if state.allow_exec { "ENABLED (sandbox/)" } else { "disabled" });
+        println!("  code execution: {}", if state.allow_exec { "ENABLED" } else { "disabled" });
+        println!("  sandbox: {}", sandbox::describe());
+        server::note(format!("sandbox: {}", sandbox::describe()));
         start_embedded_sync_server();
         let shutdown_state = state.clone();
         tokio::spawn(async move {
@@ -747,8 +767,75 @@ fn main() {
                             .show(move |accepted| {
                                 if accepted {
                                     tauri::async_runtime::spawn(async move {
-                                        if update.download_and_install(|_, _| {}, || {}).await.is_ok() {
-                                            h2.restart();
+                                        use tauri::Manager;
+                                        // The download is ~16 MB, which is over a minute on a
+                                        // slow link. Without a sign of it the app looks like it
+                                        // ignored the click, so the progress goes in the title
+                                        // bar, and a failure says so rather than leaving the
+                                        // user waiting for a restart that is never coming.
+                                        let window = h2.get_webview_window("main");
+                                        let announce = |text: &str| {
+                                            if let Some(w) = &window {
+                                                let _ = w.set_title(text);
+                                            }
+                                        };
+                                        announce("Hilbert — downloading update…");
+
+                                        let progress_window = window.clone();
+                                        let installing_window = window.clone();
+                                        let mut downloaded: u64 = 0;
+                                        let mut total: Option<u64> = None;
+                                        let mut shown_percent = u64::MAX;
+                                        let outcome = update
+                                            .download_and_install(
+                                                move |chunk, content_length| {
+                                                    downloaded += chunk as u64;
+                                                    if total.is_none() {
+                                                        total = content_length;
+                                                    }
+                                                    let Some(w) = &progress_window else { return };
+                                                    match total.filter(|size| *size > 0) {
+                                                        // Retitling on every chunk is wasted work;
+                                                        // the bar only changes each whole percent.
+                                                        Some(size) => {
+                                                            let percent = downloaded * 100 / size;
+                                                            if percent != shown_percent {
+                                                                shown_percent = percent;
+                                                                let _ = w.set_title(&format!(
+                                                                    "Hilbert — downloading update… {percent}%"
+                                                                ));
+                                                            }
+                                                        }
+                                                        // A server that sends no length still gets
+                                                        // to show that something is happening.
+                                                        None => {
+                                                            let _ = w.set_title(&format!(
+                                                                "Hilbert — downloading update… {} MB",
+                                                                downloaded / (1024 * 1024)
+                                                            ));
+                                                        }
+                                                    }
+                                                },
+                                                move || {
+                                                    if let Some(w) = &installing_window {
+                                                        let _ = w.set_title("Hilbert — installing update…");
+                                                    }
+                                                },
+                                            )
+                                            .await;
+
+                                        match outcome {
+                                            Ok(()) => h2.restart(),
+                                            Err(error) => {
+                                                announce("Hilbert");
+                                                h2.dialog()
+                                                    .message(format!(
+                                                        "The update could not be installed.\n\n{error}\n\nNothing has changed and your work is safe. Try again later, or download the new version from the releases page."
+                                                    ))
+                                                    .title("Update failed")
+                                                    .kind(MessageDialogKind::Warning)
+                                                    .show(|_| {});
+                                            }
                                         }
                                     });
                                 }

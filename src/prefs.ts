@@ -27,6 +27,39 @@ export function setInterpreter(lang: string, path: string) {
   window.dispatchEvent(new Event(PREFS_CHANGED));
 }
 
+// What a run should save its figures as. PNG is the safe default; SVG and PDF
+// keep the plot as vectors so it stays sharp at any zoom and prints properly.
+// EPS is for journals that still demand it — Typst cannot embed EPS, so an EPS
+// run also writes a PDF twin and the document points at that (see the notebook
+// harnesses in server.rs).
+export const PLOT_FORMATS = ['png', 'svg', 'pdf', 'eps'] as const;
+export type PlotFormat = (typeof PLOT_FORMATS)[number];
+
+const PLOT_FORMAT_KEY = 'plot_format';
+
+export const getPlotFormat = (): PlotFormat => {
+  const saved = localStorage.getItem(PLOT_FORMAT_KEY);
+  return (PLOT_FORMATS as readonly string[]).includes(saved || '') ? (saved as PlotFormat) : 'png';
+};
+
+export function setPlotFormat(format: PlotFormat) {
+  if (getPlotFormat() === format) return;
+  localStorage.setItem(PLOT_FORMAT_KEY, format);
+  window.dispatchEvent(new Event(PREFS_CHANGED));
+}
+
+export function applyPlotFormat(saved: unknown) {
+  if (typeof saved === 'string' && (PLOT_FORMATS as readonly string[]).includes(saved)) {
+    localStorage.setItem(PLOT_FORMAT_KEY, saved);
+  }
+}
+
+// Typst embeds raster and PDF images; EPS and PostScript it cannot read at all.
+// Anything this rejects is still saved into the project, just referenced by name
+// instead of drawn into the document.
+export const embeddableInTypst = (path: string): boolean =>
+  /\.(png|jpe?g|gif|svg|webp|pdf)$/i.test(path);
+
 // The whole set, for writing to the settings file. Languages with no choice
 // recorded are left out rather than stored as empty strings, so "no preference"
 // and "preference for nothing" don't get confused on the way back.

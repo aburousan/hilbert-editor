@@ -45,3 +45,6 @@ workspace/*.pdf
 workspace/images/
 bin/tinymist
 *.key
+
+# Working notes for this machine. Records server addresses, so it stays local.
+LIVE_SYNC_HANDOFF.txt

@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { getInterpreter, setInterpreter } from '../prefs';
+import { embeddableInTypst, getInterpreter, setInterpreter } from '../prefs';
 
 import { API, useWorkspaceAsset } from '../api';
 import { limitRunResult } from '../performanceLimits';
@@ -7,16 +7,32 @@ import { limitRunResult } from '../performanceLimits';
 // A plot a run produced. The backend needs an Authorization header the browser
 // will not attach to an <img src>, so the bytes are read through the API helper
 // and shown from a blob URL.
+//
+// Only raster formats and SVG go in an <img>. A PDF gets an <object>, whose
+// fallback content shows when the webview has no PDF viewer — WebKitGTK on
+// Linux has none. EPS nothing can draw, so it is only named.
 function RunPlot({ path }: { path: string }) {
   const { url, error } = useWorkspaceAsset(path);
   if (error) return <div className="form-hint">{error}</div>;
   if (!url) return null;
-  return <img src={url} alt={path} style={{ maxWidth: '100%', marginTop: 8, borderRadius: 4, display: 'block' }} />;
+  const saved = <div className="form-hint" style={{ marginTop: 8 }}>Saved <code>{path}</code>.</div>;
+  if (/\.(png|jpe?g|gif|svg|webp)$/i.test(path)) {
+    return <img src={url} alt={path} style={{ maxWidth: '100%', marginTop: 8, borderRadius: 4, display: 'block' }} />;
+  }
+  if (/\.pdf$/i.test(path)) {
+    return (
+      <object data={url} type="application/pdf" style={{ width: '100%', height: 260, marginTop: 8, borderRadius: 4, display: 'block' }}>
+        {saved}
+      </object>
+    );
+  }
+  return saved;
 }
 
 type Lang = 'python' | 'julia' | 'wolfram';
 type Interp = { label: string; path: string };
-type Tools = { execEnabled: boolean; interpreters: Record<Lang, Interp[]>; available: Record<Lang, boolean> };
+type Tools = { execEnabled: boolean; execRefusal?: string | null; sandbox?: { confined: boolean; detail: string };
+  interpreters: Record<Lang, Interp[]>; available: Record<Lang, boolean> };
 type RunResult = { ok: boolean; stdout: string; stderr: string; images: string[]; timedOut?: boolean; interpreter?: string; outputTruncated?: boolean };
 
 const LANG_FENCE: Record<Lang, string> = { python: 'python', julia: 'julia', wolfram: 'mathematica' };
@@ -202,7 +218,14 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
         </div>
         <div className="modal-body">
           {tools && !tools.execEnabled && (
-            <div className="form-hint" style={{ color: '#fca5a5' }}>Code execution is disabled on this server (ALLOW_CODE_EXECUTION=0).</div>
+            <div className="form-hint" style={{ color: '#fca5a5' }}>
+              {tools.execRefusal || 'Code execution is disabled on this server (ALLOW_CODE_EXECUTION=0).'}
+            </div>
+          )}
+          {tools?.sandbox && !tools.sandbox.confined && tools.execEnabled && (
+            <div className="form-hint" style={{ color: '#fbbf24' }}>
+              No sandbox on this machine — code you run here can reach everything you can.
+            </div>
           )}
 
           <div className="form-row" style={{ alignItems: 'flex-end' }}>
@@ -294,11 +317,14 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
                   )}
                 </>
               )}
-              {result.images.map(img => <button key={img} className="btn-primary" onClick={() => insertFigure(img)}>Insert figure: {img.replace('sandbox/', '')}</button>)}
+              {result.images.filter(embeddableInTypst).map(img => <button key={img} className="btn-primary" onClick={() => insertFigure(img)}>Insert figure: {img.replace('sandbox/', '')}</button>)}
+              {result.images.some(img => !embeddableInTypst(img)) && (
+                <span className="form-hint">Typst cannot embed EPS or PostScript — those files are in the project, but save a PNG, SVG or PDF to put the figure in the document.</span>
+              )}
             </div>
           )}
 
-          <div className="form-hint">Runs in an isolated <code>sandbox/</code> folder. Save plots with a filename to embed them (Python <code>savefig</code> / Wolfram <code>Export</code>). For <b>Insert as equation</b>, print LaTeX — Wolfram <code>TeXForm</code> or sympy <code>latex()</code>.</div>
+          <div className="form-hint">Runs in an isolated <code>sandbox/</code> folder. Save plots with a filename to embed them (Python <code>savefig</code> / Wolfram <code>Export</code>) — <code>.png</code>, <code>.svg</code> and <code>.pdf</code> all go straight into the document. For <b>Insert as equation</b>, print LaTeX — Wolfram <code>TeXForm</code> or sympy <code>latex()</code>.</div>
         </div>
       </div>
     </div>

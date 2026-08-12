@@ -4,6 +4,106 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.1.21
+
+Notebook code now runs inside a real sandbox. Plots can be vectors, not just
+pixels, and updating no longer looks like it has hung.
+
+### Code you run is confined by the operating system
+
+Until now the only thing between a notebook cell and the rest of your machine
+was a list of patterns: text mentioning `subprocess` or `socket` was refused, and
+anything that got past was on its honour. That is a guardrail, not a boundary,
+and it had the two failure modes guardrails have — it turned away perfectly
+ordinary code for saying `os.environ`, and it would not have stopped anyone who
+meant it.
+
+Runs now happen inside a box the kernel enforces. On Linux that is bubblewrap:
+the cell gets its own process, IPC and hostname namespaces, an empty network
+namespace, a read-only view of the disk with `~/.ssh`, `~/.gnupg`, `~/.aws` and
+the other credential directories replaced by empty ones, and exactly one place it
+can write — its own run directory. macOS gets the same two guarantees, writes
+confined and no network, through Seatbelt. Figures still reach your document:
+the app copies them out afterwards, the cell never touches `assets/` itself.
+
+Because the kernel is holding that line, the pattern list steps aside where a
+sandbox is active. Code that was refused for mentioning `shutil` or `os.environ`
+runs now.
+
+Python and Julia are confined. Wolfram is not, and that is deliberate:
+`wolframscript` launches a separate kernel over a loopback socket and works out
+which kernel to start from state outside the run directory. Confined, it does not
+start; given just enough to start, it silently runs a different version of
+Mathematica than the one you get in a terminal. Quietly changing which kernel
+does someone's algebra is worse than leaving it alone, so Wolfram keeps the
+pattern list as its guard, exactly as before.
+
+Two things change for you. A cell has no network, and a cell cannot write outside
+its run directory — so a script that downloaded a dataset mid-run, or wrote a CSV
+next to the document, needs adjusting. `HILBERT_SANDBOX_NET=1` gives the network
+back, `HILBERT_SANDBOX=off` turns the whole thing off, and App Settings →
+Interpreters says which of these is in force. Windows has no sandbox available,
+so there the pattern list still applies and the app says so.
+
+### A hosted server is stricter about who is who
+
+If you run Hilbert as a shared server (`--serve`), four things changed.
+
+It will not run code it cannot confine. Install `bubblewrap` alongside it; the
+supplied systemd unit needed loosening in two places for that to work, and
+`deploy/hilbert.service` now has both, with the reasons written next to them.
+
+Signing in no longer hands the browser the server's own API token. It gets a
+signed session that says when it expires, and the server checks that rather than
+trusting the browser's word — sessions used to be valid forever once issued.
+`POST /auth/revoke-sessions` ends every session at once without changing the token
+everyone signs in with, and `POST /auth/logout` ends just one.
+
+A cell could name a figure like `../../../something.png` and have the server move
+that file into the project. It cannot any more.
+
+Wrong passwords now slow the next attempt down, "open this link" no longer asks
+the *server* to open it, and `HILBERT_PUBLIC_HOST` lets you pin the name the
+server should be reached by.
+
+### Notebook plots in SVG, PDF and EPS
+
+Every figure a notebook produced came out as a PNG, whatever you asked for.
+`plot(a; fmt = :pdf)` was ignored, and a `savefig("figure.pdf")` of your own was
+not even noticed, because the runner only ever looked for `.png` files when it
+swept up what a cell had drawn.
+
+App Settings has a Plot format setting now, under Interpreters: PNG, SVG, PDF or
+EPS. SVG and PDF keep the figure as vectors, so it stays sharp at any zoom and
+prints properly instead of going soft in a printed thesis. Asking for a format in
+the code still wins over the setting, whether that is Julia's `fmt = :pdf` or
+naming the file yourself.
+
+EPS is there because some journals still demand it. Typst cannot embed EPS, so
+those runs write a PDF of each figure as well and the document points at that
+one, leaving the EPS in `assets/` for submission. Whether the EPS appears is up
+to the plotting backend: matplotlib writes one, and Julia's default GR backend
+cannot, in which case you get the PDF and a note saying why.
+
+### The updater says what it is doing
+
+The download is about 16 MB, which is more than a minute on a slow connection,
+and until now the app gave no sign of it: you clicked Update now and nothing
+appeared to happen, so it looked like the click had been ignored or the app had
+hung.
+
+The title bar now counts the download up as it arrives and says when it switches
+to installing. If the update fails, which quitting mid-download will do, it says
+so instead of leaving you waiting for a restart that was never coming. Nothing is
+changed on disk when that happens.
+
+The same slip caused 0.1.20's update prompt to advertise 0.1.17's changes. The
+summary the prompt shows was a string kept by hand in the release workflow, and
+nobody remembered to edit it. It now comes from the top of this file, so the two
+cannot drift apart again.
+
+---
+
 ## 0.1.20
 
 Cut and paste work from the mouse. Hilbert can serve a whole project to a browser

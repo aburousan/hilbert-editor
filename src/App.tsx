@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo, lazy, Suspense } from 'react';
 import { API, useWorkspaceAsset } from './api';
 import { THEMES, DEFAULT_THEME, isThemeId, themeInfo, themeAttribute, nextTheme, type ThemeId } from './themes';
-import { allInterpreters, applyInterpreters, getInterpreter, PREFS_CHANGED } from './prefs';
+import { allInterpreters, applyInterpreters, applyPlotFormat, embeddableInTypst, getInterpreter, getPlotFormat, PREFS_CHANGED } from './prefs';
 import Editor, { useMonaco } from '@monaco-editor/react';
 import { setupTypstLanguage, setWorkspaceImages } from './typstMonaco';
 import { useProofread } from './proofread';
@@ -1233,6 +1233,7 @@ export default function App() {
         const problems = clamp(layout.problems, 60, 900);
         if (problems) setProblemsHeight(problems);
         applyInterpreters(saved.interpreters);
+        applyPlotFormat(saved.plotFormat);
         // Native windows can have different loopback ports, so carry this
         // preference through the shared settings file there. Browser-hosted
         // visitors keep their own local toolbar instead of changing everyone
@@ -1266,6 +1267,7 @@ export default function App() {
           panels,
           layout: { sidebar: sidebarWidth, editor: editorWidth, tree: treeHeight, problems: problemsHeight },
           interpreters: allInterpreters(),
+          plotFormat: getPlotFormat(),
           ...(IS_NATIVE_APP ? { toolbarHidden: hiddenToolbarTools } : {}),
         }),
       }).catch(() => {});
@@ -3124,7 +3126,7 @@ export default function App() {
         const bin = getInterpreter(lang);
         const res = await fetch(`${API}/notebook/run`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ lang, cells: group.map(c => c.code), bin }),
+          body: JSON.stringify({ lang, cells: group.map(c => c.code), bin, plotFormat: getPlotFormat() }),
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok || !data.results) {
@@ -3151,14 +3153,35 @@ export default function App() {
       for (const image of generatedImages) await mirrorLocalPath(image);
       if (generatedImages.size) void fetchTree();
 
+      // EPS is the one format a backend may simply not have — Julia's default GR
+      // does not — and the harness falls back to the PDF rather than losing the
+      // figure. Without a word about it the setting just looks ignored. Only the
+      // harness's own captures count; a file the cell named itself was never
+      // following this setting in the first place.
+      const captured = [...generatedImages].filter(p => /\/nb_(cell|plot)_?\d+\.[^./\\]+$/.test(p));
+      if (getPlotFormat() === 'eps' && captured.length && !captured.some(p => p.toLowerCase().endsWith('.eps'))) {
+        notify('No EPS was written — this plotting backend cannot produce one (Julia\'s default GR backend, for instance). The figures went into the document as PDF.');
+      }
+
       const esc = (s: string) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r/g, '').replace(/\n/g, '\\n').replace(/\t/g, '\\t');
+      const stripExt = (p: string) => p.replace(/\.[^./\\]+$/, '');
       const outputBlock = (r: any) => {
         const parts: string[] = [];
         const so = (r?.stdout || '').replace(/\n+$/, '');
         const er = (r?.error || '').replace(/\n+$/, '');
         if (so) parts.push(`  #raw(block: true, "${esc(so)}")`);
         if (er) parts.push(`  #text(fill: red, raw(block: true, "${esc(er)}"))`);
-        for (const img of (r?.images || [])) parts.push(`  #image("${img}", width: 70%)`);
+        // An EPS run also leaves a PDF of the same figure. Embed the PDF and
+        // name the EPS instead of drawing it twice — and Typst cannot read EPS
+        // anyway, so a #image pointing at one would fail the compile.
+        const images: string[] = (r?.images || []).filter((p: unknown) => typeof p === 'string');
+        for (const img of images) {
+          if (embeddableInTypst(img)) {
+            parts.push(`  #image("${img}", width: 70%)`);
+          } else if (!images.some(other => other !== img && embeddableInTypst(other) && stripExt(other) === stripExt(img))) {
+            parts.push(`  #text(fill: gray)[Saved \`${img}\` — Typst cannot embed this format.]`);
+          }
+        }
         const inner = parts.length ? parts.join('\n') : '  #text(fill: gray)[(no output)]';
         return `// >>> nb-output — auto-generated; re-run replaces this\n#block(fill: luma(245), inset: 6pt, radius: 3pt, width: 100%)[\n${inner}\n]\n// <<< nb-output`;
       };

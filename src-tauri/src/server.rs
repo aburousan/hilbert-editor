@@ -28,6 +28,8 @@ use std::{
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
+use crate::sandbox;
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -158,6 +160,8 @@ pub struct AppState {
     remote_access_token: Option<String>,
     remote_collab_room: Option<String>,
     remote_collab_key: Option<String>,
+    sessions: Option<HostedSessions>,
+    public_host: Option<String>,
     // Interpreters found by scanning the usual install locations, plus the ones
     // the user added by hand (persisted, so they survive a restart).
     pub detected: Interpreters,
@@ -224,6 +228,130 @@ fn release_workspace_user(path: &Path) -> bool {
     }
 }
 
+// HMAC-SHA256. Written out rather than pulled in as a dependency: it is fifteen
+// lines, and sha2 is already here.
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut padded = [0u8; 64];
+    if key.len() > 64 {
+        padded[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        padded[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = padded;
+    let mut outer_pad = padded;
+    for byte in inner_pad.iter_mut() {
+        *byte ^= 0x36;
+    }
+    for byte in outer_pad.iter_mut() {
+        *byte ^= 0x5c;
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(message);
+    let inner = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner);
+    outer.finalize().into()
+}
+
+// Browser sessions for a hosted workspace.
+//
+// The cookie used to be the API token itself, which meant three things at once:
+// the browser held the server's master credential, the only expiry was the
+// Max-Age the browser had promised to honour, and there was no way to end a
+// session short of changing the token everybody signs in with.
+//
+// What the browser holds now says only when it stops being valid and which
+// generation of sessions it belongs to, carried with a MAC this server alone can
+// produce:
+//
+//     v1.<expires, unix seconds>.<generation>.<base64url MAC>
+//
+// The key is derived from the access token and the workspace path, so sessions
+// still survive an ordinary restart — the thing that lets an open browser finish
+// saving its draft after the service comes back.
+struct HostedSessions {
+    key: [u8; 32],
+    generation: AtomicU64,
+    generation_file: PathBuf,
+    lifetime: Duration,
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+impl HostedSessions {
+    fn new(key: [u8; 32], generation_file: PathBuf) -> Self {
+        let hours = std::env::var("HILBERT_SESSION_HOURS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|hours| (1..=24 * 30).contains(hours))
+            .unwrap_or(24);
+        let generation = fs::read_to_string(&generation_file)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        HostedSessions {
+            key,
+            generation: AtomicU64::new(generation),
+            generation_file,
+            lifetime: Duration::from_secs(hours * 3600),
+        }
+    }
+
+    // Length-prefixed so no combination of fields can be reinterpreted as
+    // another one — an expiry of 11 and a generation of 1 must not sign the
+    // same bytes as an expiry of 1 and a generation of 11.
+    fn tag(&self, expires: u64, generation: u64) -> String {
+        let mut message = Vec::with_capacity(48);
+        message.extend_from_slice(b"hilbert-session-v1");
+        for field in [expires, generation] {
+            message.extend_from_slice(&8u64.to_be_bytes());
+            message.extend_from_slice(&field.to_be_bytes());
+        }
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hmac_sha256(&self.key, &message))
+    }
+
+    fn issue(&self) -> String {
+        let expires = unix_now() + self.lifetime.as_secs();
+        let generation = self.generation.load(Ordering::Acquire);
+        format!("v1.{expires}.{generation}.{}", self.tag(expires, generation))
+    }
+
+    fn verify(&self, candidate: &str) -> bool {
+        let mut parts = candidate.split('.');
+        if parts.next() != Some("v1") {
+            return false;
+        }
+        let (Some(expires), Some(generation), Some(tag), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+        let (Ok(expires), Ok(generation)) = (expires.parse::<u64>(), generation.parse::<u64>()) else {
+            return false;
+        };
+        // Both checks before the comparison are on values the client chose, so
+        // they say nothing secret; the MAC is what decides.
+        if expires <= unix_now() || generation != self.generation.load(Ordering::Acquire) {
+            return false;
+        }
+        constant_time_eq(tag, &self.tag(expires, generation))
+    }
+
+    // End every session at once, without touching the token people sign in with.
+    fn revoke_all(&self) -> u64 {
+        let next = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        if let Some(parent) = self.generation_file.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&self.generation_file, next.to_string());
+        next
+    }
+}
+
 fn hosted_secret(label: &str, access_token: &str, workspace: &Path) -> [u8; 32] {
     let identity = fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     let identity = identity.to_string_lossy();
@@ -262,6 +390,8 @@ impl AppState {
             remote_access_token: None,
             remote_collab_room: None,
             remote_collab_key: None,
+            sessions: None,
+            public_host: None,
             detected: detect_interpreters(),
             custom: RwLock::new(load_custom_interpreters()),
             allow_exec: std::env::var("ALLOW_CODE_EXECUTION").ok().as_deref() != Some("0"),
@@ -287,16 +417,31 @@ impl AppState {
             .filter(|token| token.len() >= 32)
             .is_some();
         let session_secret = hosted_secret("session", &access_token, &workspace);
+        let cookie_secret = hosted_secret("cookie", &access_token, &workspace);
         let room_secret = hosted_secret("room", &access_token, &workspace);
         let key_secret = hosted_secret("key", &access_token, &workspace);
         let mut state = Self::new(workspace, dist);
-        // An explicit API token remains an operator override. Without one,
-        // derive a strong, stable cookie value from the hosted sign-in secret.
-        // This is what lets an already-open browser retry its emergency draft
-        // after the process comes back instead of receiving a surprise 401.
+        // An explicit API token remains an operator override. Without one, derive
+        // a strong, stable one from the hosted sign-in secret so the desktop
+        // shell's bearer path behaves the same across a restart. Browsers no
+        // longer see this value at all — they get a signed session instead.
         if !explicit_api_token {
             state.api_token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(session_secret);
         }
+        // The revocation counter lives outside the workspace, so a signed-in
+        // user cannot roll it back through the file API and bring cancelled
+        // sessions back to life. Its name is derived from the token and the
+        // workspace, so two hosted servers on one machine revoke separately.
+        let scope = hosted_secret("generation", &access_token, &state.ws());
+        let scope: String = scope[..8].iter().map(|byte| format!("{byte:02x}")).collect();
+        state.sessions = Some(HostedSessions::new(
+            cookie_secret,
+            hilbert_config_dir().join(format!("hosted-sessions-{scope}")),
+        ));
+        state.public_host = std::env::var("HILBERT_PUBLIC_HOST")
+            .ok()
+            .map(|host| host.trim().to_string())
+            .filter(|host| !host.is_empty());
         state.remote_access_token = Some(access_token);
         // Keep the encrypted hosted room stable too. Otherwise existing pages
         // reconnect to their pre-restart room while a newly opened page is sent
@@ -308,6 +453,16 @@ impl AppState {
 
     fn remote_mode(&self) -> bool {
         self.remote_access_token.is_some()
+    }
+
+    // Why a run cannot start, if it cannot. Both code runners ask this before
+    // doing anything else, so the two reasons — switched off by the operator,
+    // and no sandbox on a machine that insists on one — read the same way.
+    fn exec_refusal(&self) -> Option<String> {
+        if !self.allow_exec {
+            return Some("Code execution is disabled on this server (ALLOW_CODE_EXECUTION=0).".to_string());
+        }
+        sandbox::refusal().map(str::to_string)
     }
 
     fn ws(&self) -> PathBuf {
@@ -549,19 +704,22 @@ async fn run_cmd(
     cwd: Option<&Path>,
     timeout_ms: Option<u64>,
 ) -> std::io::Result<CmdOut> {
-    run_cmd_inner(program, args, cwd, timeout_ms, false).await
+    run_cmd_inner(program, args, cwd, timeout_ms, false, None).await
 }
 
-// Like run_cmd, but for untrusted user code: applies per-process OS resource
-// limits (max file size, CPU seconds) on top of the wall-clock timeout so a
-// runaway cell can't fill the disk or peg a core if the kill is ever missed.
+// Like run_cmd, but for untrusted user code. Two things are added on top of the
+// wall-clock timeout: OS-level confinement where the machine can provide it (see
+// sandbox.rs), and per-process resource limits, so a runaway cell can't fill the
+// disk or peg a core even if the kill is ever missed.
 async fn run_exec_cmd(
     program: &str,
     args: &[&str],
-    cwd: Option<&Path>,
+    run_dir: &Path,
     timeout_ms: Option<u64>,
+    lang: &str,
 ) -> std::io::Result<CmdOut> {
-    run_cmd_inner(program, args, cwd, timeout_ms, true).await
+    let confined = sandbox::confine(program, args, run_dir, lang);
+    run_cmd_inner(program, args, Some(run_dir), timeout_ms, true, confined).await
 }
 
 async fn run_cmd_inner(
@@ -569,14 +727,27 @@ async fn run_cmd_inner(
     args: &[&str],
     cwd: Option<&Path>,
     timeout_ms: Option<u64>,
-    sandboxed: bool,
+    limits: bool,
+    confined: Option<sandbox::Confined>,
 ) -> std::io::Result<CmdOut> {
-    let mut cmd = Command::new(program);
+    // Under confinement the thing we actually launch is bwrap or sandbox-exec,
+    // with the interpreter and its arguments handed over after the policy.
+    let launch = confined.as_ref().map(|c| c.program.as_str()).unwrap_or(program);
+    let launch_args: Vec<&str> = match &confined {
+        Some(c) => c.args.iter().map(String::as_str).collect(),
+        None => args.to_vec(),
+    };
+    let mut cmd = Command::new(launch);
+    if let Some(c) = &confined {
+        for (key, value) in &c.env {
+            cmd.env(key, value);
+        }
+    }
     // Windows: don't flash a console window for each spawned tool (typst, git,
     // python, julia…). CREATE_NO_WINDOW = 0x08000000. No-op on other platforms.
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
-    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    cmd.args(&launch_args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     // Never let a spawned tool block on an interactive prompt. Without this a
     // `git push` that needs a password (no TTY available) would hang the request
     // instead of failing fast. Harmless to the other tools we run.
@@ -589,7 +760,7 @@ async fn run_cmd_inner(
     // child. RLIMIT_FSIZE stops disk-fill; RLIMIT_CPU is a generous backstop to the
     // wall-clock timeout. Kept loose enough not to disturb normal numerical work.
     #[cfg(unix)]
-    if sandboxed {
+    if limits {
         let cpu_secs = timeout_ms.map(|ms| ms / 1000 + 30).unwrap_or(180);
         unsafe {
             cmd.pre_exec(move || {
@@ -606,7 +777,7 @@ async fn run_cmd_inner(
             });
         }
     }
-    let _ = sandboxed; // (Windows: limits are enforced by the wall-clock timeout only.)
+    let _ = limits; // (Windows: limits are enforced by the wall-clock timeout only.)
     let mut child = cmd.spawn()?;
     let so = child.stdout.take().unwrap();
     let se = child.stderr.take().unwrap();
@@ -3167,12 +3338,28 @@ async fn webdav_sync(State(st): St, body: Bytes) -> Response {
 // Live code execution (Python / Julia / Wolfram)
 // ---------------------------------------------------------------------------
 
-const IMAGE_EXT: [&str; 5] = [".png", ".jpg", ".jpeg", ".svg", ".gif"];
+// What counts as a figure a run produced. Vector formats are here too: Typst
+// embeds SVG and PDF directly, and EPS — which it cannot embed — is still worth
+// collecting, because it is what some journals ask for.
+const IMAGE_EXT: [&str; 8] = [".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp", ".pdf", ".eps"];
+
+// The format a run saves its figures in when the code does not name a file
+// itself. Anything the caller sends that isn't one of these falls back to PNG,
+// so a stale or hand-written request can't smuggle a filename fragment into the
+// harness scripts below.
+fn plot_format(v: &Value) -> &'static str {
+    match jstr(v, "plotFormat").unwrap_or("") {
+        "svg" => "svg",
+        "pdf" => "pdf",
+        "eps" => "eps",
+        _ => "png",
+    }
+}
 
 // Cross-platform `which`: walk PATH ourselves. On Windows the entries are
 // separated by ';' and we try each PATHEXT extension so `which("python")`
 // matches `python.exe`; on Unix it's ':' and a bare name.
-fn which(name: &str) -> Option<String> {
+pub(crate) fn which(name: &str) -> Option<String> {
     let path = std::env::var("PATH").unwrap_or_default();
     let sep = if cfg!(windows) { ';' } else { ':' };
     let exts: Vec<String> = if cfg!(windows) {
@@ -3539,8 +3726,25 @@ async fn probe_interpreter(lang: &str, path: &str) -> Result<Interp, String> {
 
 async fn tools(State(st): St) -> Response {
     let all = st.available();
+    let refusal = st.exec_refusal();
+    const RUNNABLE: [&str; 3] = ["python", "julia", "wolfram"];
+    let confined_langs: Vec<&str> =
+        RUNNABLE.into_iter().filter(|lang| sandbox::active().real() && sandbox::confines(lang)).collect();
+    let screened_langs: Vec<&str> = RUNNABLE.into_iter().filter(|lang| screen_applies(lang)).collect();
     Json(json!({
-        "execEnabled": st.allow_exec,
+        "execEnabled": st.allow_exec && refusal.is_none(),
+        "execRefusal": refusal,
+        "sandbox": {
+            "kind": sandbox::active().name(),
+            "confined": sandbox::active().real(),
+            "network": sandbox::allow_network(),
+            // Which languages the sandbox actually holds, and which are left to
+            // the source screen. The panel reads this rather than repeating the
+            // answer, so the two cannot disagree later.
+            "confinedLanguages": confined_langs,
+            "screenedLanguages": screened_langs,
+            "detail": sandbox::describe(),
+        },
         "interpreters": all,
         "available": {
             "python": !all.python.is_empty(),
@@ -3711,7 +3915,28 @@ static DENY_WOLFRAM: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 
 static DENY_NONE: LazyLock<Vec<Regex>> = LazyLock::new(Vec::new);
 
+// Whether reading the source is still worth doing. Once the operating system
+// holds the boundary the patterns below stop protecting anyone — they only
+// reject ordinary code that happens to say `os.environ` — so the screen steps
+// aside for the sandbox. `always` keeps both, `off` keeps neither.
+fn screen_applies(lang: &str) -> bool {
+    match std::env::var("HILBERT_CODE_SCREEN").ok().as_deref().map(str::trim) {
+        Some("always") | Some("strict") => true,
+        Some("off") | Some("none") => false,
+        // Wolfram is not confined at all — see sandbox::confines — so the screen
+        // is still the only thing guarding it and stays on.
+        _ => !sandbox::active().real() || !sandbox::confines(lang),
+    }
+}
+
 fn screen_code(lang: &str, code: &str) -> Option<String> {
+    if !screen_applies(lang) {
+        return None;
+    }
+    screen_source(lang, code)
+}
+
+fn screen_source(lang: &str, code: &str) -> Option<String> {
     let extra: &Vec<Regex> = match lang {
         "julia" => &DENY_JULIA,
         "wolfram" => &DENY_WOLFRAM,
@@ -3773,12 +3998,29 @@ fn ensure_hilbert(ws: &Path) {
 // persistent assets/ folder. A document that embeds a plot references it, so it
 // must survive the scratch dir being swept — assets/ is the right home for it.
 // Returns the workspace-relative paths to reference from the document.
+// A figure name has to be a plain file sitting in the run directory. This
+// matters because the notebook harness reports what it produced on stdout, and
+// stdout is whatever the cell decided to print: a cell can read its own harness
+// script, learn the sentinel, and then print a line naming any path on the
+// machine. Without this check that line would move that file into assets/.
+fn safe_image_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && !name.starts_with('.')
+        && !name.contains(['/', '\\', '\0'])
+        && Path::new(name).components().count() == 1
+        && {
+            let lower = name.to_lowercase();
+            IMAGE_EXT.iter().any(|ext| lower.ends_with(ext))
+        }
+}
+
 fn promote_images(ws: &Path, run_dir: &Path, names: &[String]) -> Vec<String> {
     if names.is_empty() { return Vec::new(); }
     let assets = ws.join("assets");
     let _ = fs::create_dir_all(&assets);
     let mut out = Vec::new();
-    for name in names {
+    for name in names.iter().filter(|name| safe_image_name(name)) {
         let from = run_dir.join(name);
         let to = assets.join(name);
         // rename is atomic within one filesystem; fall back to copy+remove.
@@ -3794,10 +4036,27 @@ fn promote_images(ws: &Path, run_dir: &Path, names: &[String]) -> Vec<String> {
     out
 }
 
+// One run at a time, server-wide. On a shared workspace that means queueing
+// behind somebody else's notebook, which is fine — waiting forever is not. The
+// request holds a connection open the whole time and the person in front of it
+// has no way to tell whether anything is happening, so give up and say so.
+const EXEC_QUEUE_WAIT: Duration = Duration::from_secs(120);
+
+async fn exec_permit(st: &AppState) -> Result<tokio::sync::SemaphorePermit<'_>, Response> {
+    match tokio::time::timeout(EXEC_QUEUE_WAIT, st.exec_gate.acquire()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(json_err(StatusCode::SERVICE_UNAVAILABLE, "Code runner is shutting down.")),
+        Err(_) => Err(json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Another run is still going and this one waited two minutes for its turn. Try again once it finishes.",
+        )),
+    }
+}
+
 async fn run_code(State(st): St, body: Bytes) -> Response {
     static CONNECTING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Connecting….*?\n").unwrap());
-    if !st.allow_exec {
-        return json_err(StatusCode::FORBIDDEN, "Code execution is disabled on this server (ALLOW_CODE_EXECUTION=0).");
+    if let Some(reason) = st.exec_refusal() {
+        return json_err(StatusCode::FORBIDDEN, reason);
     }
     let v = parse_json(&body);
     let lang = jstr(&v, "lang").unwrap_or("");
@@ -3829,8 +4088,9 @@ async fn run_code(State(st): St, body: Bytes) -> Response {
     let Some(chosen) = options.iter().find(|o| same_path(&o.path, bin)).or_else(|| options.first()) else {
         return json_err(StatusCode::BAD_REQUEST, format!("{lang} is not available on this system."));
     };
-    let Ok(_permit) = st.exec_gate.acquire().await else {
-        return json_err(StatusCode::SERVICE_UNAVAILABLE, "Code runner is shutting down.");
+    let _permit = match exec_permit(&st).await {
+        Ok(permit) => permit,
+        Err(response) => return response,
     };
 
     let ws = st.ws();
@@ -3850,7 +4110,7 @@ async fn run_code(State(st): St, body: Bytes) -> Response {
         "julia" => vec!["--startup-file=no", "-q", &script_name],
         _ => vec![&script_name],
     };
-    let out = match run_exec_cmd(&chosen.path, &args, Some(&sandbox), Some(st.exec_timeout_ms)).await {
+    let out = match run_exec_cmd(&chosen.path, &args, &sandbox, Some(st.exec_timeout_ms), lang).await {
         Ok(o) => o,
         Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start {lang}: {e}")),
     };
@@ -3887,12 +4147,13 @@ async fn run_code(State(st): St, body: Bytes) -> Response {
 
 const NB_PY: &str = r#"import sys, io, os, base64, traceback, ast
 os.environ.setdefault("MPLBACKEND", "Agg")
-SEP = "__SEP__"; SENT = "__SENT__"
+SEP = "__SEP__"; SENT = "__SENT__"; FMT = "__FMT__"
+EXTS = (".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp", ".pdf", ".eps")
 src = open("nb_cells.txt", encoding="utf-8").read()
 cells = src.split("\n" + SEP + "\n") if src else []
 g = {"__name__": "__main__"}
 real = sys.__stdout__
-def _pngs(): return {f: os.path.getmtime(f) for f in os.listdir(".") if f.lower().endswith(".png")}
+def _pngs(): return {f: os.path.getmtime(f) for f in os.listdir(".") if f.lower().endswith(EXTS)}
 def _b(s): return base64.b64encode(s.encode("utf-8")).decode("ascii")
 for i, code in enumerate(cells):
     before = _pngs(); buf = io.StringIO(); old = sys.stdout; sys.stdout = buf; err = ""
@@ -3915,7 +4176,14 @@ for i, code in enumerate(cells):
     try:
         import matplotlib.pyplot as plt
         if plt.get_fignums():
-            p = "nb_cell%d.png" % i; plt.gcf().savefig(p, dpi=130, bbox_inches="tight"); plt.close("all"); imgs.append(p)
+            fig = plt.gcf()
+            # Typst has no EPS reader, so an EPS run writes the PDF as well and
+            # the document embeds that one; the EPS is there to hand to a journal.
+            for ext in (("eps", "pdf") if FMT == "eps" else (FMT,)):
+                p = "nb_cell%d.%s" % (i, ext)
+                fig.savefig(p, dpi=130, bbox_inches="tight")
+                imgs.append(p)
+            plt.close("all")
     except Exception:
         pass
     after = _pngs()
@@ -3925,11 +4193,52 @@ for i, code in enumerate(cells):
 "#;
 
 const NB_JL: &str = r#"using Base64
-SEP = "__SEP__"; SENT = "__SENT__"
+SEP = "__SEP__"; SENT = "__SENT__"; FMT = "__FMT__"
+EXTS = (".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp", ".pdf", ".eps")
+MIMES = Dict("png" => "image/png", "svg" => "image/svg+xml", "pdf" => "application/pdf", "eps" => "image/eps")
 src = read("nb_cells.txt", String)
 cells = isempty(src) ? String[] : split(src, "\n" * SEP * "\n")
 real = stdout
-pngs() = Dict(f => mtime(f) for f in filter(x->endswith(lowercase(x), ".png"), readdir(".")))
+pngs() = Dict(f => mtime(f) for f in filter(x->any(e->endswith(lowercase(x), e), EXTS), readdir(".")))
+
+# Write a displayable value — a plot — to `file` in the format `ext` names.
+# Backends disagree about which MIME types they answer to, so ask for the MIME
+# first and fall back to Plots' filename-driven savefig, which dispatches on the
+# extension instead. invokelatest throughout for the same world-age reason as
+# below. Returns whether anything actually landed on disk.
+function write_figure(val, file, ext)
+    mime = get(MIMES, ext, "image/png")
+    try
+        if Base.invokelatest(showable, mime, val)
+            open(file, "w") do io
+                Base.invokelatest(show, io, mime, val)
+            end
+            isfile(file) && filesize(file) > 0 && return true
+        end
+    catch
+    end
+    if isdefined(Main, :savefig)
+        try
+            Base.invokelatest(getfield(Main, :savefig), val, file)
+            isfile(file) && filesize(file) > 0 && return true
+        catch
+        end
+    end
+    false
+end
+
+# `plot(x; fmt = :pdf)` is Plots asking for a format in the code itself, which is
+# more specific than the app-wide setting, so it wins. Plots files that request
+# under :html_output_format; anything else, or an unset :auto, leaves the
+# setting in charge.
+function wanted_format(val, fallback)
+    try
+        f = String(Base.invokelatest(get, getfield(val, :attr), :html_output_format, :auto))
+        f in ("png", "svg", "pdf", "eps") && return f
+    catch
+    end
+    fallback
+end
 for (idx, code) in enumerate(cells)
     i = idx - 1
     before = pngs()
@@ -3947,12 +4256,21 @@ for (idx, code) in enumerate(cells)
                     # loop body runs at the world captured before that, so calling
                     # show()/showable() directly would hit "method too new" world-age
                     # errors — invokelatest runs them in the current world instead.
-                    # A displayable value (a plot) is written to a PNG so the
+                    # A displayable value (a plot) is written to a file so the
                     # notebook shows it as an image; anything else echoes as text.
+                    # Typst has no EPS reader, so an EPS run writes the PDF as
+                    # well and the document embeds that one; the EPS is there to
+                    # hand to a journal. Whether the EPS appears at all is up to
+                    # the backend — GR, which Plots uses by default, has no EPS
+                    # writer, while PyPlot does.
                     if Base.invokelatest(showable, "image/png", val)
-                        open("nb_plot_$i.png", "w") do pio
-                            Base.invokelatest(show, pio, "image/png", val)
+                        wrote = false
+                        fmt = wanted_format(val, FMT)
+                        for ext in (fmt == "eps" ? ("eps", "pdf") : (fmt,))
+                            wrote |= write_figure(val, "nb_plot_$(i).$(ext)", ext)
                         end
+                        # Whatever the backend can manage beats no figure at all.
+                        wrote || write_figure(val, "nb_plot_$i.png", "png")
                     else
                         Base.invokelatest(show, stdout, "text/plain", val); println(stdout)
                     end
@@ -3972,8 +4290,8 @@ end
 "#;
 
 async fn notebook_run(State(st): St, body: Bytes) -> Response {
-    if !st.allow_exec {
-        return json_err(StatusCode::FORBIDDEN, "Code execution is disabled on this server (ALLOW_CODE_EXECUTION=0).");
+    if let Some(reason) = st.exec_refusal() {
+        return json_err(StatusCode::FORBIDDEN, reason);
     }
     let v = parse_json(&body);
     let lang = jstr(&v, "lang").unwrap_or("");
@@ -3998,8 +4316,9 @@ async fn notebook_run(State(st): St, body: Bytes) -> Response {
     let Some(chosen) = options.iter().find(|o| same_path(&o.path, bin)).or_else(|| options.first()) else {
         return json_err(StatusCode::BAD_REQUEST, format!("{lang} is not available on this system."));
     };
-    let Ok(_permit) = st.exec_gate.acquire().await else {
-        return json_err(StatusCode::SERVICE_UNAVAILABLE, "Code runner is shutting down.");
+    let _permit = match exec_permit(&st).await {
+        Ok(permit) => permit,
+        Err(response) => return response,
     };
 
     let ws = st.ws();
@@ -4019,7 +4338,10 @@ async fn notebook_run(State(st): St, body: Bytes) -> Response {
         "julia" => ("_nb.jl", NB_JL),
         _ => ("_nb.py", NB_PY),
     };
-    let script = harness.replace("__SEP__", &sep).replace("__SENT__", &sent);
+    let script = harness
+        .replace("__SEP__", &sep)
+        .replace("__SENT__", &sent)
+        .replace("__FMT__", plot_format(&v));
     if fs::write(sandbox.join(script_name), script).is_err() {
         return json_err(StatusCode::INTERNAL_SERVER_ERROR, "Could not write notebook harness.");
     }
@@ -4030,7 +4352,7 @@ async fn notebook_run(State(st): St, body: Bytes) -> Response {
     };
     // One process runs every cell, so give it room proportional to cell count.
     let timeout = st.exec_timeout_ms.saturating_mul(cells.len() as u64).min(600_000);
-    let out = match run_exec_cmd(&chosen.path, &args, Some(&sandbox), Some(timeout)).await {
+    let out = match run_exec_cmd(&chosen.path, &args, &sandbox, Some(timeout), lang).await {
         Ok(o) => o,
         Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start {lang}: {e}")),
     };
@@ -4610,7 +4932,14 @@ fn allowed_external_url(raw: &str) -> bool {
     }
 }
 
-async fn desktop_open(body: Bytes) -> Response {
+async fn desktop_open(State(st): St, body: Bytes) -> Response {
+    // "Open this link" means the machine running the browser, not the machine
+    // running the server. Honouring it in a hosted session would let anyone
+    // signed in make the server fetch a URL of their choosing, or pop a window
+    // on somebody's console; the browser opens its own links perfectly well.
+    if st.remote_mode() {
+        return json_err(StatusCode::NOT_IMPLEMENTED, "Opening links is unavailable in a hosted browser session.");
+    }
     let v = parse_json(&body);
     let url = jstr(&v, "url").unwrap_or("");
     if allowed_external_url(url) {
@@ -4669,7 +4998,7 @@ async fn static_fallback(State(st): St, headers: HeaderMap, method: Method, uri:
     // mode never sends the application shell until the browser has signed in;
     // static hashed assets contain no workspace data and may remain cacheable.
     if !decoded.contains('.') {
-        if st.remote_mode() && !valid_request_auth(&headers, &st.api_token) {
+        if st.remote_mode() && !valid_request_auth(&st, &headers) {
             return login_page();
         }
         if let Ok(bytes) = fs::read(dist.join("index.html")) {
@@ -4689,9 +5018,25 @@ async fn static_fallback(State(st): St, headers: HeaderMap, method: Method, uri:
 
 static DEV_ORIGIN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^http://(localhost|127\.0\.0\.1):5173$").unwrap());
 
+fn hostname_of(host: &str) -> &str {
+    host.rsplit_once(':').map(|(name, _)| name).unwrap_or(host)
+}
+
 fn local_host(host: &str) -> bool {
-    let hostname = host.rsplit_once(':').map(|(name, _)| name).unwrap_or(host);
+    let hostname = hostname_of(host);
     hostname == "127.0.0.1" || hostname == "localhost"
+}
+
+// A hosted server normally accepts whatever name it was reached by, because it
+// has no way to know which one the proxy in front of it publishes. Telling it
+// (HILBERT_PUBLIC_HOST) closes the gap: a request arriving under some other name
+// is one that was routed here by something other than the intended front door.
+// Loopback stays allowed regardless, so health checks on the box keep working.
+fn public_host_allowed(expected: Option<&str>, host: &str) -> bool {
+    match expected {
+        Some(expected) => hostname_of(host).eq_ignore_ascii_case(expected) || local_host(host),
+        None => true,
+    }
 }
 
 fn origin_allowed(host: &str, origin: &str) -> bool {
@@ -4709,7 +5054,11 @@ async fn request_guard(State(st): St, req: axum::extract::Request, next: axum::m
     let Some(host) = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()) else {
         return (StatusCode::FORBIDDEN, "Forbidden: missing Host").into_response();
     };
-    if !st.remote_mode() && !local_host(host) {
+    if st.remote_mode() {
+        if !public_host_allowed(st.public_host.as_deref(), host) {
+            return (StatusCode::FORBIDDEN, "Forbidden: unexpected Host").into_response();
+        }
+    } else if !local_host(host) {
         return (StatusCode::FORBIDDEN, "Forbidden: non-local Host").into_response();
     }
     if let Some(origin) = req.headers().get(header::ORIGIN).and_then(|h| h.to_str().ok()) {
@@ -4738,33 +5087,73 @@ fn constant_time_eq(candidate: &str, expected: &str) -> bool {
     difference == 0
 }
 
-fn valid_request_auth(headers: &HeaderMap, expected: &str) -> bool {
-    if let Some(candidate) = headers
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-    {
-        if constant_time_eq(candidate, expected) {
-            return true;
-        }
-    }
+}
+
+fn session_cookie(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
         .and_then(|cookies| cookies.split(';').map(str::trim).find_map(|cookie| cookie.strip_prefix("hilbert_session=")))
-        .map(|candidate| constant_time_eq(candidate, expected))
-        .unwrap_or(false)
+}
+
+// Two ways in, and they are not the same credential. The bearer token is the
+// desktop shell and the local API talking to their own backend. The cookie is a
+// browser that signed in to a hosted workspace, and it carries a signed session
+// rather than the token itself.
+fn valid_request_auth(st: &AppState, headers: &HeaderMap) -> bool {
+    if let Some(candidate) = bearer_token(headers) {
+        if constant_time_eq(candidate, &st.api_token) {
+            return true;
+        }
+    }
+    match (&st.sessions, session_cookie(headers)) {
+        (Some(sessions), Some(candidate)) => sessions.verify(candidate),
+        // Outside hosted mode the cookie is how the desktop webview carries the
+        // same local token it would otherwise put in a header.
+        (None, Some(candidate)) => constant_time_eq(candidate, &st.api_token),
+        _ => false,
+    }
 }
 
 async fn auth_guard(State(st): St, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
-    if !valid_request_auth(req.headers(), &st.api_token) {
+    if !valid_request_auth(&st, req.headers()) {
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
     next.run(req).await
 }
 
+// Guessing a 32-character secret over HTTP is not a realistic attack, but an
+// endpoint that answers wrong passwords as fast as it can is an invitation to
+// try. Each failure slows the next one down, server-wide — deliberately not
+// per-IP, because the address a request claims to come from is a header a
+// determined guesser would simply vary. There is no lockout: a wrong password
+// must never be a way to stop the real user signing in.
+static LOGIN_FAILURES: LazyLock<Mutex<(Instant, u32)>> =
+    LazyLock::new(|| Mutex::new((Instant::now(), 0)));
+const LOGIN_FAILURE_WINDOW: Duration = Duration::from_secs(300);
+const LOGIN_MAX_DELAY: Duration = Duration::from_millis(2000);
+
+fn record_login_failure() -> Duration {
+    let mut state = LOGIN_FAILURES.lock().unwrap_or_else(|e| e.into_inner());
+    if state.0.elapsed() > LOGIN_FAILURE_WINDOW {
+        *state = (Instant::now(), 0);
+    }
+    state.1 = state.1.saturating_add(1);
+    LOGIN_MAX_DELAY.min(Duration::from_millis(150) * state.1)
+}
+
+fn clear_login_failures() {
+    let mut state = LOGIN_FAILURES.lock().unwrap_or_else(|e| e.into_inner());
+    *state = (Instant::now(), 0);
+}
+
 async fn remote_login(State(st): St, headers: HeaderMap, body: Bytes) -> Response {
-    let Some(expected) = st.remote_access_token.as_deref() else {
+    let (Some(expected), Some(sessions)) = (st.remote_access_token.as_deref(), st.sessions.as_ref()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let encoded = String::from_utf8_lossy(&body);
@@ -4774,21 +5163,74 @@ async fn remote_login(State(st): St, headers: HeaderMap, body: Bytes) -> Respons
         .map(|value| percent_decode_str(&value.replace('+', " ")).decode_utf8_lossy().into_owned())
         .unwrap_or_default();
     if !constant_time_eq(&candidate, expected) {
+        let delay = record_login_failure();
+        note(format!("hosted sign-in rejected; next attempt delayed {} ms", delay.as_millis()));
+        tokio::time::sleep(delay).await;
         return (StatusCode::UNAUTHORIZED, "Invalid access token").into_response();
     }
+    clear_login_failures();
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::SET_COOKIE, session_cookie_header(&st, sessions.issue(), Some(sessions.lifetime), &headers)),
+            (header::LOCATION, "/".to_string()),
+        ],
+    )
+        .into_response()
+}
+
+// One place decides what the cookie looks like, so signing out cannot
+// accidentally write a differently-scoped cookie that the browser keeps
+// alongside the real one instead of replacing it.
+fn session_cookie_header(st: &AppState, value: String, max_age: Option<Duration>, headers: &HeaderMap) -> String {
+    let _ = st;
+    // Behind a proxy this is how the app learns the visitor arrived over TLS;
+    // marking the cookie Secure on a plain-HTTP connection would make the
+    // browser drop it and the sign-in would appear to do nothing.
     let secure = headers
         .get("x-forwarded-proto")
         .and_then(|value| value.to_str().ok())
         .map(|value| value.eq_ignore_ascii_case("https"))
         .unwrap_or(false);
-    let cookie = format!(
-        "hilbert_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400{}",
-        st.api_token,
+    let age = match max_age {
+        Some(age) => format!("; Max-Age={}", age.as_secs()),
+        None => "; Max-Age=0".to_string(),
+    };
+    format!(
+        "hilbert_session={value}; HttpOnly; SameSite=Strict; Path=/{age}{}",
         if secure { "; Secure" } else { "" },
-    );
+    )
+}
+
+async fn remote_logout(State(st): St, headers: HeaderMap) -> Response {
+    if st.sessions.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     (
         StatusCode::SEE_OTHER,
-        [(header::SET_COOKIE, cookie), (header::LOCATION, "/".to_string())],
+        [
+            (header::SET_COOKIE, session_cookie_header(&st, String::new(), None, &headers)),
+            (header::LOCATION, "/".to_string()),
+        ],
+    )
+        .into_response()
+}
+
+// Sign everybody out — the answer to a laptop left on a train, when changing the
+// server's token and telling everyone the new one is more disruption than the
+// situation needs.
+async fn remote_revoke_sessions(State(st): St, headers: HeaderMap) -> Response {
+    let Some(sessions) = st.sessions.as_ref() else {
+        return json_err(StatusCode::NOT_FOUND, "This server has no browser sessions to end.");
+    };
+    let generation = sessions.revoke_all();
+    note(format!("hosted sessions revoked; generation is now {generation}"));
+    // Including the caller, who gets a fresh one in the same response rather
+    // than being bounced back to the sign-in page for using the button.
+    (
+        StatusCode::OK,
+        [(header::SET_COOKIE, session_cookie_header(&st, sessions.issue(), Some(sessions.lifetime), &headers))],
+        Json(json!({ "ok": true, "generation": generation })),
     )
         .into_response()
 }
@@ -6023,6 +6465,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/session", get(session_get).post(session_post))
         .route("/settings", get(settings_get).post(settings_post))
         .route("/clipboard", get(clipboard_get).post(clipboard_post).layer(DefaultBodyLimit::max(16 * 1024 * 1024)))
+        .route("/auth/revoke-sessions", post(remote_revoke_sessions))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_guard));
 
     let app = Router::new().merge(api);
@@ -6035,7 +6478,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/auth/login",
             post(remote_login).layer(DefaultBodyLimit::max(4096)),
-        );
+        )
+        // Signing out only clears the browser's own cookie, so it needs no
+        // credential of its own — and must still work when the session it is
+        // trying to drop has already expired.
+        .route("/auth/logout", post(remote_logout));
     #[cfg(debug_assertions)]
     let app = app.route("/auth/dev-token", get(dev_api_token));
 
@@ -6122,6 +6569,72 @@ mod tests {
     }
 
     #[test]
+    fn plot_format_only_accepts_the_four_it_can_produce() {
+        for want in ["png", "svg", "pdf", "eps"] {
+            assert_eq!(plot_format(&json!({ "plotFormat": want })), want);
+        }
+        // The value is substituted straight into the harness scripts, so
+        // anything unrecognised — including an attempt to smuggle in code —
+        // has to come back as the plain default.
+        assert_eq!(plot_format(&json!({})), "png");
+        assert_eq!(plot_format(&json!({ "plotFormat": "png\"; import os" })), "png");
+        assert_eq!(plot_format(&json!({ "plotFormat": 7 })), "png");
+    }
+
+    #[test]
+    fn a_cell_cannot_name_a_figure_outside_the_run_directory() {
+        for good in ["nb_plot_0.png", "figure.PDF", "one_shot.svg", "a b c.jpeg"] {
+            assert!(safe_image_name(good), "rejected {good}");
+        }
+        // The names come off the run's stdout, and a cell writes its own stdout.
+        // Any of these would have moved a file from elsewhere on the machine
+        // into assets/ and handed back a path pointing at it.
+        for bad in [
+            "../../../../etc/hosts.png",
+            "..\\..\\secrets.png",
+            "/etc/passwd.png",
+            "sub/dir.png",
+            ".hidden.png",
+            "",
+            "notes.txt",
+            "script.py",
+        ] {
+            assert!(!safe_image_name(bad), "accepted {bad}");
+        }
+    }
+
+    #[test]
+    fn promote_images_drops_what_it_will_not_move() {
+        let workspace = temp_workspace("promote-images");
+        let run = workspace.join(".hilbert/run");
+        fs::create_dir_all(&run).unwrap();
+        fs::write(run.join("nb_plot_0.png"), b"png").unwrap();
+        let outside = workspace.join("private.png");
+        fs::write(&outside, b"secret").unwrap();
+
+        let promoted = promote_images(
+            &workspace,
+            &run,
+            &["nb_plot_0.png".to_string(), "../../private.png".to_string()],
+        );
+        assert_eq!(promoted, vec!["assets/nb_plot_0.png".to_string()]);
+        assert!(outside.is_file(), "the file outside the run directory must not have moved");
+
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn notebook_harnesses_take_the_requested_format() {
+        // A format that never reaches the script would leave the placeholder
+        // behind and the harness would save to a file literally called __FMT__.
+        for harness in [NB_PY, NB_JL] {
+            assert!(harness.contains("__FMT__"));
+            let filled = harness.replace("__FMT__", "pdf");
+            assert!(!filled.contains("__FMT__"));
+        }
+    }
+
+    #[test]
     fn workspace_paths_allow_nested_creates_and_reject_traversal() {
         let ws = temp_workspace("paths");
         fs::create_dir(ws.join("chapters")).unwrap();
@@ -6184,6 +6697,16 @@ mod tests {
         assert!(origin_allowed("127.0.0.1:3001", "http://127.0.0.1:3001"));
         assert!(!origin_allowed("127.0.0.1:3001", "http://localhost:4444"));
         assert_eq!(origin_allowed("127.0.0.1:3001", "http://localhost:5173"), cfg!(debug_assertions));
+
+        // Without a published name a hosted server has to take the Host it is
+        // given; with one, anything else was routed here by something other than
+        // the proxy it sits behind.
+        assert!(public_host_allowed(None, "anything.example.org"));
+        assert!(public_host_allowed(Some("hilbert.example.org"), "hilbert.example.org"));
+        assert!(public_host_allowed(Some("hilbert.example.org"), "Hilbert.Example.ORG:443"));
+        assert!(public_host_allowed(Some("hilbert.example.org"), "127.0.0.1:3001"));
+        assert!(!public_host_allowed(Some("hilbert.example.org"), "evil.example.com"));
+        assert!(!public_host_allowed(Some("hilbert.example.org"), "hilbert.example.org.evil.com"));
     }
 
     #[test]
@@ -6197,36 +6720,63 @@ mod tests {
 
     #[test]
     fn api_bearer_token_must_match_exactly() {
+        let workspace = temp_workspace("bearer-token");
+        let state = AppState::new(workspace.clone(), None);
+        let token = state.api_token().to_string();
+
         let mut headers = HeaderMap::new();
-        assert!(!valid_request_auth(&headers, "fixed-token"));
+        assert!(!valid_request_auth(&state, &headers));
         headers.insert(header::AUTHORIZATION, "Bearer wrong-token".parse().unwrap());
-        assert!(!valid_request_auth(&headers, "fixed-token"));
-        headers.insert(header::AUTHORIZATION, "Bearer fixed-token".parse().unwrap());
-        assert!(valid_request_auth(&headers, "fixed-token"));
+        assert!(!valid_request_auth(&state, &headers));
+        headers.insert(header::AUTHORIZATION, format!("Bearer {token}extra").parse().unwrap());
+        assert!(!valid_request_auth(&state, &headers));
+        headers.insert(header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        assert!(valid_request_auth(&state, &headers));
+
+        fs::remove_dir_all(workspace).unwrap();
     }
 
     #[test]
-    fn hosted_auth_accepts_only_an_exact_bearer_or_session_cookie() {
-        let expected = "hosted-session-token-0123456789abcdef";
+    fn a_hosted_browser_session_is_signed_bounded_and_revocable() {
+        let workspace = temp_workspace("hosted-sessions");
+        let access = "hosted-access-token-0123456789abcdef";
+        let state = AppState::new_remote(workspace.clone(), None, access.to_string());
+        let sessions = state.sessions.as_ref().expect("hosted mode issues sessions");
+        let cookie = sessions.issue();
+
         let mut headers = HeaderMap::new();
-        assert!(!valid_request_auth(&headers, expected));
-
-        headers.insert(header::AUTHORIZATION, format!("Bearer {expected}-extra").parse().unwrap());
-        assert!(!valid_request_auth(&headers, expected));
-        headers.insert(header::AUTHORIZATION, format!("Bearer {expected}").parse().unwrap());
-        assert!(valid_request_auth(&headers, expected));
-
-        headers.remove(header::AUTHORIZATION);
         headers.insert(
             header::COOKIE,
-            format!("theme=ink; hilbert_session={expected}; another=value").parse().unwrap(),
+            format!("theme=ink; hilbert_session={cookie}; another=value").parse().unwrap(),
         );
-        assert!(valid_request_auth(&headers, expected));
-        headers.insert(
-            header::COOKIE,
-            format!("hilbert_session={expected}-extra").parse().unwrap(),
-        );
-        assert!(!valid_request_auth(&headers, expected));
+        assert!(valid_request_auth(&state, &headers));
+
+        // None of the server's other secrets is a session. This is the part the
+        // old scheme got wrong: the cookie used to be the API token itself.
+        for wrong in [state.api_token().to_string(), access.to_string(), format!("{cookie}x")] {
+            headers.insert(header::COOKIE, format!("hilbert_session={wrong}").parse().unwrap());
+            assert!(!valid_request_auth(&state, &headers), "accepted {wrong}");
+        }
+
+        // An expiry is something the client sends back to us, so it only counts
+        // when the MAC covering it still adds up.
+        let far_future = unix_now() + 999_999;
+        let stolen_tag = cookie.rsplit('.').next().unwrap();
+        assert!(!sessions.verify(&format!("v1.{far_future}.0.{stolen_tag}")));
+
+        // And a correctly signed session still stops working once it is past.
+        let expired = unix_now() - 1;
+        assert!(!sessions.verify(&format!("v1.{expired}.0.{}", sessions.tag(expired, 0))));
+
+        // Revoking moves the generation on, which ends every cookie already out
+        // there without changing the token anyone signs in with.
+        assert!(sessions.verify(&cookie));
+        sessions.revoke_all();
+        assert!(!sessions.verify(&cookie));
+        assert!(sessions.verify(&sessions.issue()));
+
+        let _ = fs::remove_file(&sessions.generation_file);
+        fs::remove_dir_all(workspace).unwrap();
     }
 
     #[test]

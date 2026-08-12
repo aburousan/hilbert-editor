@@ -270,6 +270,12 @@ Run Notebook executes every ```` ```python ```` and ```` ```julia ```` block in 
 document as one session, so variables persist between cells. Output and plots land
 below each block, and the compiled PDF badges each block with its language logo.
 
+Figures are saved as PNG by default; App Settings → Interpreters switches that to SVG
+or PDF, so plots stay vector and print sharp. Asking for a format in the code wins over
+the setting — Julia's `plot(x; fmt = :pdf)`, or naming the file yourself with
+`savefig("figure.svg")`. EPS is there for journals that insist on it: Typst cannot embed
+EPS, so those runs also write a PDF of each figure and the document points at that one.
+
 Compute on a selection: highlight an expression and simplify, solve, differentiate,
 integrate, or evaluate it with sympy, dropped back in as an equation.
 
@@ -332,8 +338,9 @@ Use `--bind 0.0.0.0` for network access. Encrypted browser collaboration require
 (including on a LAN) or a localhost SSH tunnel; plain LAN HTTP can edit and compile but
 browsers withhold the encryption API there. In this mode the server workspace is
 authoritative, so browser visitors do not silently get an offline folder on their own
-device. Code running is available to signed-in users, or can be disabled with
-`ALLOW_CODE_EXECUTION=0`. See the hosted-workspace section in
+device. Code running is available to signed-in users, and a hosted server will not run
+any unless the kernel can confine it — install `bubblewrap`, or set
+`HILBERT_SANDBOX=off` to accept running it unconfined. See the hosted-workspace section in
 [docs/COLLABORATION.md](docs/COLLABORATION.md) for the security and backup details.
 Keeping the same server token and workspace path also keeps authenticated sessions and
 the encrypted live room stable through an ordinary hosted-server restart.
@@ -564,7 +571,12 @@ cd hilbert-editor ; npm install ; npm run dev   # then open http://localhost:517
 | --- | --- | --- |
 | `ALLOW_CODE_EXECUTION` | `1` | Set to `0` to disable all code execution. |
 | `EXEC_TIMEOUT_MS` | `45000` | Per-run wall-clock limit. |
+| `HILBERT_SANDBOX` | `auto`, `require` when hosted | `auto` runs code unconfined where no sandbox exists; `require` refuses to run it; `off` never confines. |
+| `HILBERT_SANDBOX_NET` | `0` | `1` keeps the sandbox but gives the code back its network. |
+| `HILBERT_CODE_SCREEN` | `auto` | `always` keeps the source pattern screen on under a sandbox; `off` never screens. |
 | `HILBERT_SERVER_TOKEN` | none | Required 32+ character browser sign-in secret for `--hosted-server`. |
+| `HILBERT_SESSION_HOURS` | `24` | How long a hosted browser session lasts, 1–720. |
+| `HILBERT_PUBLIC_HOST` | none | Hosted only: the hostname this server is published as. Requests arriving under any other name are refused. |
 | `HILBERT_API_TOKEN` | generated | Optional 32+ character API-token override. Hosted mode otherwise derives a stable, separate session token from its server token and workspace. |
 
 Interpreters (including conda environments) are auto-detected; choose the default per
@@ -607,12 +619,24 @@ The backend is built for local, single-user use:
   to move it off 3020.
 - Code execution can be turned off (`ALLOW_CODE_EXECUTION=0`). When on, it is
   time-limited, runs in a scratch directory under `.hilbert/run/` with OS resource
-  limits on file size and CPU, has its output capped, and is screened for process,
-  network, shell, and destructive calls.
+  limits on file size and CPU, and has its output capped.
+- On Linux and macOS a run is confined by the kernel: bubblewrap on Linux, Seatbelt
+  on macOS. The code can write to its own run directory and nowhere else, has no
+  network, and cannot read `~/.ssh`, `~/.gnupg`, `~/.aws` and the other credential
+  directories. Figures still reach the document — the app copies them out afterwards.
+  On Linux it also gets its own process, IPC and hostname namespaces.
+- Where a sandbox is active the older pattern screen steps aside, since the kernel is
+  enforcing the boundary the patterns were guessing at. Where there is none — Windows,
+  or `HILBERT_SANDBOX=off` — the screen still refuses process, network, shell and
+  destructive calls, and App Settings → Interpreters says which is in force.
+- Wolfram is not confined. `wolframscript` launches a separate kernel over a loopback
+  socket and decides which kernel from state outside the run directory; confining it
+  either stops it starting or silently switches it to a different Mathematica version.
+  It keeps the pattern screen instead, exactly as before.
 
-These are guardrails, not a hardened sandbox: code runs with your user privileges.
-Don't expose port 3001 to a network, and don't run untrusted documents. For untrusted
-use you'd want real OS-level isolation, a container or a VM.
+Don't expose port 3001 to a network. For running documents you genuinely do not
+trust, the sandbox is a real boundary but not the only one worth having: a container
+or a VM still costs you nothing and assumes less.
 
 Cloud credentials (Google Drive OAuth, WebDAV) live only in your browser's local
 storage. A GitHub token is used for the one push you asked for and is never written to

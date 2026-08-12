@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { THEMES, type ThemeId } from '../themes';
-import { getInterpreter, setInterpreter } from '../prefs';
+import { getInterpreter, getPlotFormat, setInterpreter, setPlotFormat, type PlotFormat } from '../prefs';
 
 import { API } from '../api';
 
@@ -13,7 +13,9 @@ type GitStatus = {
 };
 
 type Interp = { label: string; path: string; custom?: boolean };
-type Tools = { execEnabled: boolean; interpreters: Record<string, Interp[]> };
+type Sandbox = { kind: string; confined: boolean; network: boolean; detail: string;
+  confinedLanguages?: string[]; screenedLanguages?: string[] };
+type Tools = { execEnabled: boolean; execRefusal?: string | null; sandbox?: Sandbox; interpreters: Record<string, Interp[]> };
 type TinymistStatus = {
   available: boolean;
   running: boolean;
@@ -37,6 +39,13 @@ function interpPlaceholder(lang: string): string {
   return windows ? String.raw`C:\path\to\project\.venv\Scripts\python.exe` : '/path/to/project/.venv/bin/python';
 }
 
+// "Python and Julia", not "python, julia" — this sits in the middle of a sentence.
+function listLangs(langs?: string[]): string {
+  const names = (langs || []).map(l => (l === 'wolfram' ? 'Wolfram' : l[0].toUpperCase() + l.slice(1)));
+  if (names.length <= 1) return names[0] || '';
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+}
+
 type SettingsProps = {
   onClose: () => void,
   theme: ThemeId, onTheme: (t: ThemeId) => void,
@@ -54,6 +63,7 @@ export default function AppSettingsModal({ onClose, theme, onTheme, fontSize, on
   const [picked, setPicked] = useState<Record<string, string>>({});
   // Export resolution for inserted diagrams (flowchart etc.), in DPI.
   const [exportDpi, setExportDpi] = useState<number>(() => Number(localStorage.getItem('fc_export_dpi')) || 200);
+  const [plotFmt, setPlotFmt] = useState<PlotFormat>(getPlotFormat);
 
   // Path the user is typing/browsing for, and the last message, per language.
   const [draft, setDraft] = useState<Record<string, string>>({});
@@ -334,8 +344,41 @@ export default function AppSettingsModal({ onClose, theme, onTheme, fontSize, on
                 yourself, and it is remembered.
               </p>
               {tools && tools.execEnabled === false && (
-                <p style={{ fontSize: '13px', color: '#fca5a5' }}>Code execution is disabled on this server (ALLOW_CODE_EXECUTION=0).</p>
+                <p style={{ fontSize: '13px', color: '#fca5a5' }}>
+                  {tools.execRefusal || 'Code execution is disabled on this server (ALLOW_CODE_EXECUTION=0).'}
+                </p>
               )}
+              {tools?.sandbox && (
+                <p style={{ fontSize: '13px', color: tools.sandbox.confined ? 'var(--text-muted)' : '#fbbf24' }}>
+                  <b>Sandbox:</b> {tools.sandbox.detail}
+                  {tools.sandbox.confined ? (
+                    <>
+                      {' — '}
+                      <b>{listLangs(tools.sandbox.confinedLanguages)}</b> can save files next to the code and
+                      nowhere else, with the figures copied into the project afterwards.
+                      {tools.sandbox.screenedLanguages?.length ? (
+                        <> <b>{listLangs(tools.sandbox.screenedLanguages)}</b> cannot run inside it — the kernel
+                        will not start — so it is screened for risky calls instead.</>
+                      ) : null}
+                    </>
+                  ) : ' Code you run has the same reach over this machine as you do, so only run what you would run in a terminal.'}
+                </p>
+              )}
+              <label style={{ ...labelStyle, marginTop: 16 }}>
+                Plot format
+                <select style={inputStyle} value={plotFmt}
+                  onChange={e => { const f = e.target.value as PlotFormat; setPlotFmt(f); setPlotFormat(f); }}>
+                  <option value="png">PNG — pixels, works everywhere</option>
+                  <option value="svg">SVG — vector, stays sharp at any zoom</option>
+                  <option value="pdf">PDF — vector, best for print</option>
+                  <option value="eps">EPS — for journals that require it</option>
+                </select>
+                <span style={{ fontSize: '12px', color: 'var(--text-muted)', fontWeight: 400 }}>
+                  What <b>Run Notebook</b> saves a figure as when the code doesn't name a file itself.
+                  {plotFmt === 'eps' && ' Typst cannot embed EPS, so each figure is also written as a PDF and the document points at that one.'}
+                  {' '}Saving a file yourself (<code>savefig("f.pdf")</code>) always wins.
+                </span>
+              </label>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '18px', marginTop: '20px' }}>
                 {tools && Object.entries(tools.interpreters).map(([lang, list]) => (
                   <div key={lang} style={{ ...labelStyle, gap: 7, minWidth: 0 }}>

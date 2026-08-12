@@ -32,6 +32,9 @@ The whole project, not just one file:
 Each person keeps a real copy of the project on their own disk and compiles it locally,
 so the preview each of you sees is your own Typst build of the real document.
 
+One gap worth knowing: what travels is files, so a folder you create and leave empty does
+not appear for anyone else. It shows up the moment you put something in it.
+
 ## What you need
 
 - Hilbert running on each person's computer.
@@ -171,7 +174,20 @@ per-session encryption.
 
 The relay above only forwards encrypted collaboration traffic: everyone still runs the
 desktop app and keeps their own project copy. Hilbert can instead host the editor, files,
-compiler, preview, and collaboration together, for an Overleaf-like setup in a browser:
+compiler, preview, and collaboration together, for an Overleaf-like setup in a browser.
+
+An installed copy can do this directly. `--serve` is the same thing as
+`--hosted-server`, and the installed build already carries the web app, so there is
+nothing to point it at:
+
+```sh
+HILBERT_SERVER_TOKEN="replace-with-a-random-secret-of-at-least-32-characters" \
+  hilbert --serve --bind 127.0.0.1 --port 3001 --workspace /srv/hilbert/project
+```
+
+On macOS the binary lives inside the bundle, at
+`/Applications/Hilbert.app/Contents/MacOS/hilbert`. Building from source instead, you
+have to say where the built web app is, because there is no bundle to find it in:
 
 ```sh
 npm run build
@@ -179,7 +195,7 @@ cd src-tauri
 cargo build --release
 HILBERT_SERVER_TOKEN="replace-with-a-random-secret-of-at-least-32-characters" \
   TYPST_DIST=../dist \
-  ./target/release/typst-editor --hosted-server \
+  ./target/release/typst-editor --serve \
   --bind 127.0.0.1 --port 3001 --workspace /srv/hilbert/project
 ```
 
@@ -241,6 +257,193 @@ a hardened security boundary. Set `ALLOW_CODE_EXECUTION=0` if collaborators shou
 run code, and use a dedicated OS account, container, or VM when hosting documents you do
 not fully trust.
 
+A few things a browser tab cannot do, because they belong to the machine the app is
+installed on rather than the one you are sitting at. Reveal in file manager and opening
+a second native window are unavailable. Cut, copy and paste use the browser's own
+clipboard rather than the server's, so the first paste may ask for clipboard permission,
+and Firefox restricts reading the clipboard from a page more tightly than Chrome does.
+Toolbar customization is remembered per browser, so hiding a button does not change what
+anyone else sees.
+
+Two ceilings protect the server's memory, and both apply only to what the browser is
+shown. A file preview stops at 64 MiB and a compiled PDF at 96 MiB. The file itself is
+untouched on disk and the compile still succeeds; only the in-browser preview is refused,
+with a message saying so.
+
+When you run this under systemd or from a terminal, SIGINT and SIGTERM go through the
+normal shutdown path, so the compiler and language-server children are stopped rather
+than orphaned. `systemctl stop` leaves nothing behind.
+
+## Leaving it running
+
+A hosted workspace is meant to sit there for months, and a command typed into a terminal
+does not survive the terminal closing. The `deploy/` folder has what a real deployment
+needs: a systemd unit, an nginx server block, and the same thing for Caddy.
+
+### The service
+
+`deploy/hilbert.service` runs Hilbert as a dedicated unprivileged `hilbert` account with
+its own home under `/var/lib/hilbert`, restarts it if it dies, and stops it cleanly. The
+header of that file lists the four commands that create the account, the workspace, and
+the environment file. Install it with:
+
+```sh
+sudo install -m 644 deploy/hilbert.service /etc/systemd/system/hilbert.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now hilbert
+journalctl -u hilbert -f
+```
+
+Install bubblewrap too, before you enable the service:
+
+```sh
+sudo apt install bubblewrap        # or: sudo dnf install bubblewrap
+```
+
+A hosted workspace will not run code it cannot confine. Without `bwrap` the service still
+starts and still serves and compiles documents; the Run buttons just say why they are
+unavailable. See [Running other people's code](#running-other-peoples-code) below.
+
+The unit is deliberately confined, because this service runs code its own users write:
+no new privileges, a private `/tmp`, a read-only view of the filesystem apart from
+`/var/lib/hilbert`, no access to kernel tunables or modules, and a memory ceiling. Three
+of those choices are worth knowing about before you debug something.
+
+`ProtectHome=yes` hides `/home` from the service, which also hides any interpreter
+installed there. A conda environment under your own home directory is simply not found.
+Install the interpreters system-wide, or relax that line to `ProtectHome=read-only` and
+accept that a cell can then read every home directory on the box.
+
+`RestrictNamespaces` and `SystemCallFilter` are looser than they first look, and that is
+on purpose. Bubblewrap builds the box that user code runs in, and to do that it has to
+create namespaces and mount things inside them — which `RestrictNamespaces=yes` and a
+plain `@system-service` filter both forbid. Tightening those two lines produces a service
+that looks well hardened, reports no sandbox available, and refuses to run anything.
+
+`MemoryDenyWriteExecute` is left off on purpose. Julia compiles as it runs and needs
+writable-executable pages; turning that protection on breaks every Julia cell.
+
+### HTTPS
+
+Hilbert binds to loopback and expects a reverse proxy to terminate TLS. Two headers in
+that proxy are load-bearing rather than boilerplate:
+
+- **`Host` must be passed through unchanged.** Hilbert checks each request's `Origin`
+  against its `Host`, so a proxy that rewrites `Host` to the upstream name makes every
+  browser request look cross-site and the server answers `403 Forbidden: cross-site
+  request`. The site loads and then refuses everything you click.
+- **`X-Forwarded-Proto` must say `https`.** It is how the app knows the visitor arrived
+  over TLS, and it decides both whether the session cookie is marked `Secure` and whether
+  the collaboration relay is offered as `wss://` or `ws://`.
+
+The relay also needs a long read timeout, because the socket stays open for as long as
+someone has the document open and is silent whenever nobody is typing. nginx's default
+60 seconds closes it repeatedly and every editor reconnects in a loop.
+`deploy/nginx-hilbert.conf` has all of this; `deploy/Caddyfile` is shorter because Caddy
+passes `Host` through and sets `X-Forwarded-Proto` on its own.
+
+### The token
+
+`HILBERT_SERVER_TOKEN` is the sign-in secret for every visitor, and it lives in
+`/etc/hilbert/hilbert.env` at mode 600, read by systemd as root before privileges are
+dropped. To rotate it:
+
+```sh
+printf 'HILBERT_SERVER_TOKEN=%s\n' "$(openssl rand -base64 48 | tr -d '\n')" \
+  | sudo tee /etc/hilbert/hilbert.env >/dev/null
+sudo chmod 600 /etc/hilbert/hilbert.env
+sudo systemctl restart hilbert
+```
+
+Rotating it signs everyone out, which is the point, but it does more than that. The
+hosted room and session keys are derived from the token and the workspace path, so a new
+token is a new hosted workspace identity: open browser tabs stop being able to reach the
+old room and have to sign in again. Files on disk are untouched. Do it if the token
+leaks, or when someone who had it should no longer have access.
+
+### Backups
+
+The workspace directory is the authoritative copy of everything. Browser recovery drafts
+are not a backup, and a browser cannot even load the UI while the server is down. Back up
+`/var/lib/hilbert/workspace` the way you would back up any other directory of source
+files. A `git` repository inside it works well and gives you history for free; a nightly
+`rsync` or filesystem snapshot to another machine covers the case where this one dies.
+Nothing outside the workspace needs backing up except `/etc/hilbert/hilbert.env`, and
+that one you can just regenerate.
+
+### Sessions
+
+Signing in exchanges the token for a cookie. That cookie is not the token — it is a short
+signed statement saying when the session expires and which generation of sessions it
+belongs to, and the server checks both on every request. Three consequences:
+
+- Sessions expire on the server, not on the browser's honour. The default is 24 hours;
+  `HILBERT_SESSION_HOURS` in the environment file changes it, between 1 and 720.
+- They survive a restart, so a browser that was mid-edit when the service bounced picks up
+  where it was instead of losing the draft behind a sign-in page.
+- They can be ended without changing the token. `POST /auth/revoke-sessions`, from a
+  signed-in browser or with the API token, signs everyone out at once and leaves the
+  sign-in secret alone. Use it for a lost laptop; rotate the token for a leaked token.
+
+`POST /auth/logout` clears just the calling browser's cookie.
+
+### Running other people's code
+
+Everything above this line protects the machine from the network. This part is about the
+code inside the documents, which is a different problem: a notebook cell is a program
+somebody else wrote, and running it is the entire point of the feature.
+
+On Linux each run happens inside bubblewrap. The cell gets its own PID, IPC and UTS
+namespaces, an empty network namespace, a read-only view of the filesystem with the
+credential directories (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`,
+`~/.config/gh`, `~/.config/gcloud`) replaced by empty ones, and exactly one writable
+directory: `.hilbert/run` inside the workspace, where it starts. Figures it produces are
+copied out into `assets/` afterwards by the server, not by the cell. macOS gets the same
+two guarantees — writes confined to the run directory, no network — through Seatbelt,
+which cannot restrict reads as tightly, so the rest of the disk stays readable apart from
+those same credential paths. Windows has neither.
+
+Because the operating system is holding that line, the pattern-matching screen that used
+to refuse anything mentioning `subprocess` or `os.environ` steps aside when a sandbox is
+active: it was rejecting ordinary code and stopping nobody determined. Where there is no
+sandbox, it still applies.
+
+**Wolfram is the exception, and runs unconfined.** `wolframscript` is a launcher: it
+starts a separate WolframKernel, talks to it over a loopback socket with link files in
+`/tmp`, and works out which kernel to start from state under `~/Library`. Confined, the
+kernel does not come up at all. Given loopback and `/tmp` it starts but silently picks a
+*different* kernel — Wolfram Engine 14.2 in place of Wolfram 15.0 on the machine this was
+tested on. Running someone's algebra on a quietly different version of Mathematica is a
+worse outcome than not confining it, so Wolfram keeps the source screen — which refuses
+`Run`, `RunProcess`, `URLFetch`, `Import` of a URL and the rest — as its guard. That is
+what it had before, so nothing about Wolfram got worse; it just did not get better. If
+that matters to you, `ALLOW_CODE_EXECUTION=0` or a machine of its own are the answers.
+
+What this costs: a cell cannot write outside `.hilbert/run`, and it has no network. Code
+that fetched a dataset mid-run, or wrote a CSV next to the document, needs changing —
+write it in the run directory and it will be there.
+
+Julia's package caches are the one exception, because Julia refuses to load a package it
+cannot precompile: the depot's `compiled/`, `scratchspaces/` and `logs/` are writable,
+and the package sources beside them are not. A few Julia packages also write straight
+into your home directory — PlotlyJS and anything else built on WebIO keep a lock file at
+`~/.jlassetregistry.lock` — and those fail to load under the sandbox. Plots.jl, which is
+what the notebook runner is built around, does not do this and works normally.
+
+Four settings, all in the environment file:
+
+| Setting | Effect |
+| --- | --- |
+| `HILBERT_SANDBOX=require` | The default when hosted. No sandbox, no code execution. |
+| `HILBERT_SANDBOX=auto` | Run code unconfined if the machine has no sandbox. The desktop default. |
+| `HILBERT_SANDBOX=off` | Never confine anything. Means what it says. |
+| `HILBERT_SANDBOX_NET=1` | Keep the sandbox, give the code back its network. |
+| `HILBERT_CODE_SCREEN=always` | Keep the source screen on even under a sandbox. |
+
+If you are hosting documents from people you do not trust at all, none of this is a
+substitute for `ALLOW_CODE_EXECUTION=0`, or for giving the service a machine of its own:
+a container or a VM, not just a separate account.
+
 ## Running from source
 
 You need [Rust](https://www.rust-lang.org/tools/install) and
@@ -251,8 +454,12 @@ Raspberry Pi OS it is roughly:
 
 ```sh
 sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file \
-  libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+  libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libwayland-dev
 ```
+
+`libwayland-dev` is the one people miss. The editor's clipboard talks to the system
+clipboard directly, and on Linux that needs Wayland's headers present at build time even
+when you are running X11.
 
 Then build and run:
 
@@ -297,6 +504,16 @@ preview recompiles by itself once it lands.
 
 **Someone's whiteboard changes are not showing.** Whiteboards sync on save, not stroke by
 stroke. Ask them to save (Ctrl/Cmd+S) in the whiteboard tab.
+
+**Paste does nothing in a browser tab.** A hosted page uses the browser's clipboard, not
+the server's, and the browser has to grant the page permission to read it. Accept the
+prompt the first time, or use Ctrl/Cmd+V, which browsers always allow because the
+keystroke is the permission. The desktop app is not affected.
+
+**The browser says a file is too large to preview.** Hosted mode stops showing a file
+past 64 MiB, and a compiled PDF past 96 MiB, to keep the server's memory bounded. The
+file is untouched and the compile still ran; download it or open the project in the
+desktop app to see it.
 
 ## Good to know
 
