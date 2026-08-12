@@ -1,0 +1,20 @@
+# The same thing in Caddy, which gets and renews the certificate itself.
+#
+# Caddy passes the original Host through and sets X-Forwarded-Proto by default,
+# which is exactly what Hilbert needs, so there is nothing to remember here.
+# WebSockets and streaming work out of the box as well.
+
+hilbert.example.org {
+	reverse_proxy 127.0.0.1:3001 {
+		# The relay socket is idle whenever nobody is typing. Without this it is
+		# torn down every couple of minutes and every editor reconnects.
+		transport http {
+			read_timeout 3600s
+			write_timeout 3600s
+		}
+	}
+
+	request_body {
+		max_size 128MB
+	}
+}

@@ -1,0 +1,122 @@
+# Hilbert as a long-running hosted workspace.
+#
+#   sudo install -m 644 deploy/hilbert.service /etc/systemd/system/hilbert.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now hilbert
+#
+# Set-up this expects, in full:
+#
+#   sudo useradd --system --home-dir /var/lib/hilbert --create-home --shell /usr/sbin/nologin hilbert
+#   sudo install -d -m 700 -o hilbert -g hilbert /var/lib/hilbert/workspace
+#   sudo install -d -m 755 /etc/hilbert
+#   printf 'HILBERT_SERVER_TOKEN=%s\n' "$(openssl rand -base64 48 | tr -d '\n')" \
+#     | sudo tee /etc/hilbert/hilbert.env >/dev/null
+#   sudo chmod 600 /etc/hilbert/hilbert.env
+#
+# The token is the sign-in secret for every visitor, so it belongs in that file
+# and nowhere else. Rotating it is a matter of writing a new one and restarting;
+# see docs/COLLABORATION.md, which also explains why the room and session keys
+# change with it.
+#
+# One more thing this needs:
+#
+#   sudo apt install bubblewrap        # or dnf install bubblewrap
+#
+# A hosted workspace runs code its users write, so it refuses to run any unless
+# the kernel can confine it. Without bubblewrap the service still starts, still
+# serves documents and still compiles them — the Run buttons simply say why they
+# are not available. HILBERT_SANDBOX=off in the environment file overrides that,
+# and means what it says.
+
+[Unit]
+Description=Hilbert hosted Typst workspace
+Documentation=https://github.com/aburousan/hilbert-editor
+After=network-online.target
+Wants=network-online.target
+# A crash loop from a bad token or an occupied port should stop, not spin.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=hilbert
+Group=hilbert
+WorkingDirectory=/var/lib/hilbert
+
+# Holds HILBERT_SERVER_TOKEN, mode 600. systemd reads it as root before dropping
+# privileges, so the hilbert user never needs to be able to read it.
+EnvironmentFile=/etc/hilbert/hilbert.env
+
+# Everything the app writes outside the workspace follows HOME: the log and the
+# interpreter list land in $HOME/.config/hilbert, Typst's package cache in
+# $HOME/.cache. Pinned here so ProtectSystem below knows what to leave writable.
+Environment=HOME=/var/lib/hilbert
+Environment=XDG_CONFIG_HOME=/var/lib/hilbert/.config
+Environment=XDG_CACHE_HOME=/var/lib/hilbert/.cache
+Environment=TYPST_PACKAGE_CACHE_PATH=/var/lib/hilbert/.cache/typst/packages/preview
+Environment=JULIA_DEPOT_PATH=/var/lib/hilbert/.julia
+
+# Bind to loopback and put a reverse proxy in front for TLS. Binding to 0.0.0.0
+# serves the whole project over plain HTTP, token and all.
+ExecStart=/usr/bin/hilbert --serve --bind 127.0.0.1 --port 3001 --workspace /var/lib/hilbert/workspace
+
+# The server closes its children and saves on SIGINT/SIGTERM. Give it room to
+# finish rather than having systemd shoot it mid-write.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=always
+RestartSec=3
+
+# --- Containment -----------------------------------------------------------
+# This service runs code its users write. These settings are what stands between
+# a cell that gets past the request-level screen and the rest of the machine.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+# /home is hidden from the service, which also hides any interpreter installed
+# there: a conda env under /home/you is simply not found. Install the
+# interpreters system-wide, or move this to ProtectHome=read-only and accept
+# that a cell can then read every home directory on the machine.
+ProtectHome=yes
+ReadWritePaths=/var/lib/hilbert
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# The next two look like holes and are the opposite. Bubblewrap builds the box
+# that user code runs inside, and to do that it has to create namespaces and
+# mount things in them. RestrictNamespaces=yes and a plain @system-service
+# filter both forbid exactly that, so the service would come up looking well
+# hardened while reporting no sandbox available and refusing to run anything.
+# Listing the namespaces explicitly, and adding @mount, is what lets the tighter
+# boundary — the one around the user's code — exist at all.
+RestrictNamespaces=cgroup ipc net mnt pid user uts
+SystemCallFilter=@system-service @mount
+
+# Deliberately NOT set: Julia compiles as it runs and needs writable-executable
+# pages, so MemoryDenyWriteExecute=yes would break every Julia cell.
+#
+# Also worth knowing: NoNewPrivileges=yes above is free when unprivileged user
+# namespaces are enabled, which is the normal case. On a distribution that
+# disables them and ships bubblewrap setuid instead, it stops bwrap working —
+# the service then reports no sandbox and refuses to run code, rather than
+# quietly running it unconfined.
+
+# A runaway cell should hit a wall before the machine starts swapping. Raise
+# MemoryMax if your documents genuinely need more; the point is that there is a
+# ceiling at all.
+MemoryMax=4G
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target
