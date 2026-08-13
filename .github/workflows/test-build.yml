@@ -82,12 +82,21 @@ jobs:
           projectPath: .
           args: ${{ matrix.args }}
 
+      # One installer per platform, not the whole bundle directory. Collecting
+      # everything meant a macOS artifact carried the .app folder and the
+      # updater tarball beside the .dmg — three copies of the same program, and
+      # 49 MB to download for a 16 MB installer. A build with --target puts its
+      # output under target/<triple>/, hence the second line of each pair.
       - name: Collect installers
         uses: actions/upload-artifact@v4
         with:
           name: hilbert-${{ matrix.name }}
           path: |
-            src-tauri/target/release/bundle/**
-            src-tauri/target/*/release/bundle/**
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/*/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/*/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/*/release/bundle/appimage/*.AppImage
           if-no-files-found: error
           retention-days: 14
