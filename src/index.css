@@ -1500,6 +1500,15 @@ body.is-resizing .editor-container {
   unicode-bidi: embed !important;
 }
 
+/* Where an invisible character sits. It has no width of its own, so the
+   hairline is a border rather than a background — enough to see that something
+   is there and to put the caret either side of it, without the character being
+   replaced by a placeholder and losing its effect on the line. */
+.monaco-editor .view-line span.bidi-mark {
+  border-left: 1px dashed var(--accent-line);
+  margin-right: 1px;
+}
+
 /* brief flash when jumping to a synced word */
 .sync-flash { background: rgba(139, 92, 246, 0.35); border-radius: 2px; }
 

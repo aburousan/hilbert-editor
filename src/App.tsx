@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo, lazy, Suspense } from 'react';
 import { API, useWorkspaceAsset } from './api';
 import { THEMES, DEFAULT_THEME, isThemeId, themeInfo, themeAttribute, nextTheme, type ThemeId } from './themes';
-import { BIDI_MARKS, HAS_RTL, isolateMarks, isTextDirection, lineDirection, segmentLine, type TextDirection } from './textDirection';
+import { BIDI_MARKS, HAS_RTL, INVISIBLE, INVISIBLE_ALL, blockAfter, invisibleName, isolateMarks, isTextDirection, lineDirection, segmentLine, type OpenBlock, type TextDirection } from './textDirection';
 import { allInterpreters, applyInterpreters, applyPlotFormat, embeddableInTypst, getInterpreter, getPlotFormat, PREFS_CHANGED } from './prefs';
 import Editor, { useMonaco } from '@monaco-editor/react';
 import { setupTypstLanguage, setWorkspaceImages } from './typstMonaco';
@@ -953,6 +953,12 @@ export default function App() {
     // Hilbert draws the right-click menu itself; Monaco's cannot cut or paste
     // inside a webview. EditorContextMenu carries the same entries.
     contextmenu: false,
+    // Monaco's own answer to an invisible character is to swap it for a visible
+    // `[U+200F]` box, which takes the real character out of the line — so an
+    // isolate inserted from Insert → Text Direction showed up as a box and then
+    // did nothing, because the bidi algorithm never saw it. Hilbert marks these
+    // with a hairline decoration instead, which leaves the character in place.
+    renderControlCharacters: false,
   }), [editorFontSize]);
   const [codeRunner, setCodeRunner] = useState<null | { initialLang?: 'python' | 'julia' | 'wolfram'; initialCode?: string; initialMode?: 'text' | 'equation' }>(null);
   const [showSaveAs, setShowSaveAs] = useState(false);
@@ -1093,20 +1099,35 @@ export default function App() {
       if (!rtlLinesRef.current) rtlLinesRef.current = editor.createDecorationsCollection([]);
       const collection = rtlLinesRef.current;
       const flips = readFlips();
-      // Nothing to look at: the setting says left-to-right and no line has been
-      // turned round by hand. Reading the document at all would be wasted work.
-      if (editorTextDir === 'ltr' && !flips.size) {
-        collection.clear();
-        return;
-      }
-      // One cheap regex decides whether a line is worth looking at properly, so
-      // an ordinary document costs a test per line rather than a scan of it.
+      // Two cheap regexes decide whether a line is worth looking at properly,
+      // so an ordinary document costs a pair of tests per line rather than a
+      // scan of it. Both run whatever the setting says: someone who has turned
+      // the direction handling off still wants to be shown the invisible
+      // character that is quietly moving their text about.
       const forced = editorTextDir === 'rtl' ? 'rtl' : editorTextDir === 'ltr' ? 'ltr' : null;
       const decorations = [];
+      let open: OpenBlock = null;
       for (let line = 1; line <= model.getLineCount(); line++) {
         const content = model.getLineContent(line);
+        // Whether this line began inside a fenced raw block or a display
+        // formula, which the scanner cannot see from the line alone.
+        const inside = open;
+        open = blockAfter(content, open);
+        if (INVISIBLE.test(content)) {
+          for (const found of content.matchAll(INVISIBLE_ALL)) {
+            decorations.push({
+              range: new monaco.Range(line, found.index + 1, line, found.index + 2),
+              options: {
+                description: 'invisible-character',
+                inlineClassName: 'bidi-mark',
+                hoverMessage: { value: invisibleName(found[0]) },
+              },
+            });
+          }
+        }
         const mixed = HAS_RTL.test(content);
-        const side = flips.get(line) || forced || (mixed ? lineDirection(content) : 'ltr');
+        const side = flips.get(line) || forced
+          || (inside ? 'ltr' : mixed ? lineDirection(content) : 'ltr');
         if (side === 'rtl') decorations.push({
           // The whole line, not a point on it. Monaco decides a view line's
           // direction by asking which decorations cover that view line, and a
@@ -1117,11 +1138,18 @@ export default function App() {
           options: { description: 'text-direction', textDirection: rtl },
         });
         // Everything the scanner calls code — maths, raw, labels, #calls — is
-        // fenced off from the bidi pass so its delimiters stay put. Only lines
-        // that actually mix scripts pay for this; a pure Hebrew or pure Latin
-        // line has nothing to reorder against.
-        if (!mixed) continue;
-        for (const segment of segmentLine(content)) {
+        // fenced off from the bidi pass so its delimiters stay put. Lines that
+        // mix scripts need it, and so does any line laid out right-to-left even
+        // if every character in it is Latin: under the forced setting
+        // `#set page(paper: "a4")` renders as `set page(paper: "a4")#`, the
+        // hash carried to the far end as a neutral at the start of the line.
+        if (!mixed && side !== 'rtl') continue;
+        // Inside one of those blocks the whole line is code, delimiters and
+        // all; elsewhere the scanner says which stretches are.
+        const segments = inside
+          ? [{ start: 0, end: content.length, code: true }]
+          : segmentLine(content);
+        for (const segment of segments) {
           if (!segment.code) continue;
           decorations.push({
             range: new monaco.Range(line, segment.start + 1, line, segment.end + 1),

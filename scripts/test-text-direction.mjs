@@ -22,8 +22,12 @@ function loadTypeScriptModule(relativePath) {
 const {
   BIDI_MARKS,
   HAS_RTL,
+  INVISIBLE,
+  INVISIBLE_ALL,
+  blockAfter,
   detectedDirection,
   findTextRules,
+  invisibleName,
   isolateMarks,
   isRtlLanguage,
   isTextDirection,
@@ -195,5 +199,57 @@ for (const lang of ['ar', 'he', 'en', 'fa']) {
     assert.deepEqual(read, { lang, dir }, `round trip for ${lang}/${dir}`);
   }
 }
+
+// Blocks that outlive the line that opened them. Walking a document is a fold
+// over these: whatever comes back is the state the next line starts in.
+function walk(source) {
+  let open = null;
+  return source.split('\n').map(line => {
+    const before = open;
+    open = blockAfter(line, open);
+    return before ? before.kind : null;
+  });
+}
+assert.deepEqual(walk('```python\nprint("שלום")\n```\nafter'), [null, 'raw', 'raw', null]);
+assert.deepEqual(walk('$\n  "טקסט" + x\n$\nafter'), [null, 'math', 'math', null]);
+// A longer fence is not closed by a shorter one.
+assert.deepEqual(walk('````\n```\nstill raw\n````\nafter'), [null, 'raw', 'raw', 'raw', null]);
+// Inline raw and inline maths stay on their line.
+assert.deepEqual(walk('a `x` b\nc'), [null, null]);
+assert.deepEqual(walk('a $x$ b\nc'), [null, null]);
+// An escaped dollar is a dollar sign, not the start of a formula.
+assert.deepEqual(walk('costs \\$5 today\nplain'), [null, null]);
+// Backticks inside a formula are maths, not a fence.
+assert.deepEqual(walk('$ a ` b $\nplain'), [null, null]);
+// A dollar in a comment or a string opens nothing. Either false positive would
+// leave the whole rest of the document looking like the inside of a formula.
+assert.deepEqual(walk('// costs $5 today\nשלום'), [null, null]);
+assert.deepEqual(walk('#let sign = "$"\nשלום'), [null, null]);
+assert.deepEqual(walk('He said "it costs $5" and left\nשלום'), [null, null]);
+// The slashes in a URL are inside a string, so they are not a comment.
+assert.deepEqual(walk('#link("https://a.b")[$x$]\nשלום'), [null, null]);
+// An unclosed quote is punctuation, not a string, so what follows still counts.
+assert.deepEqual(walk('התשפ"ו $\n  x\n$'), [null, 'math', 'math']);
+
+// Invisible characters. Every mark the Insert menu can drop into a document
+// has to be one the editor will then draw a hairline for, or the reader ends up
+// with a file that reorders itself around nothing they can see.
+for (const mark of BIDI_MARKS) {
+  assert.ok(INVISIBLE.test(mark.char), `${mark.id} is marked as invisible`);
+  assert.equal(invisibleName(mark.char), `${mark.label} (U+${mark.char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')})`);
+}
+// The older embedding codes are not on the Insert menu but turn up in pasted
+// text, and a right-to-left override is worth being loud about.
+assert.equal(invisibleName('\u202e'), 'Right-to-left override (U+202E)');
+assert.equal(invisibleName('\u0007'), 'Control character (U+0007)');
+// Tab and newline are structure, not contraband.
+assert.equal(INVISIBLE.test('\t'), false);
+assert.equal(INVISIBLE.test('\n'), false);
+assert.equal(INVISIBLE.test('plain text'), false);
+// The global copy has to find every one of them, not just the first.
+assert.deepEqual(
+  [...'a\u200fb\u2066c'.matchAll(INVISIBLE_ALL)].map(m => m[0]),
+  ['\u200f', '\u2066'],
+);
 
 console.log('text direction: ok');

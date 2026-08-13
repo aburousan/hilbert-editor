@@ -36,6 +36,40 @@ export function isolateMarks(side: 'rtl' | 'ltr' | 'auto' = 'auto'): [string, st
   return [side === 'rtl' ? '\u2067' : side === 'ltr' ? '\u2066' : '\u2068', '\u2069'];
 }
 
+// Characters that occupy no width and yet change what a line looks like: the
+// directional marks above, the older embedding codes, and the control
+// characters that have no business being in a document at all. The editor
+// draws a hairline where one sits, because a file that reorders itself around
+// something you cannot see is a file you cannot fix.
+//
+// Written as escapes on purpose. Typed literally these are invisible in the
+// source too, and a stray one is then impossible to spot in review.
+const INVISIBLE_NAMES: Record<string, string> = {
+  '\u200e': 'Left-to-right mark',
+  '\u200f': 'Right-to-left mark',
+  '\u061c': 'Arabic letter mark',
+  '\u202a': 'Left-to-right embedding',
+  '\u202b': 'Right-to-left embedding',
+  '\u202c': 'Pop directional formatting',
+  '\u202d': 'Left-to-right override',
+  '\u202e': 'Right-to-left override',
+  '\u2066': 'Left-to-right isolate',
+  '\u2067': 'Right-to-left isolate',
+  '\u2068': 'First-strong isolate',
+  '\u2069': 'Pop directional isolate',
+};
+
+// Matching control characters is the whole point here: they are what has to
+// be found and drawn, rather than left to shove the text about unseen.
+// eslint-disable-next-line no-control-regex
+export const INVISIBLE = /[\u200e\u200f\u061c\u202a-\u202e\u2066-\u2069\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+export const INVISIBLE_ALL = new RegExp(INVISIBLE.source, 'g');
+
+export function invisibleName(char: string): string {
+  const hex = (char.codePointAt(0) || 0).toString(16).toUpperCase().padStart(4, '0');
+  return `${INVISIBLE_NAMES[char] || 'Control character'} (U+${hex})`;
+}
+
 // The first strong character in a line decides which way that line runs —
 // rule P2/P3 of the bidi algorithm, and the same heuristic Katvan applies.
 // The isolates and marks count as strong, which is what makes dropping an RLM
@@ -185,6 +219,48 @@ export function segmentLine(line: string): Segment[] {
   }
   closeContent(line.length);
   return segments;
+}
+
+// Two Typst blocks outlive the line that opens them: a fenced raw block and a
+// display formula. segmentLine works one line at a time and so calls the middle
+// of either one prose, which turns a line round the moment a Hebrew string
+// appears inside a formula or a code sample. This carries just enough state
+// between lines to know when we are inside one — the two shapes that span
+// lines, not a second parser.
+export type OpenBlock = null | { kind: 'raw', ticks: number } | { kind: 'math' };
+
+export function blockAfter(line: string, open: OpenBlock): OpenBlock {
+  if (open && open.kind === 'raw') {
+    return line.includes('`'.repeat(open.ticks)) ? null : open;
+  }
+  let math = open !== null;
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    if (char === '\\') { i++; continue; }
+    // A dollar in a comment or a string is a dollar sign. Getting this wrong is
+    // not a small error: one stray `// costs $5` would leave every line below
+    // it looking like the inside of a formula.
+    if (char === '/' && line[i + 1] === '/') break;
+    if (char === '"') {
+      const close = line.indexOf('"', i + 1);
+      // Only a quote that closes on this line is a string. An open one is far
+      // more likely to be punctuation — Hebrew writes its own gershayim that
+      // way, as in התשפ"ו — and swallowing the rest of the line for it would
+      // hide whatever came after.
+      if (close > i) { i = close; continue; }
+    }
+    if (char === '$') { math = !math; continue; }
+    if (char !== '`' || math) continue;
+    let ticks = 0;
+    while (line[i + ticks] === '`') ticks++;
+    const close = line.indexOf('`'.repeat(ticks), i + ticks);
+    // Inline raw closes on its own line or not at all; only a fence of three
+    // or more carries on to the next one.
+    if (close >= 0) { i = close + ticks - 1; continue; }
+    if (ticks >= 3) return { kind: 'raw', ticks };
+    i += ticks - 1;
+  }
+  return math ? { kind: 'math' } : null;
 }
 
 export function lineDirection(line: string): 'rtl' | 'ltr' {
