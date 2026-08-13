@@ -1464,6 +1464,42 @@ body.is-resizing .editor-container {
 .textLayer span::selection { background: rgba(139, 92, 246, 0.4); }
 .textLayer ::selection { background: rgba(139, 92, 246, 0.4); }
 
+/* Monaco stamps dir="rtl" and an inline isolate on every token span holding a
+   single right-to-left character, which turns each coloured token into an
+   atom laid out on its own. One token covering `abc שלום def` then renders as
+   `def שלום abc` — the whole line backwards — because the token, not the line,
+   decided the direction. Handing the direction back to the line is what makes
+   an English sentence with a Hebrew word in it come out in the right order,
+   and it is what lets the per-line direction decorations mean anything.
+
+   Only an author rule marked important can reach an inline style. */
+.monaco-editor .view-line span[dir="rtl"] {
+  direction: inherit !important;
+  unicode-bidi: normal !important;
+}
+
+/* Maths, raw spans and code calls inside a Hebrew or Arabic sentence read left
+   to right whatever the sentence around them does, and left to the bidi pass
+   they come apart: `$1+1=2$` in a Hebrew line renders as `2$=$1+1`, the two
+   dollar signs pulled into the middle of the sum.
+
+   embed rather than isolate, which is the tempting one. Monaco puts a
+   decoration's class on every token span the range covers, not on one span
+   around the range, so an isolate makes each token its own atom and the atoms
+   reorder against each other — the formula above came back reversed whole, as
+   `$2=1+1$`. Embedded runs at one level stay contiguous instead, so it stops
+   mattering how many spans the highlighter decided to use. The cost is that
+   two of these side by side in one right-to-left line order as runs rather
+   than as isolates, which swaps them; one island in a sentence, the ordinary
+   case, is identical either way.
+
+   Same specificity as the rule above and written after it, so a code span that
+   happens to contain Hebrew still gets this one. */
+.monaco-editor .view-line span.bidi-isolate {
+  direction: ltr !important;
+  unicode-bidi: embed !important;
+}
+
 /* brief flash when jumping to a synced word */
 .sync-flash { background: rgba(139, 92, 246, 0.35); border-radius: 2px; }
 

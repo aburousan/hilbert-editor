@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo, lazy, Suspense } from 'react';
 import { API, useWorkspaceAsset } from './api';
 import { THEMES, DEFAULT_THEME, isThemeId, themeInfo, themeAttribute, nextTheme, type ThemeId } from './themes';
-import { BIDI_MARKS, isolateMarks, isTextDirection, lineDirection, type TextDirection } from './textDirection';
+import { BIDI_MARKS, HAS_RTL, isolateMarks, isTextDirection, lineDirection, segmentLine, type TextDirection } from './textDirection';
 import { allInterpreters, applyInterpreters, applyPlotFormat, embeddableInTypst, getInterpreter, getPlotFormat, PREFS_CHANGED } from './prefs';
 import Editor, { useMonaco } from '@monaco-editor/react';
 import { setupTypstLanguage, setWorkspaceImages } from './typstMonaco';
@@ -1099,15 +1099,15 @@ export default function App() {
         collection.clear();
         return;
       }
-      // lineDirection answers a line with no right-to-left character in it from
-      // a single regex, so an ordinary document costs one cheap test per line
-      // rather than a copy of the whole buffer.
+      // One cheap regex decides whether a line is worth looking at properly, so
+      // an ordinary document costs a test per line rather than a scan of it.
       const forced = editorTextDir === 'rtl' ? 'rtl' : editorTextDir === 'ltr' ? 'ltr' : null;
       const decorations = [];
       for (let line = 1; line <= model.getLineCount(); line++) {
-        const side = flips.get(line) || forced || lineDirection(model.getLineContent(line));
-        if (side !== 'rtl') continue;
-        decorations.push({
+        const content = model.getLineContent(line);
+        const mixed = HAS_RTL.test(content);
+        const side = flips.get(line) || forced || (mixed ? lineDirection(content) : 'ltr');
+        if (side === 'rtl') decorations.push({
           // The whole line, not a point on it. Monaco decides a view line's
           // direction by asking which decorations cover that view line, and a
           // wrapped paragraph is several view lines: a marker at column 1
@@ -1116,6 +1116,18 @@ export default function App() {
           range: new monaco.Range(line, 1, line, model.getLineMaxColumn(line)),
           options: { description: 'text-direction', textDirection: rtl },
         });
+        // Everything the scanner calls code — maths, raw, labels, #calls — is
+        // fenced off from the bidi pass so its delimiters stay put. Only lines
+        // that actually mix scripts pay for this; a pure Hebrew or pure Latin
+        // line has nothing to reorder against.
+        if (!mixed) continue;
+        for (const segment of segmentLine(content)) {
+          if (!segment.code) continue;
+          decorations.push({
+            range: new monaco.Range(line, segment.start + 1, line, segment.end + 1),
+            options: { description: 'bidi-isolate', inlineClassName: 'bidi-isolate' },
+          });
+        }
       }
       // Deliberately unconditional. Skipping the write when the same lines came
       // back looks like an easy saving, and it is about a millisecond per pass,
