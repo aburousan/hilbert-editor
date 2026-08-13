@@ -83,6 +83,7 @@ const SECTIONS: Section[] = [
       { title: 'Server-outage recovery', where: 'Automatic in the browser-hosted editor', desc: 'Unsaved text is also kept on this device until the server confirms it. When the server returns, Hilbert safely replays it or asks before replacing a separately changed server copy.' },
       { title: 'Folder sync', where: 'Share button', desc: 'Mirror the project into a synced folder (Google Drive, Dropbox…) or a WebDAV server (Nextcloud).' },
       { title: 'Custom fonts', where: 'File → Import Font', desc: 'Import .ttf/.otf files and use them with #set text(font: "…").' },
+      { title: 'Right-to-left writing', where: 'Settings → Editor text direction, Edit → Document Settings', desc: 'Hebrew, Arabic, Persian and Urdu. Each line follows the script you typed it in, skipping maths and code; the document\'s language decides what the PDF does. Ctrl/Cmd+Shift+X turns one line round by hand, and Insert → Text Direction has the bidi marks.' },
     ],
   },
 ];

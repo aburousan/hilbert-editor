@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { THEMES, type ThemeId } from '../themes';
+import { TEXT_DIRECTIONS, type TextDirection } from '../textDirection';
 import { getInterpreter, getPlotFormat, setInterpreter, setPlotFormat, type PlotFormat } from '../prefs';
 
 import { API } from '../api';
@@ -50,10 +51,11 @@ type SettingsProps = {
   onClose: () => void,
   theme: ThemeId, onTheme: (t: ThemeId) => void,
   fontSize: number, onFontSize: (n: number) => void,
+  textDirection: TextDirection, onTextDirection: (d: TextDirection) => void,
   compileDelay: number, onCompileDelay: (n: number) => void,
 };
 
-export default function AppSettingsModal({ onClose, theme, onTheme, fontSize, onFontSize, compileDelay, onCompileDelay }: SettingsProps) {
+export default function AppSettingsModal({ onClose, theme, onTheme, fontSize, onFontSize, textDirection, onTextDirection, compileDelay, onCompileDelay }: SettingsProps) {
   const [activeTab, setActiveTab] = useState<'general' | 'interpreters' | 'git' | 'cloud'>('general');
   const [tools, setTools] = useState<Tools | null>(null);
   const [tinymist, setTinymist] = useState<TinymistStatus | null>(null);
@@ -259,6 +261,18 @@ export default function AppSettingsModal({ onClose, theme, onTheme, fontSize, on
                 <label style={labelStyle}>
                   Editor font size
                   <input type="number" min={10} max={24} value={fontSize} onChange={e => onFontSize(Math.min(24, Math.max(10, Number(e.target.value) || 14)))} style={inputStyle} />
+                </label>
+                <label style={labelStyle}>
+                  Editor text direction
+                  <select style={inputStyle} value={textDirection} onChange={e => onTextDirection(e.target.value as TextDirection)}>
+                    {TEXT_DIRECTIONS.map(d => (
+                      <option key={d.id} value={d.id}>{d.label} — {d.note}</option>
+                    ))}
+                  </select>
+                  <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                    How the editor lays out a line of Hebrew, Arabic, Persian or Urdu. This is the editor only —
+                    what the PDF does comes from the document's own language, under <b>Edit → Document Settings</b>.
+                  </span>
                 </label>
                 <label style={labelStyle}>
                   Auto-compile after typing stops

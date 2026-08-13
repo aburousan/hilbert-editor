@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo, lazy, Suspense } from 'react';
 import { API, useWorkspaceAsset } from './api';
 import { THEMES, DEFAULT_THEME, isThemeId, themeInfo, themeAttribute, nextTheme, type ThemeId } from './themes';
+import { BIDI_MARKS, isolateMarks, isTextDirection, lineDirection, type TextDirection } from './textDirection';
 import { allInterpreters, applyInterpreters, applyPlotFormat, embeddableInTypst, getInterpreter, getPlotFormat, PREFS_CHANGED } from './prefs';
 import Editor, { useMonaco } from '@monaco-editor/react';
 import { setupTypstLanguage, setWorkspaceImages } from './typstMonaco';
@@ -464,6 +465,7 @@ export default function App() {
   const [editorEpoch, setEditorEpoch] = useState(0);
   const pdfRef = useRef<PdfHandle | null>(null);
   const forwardSyncRef = useRef<() => void>(() => {});
+  const flipLineDirectionRef = useRef<() => void>(() => {});
   // Start with no tabs. Seeding main.typ with DEFAULT_CODE here would build a
   // Monaco model holding the starter template, and a restored session then lands
   // its real content on that same model as an *edit* — leaving the template one
@@ -537,6 +539,10 @@ export default function App() {
     return isThemeId(saved) ? saved : DEFAULT_THEME;
   });
   const [editorFontSize, setEditorFontSize] = useState<number>(() => Number(localStorage.getItem('editor_font_size')) || 14);
+  const [editorTextDir, setEditorTextDir] = useState<TextDirection>(() => {
+    const saved = localStorage.getItem('editor_text_dir');
+    return isTextDirection(saved) ? saved : 'auto';
+  });
   const [compileDelay, setCompileDelay] = useState<number>(() => {
     const saved = Number(localStorage.getItem('compile_delay'));
     // Move former defaults to the faster value once. After migration, every
@@ -573,6 +579,7 @@ export default function App() {
   useEffect(() => { localStorage.setItem('highlight_color', highlightColor); }, [highlightColor]);
   useEffect(() => { localStorage.setItem('text_color', textColor); }, [textColor]);
   useEffect(() => { localStorage.setItem('editor_font_size', String(editorFontSize)); }, [editorFontSize]);
+  useEffect(() => { localStorage.setItem('editor_text_dir', editorTextDir); }, [editorTextDir]);
   useEffect(() => {
     localStorage.setItem('compile_delay', String(compileDelay));
     localStorage.setItem('compile_delay_version', '3');
@@ -1019,6 +1026,128 @@ export default function App() {
 
   const monaco = useMonaco();
 
+  // Right-click opens Hilbert's own editor menu rather than the webview's.
+  // Clicking outside the selection moves the caret first, the way every editor
+  // does, so Cut and Copy act on the line the menu was opened over rather than
+  // wherever the caret happened to be.
+  //
+  // This listens on the document for the app's lifetime and asks which editor
+  // is current when it fires, instead of being bound to one editor and the DOM
+  // node it had at mount. That binding is what broke: opening a second file
+  // builds a new editor, and the old one's dispose — arriving after the new one
+  // had wired itself up, on a container Monaco had reused — took the new
+  // listener off with it. Right-click then fell through to the webview's own
+  // menu, which is how it looked to the reader: fine until you opened a file,
+  // then never again.
+  useEffect(() => {
+    const openEditorMenu = (ev: MouseEvent) => {
+      const editor = editorRef.current;
+      const dom = editor?.getDomNode?.();
+      // Outside the editor — the file tree, the preview — is not ours to take.
+      if (!editor || !dom || !(ev.target instanceof Node) || !dom.contains(ev.target)) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      setActiveMenu(null);
+      setContextMenu(null);
+      const position = editor.getTargetAtClientPoint(ev.clientX, ev.clientY)?.position;
+      const inSelection = position && (editor.getSelections() || [])
+        .some((s: any) => !s.isEmpty() && s.containsPosition(position));
+      if (position && !inSelection) editor.setPosition(position);
+      editor.focus();
+      setEditorMenu({ x: ev.clientX, y: ev.clientY });
+    };
+    document.addEventListener('contextmenu', openEditorMenu, true);
+    return () => document.removeEventListener('contextmenu', openEditorMenu, true);
+  }, []);
+
+  const [editorReady, setEditorReady] = useState(0);
+  const rtlLinesRef = useRef<any>(null);
+  const applyDirectionRef = useRef<() => void>(() => {});
+  // Lines the reader has flipped by hand. Held as decorations rather than line
+  // numbers so Monaco carries them along when text is inserted above, instead
+  // of leaving them pointing at whatever moved into that line. A mark in the
+  // file would be the other way to do it, but a mark before `= Heading` stops
+  // Typst seeing a heading at all — measured, not assumed — so the override
+  // stays in the editor and out of the document.
+  const flipRtlRef = useRef<any>(null);
+  const flipLtrRef = useRef<any>(null);
+  const readFlips = useCallback(() => {
+    const flips = new Map<number, 'rtl' | 'ltr'>();
+    for (const range of flipLtrRef.current?.getRanges() || []) flips.set(range.startLineNumber, 'ltr');
+    for (const range of flipRtlRef.current?.getRanges() || []) flips.set(range.startLineNumber, 'rtl');
+    return flips;
+  }, []);
+  // Monaco will lay a line out right-to-left — dir="rtl" on the line, aligned
+  // to the right edge, caret and selection following it — but only for lines a
+  // decoration marks that way, and nothing works out which lines those are.
+  // That is this: the choice in App Settings, turned into per-line decorations
+  // and kept current as the text changes.
+  useEffect(() => {
+    const editor = editorRef.current;
+    const rtl = monaco?.editor?.TextDirection?.RTL;
+    if (!editor || !monaco || rtl === undefined) return;
+
+    const apply = () => {
+      const model = editor.getModel();
+      if (!model) return;
+      if (!rtlLinesRef.current) rtlLinesRef.current = editor.createDecorationsCollection([]);
+      const collection = rtlLinesRef.current;
+      const flips = readFlips();
+      // Nothing to look at: the setting says left-to-right and no line has been
+      // turned round by hand. Reading the document at all would be wasted work.
+      if (editorTextDir === 'ltr' && !flips.size) {
+        collection.clear();
+        return;
+      }
+      // lineDirection answers a line with no right-to-left character in it from
+      // a single regex, so an ordinary document costs one cheap test per line
+      // rather than a copy of the whole buffer.
+      const forced = editorTextDir === 'rtl' ? 'rtl' : editorTextDir === 'ltr' ? 'ltr' : null;
+      const decorations = [];
+      for (let line = 1; line <= model.getLineCount(); line++) {
+        const side = flips.get(line) || forced || lineDirection(model.getLineContent(line));
+        if (side !== 'rtl') continue;
+        decorations.push({
+          // The whole line, not a point on it. Monaco decides a view line's
+          // direction by asking which decorations cover that view line, and a
+          // wrapped paragraph is several view lines: a marker at column 1
+          // reaches only the first of them, leaving the rest of a Hebrew
+          // paragraph running the other way.
+          range: new monaco.Range(line, 1, line, model.getLineMaxColumn(line)),
+          options: { description: 'text-direction', textDirection: rtl },
+        });
+      }
+      // Deliberately unconditional. Skipping the write when the same lines came
+      // back looks like an easy saving, and it is about a millisecond per pass,
+      // but a whole-document replacement — a collaborator's edit, a reload
+      // after an external change — throws the decorations away while the
+      // collection still reports holding them. Nothing cheap can tell that
+      // apart from "nothing changed", and the failure is a document that
+      // silently stops laying itself out right until you switch tabs.
+      collection.set(decorations);
+    };
+
+    applyDirectionRef.current = apply;
+    apply();
+    // Typing the first Hebrew letter of a line should turn it round, but not
+    // once per keystroke while the sentence is still being written.
+    let timer: ReturnType<typeof setTimeout>;
+    const schedule = () => { clearTimeout(timer); timer = setTimeout(apply, 150); };
+    const subscriptions = [editor.onDidChangeModelContent(schedule), editor.onDidChangeModel(apply)];
+    return () => {
+      clearTimeout(timer);
+      subscriptions.forEach(s => s.dispose());
+    };
+  }, [editorTextDir, monaco, editorReady, readFlips]);
+
+  // Katvan also isolates inline maths and code automatically, so a formula in
+  // a Hebrew sentence keeps its pieces in order. That is not reachable
+  // through Monaco: it renders a line as one span per token, CSS isolation
+  // applied per span lets the pieces reorder against each other (`$x = 1$`
+  // measured as `$ 1= x$`), and injected view-only text is drawn as visible
+  // [U+2068] placeholders. Doing it properly means real characters in the
+  // file, which is what Insert → Text Direction does on a selection.
+
   const proof = useProofread(monaco, editorRef, activeTab?.path, activeTab?.content, PROOFREAD_FEATURE_ENABLED && proofreadEnabled);
   const tinymist = useTinymistDiagnostics(monaco, editorRef, activeTab?.path, activeTab?.content);
 
@@ -1216,6 +1345,7 @@ export default function App() {
         if (abandoned || !saved || typeof saved !== 'object') return;
         const size = clamp(saved.fontSize, 6, 96);
         if (size) setEditorFontSize(size);
+        if (isTextDirection(saved.textDirection)) setEditorTextDir(saved.textDirection);
         if (isThemeId(saved.theme)) setTheme(saved.theme);
         const delay = clamp(saved.compileDelay, 0, 10000);
         if (delay !== null) setCompileDelay(delay);
@@ -1262,6 +1392,7 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           fontSize: editorFontSize,
+          textDirection: editorTextDir,
           theme,
           compileDelay,
           panels,
@@ -1272,7 +1403,7 @@ export default function App() {
         }),
       }).catch(() => {});
     }, 400);
-  }, [settingsLoaded, prefsRevision, editorFontSize, theme, compileDelay, panels, sidebarWidth, editorWidth, treeHeight, problemsHeight, hiddenToolbarTools]);
+  }, [settingsLoaded, prefsRevision, editorFontSize, editorTextDir, theme, compileDelay, panels, sidebarWidth, editorWidth, treeHeight, problemsHeight, hiddenToolbarTools]);
 
   // Interpreter choices are made in two different dialogs and land in
   // localStorage rather than in this component's state, so nothing above would
@@ -3427,6 +3558,71 @@ export default function App() {
       forceMoveMarkers: true
     }]);
     editor.focus();
+  };
+
+  // Turn the caret's line round by hand, for the times the first-strong rule
+  // reads a line differently from the person who wrote it. Cycles through the
+  // three states rather than toggling two, so there is always a way back to
+  // letting the line decide for itself.
+  const flipLineDirection = () => {
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    const at = editor?.getPosition();
+    if (!editor || !model || !at || !monaco) return;
+    const line = at.lineNumber;
+
+    if (!flipRtlRef.current) flipRtlRef.current = editor.createDecorationsCollection([]);
+    if (!flipLtrRef.current) flipLtrRef.current = editor.createDecorationsCollection([]);
+
+    const lines = (ref: React.MutableRefObject<any>) =>
+      (ref.current.getRanges() as any[]).map(r => r.startLineNumber).filter(n => n !== line);
+    const rtlLines = lines(flipRtlRef);
+    const ltrLines = lines(flipLtrRef);
+
+    const current = readFlips().get(line);
+    const next = current === undefined ? 'rtl' : current === 'rtl' ? 'ltr' : undefined;
+    if (next === 'rtl') rtlLines.push(line);
+    if (next === 'ltr') ltrLines.push(line);
+
+    // A flip belongs to the line, not to a character in it, so the range must
+    // not stretch as the line is typed into.
+    const asDecorations = (numbers: number[], side: string) => numbers.map(n => ({
+      range: new monaco.Range(n, 1, n, 1),
+      options: {
+        description: `flip-${side}`,
+        stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+      },
+    }));
+    flipRtlRef.current.set(asDecorations(rtlLines, 'rtl'));
+    flipLtrRef.current.set(asDecorations(ltrLines, 'ltr'));
+    applyDirectionRef.current();
+
+    notify(next === 'rtl' ? `Line ${line} forced right-to-left`
+      : next === 'ltr' ? `Line ${line} forced left-to-right`
+      : `Line ${line} follows its own text again`, 'info');
+  };
+  flipLineDirectionRef.current = flipLineDirection;
+
+  // Fence a run of text off from the bidi algorithm, so a phrase in the other
+  // script stops being dragged to the wrong end of the line. "auto" lets the
+  // run pick its own side from its first strong character; the other two say
+  // outright which one it is. The marks are invisible and travel with the
+  // text, in the source and in the PDF alike.
+  const isolateSelection = (side: 'rtl' | 'ltr' | 'auto') => {
+    const editor = editorRef.current;
+    const selection = editor?.getSelection();
+    if (!editor) return;
+    const [open, close] = isolateMarks(side);
+    if (!selection || selection.isEmpty()) {
+      // Nothing selected, so leave the pair around the cursor and put the
+      // caret between them, ready to type into.
+      insertCode(open + close);
+      const at = editor.getPosition();
+      if (at) editor.setPosition({ lineNumber: at.lineNumber, column: at.column - 1 });
+      editor.focus();
+      return;
+    }
+    wrapSelection(open, close);
   };
 
   // Comment or uncomment the current line, or every line the selection touches.
@@ -5672,6 +5868,11 @@ export default function App() {
     { category: 'Edit', title: 'Customize Toolbar...', run: () => setShowToolbarPreferences(true) },
     ...(recoveryConflicts.length ? [{ category: 'Edit', title: `Review Local Recovery Copies (${recoveryConflicts.length})...`, run: () => setShowRecoveryDrafts(true) }] : []),
     { category: 'Edit', title: 'Document Settings...', run: () => setShowEditSettings(true) },
+    { category: 'Edit', title: 'Flip This Line’s Text Direction', hint: IS_MAC ? '⌘⇧X' : 'Ctrl+Shift+X', run: flipLineDirection },
+    { category: 'Insert', title: 'Keep Selection Right-to-Left', run: () => isolateSelection('rtl') },
+    { category: 'Insert', title: 'Keep Selection Left-to-Right', run: () => isolateSelection('ltr') },
+    { category: 'Insert', title: 'Keep Selection Together (direction isolate)', run: () => isolateSelection('auto') },
+    ...BIDI_MARKS.map(mark => ({ category: 'Insert', title: `${mark.label} (${mark.note.split(' — ')[0]})`, run: () => insertCode(mark.char) })),
     { category: 'File', title: 'New Window', run: openNewWindow },
     { category: 'Collaborate', title: 'Share this project live (experimental)…', run: hostCollab },
     { category: 'Collaborate', title: 'Join a shared project (experimental)…', run: joinCollab },
@@ -5999,6 +6200,23 @@ export default function App() {
                       <div className="dropdown-item" onClick={() => { insertFootnote(); setActiveMenu(null); }}>Footnote</div>
                       <div className="dropdown-item" onClick={() => { insertSideNote(); setActiveMenu(null); }}>Margin / Side Note...</div>
                       <div className="dropdown-item" onClick={() => { insertHRule(); setActiveMenu(null); }}>Horizontal Line (full width) <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧H</span></div>
+                    </div>
+                  </div>
+                  <div className="dropdown-item has-submenu">
+                    <span>Text Direction</span><span className="submenu-arrow">›</span>
+                    <div className="submenu">
+                      <div className="dropdown-item" onClick={() => { flipLineDirection(); setActiveMenu(null); }}>Flip This Line <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{IS_MAC ? '⌘⇧X' : 'Ctrl+Shift+X'}</span></div>
+                      <div className="dropdown-divider"></div>
+                      <div className="dropdown-item" onClick={() => { isolateSelection('rtl'); setActiveMenu(null); }}>Keep Selection Right-to-Left</div>
+                      <div className="dropdown-item" onClick={() => { isolateSelection('ltr'); setActiveMenu(null); }}>Keep Selection Left-to-Right</div>
+                      <div className="dropdown-item" onClick={() => { isolateSelection('auto'); setActiveMenu(null); }}>Keep Selection Together</div>
+                      <div className="dropdown-divider"></div>
+                      <div className="dropdown-header">Marks</div>
+                      {BIDI_MARKS.map(mark => (
+                        <div className="dropdown-item" key={mark.id} onClick={() => { insertCode(mark.char); setActiveMenu(null); }}>
+                          {mark.label} <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.72rem' }}>{mark.note.split(' — ')[0]}</span>
+                        </div>
+                      ))}
                     </div>
                   </div>
                   <div className="dropdown-header">Figures &amp; Data</div>
@@ -6646,27 +6864,10 @@ export default function App() {
                     onMount={(e, monacoInstance) => {
                       (window as any).logTiming('Monaco ready');
                       editorRef.current = e;
-                      // Right-click opens Hilbert's own editor menu. Clicking
-                      // outside the selection moves the caret first, the way
-                      // every editor does, so Cut and Copy act on the line the
-                      // menu was opened over rather than wherever the caret
-                      // happened to be.
-                      const editorDom = e.getDomNode();
-                      const openEditorMenu = (ev: MouseEvent) => {
-                        ev.preventDefault();
-                        ev.stopPropagation();
-                        setActiveMenu(null);
-                        setContextMenu(null);
-                        const position = e.getTargetAtClientPoint(ev.clientX, ev.clientY)?.position;
-                        const inSelection = position && (e.getSelections() || [])
-                          .some(s => !s.isEmpty() && s.containsPosition(position));
-                        if (position && !inSelection) e.setPosition(position);
-                        e.focus();
-                        setEditorMenu({ x: ev.clientX, y: ev.clientY });
-                      };
-                      editorDom?.addEventListener('contextmenu', openEditorMenu);
+                      // editorRef is a ref, so nothing re-runs when it fills in.
+                      // Effects that need the editor itself wait on this.
+                      setEditorReady(n => n + 1);
                       e.onDidDispose(() => {
-                        editorDom?.removeEventListener('contextmenu', openEditorMenu);
                         if (editorRef.current === e) editorRef.current = null;
                       });
                       // Tell anything holding the old editor that this one replaced it.
@@ -6740,6 +6941,13 @@ export default function App() {
                         contextMenuGroupId: 'navigation',
                         contextMenuOrder: 1.5,
                         run: () => forwardSyncRef.current(),
+                      });
+                      // Same shortcut Katvan and Firefox use for this.
+                      e.addAction({
+                        id: 'hilbert.flipLineDirection',
+                        label: 'Flip this line’s text direction',
+                        keybindings: [monacoInstance.KeyMod.CtrlCmd | monacoInstance.KeyMod.Shift | monacoInstance.KeyCode.KeyX],
+                        run: () => flipLineDirectionRef.current(),
                       });
                       // The editor exists from here on, so a cursor position held
                       // over from the last session can finally be applied. It
@@ -6981,6 +7189,7 @@ export default function App() {
       {showAppSettings && <Suspense fallback={null}><AppSettingsModal onClose={() => setShowAppSettings(false)}
         theme={theme} onTheme={setTheme}
         fontSize={editorFontSize} onFontSize={setEditorFontSize}
+        textDirection={editorTextDir} onTextDirection={setEditorTextDir}
         compileDelay={compileDelay} onCompileDelay={setCompileDelay} /></Suspense>}
       {showQuiver && <Suspense fallback={null}><QuiverDiagram onClose={() => setShowQuiver(false)} onInsert={insertQuiverDiagram} /></Suspense>}
       {inputModal && <InputModal {...inputModal} onClose={() => setInputModal(null)} />}

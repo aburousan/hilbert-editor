@@ -1,10 +1,17 @@
-import React, { useState } from 'react';
-
-type TextRule = {
-  start: number;
-  end: number;
-  body: string;
-};
+import React, { useEffect, useState } from 'react';
+import { API } from '../api';
+import {
+  DOCUMENT_LANGUAGES,
+  detectedDirection,
+  escapeTypstString,
+  findTextRules,
+  isRtlLanguage,
+  namedArgument,
+  setNamedArgument,
+  unquoteTypstString,
+  type DocumentDirection,
+  type TextRule,
+} from '../textDirection';
 
 const KNOWN_FONTS = [
   'New Computer Modern',
@@ -13,80 +20,27 @@ const KNOWN_FONTS = [
   'Times New Roman',
 ];
 
-function findTextRules(source: string): TextRule[] {
-  const rules: TextRule[] = [];
-  const pattern = /#set\s+text\s*\(/g;
-  let match: RegExpExecArray | null;
-
-  while ((match = pattern.exec(source))) {
-    const open = match.index + match[0].lastIndexOf('(');
-    let depth = 1;
-    let quote = '';
-    let escaped = false;
-
-    for (let i = open + 1; i < source.length; i++) {
-      const char = source[i];
-      if (quote) {
-        if (escaped) escaped = false;
-        else if (char === '\\') escaped = true;
-        else if (char === quote) quote = '';
-        continue;
-      }
-      if (char === '"' || char === "'") {
-        quote = char;
-        continue;
-      }
-      if (char === '(') depth++;
-      if (char === ')' && --depth === 0) {
-        rules.push({ start: match.index, end: i + 1, body: source.slice(open + 1, i) });
-        pattern.lastIndex = i + 1;
-        break;
-      }
-    }
-  }
-  return rules;
-}
-
-function splitArguments(body: string): string[] {
-  const parts: string[] = [];
-  let start = 0;
-  let round = 0;
-  let square = 0;
-  let curly = 0;
-  let quote = '';
-  let escaped = false;
-
-  for (let i = 0; i < body.length; i++) {
-    const char = body[i];
-    if (quote) {
-      if (escaped) escaped = false;
-      else if (char === '\\') escaped = true;
-      else if (char === quote) quote = '';
-      continue;
-    }
-    if (char === '"' || char === "'") {
-      quote = char;
-      continue;
-    }
-    if (char === '(') round++;
-    else if (char === ')') round--;
-    else if (char === '[') square++;
-    else if (char === ']') square--;
-    else if (char === '{') curly++;
-    else if (char === '}') curly--;
-    else if (char === ',' && round === 0 && square === 0 && curly === 0) {
-      parts.push(body.slice(start, i));
-      start = i + 1;
-    }
-  }
-  parts.push(body.slice(start));
-  return parts;
-}
-
-function namedArgument(body: string, name: string): string | null {
-  const part = splitArguments(body).find(arg => new RegExp(`^\\s*${name}\\s*:`).test(arg));
-  return part ? part.replace(new RegExp(`^\\s*${name}\\s*:\\s*`), '').trim() : null;
-}
+// Typst's default families have no Arabic glyphs of their own, so a document
+// that keeps them falls through to whatever the system offers — and on a plain
+// Linux install that is a font with the letters but no joining rules, which
+// prints every Arabic letter in its isolated form. Measured on Ubuntu 22.04:
+// New Computer Modern comes out disconnected, DejaVu Sans and the Kacst
+// families come out properly joined. Hebrew has no joining to get wrong, so it
+// survives the same fallback; these are still better shapes for it.
+//
+// Ordered best first, and the last few are the ones that tend to be present
+// when nothing else is.
+const RTL_FONTS: Record<string, string[]> = {
+  ar: ['Noto Naskh Arabic', 'Amiri', 'Scheherazade New', 'Geeza Pro', 'KacstOne', 'KacstNaskh', 'FreeSerif', 'DejaVu Sans'],
+  fa: ['Noto Naskh Arabic', 'Vazirmatn', 'Amiri', 'Geeza Pro', 'KacstFarsi', 'FreeSerif', 'DejaVu Sans'],
+  ur: ['Noto Nastaliq Urdu', 'Jameel Noori Nastaleeq', 'Noto Naskh Arabic', 'FreeSerif', 'DejaVu Sans'],
+  ps: ['Noto Naskh Arabic', 'Geeza Pro', 'KacstOne', 'FreeSerif', 'DejaVu Sans'],
+  sd: ['Noto Naskh Arabic', 'Geeza Pro', 'KacstOne', 'FreeSerif', 'DejaVu Sans'],
+  ug: ['Noto Naskh Arabic', 'Geeza Pro', 'KacstOne', 'FreeSerif', 'DejaVu Sans'],
+  he: ['Noto Sans Hebrew', 'David CLM', 'Arial Hebrew', 'FreeSerif', 'DejaVu Sans'],
+  yi: ['Noto Sans Hebrew', 'Arial Hebrew', 'FreeSerif', 'DejaVu Sans'],
+  dv: ['Noto Sans Thaana', 'MV Boli'],
+};
 
 function detectedTextSettings(source: string) {
   let fontValue: string | null = null;
@@ -95,41 +49,48 @@ function detectedTextSettings(source: string) {
     fontValue = namedArgument(rule.body, 'font') || fontValue;
     sizeValue = namedArgument(rule.body, 'size') || sizeValue;
   }
-  const fontMatch = fontValue?.match(/^"((?:\\.|[^"\\])*)"$/);
   const sizeMatch = sizeValue?.match(/^(\d+(?:\.\d+)?)pt$/);
   return {
-    fontFamily: fontMatch ? fontMatch[1].replace(/\\([\\"])/g, '$1') : 'New Computer Modern',
+    fontFamily: unquoteTypstString(fontValue) ?? 'New Computer Modern',
     fontSize: sizeMatch ? sizeMatch[1] : '11',
   };
 }
 
-function setNamedArgument(body: string, name: string, value: string): string {
-  const parts = splitArguments(body);
-  const index = parts.findIndex(arg => new RegExp(`^\\s*${name}\\s*:`).test(arg));
-  if (index >= 0) {
-    const leading = parts[index].match(/^\s*/)?.[0] || '';
-    const trailing = parts[index].match(/\s*$/)?.[0] || '';
-    parts[index] = `${leading}${name}: ${value}${trailing}`;
-    return parts.join(',');
-  }
-
-  const trailing = body.match(/\s*$/)?.[0] || '';
-  const content = body.slice(0, body.length - trailing.length);
-  return `${content}${content.trim() ? ', ' : ''}${name}: ${value}${trailing}`;
-}
-
-function escapeTypstString(value: string): string {
-  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-}
-
 export default function EditSettings({ onClose, editorRef, monaco }: { onClose: () => void, editorRef: React.MutableRefObject<any>, monaco: any }) {
-  const initialText = detectedTextSettings(editorRef.current?.getValue?.() || '');
+  const source = editorRef.current?.getValue?.() || '';
+  const initialText = detectedTextSettings(source);
+  const initialDirection = detectedDirection(source);
   const [fontSize, setFontSize] = useState(initialText.fontSize);
   const [fontFamily, setFontFamily] = useState(initialText.fontFamily);
+  const [lang, setLang] = useState(initialDirection.lang);
+  const [dir, setDir] = useState<DocumentDirection>(initialDirection.dir);
   const [margin, setMargin] = useState('auto');
   const [pageColor, setPageColor] = useState('#ffffff');
   const [alignment, setAlignment] = useState('left');
   const [headingNumbering, setHeadingNumbering] = useState('none');
+
+  // What this machine can actually typeset with. Without it the advice below
+  // is a guess, and a guess that names an uninstalled font leaves the reader
+  // exactly where they started.
+  const [installed, setInstalled] = useState<string[] | null>(null);
+  useEffect(() => {
+    let dropped = false;
+    fetch(`${API}/fonts`)
+      .then(r => r.json())
+      .then(data => { if (!dropped && Array.isArray(data?.families)) setInstalled(data.families); })
+      .catch(() => {});
+    return () => { dropped = true; };
+  }, []);
+
+  // Whether this document will come out right-to-left once applied, which is
+  // what decides if the font warning below is worth showing.
+  const rtl = dir === 'rtl' || (dir === 'auto' && isRtlLanguage(lang));
+  const scriptFonts = RTL_FONTS[lang.trim().toLowerCase().split(/[-_]/)[0]] || [];
+  const fontLooksLatin = KNOWN_FONTS.includes(fontFamily.trim());
+  const has = (name: string) => !installed || installed.includes(name);
+  // The best candidate that is really here. Before the list arrives this is
+  // simply the best candidate, which is the old behaviour.
+  const suggestion = scriptFonts.find(has);
 
   const handleApply = () => {
     if (!editorRef.current || !monaco) return;
@@ -137,21 +98,33 @@ export default function EditSettings({ onClose, editorRef, monaco }: { onClose: 
     if (!model) return;
     const family = fontFamily.trim() || 'New Computer Modern';
     const size = Math.min(144, Math.max(1, Number(fontSize) || 11));
-    const source = model.getValue();
+    const code = model.getValue();
     const edits: { range: any, text: string, forceMoveMarkers: boolean }[] = [];
-    const textRules = findTextRules(source);
+    const textRules = findTextRules(code);
+    // Leaving dir out is not the same as writing `dir: auto`, but it is what
+    // Typst does by default and it keeps the rule readable, so "Automatic"
+    // takes the argument back out rather than pinning it.
+    const dirValue = dir === 'auto' ? null : dir;
+    const langValue = `"${escapeTypstString(lang.trim() || 'en')}"`;
+
     if (textRules.length) {
-      const fontRule = [...textRules].reverse().find(rule => namedArgument(rule.body, 'font') !== null);
-      const sizeRule = [...textRules].reverse().find(rule => namedArgument(rule.body, 'size') !== null);
+      const ruleWith = (name: string) => [...textRules].reverse().find(rule => namedArgument(rule.body, name) !== null);
+      const fontRule = ruleWith('font');
+      const sizeRule = ruleWith('size');
       const fallbackRule = fontRule || sizeRule || textRules[0];
       const replacements = new Map<number, { rule: TextRule, body: string }>();
-      const replaceArgument = (rule: TextRule, name: string, value: string) => {
+      const replaceArgument = (rule: TextRule, name: string, value: string | null) => {
         const current = replacements.get(rule.start) || { rule, body: rule.body };
         current.body = setNamedArgument(current.body, name, value);
         replacements.set(rule.start, current);
       };
       replaceArgument(fontRule || fallbackRule, 'font', `"${escapeTypstString(family)}"`);
       replaceArgument(sizeRule || fallbackRule, 'size', `${size}pt`);
+      replaceArgument(ruleWith('lang') || fallbackRule, 'lang', langValue);
+      // A dir already in the file has to be revisited even when the answer is
+      // "take it out", or switching back to Automatic would change nothing.
+      const dirRule = ruleWith('dir');
+      if (dirRule || dirValue) replaceArgument(dirRule || fallbackRule, 'dir', dirValue);
       for (const { rule, body } of replacements.values()) {
         edits.push({
           range: monaco.Range.fromPositions(model.getPositionAt(rule.start), model.getPositionAt(rule.end)),
@@ -160,19 +133,21 @@ export default function EditSettings({ onClose, editorRef, monaco }: { onClose: 
         });
       }
     } else {
+      const args = [`font: "${escapeTypstString(family)}"`, `size: ${size}pt`, `lang: ${langValue}`];
+      if (dirValue) args.push(`dir: ${dirValue}`);
       edits.push({
         range: new monaco.Range(1, 1, 1, 1),
-        text: `#set text(font: "${escapeTypstString(family)}", size: ${size}pt)\n`,
+        text: `#set text(${args.join(', ')})\n`,
         forceMoveMarkers: true,
       });
     }
 
-    let code = '';
-    if (margin !== 'auto') code += `#set page(margin: ${margin})\n`;
-    if (pageColor !== '#ffffff') code += `#set page(fill: rgb("${pageColor}"))\n`;
-    if (alignment !== 'left') code += `#set align(${alignment})\n`;
-    if (headingNumbering !== 'none') code += `#set heading(numbering: "${headingNumbering}")\n`;
-    if (code) edits.push({ range: new monaco.Range(1, 1, 1, 1), text: code, forceMoveMarkers: true });
+    let extra = '';
+    if (margin !== 'auto') extra += `#set page(margin: ${margin})\n`;
+    if (pageColor !== '#ffffff') extra += `#set page(fill: rgb("${pageColor}"))\n`;
+    if (alignment !== 'left') extra += `#set align(${alignment})\n`;
+    if (headingNumbering !== 'none') extra += `#set heading(numbering: "${headingNumbering}")\n`;
+    if (extra) edits.push({ range: new monaco.Range(1, 1, 1, 1), text: extra, forceMoveMarkers: true });
 
     editorRef.current.executeEdits('settings', edits);
     onClose();
@@ -192,7 +167,8 @@ export default function EditSettings({ onClose, editorRef, monaco }: { onClose: 
               <span>Font family</span>
               <input list="document-font-families" value={fontFamily} onChange={e => setFontFamily(e.target.value)} />
               <datalist id="document-font-families">
-                {KNOWN_FONTS.map(font => <option value={font} key={font} />)}
+                {[...new Set([...scriptFonts.filter(has), ...KNOWN_FONTS.filter(has), ...(installed || [])])]
+                  .map(font => <option value={font} key={font} />)}
               </datalist>
             </label>
             <label className="form-field" style={{ maxWidth: 130 }}>
@@ -204,6 +180,42 @@ export default function EditSettings({ onClose, editorRef, monaco }: { onClose: 
               </div>
             </label>
           </div>
+
+          <div className="form-row">
+            <label className="form-field">
+              <span>Language</span>
+              <input list="document-languages" value={lang} onChange={e => setLang(e.target.value)} />
+              <datalist id="document-languages">
+                {DOCUMENT_LANGUAGES.map(l => <option value={l.code} key={l.code} label={l.label} />)}
+              </datalist>
+            </label>
+            <label className="form-field">
+              <span>Text direction</span>
+              <select value={dir} onChange={e => setDir(e.target.value as DocumentDirection)}>
+                <option value="auto">From the language</option>
+                <option value="ltr">Left-to-right</option>
+                <option value="rtl">Right-to-left</option>
+              </select>
+            </label>
+          </div>
+
+          {rtl && fontLooksLatin && scriptFonts.length > 0 && (
+            <div className="form-hint" style={{ color: '#f59e0b' }}>
+              <b>{fontFamily.trim()}</b> has no glyphs for this script, so the PDF falls back to whatever the system
+              offers — which for Arabic script is usually a font that prints every letter on its own instead of
+              joining them up.{' '}
+              {suggestion
+                ? <>Try <b>{suggestion}</b> instead.</>
+                : <>None of the fonts this script needs is installed here; add one (<b>{scriptFonts[0]}</b> is a
+                  good choice) or import a font under File → Import Font.</>}
+            </div>
+          )}
+          {installed && fontFamily.trim() && !installed.includes(fontFamily.trim()) && !fontLooksLatin && (
+            <div className="form-hint" style={{ color: '#f59e0b' }}>
+              No font called <b>{fontFamily.trim()}</b> is installed on this machine, so Typst will quietly use
+              something else.
+            </div>
+          )}
 
           <div className="form-row">
             <label className="form-field">

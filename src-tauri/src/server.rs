@@ -846,6 +846,36 @@ async fn toolchain_status() -> Response {
     .into_response()
 }
 
+// Which font families this machine can actually typeset with, workspace fonts
+// included. Recommending a font the user does not have is worse than saying
+// nothing: on a bare Linux box the Arabic fallback renders every letter in its
+// isolated form, so the text is legible only to someone who already knows what
+// it should say, and the fix is to name a family that is really installed.
+async fn fonts_list(State(st): St) -> Response {
+    let Some(typst) = which("typst") else {
+        return Json(json!({ "available": false, "families": [] })).into_response();
+    };
+    let ws = st.ws();
+    let mut args: Vec<String> = vec!["fonts".into()];
+    if ws.join("fonts").is_dir() {
+        args.push("--font-path".into());
+        args.push("fonts".into());
+    }
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let Ok(out) = run_cmd(&typst, &argv, Some(&ws), Some(8000)).await else {
+        return Json(json!({ "available": false, "families": [] })).into_response();
+    };
+    // One family per line, and `typst fonts` repeats a family once per style
+    // unless asked otherwise, so this keeps the first of each.
+    let mut families: Vec<&str> = Vec::new();
+    for line in out.stdout.lines() {
+        let name = line.trim();
+        if name.is_empty() || line.starts_with(char::is_whitespace) { continue; }
+        if !families.contains(&name) { families.push(name); }
+    }
+    Json(json!({ "available": true, "families": families })).into_response()
+}
+
 // Typst's PDF format has no SyncTeX sidecar. The compiler does, however, retain
 // source spans while evaluating the paged document: querying equation elements
 // gives their real page positions and structured rendered bodies. Reverse sync
@@ -6438,6 +6468,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/webdav/sync", post(webdav_sync))
         .route("/tools", get(tools))
         .route("/toolchain/status", get(toolchain_status))
+        .route("/fonts", get(fonts_list))
         .route("/tools/interpreter", post(tools_interpreter_add))
         .route("/tools/interpreter/remove", post(tools_interpreter_remove))
         .route("/tools/interpreter/pick", post(tools_interpreter_pick))

@@ -6,8 +6,8 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ## 0.1.21
 
-Notebook code now runs inside a real sandbox. Plots can be vectors, not just
-pixels, and updating no longer looks like it has hung.
+Notebook code now runs inside a real sandbox. You can write right-to-left. Plots
+can be vectors, not just pixels, and updating no longer looks like it has hung.
 
 ### Code you run is confined by the operating system
 
@@ -65,6 +65,41 @@ that file into the project. It cannot any more.
 Wrong passwords now slow the next attempt down, "open this link" no longer asks
 the *server* to open it, and `HILBERT_PUBLIC_HOST` lets you pin the name the
 server should be reached by.
+
+### Writing right-to-left
+
+Hebrew, Arabic, Persian and Urdu were awkward in two separate places, and each
+needed its own fix.
+
+In the editor, every line was laid out left-to-right whatever you had typed into
+it, so a Hebrew sentence ran from the wrong margin with its full stop stranded on
+the wrong side. Each line now takes its direction from the first real letter in
+it, the way a bidirectional editor should: Hebrew lines start at the right edge,
+`#set text(…)` and your English paragraphs stay where they were. App Settings has
+the switch if you would rather force one direction or the other.
+
+That rule knows Typst rather than just counting letters. Maths, raw blocks,
+labels and code are written in Latin whatever language the document is in, so
+they are skipped when working out which way a line runs — without that,
+`#emph[שלום]` comes out left-to-right, because the first letter in it is the
+`e` of `emph`. Where the rule still reads a line differently from the person who
+wrote it, `Ctrl+Shift+X` turns that line round by hand, cycling through
+right-to-left, left-to-right and back to deciding for itself. That override
+lives in the editor and never touches the file — a directional mark before
+`= Heading` would stop Typst seeing a heading at all.
+
+In the PDF, direction comes from the document's language, and nothing in Hilbert
+ever let you set one — every template said `lang: "en"`, so Arabic came out
+left-aligned and misordered no matter how it looked while you typed it. Document
+Settings now has Language and Text direction alongside font and size. It also
+warns when the font you have chosen has no glyphs for the script you have picked,
+which is the difference between a PDF that reads properly and one full of boxes.
+
+For the lines no heuristic gets right — a price in a Hebrew sentence, an English
+product name in Arabic — Insert → Text Direction wraps a selection in a
+directional isolate or drops in a single mark. The marks are real characters that
+travel with the file, and the editor shows them rather than leaving you to guess
+where they went.
 
 ### Notebook plots in SVG, PDF and EPS
 

@@ -27,6 +27,7 @@
     "test:recovery": "node scripts/test-recovery-preferences.mjs",
     "test:status": "node scripts/test-workspace-status.mjs",
     "test:performance": "node scripts/test-performance-limits.mjs",
+    "test:direction": "node scripts/test-text-direction.mjs",
     "lint": "oxlint",
     "preview": "vite preview",
     "test:sync": "node scripts/test-workspace-sync.mjs",
