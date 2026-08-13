@@ -75,10 +75,6 @@ export function tokenizeTypstMathSource(text: string): string[] {
 }
 
 /** Lowercase and strip edge punctuation, keeping intra-word marks (’, -, _). */
-export function normalizeWord(w: string): string {
-  return tokenizeRenderedText(w)[0] || '';
-}
-
 /** Split a line of text into normalized words, keeping each word's 0-based offset. */
 export function tokenizeLine(text: string): { w: string; offset: number }[] {
   const out: { w: string; offset: number }[] = [];

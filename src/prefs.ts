@@ -13,7 +13,6 @@
 // here announces itself so that mirroring actually happens.
 
 export const INTERPRETER_LANGS = ['python', 'julia', 'wolfram'] as const;
-export type InterpreterLang = (typeof INTERPRETER_LANGS)[number];
 
 export const PREFS_CHANGED = 'hilbert:prefs-changed';
 
