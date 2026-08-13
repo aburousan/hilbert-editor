@@ -106,8 +106,16 @@ which is the difference between a PDF that reads properly and one full of boxes.
 For the lines no heuristic gets right — a price in a Hebrew sentence, an English
 product name in Arabic — Insert → Text Direction wraps a selection in a
 directional isolate or drops in a single mark. The marks are real characters that
-travel with the file, and the editor shows them rather than leaving you to guess
-where they went.
+travel with the file, and a hairline in the margin of the text shows where each
+one sits, so a file that reorders itself is a file you can still fix. The editor
+used to draw them as a `[U+200F]` box, which replaced the character and so kept
+it from having any effect at all; what you see now is what the PDF will do.
+
+Two more places where a line was read as prose when it was not. Under the forced
+right-to-left setting, `#set page(paper: "a4")` came out as
+`set page(paper: "a4")#`. And a Hebrew string inside a fenced code block or a
+display formula turned that line round, because the rule looked at one line at a
+time and could not see it was inside a block that started further up.
 
 ### Notebook plots in SVG, PDF and EPS
 
