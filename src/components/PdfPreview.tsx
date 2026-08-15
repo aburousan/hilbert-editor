@@ -670,12 +670,30 @@ function PdfPreview(
           y: Math.max(0, Math.min(pageInfo.h, (event.clientY - pageRect.top) / pageRect.height * pageInfo.h)),
         }
       : undefined;
+    // The number Typst prints beside a block equation: the last thing on the
+    // formula's line, out at the margin. It has to be the last one — digits
+    // inside the formula itself look exactly like it, and picking `8` out of
+    // `58.8` sends the jump to whichever equation happens to be eighth.
+    const equationNumber = (() => {
+      if (!clickedSpan || !layer) return null;
+      const rect = clickedSpan.getBoundingClientRect();
+      const line = Array.from(layer.querySelectorAll<HTMLElement>('span'))
+        .map(span => ({ span, box: span.getBoundingClientRect() }))
+        .filter(({ span, box }) => box.width > 0 && span.textContent?.trim()
+          && Math.abs(box.top - rect.top) <= rect.height * 0.9)
+        .sort((a, b) => a.box.left - b.box.left);
+      const last = line[line.length - 1];
+      if (!last || last.box.left < rect.right - 1) return null;
+      const digits = /^\(?(\d{1,4})\)?$/.exec(last.span.textContent?.trim() || '');
+      return digits ? Number(digits[1]) : null;
+    })();
+
     const pagesRect = pagesRef.current?.getBoundingClientRect();
     const clickedFraction = pagesRect?.height
       ? Math.max(0, Math.min(1, (event.clientY - pagesRect.top) / pagesRect.height))
       : 0;
     if (!clickedSpan || !layer) {
-      if (documentPosition) onReverseSync({ words: [], focus: 0, docFraction: clickedFraction, documentPosition, mathHint });
+      if (documentPosition) onReverseSync({ words: [], focus: 0, docFraction: clickedFraction, documentPosition, mathHint, equationNumber });
       return;
     }
 
@@ -684,7 +702,7 @@ function PdfPreview(
     // Operators and fraction/radical geometry may have no word token at all.
     // The compiled equation-location resolver can still map their coordinates.
     if (!spanIndexes.length) {
-      if (documentPosition) onReverseSync({ words: [], focus: 0, docFraction: docFractionOf(clickedSpan), documentPosition, mathHint });
+      if (documentPosition) onReverseSync({ words: [], focus: 0, docFraction: docFractionOf(clickedSpan), documentPosition, mathHint, equationNumber });
       return;
     }
     const selectedWord = selectedWords.find(word => spanIndexes.some(index => words[index] === word)) || selectedWords[0];
@@ -708,7 +726,7 @@ function PdfPreview(
     // word this one click happened to select.
     const context = words.slice(from, to);
     if (selectedWord) context[focus - from] = selectedWord;
-    onReverseSync({ words: context, focus: focus - from, docFraction: docFractionOf(clickedSpan), documentPosition, mathHint });
+    onReverseSync({ words: context, focus: focus - from, docFraction: docFractionOf(clickedSpan), documentPosition, mathHint, equationNumber });
   };
 
   // Save the currently shown PDF to disk. Works for both the compile preview

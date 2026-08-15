@@ -1498,6 +1498,26 @@ body.is-resizing .editor-container {
 .monaco-editor .view-line span.bidi-open::before { content: "\2066"; }
 .monaco-editor .view-line span.bidi-close::after { content: "\2069"; }
 
+/* The fold control on an outline heading. It keeps its width when a heading has
+   nothing under it, so the titles still line up in a column. */
+.outline-twisty {
+  flex: none;
+  width: 14px;
+  height: 18px;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 0.7;
+}
+.outline-twisty:hover { opacity: 1; color: var(--text-main); }
+.outline-twisty-empty { cursor: default; }
+
 /* Right-to-left setting: the editor is mirrored, not merely right-aligned.
    Monaco has no notion of a right-hand gutter — it writes the geometry as
    inline pixel positions — so the three pieces that make a left-hand edge get

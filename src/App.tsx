@@ -385,6 +385,63 @@ function mathEquationOrdinal(model: any, targetLine: number): number {
   return Math.max(0, dollarPairs + explicitEquations - (open ? 0 : 1));
 }
 
+// Where the nth *numbered* equation begins in the source. Typst numbers block
+// equations — the ones written with a space inside the dollars — in document
+// order, so the number the reader sees beside a formula in the PDF counts to
+// exactly one place in the file. Matching the formula by its symbols cannot:
+// in a paper about dust, every letter of `I_nu = kappa_0 (nu/nu_0)^beta Sigma
+// B_nu (T)` occurs on every page, and the best match is a coin toss between
+// hundreds of equally good candidates.
+type OutlineEntry = { level: number; text: string; line: number; children: number };
+
+// What the heading says, without the parts that are there for the compiler. A
+// label reads as part of the title in the sidebar — `<sec:hi>` sitting at the
+// end of "counting atoms with hydrogen" is noise — and so do the markers around
+// emphasis and the braces of an inline formula.
+function headingTitle(raw: string): string {
+  return raw
+    .replace(/<[a-zA-Z_][\w.:-]*>\s*$/, '')
+    .replace(/#(?:emph|strong|text|smallcaps|upper|lower)\s*(?:\([^)]*\))?\[([^\]]*)\]/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/_([^_]+)_/g, '$1')
+    .replace(/\$([^$]*)\$/g, (_all, body) => body.replace(/["\\]/g, '').trim())
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function blockEquationStart(model: any, ordinal: number): { line: number; column: number; text: string } | null {
+  let seen = 0;
+  let open: { line: number; column: number } | null = null;
+  let body = '';
+  let blockish = false;
+  for (let line = 1; line <= model.getLineCount(); line++) {
+    const raw = model.getLineContent(line).replace(/\/\/.*$/, '');
+    for (let i = 0; i < raw.length; i++) {
+      if (raw[i] !== '$' || raw[i - 1] === '\\') {
+        if (open) body += raw[i];
+        continue;
+      }
+      if (!open) {
+        // A dollar followed by a space (or by nothing more on this line) opens
+        // a block equation; `$x$` glued to its content is inline and unnumbered.
+        open = { line, column: i + 1 };
+        blockish = i + 1 >= raw.length || raw[i + 1] === ' ' || raw[i + 1] === '\t';
+        body = '';
+        continue;
+      }
+      const closesBlock = blockish && (i === 0 || raw[i - 1] === ' ' || raw[i - 1] === '\t' || body.trim() === '');
+      if (closesBlock) {
+        seen++;
+        if (seen === ordinal) return { ...open, text: body };
+      }
+      open = null;
+      body = '';
+    }
+    if (open) body += ' ';
+  }
+  return null;
+}
+
 function cursorIsInMath(model: any, line: number, column: number): boolean {
   let open = false;
   for (let current = 1; current <= line; current++) {
@@ -1054,6 +1111,10 @@ export default function App() {
   // text in it: the writing starts at the window's right edge, which is where
   // the line numbers, the panes and the scrollbar have to make room for it.
   const mirrored = editorTextDir === 'rtl';
+  // Which outline headings are folded shut, by the line they sit on. Keyed by
+  // line rather than by index so editing elsewhere in the file doesn't quietly
+  // fold a different section.
+  const [foldedHeadings, setFoldedHeadings] = useState<Set<number>>(new Set());
   const resizeLayoutRef = useRef({ sidebarVisible, sidebarWidth, mirrored });
   resizeLayoutRef.current = { sidebarVisible, sidebarWidth, mirrored };
   const toggleNumberingRef = useRef<() => void>(() => {});
@@ -4715,11 +4776,19 @@ export default function App() {
   const getOutline = () => {
     if (!activeTab) return [];
     const lines = activeTab.content.split('\n');
-    return lines.map((line, i) => {
+    const found = lines.map((line, i) => {
       const match = line.match(/^(=+)\s+(.*)/);
-      if (match) return { level: match[1].length, text: match[2], line: i + 1 };
-      return null;
-    }).filter(Boolean) as { level: number; text: string; line: number }[];
+      if (!match) return null;
+      return { level: match[1].length, text: headingTitle(match[2]), line: i + 1, children: 0 };
+    }).filter(Boolean) as OutlineEntry[];
+    // How many entries each heading owns, so one with nothing under it gets no
+    // twisty and one that is collapsed knows how much to hide.
+    for (let at = 0; at < found.length; at++) {
+      let count = 0;
+      while (at + count + 1 < found.length && found[at + count + 1].level > found[at].level) count++;
+      found[at].children = count;
+    }
+    return found;
   };
 
   const jumpToLine = (line: number) => {
@@ -4865,6 +4934,23 @@ export default function App() {
     const editor = editorRef.current; const model = editor?.getModel();
     if (!editor || !model) return;
     let focusWord = p.words[p.focus] || '';
+
+    // A numbered equation says which one it is, right there on the page.
+    // Counting the source's block equations to that number beats any amount of
+    // symbol matching, so it goes first — with a check that the formula found
+    // that way really is the one on the page, in case the document numbers its
+    // equations by section or hides a dollar somewhere the scanner misreads.
+    if (p.equationNumber) {
+      const counted = blockEquationStart(model, p.equationNumber);
+      if (counted) {
+        const sourceWords = new Set(tokenizeTypstMathSource(counted.text));
+        const shown = p.words.filter(word => sourceWords.has(word)).length;
+        if (!p.words.length || shown > 0) {
+          flashSourceRange(counted.line, counted.column, 1);
+          return;
+        }
+      }
+    }
 
     const src = tokenizeSourceModel(model);
     const prior = Math.round(p.docFraction * src.length);
@@ -6727,6 +6813,10 @@ export default function App() {
                     <div style={{ color: 'var(--text-muted)', fontSize: '12px', textAlign: 'center', marginTop: '20px' }}>No headings found.</div>
                   )}
                   {outline.map((item, i) => {
+                    // Anything under a folded heading stays out of the list.
+                    const hidden = outline.some((other, j) =>
+                      j < i && other.level < item.level && foldedHeadings.has(other.line) && j + other.children >= i);
+                    if (hidden) return null;
                     // A Hebrew heading belongs against the right edge of the
                     // list and an English one against the left, the same way
                     // each reads in the file itself.
@@ -6734,15 +6824,38 @@ export default function App() {
                       ? (HAS_RTL.test(item.text) ? lineDirection(item.text) : 'ltr')
                       : editorTextDir;
                     const indent = `${(item.level - 1) * 12}px`;
+                    const folded = foldedHeadings.has(item.line);
                     return (
-                      <div key={i} onClick={() => jumpToLine(item.line)} dir={side} style={{
+                      <div key={item.line} onClick={() => jumpToLine(item.line)} dir={side} style={{
                         padding: '4px 0', cursor: 'pointer', fontSize: '13px', color: 'var(--text-main)',
-                        borderBottom: '1px solid transparent',
+                        borderBottom: '1px solid transparent', display: 'flex', alignItems: 'flex-start', gap: 4,
+                        flexDirection: side === 'rtl' ? 'row-reverse' : 'row',
                         textAlign: side === 'rtl' ? 'right' : 'left',
                         paddingLeft: side === 'rtl' ? 0 : indent,
                         paddingRight: side === 'rtl' ? indent : 0,
                       }} className="outline-item">
-                        {item.text}
+                        {item.children > 0 ? (
+                          <button
+                            className="outline-twisty"
+                            title={folded ? 'Show what is under this heading' : 'Hide what is under this heading'}
+                            aria-expanded={!folded}
+                            onClick={event => {
+                              event.stopPropagation();
+                              setFoldedHeadings(previous => {
+                                const next = new Set(previous);
+                                if (!next.delete(item.line)) next.add(item.line);
+                                return next;
+                              });
+                            }}
+                          >
+                            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                              strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"
+                              style={{ transform: folded ? (side === 'rtl' ? 'rotate(180deg)' : 'none') : 'rotate(90deg)' }}>
+                              <path d="M9 6l6 6-6 6" />
+                            </svg>
+                          </button>
+                        ) : <span className="outline-twisty outline-twisty-empty" />}
+                        <span style={{ flex: 1, minWidth: 0 }}>{item.text}</span>
                       </div>
                     );
                   })}

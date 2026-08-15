@@ -27,6 +27,8 @@ export type SyncPayload = {
   mathHint?: boolean;
   // Which repeat of the focus word this is, counted through the source.
   repeat?: WordRepeat | null;
+  // The number printed beside a block equation, when the click was on one.
+  equationNumber?: number | null;
 };
 
 const WORD_RE = /[\p{L}\p{N}][\p{L}\p{N}\p{M}_'’-]*/gu;
