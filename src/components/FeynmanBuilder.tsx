@@ -8,7 +8,7 @@ import React, { useEffect, useRef, useState } from 'react';
 // lines (so no deprecated `pattern`/`tiling` is needed).
 
 type Pt = { x: number, y: number };
-type EdgeKind = 'fermion' | 'antifermion' | 'photon' | 'gluon' | 'scalar' | 'ghost' | 'plain' | 'double' | 'cscalar' | 'majorana';
+type EdgeKind = 'fermion' | 'antifermion' | 'photon' | 'gluon' | 'scalar' | 'ghost' | 'plain' | 'double' | 'cscalar' | 'majorana' | 'wilson';
 type LoopKind = 'plain' | 'photon' | 'gluon';
 type LoopFill = 'none' | 'hatched' | 'shaded';
 
@@ -30,6 +30,7 @@ const EDGE_KINDS: { k: EdgeKind, name: string }[] = [
   { k: 'cscalar', name: 'Charged scalar - ▶ -' },
   { k: 'ghost', name: 'Ghost · · ·' },
   { k: 'majorana', name: 'Majorana —▶◀—' },
+  { k: 'wilson', name: 'Wilson line ⋀⋁⋀ (gauge link)' },
   { k: 'double', name: 'Double line ═══' },
   { k: 'plain', name: 'Plain line' },
 ];
@@ -56,6 +57,24 @@ const pathLen = (a: Pt, c: Pt, b: Pt) => {
   for (let i = 1; i <= 16; i++) { const q = bezPt(a, c, b, i / 16); len += Math.hypot(q.x - p.x, q.y - p.y); p = q; }
   return len;
 };
+
+// SVG preview path for a Wilson line: a sawtooth along the path, the usual way
+// a gauge link is drawn so it cannot be mistaken for a propagator.
+function zigzagPath(a: Pt, b: Pt, bend: number, amp: number): string {
+  const c = ctrlPt(a, b, bend);
+  const len = pathLen(a, c, b);
+  const teeth = Math.max(3, Math.round(len / 14));
+  const N = teeth * 8;
+  const pts: string[] = [];
+  for (let i = 0; i <= N; i++) {
+    const t = i / N, u = 2 * Math.PI * teeth * t;
+    const p = bezPt(a, c, b, t), d = bezTan(a, c, b, t);
+    // A triangle wave, rather than the sine the photon uses.
+    const wave = (2 / Math.PI) * Math.asin(Math.sin(u));
+    pts.push(`${(p.x - d.y * amp * wave).toFixed(1)},${(p.y + d.x * amp * wave).toFixed(1)}`);
+  }
+  return 'M' + pts.join(' L');
+}
 
 // SVG preview path for a wavy / coiled edge (approximates what cetz renders)
 function decoPath(a: Pt, b: Pt, bend: number, kind: 'photon' | 'gluon', amp: number): string {
@@ -129,6 +148,14 @@ function edgeCode(e: Edge): string[] {
     ? `line(${cx(a)}, ${cx(b)}`
     : `bezier(${cx(a)}, ${cx(b)}, ${cx(cc)}`;
   const base = mkBase(e.from, e.to, c);
+
+  if (e.kind === 'wilson') {
+    const teeth = Math.max(3, Math.round(len / 14));
+    out.push(`  decorations.zigzag(${base}), stroke: ${strokeOf(e.thickness, e.color)}, amplitude: ${num(e.amplitude / UNIT)}, segments: ${teeth})`);
+    const m = bezPt(e.from, c, e.to, 0.5), d = bezTan(e.from, c, e.to, 0.5), ex = 3.2;
+    out.push(`  mark(${cx({ x: m.x - d.x * ex, y: m.y - d.y * ex })}, ${cx({ x: m.x + d.x * ex, y: m.y + d.y * ex })}, symbol: ">", fill: ${paintOf(e.color)}, stroke: ${paintOf(e.color)}, scale: ${num(Math.max(0.8, e.thickness * 0.8))})`);
+    return out;
+  }
 
   if (e.kind === 'photon' || e.kind === 'gluon') {
     const fn = e.kind === 'photon' ? 'wave' : 'coil';
@@ -239,6 +266,93 @@ const TEMPLATES: { name: string, make: () => El[] }[] = [
       { id: tid++, type: 'edge', kind: 'photon', from: T(350, 240), to: T(480, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'gamma', side: 1 },
       { id: tid++, type: 'vertex', at: T(230, 240), size: 3 },
       { id: tid++, type: 'vertex', at: T(350, 240), size: 3 },
+    ],
+  },
+  {
+    name: 'QCD: three-gluon vertex',
+    make: () => [
+      { id: tid++, type: 'edge', kind: 'gluon', from: T(120, 140), to: T(300, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'a, mu', side: 1 },
+      { id: tid++, type: 'edge', kind: 'gluon', from: T(120, 340), to: T(300, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'b, nu', side: -1 },
+      { id: tid++, type: 'edge', kind: 'gluon', from: T(300, 240), to: T(500, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'c, rho', side: 1 },
+      { id: tid++, type: 'vertex', at: T(300, 240), size: 3.5 },
+    ],
+  },
+  {
+    name: 'QCD: four-gluon vertex',
+    make: () => [
+      { id: tid++, type: 'edge', kind: 'gluon', from: T(140, 120), to: T(300, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'a, mu', side: 1 },
+      { id: tid++, type: 'edge', kind: 'gluon', from: T(460, 120), to: T(300, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'b, nu', side: -1 },
+      { id: tid++, type: 'edge', kind: 'gluon', from: T(140, 360), to: T(300, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'c, rho', side: -1 },
+      { id: tid++, type: 'edge', kind: 'gluon', from: T(460, 360), to: T(300, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'd, sigma', side: 1 },
+      { id: tid++, type: 'vertex', at: T(300, 240), size: 3.5 },
+    ],
+  },
+  {
+    name: 'QCD: quark self-energy (gluon arch)',
+    make: () => [
+      { id: tid++, type: 'edge', kind: 'fermion', from: T(100, 280), to: T(500, 280), bend: 0, thickness: 1.2, amplitude: 6, endArrow: true, label: 'q', side: 1 },
+      { id: tid++, type: 'edge', kind: 'gluon', from: T(210, 280), to: T(390, 280), bend: -60, thickness: 1, amplitude: 5, endArrow: false, label: 'g', side: 1 },
+      { id: tid++, type: 'vertex', at: T(210, 280), size: 3 },
+      { id: tid++, type: 'vertex', at: T(390, 280), size: 3 },
+    ],
+  },
+  {
+    name: 'QCD: gluon self-energy (quark loop)',
+    make: () => [
+      { id: tid++, type: 'edge', kind: 'gluon', from: T(90, 240), to: T(230, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'g', side: 1 },
+      { id: tid++, type: 'loop', kind: 'plain', fill: 'none', center: T(290, 240), radius: 60, thickness: 1.2, amplitude: 5, label: 'q', arrow: 1 },
+      { id: tid++, type: 'edge', kind: 'gluon', from: T(350, 240), to: T(490, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'g', side: 1 },
+      { id: tid++, type: 'vertex', at: T(230, 240), size: 3 },
+      { id: tid++, type: 'vertex', at: T(350, 240), size: 3 },
+    ],
+  },
+  {
+    name: 'QCD: gluon self-energy (ghost loop)',
+    make: () => [
+      { id: tid++, type: 'edge', kind: 'gluon', from: T(90, 240), to: T(230, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'g', side: 1 },
+      { id: tid++, type: 'edge', kind: 'ghost', from: T(230, 240), to: T(350, 240), bend: 60, thickness: 1.1, amplitude: 5, endArrow: false, label: 'c', side: 1 },
+      { id: tid++, type: 'edge', kind: 'ghost', from: T(350, 240), to: T(230, 240), bend: 60, thickness: 1.1, amplitude: 5, endArrow: false, label: 'macron(c)', side: 1 },
+      { id: tid++, type: 'edge', kind: 'gluon', from: T(350, 240), to: T(490, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'g', side: 1 },
+      { id: tid++, type: 'vertex', at: T(230, 240), size: 3 },
+      { id: tid++, type: 'vertex', at: T(350, 240), size: 3 },
+    ],
+  },
+  {
+    name: 'QCD: gluon emission off a Wilson line (eikonal)',
+    make: () => [
+      { id: tid++, type: 'edge', kind: 'wilson', from: T(100, 300), to: T(520, 300), bend: 0, thickness: 1.3, amplitude: 5, endArrow: false, label: 'n dot A', side: 1 },
+      { id: tid++, type: 'edge', kind: 'gluon', from: T(280, 300), to: T(400, 180), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'g', side: 1 },
+      { id: tid++, type: 'vertex', at: T(280, 300), size: 3 },
+    ],
+  },
+  {
+    name: 'QCD: Wilson loop (rectangle)',
+    make: () => [
+      { id: tid++, type: 'edge', kind: 'wilson', from: T(160, 320), to: T(460, 320), bend: 0, thickness: 1.3, amplitude: 5, endArrow: false, label: 'R', side: 1 },
+      { id: tid++, type: 'edge', kind: 'wilson', from: T(460, 320), to: T(460, 140), bend: 0, thickness: 1.3, amplitude: 5, endArrow: false, label: 'T', side: 1 },
+      { id: tid++, type: 'edge', kind: 'wilson', from: T(460, 140), to: T(160, 140), bend: 0, thickness: 1.3, amplitude: 5, endArrow: false, label: '', side: 1 },
+      { id: tid++, type: 'edge', kind: 'wilson', from: T(160, 140), to: T(160, 320), bend: 0, thickness: 1.3, amplitude: 5, endArrow: false, label: '', side: 1 },
+    ],
+  },
+  {
+    name: 'QCD: gauge-link staple (TMD)',
+    make: () => [
+      { id: tid++, type: 'edge', kind: 'fermion', from: T(120, 340), to: T(240, 340), bend: 0, thickness: 1.2, amplitude: 6, endArrow: true, label: 'q', side: 1 },
+      { id: tid++, type: 'edge', kind: 'wilson', from: T(240, 340), to: T(240, 140), bend: 0, thickness: 1.3, amplitude: 5, endArrow: false, label: '', side: 1 },
+      { id: tid++, type: 'edge', kind: 'wilson', from: T(240, 140), to: T(440, 140), bend: 0, thickness: 1.3, amplitude: 5, endArrow: false, label: 'infinity', side: 1 },
+      { id: tid++, type: 'edge', kind: 'wilson', from: T(440, 140), to: T(440, 340), bend: 0, thickness: 1.3, amplitude: 5, endArrow: false, label: '', side: 1 },
+      { id: tid++, type: 'edge', kind: 'antifermion', from: T(440, 340), to: T(560, 340), bend: 0, thickness: 1.2, amplitude: 6, endArrow: false, label: 'macron(q)', side: 1 },
+      { id: tid++, type: 'vertex', at: T(240, 340), size: 3 },
+      { id: tid++, type: 'vertex', at: T(440, 340), size: 3 },
+    ],
+  },
+  {
+    name: 'QCD: quark–gluon vertex',
+    make: () => [
+      { id: tid++, type: 'edge', kind: 'fermion', from: T(120, 160), to: T(300, 280), bend: 0, thickness: 1.2, amplitude: 6, endArrow: false, label: 'q', side: 1 },
+      { id: tid++, type: 'edge', kind: 'fermion', from: T(300, 280), to: T(120, 400), bend: 0, thickness: 1.2, amplitude: 6, endArrow: true, label: 'macron(q)', side: -1 },
+      { id: tid++, type: 'edge', kind: 'gluon', from: T(300, 280), to: T(520, 280), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'a, mu', side: 1 },
+      { id: tid++, type: 'vertex', at: T(300, 280), size: 3.5 },
     ],
   },
   {
@@ -472,6 +586,9 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
     };
     if (e.kind === 'photon' || e.kind === 'gluon') {
       parts.push(<path key="p" d={decoPath(e.from, e.to, e.bend, e.kind, e.amplitude)} fill="none" stroke={col} strokeWidth={e.thickness} />);
+    } else if (e.kind === 'wilson') {
+      parts.push(<path key="p" d={zigzagPath(e.from, e.to, e.bend, e.amplitude)} fill="none" stroke={col} strokeWidth={e.thickness} />);
+      midArrow(0.5, false); // a gauge link runs one way; show which
     } else if (e.kind === 'double') {
       const l0 = Math.hypot(e.to.x - e.from.x, e.to.y - e.from.y) || 1;
       const nx = -(e.to.y - e.from.y) / l0, ny = (e.to.x - e.from.x) / l0;
@@ -487,7 +604,7 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
       else if (e.kind === 'antifermion') midArrow(0.5, true);
       else if (e.kind === 'majorana') { midArrow(0.4, false); midArrow(0.6, true); }
     }
-    if (e.endArrow && e.kind !== 'photon' && e.kind !== 'gluon' && e.kind !== 'double') {
+    if (e.endArrow && e.kind !== 'photon' && e.kind !== 'gluon' && e.kind !== 'double' && e.kind !== 'wilson') {
       const d = bezTan(e.from, c, e.to, 1);
       parts.push(<polygon key="e" points={arrowPts(e.to, d, 5 + e.thickness * 1.5, false)} fill={col} />);
     }

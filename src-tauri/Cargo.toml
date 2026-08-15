@@ -68,4 +68,9 @@ codegen-units = 1
 lto = true
 opt-level = "s"
 strip = true
-panic = "abort"
+# Panics unwind rather than abort. The backend runs the proofreader, the
+# watcher and the language server on their own threads, and every one of those
+# call sites already treats failure as "no result this time" — but only if the
+# thread is allowed to fail. Aborting turns a bad line of prose into a dead
+# editor with the user's unsaved work in it, which is how a crash was reported
+# during proofreading. The cost is a slightly larger binary.

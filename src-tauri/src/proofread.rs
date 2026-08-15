@@ -66,13 +66,13 @@ thread_local! {
 // Suggestions for one word, memoized. The lock is only held around the cheap
 // map ops, never across the expensive `suggest()` call.
 fn suggestions_for(dict: &SpellDict, word: &str) -> Vec<String> {
-    if let Some(hit) = SUGGEST_CACHE.lock().unwrap().get(word) {
+    if let Some(hit) = SUGGEST_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(word) {
         return hit.clone();
     }
     let mut buf: Vec<String> = Vec::new();
     dict.suggest(word, &mut buf);
     buf.truncate(8);
-    SUGGEST_CACHE.lock().unwrap().insert(word.to_string(), buf.clone());
+    SUGGEST_CACHE.lock().unwrap_or_else(|e| e.into_inner()).insert(word.to_string(), buf.clone());
     buf
 }
 
@@ -100,7 +100,7 @@ pub fn lint(text: &str) -> Vec<Issue> {
         return issues;
     }
 
-    let ignored = IGNORED.read().unwrap().clone();
+    let ignored = IGNORED.read().unwrap_or_else(|e| e.into_inner()).clone();
 
     // One parse of the Typst document, reused for spelling and grammar.
     let doc = Document::new_curated(text, &Typst);
@@ -200,6 +200,14 @@ pub fn lint(text: &str) -> Vec<Issue> {
         .collect();
     for pair in words.windows(2) {
         let (a, b) = (&pair[0], &pair[1]);
+        // Two tokens that overlap, or arrive out of order, would make the slice
+        // below run backwards and take the whole editor down with it — the
+        // release build turns a panic into an abort. Nothing in the tokenizer
+        // is supposed to produce that; this is here because the linter reads
+        // whatever anyone happens to type.
+        if b.0 < a.1 || b.1 > source.len() {
+            continue;
+        }
         // Require true adjacency: only whitespace between them (so "play. Play"
         // across a sentence boundary isn't flagged).
         if source[a.1..b.0].iter().any(|c| !c.is_whitespace()) {
@@ -255,7 +263,7 @@ pub fn add_ignored_word(word: &str) {
         return;
     }
     {
-        let mut g = IGNORED.write().unwrap();
+        let mut g = IGNORED.write().unwrap_or_else(|e| e.into_inner());
         if !g.insert(w.clone()) {
             return; // already present
         }
@@ -320,4 +328,62 @@ fn load_user_dict() -> HashSet<String> {
     std::fs::read_to_string(user_dict_path())
         .map(|s| s.lines().map(|l| l.trim().to_lowercase()).filter(|l| !l.is_empty()).collect())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The linter runs over whatever the writer happens to have typed, and a
+    // panic in it takes the whole editor with it. These are the shapes that
+    // reach it in practice: scripts it has no rules for, formulas, code, and
+    // the half-finished markup of something being written.
+    #[test]
+    fn lint_survives_awkward_documents() {
+        let cases = [
+            "The the quick brown fox.",
+            "שלום עולם, this is mixed עברית and English.",
+            "مرحبا بالعالم with English after it.",
+            "$ I_nu = kappa_0 (nu\\/nu_0)^beta Sigma B_nu (T). $ <eq:mbb>",
+            "#set text(lang: \"en\")\n#let x = 3\nSome prose after code.",
+            "A person once said \\\"Please give me a fish\\\".",
+            "emoji 🎉🎉 and combining é and ﬁ ligature",
+            "don't can't won't it's o'clock rock'n'roll",
+            "a a a a a b b b b",
+            "Word\u{200f}with\u{200e}bidi marks inside",
+            "trailing spaces    \n\n\n   leading",
+            "Ünïcödé wörds with ÄÖÜ and ß and ıİ",
+            "hyphen-ated compound-word test-case here",
+            "1.5--1.8, 10^(-26), 58.8 GHz, x_\"pk\"",
+            "```python\nprint(\"hello\")\n```\nprose after a code block",
+            "= Heading <label>\n\nBody text under it.",
+        ];
+        for case in cases {
+            let issues = lint(case);
+            // Every span the linter reports has to be a real slice of the text
+            // it was given, or the editor will underline the wrong words.
+            let chars = case.chars().count();
+            for issue in &issues {
+                assert!(issue.start <= issue.end,
+                    "reversed span in {case:?}: {}..{} {:?}", issue.start, issue.end, issue.text);
+                assert!(issue.end <= chars,
+                    "span past the end of {case:?}: {}..{} {:?}", issue.start, issue.end, issue.text);
+            }
+        }
+    }
+
+    #[test]
+    fn lint_survives_a_long_technical_document() {
+        // Something the size of a real paper, with the mixture that goes with it.
+        let mut text = String::new();
+        for section in 0..40 {
+            text.push_str(&format!("= Section {section} <sec:{section}>\n\n"));
+            text.push_str("The dust temperature is measured here, and the the emissivity follows.\n\n");
+            text.push_str("$ tau_nu = kappa_nu times Sigma, $ <eq:kappa>\n\n");
+            text.push_str("#set text(font: \"New Computer Modern\")\n\n");
+            text.push_str("שלום עולם in the middle of a paragraph.\n\n");
+        }
+        let issues = lint(&text);
+        assert!(!issues.is_empty(), "a document this size should raise something");
+    }
 }
