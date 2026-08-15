@@ -8,6 +8,8 @@ Paste the current section into the GitHub release when you cut a tag.
 
 Notebook code now runs inside a real sandbox. You can write right-to-left. Plots
 can be vectors, not just pixels, and updating no longer looks like it has hung.
+Proofreading no longer takes the editor down with it, the outline folds, and the
+diagram builder knows about Wilson lines.
 
 ### Code you run is confined by the operating system
 
@@ -119,6 +121,66 @@ right-to-left setting, `#set page(paper: "a4")` came out as
 `set page(paper: "a4")#`. And a Hebrew string inside a fenced code block or a
 display formula turned that line round, because the rule looked at one line at a
 time and could not see it was inside a block that started further up.
+
+### Proofreading cannot take the editor with it
+
+Switching proofreading on could kill the app outright, losing whatever was
+unsaved. The cause was one line deep in a dependency: Harper's thesaurus is a
+compressed blob that asks for a 128 MB decompression window against a 100 MB
+limit and gives up by panicking, and the release build was configured to treat
+any panic as fatal. The rule that reaches for that thesaurus suggests livelier
+synonyms — noise in technical prose, and its output was already being discarded
+here — so it is off, and the thesaurus is never unpacked. Panics elsewhere in
+the backend now unwind rather than abort, so a bad line of prose costs you one
+empty result rather than the editor.
+
+The panel also stops claiming your document reads clean before it has read it.
+An empty list meant two different things — nothing found, or nothing checked yet
+— and it said "No issues" for both. On a paper of any size the first pass takes
+a moment, and for that moment you were being told it was clean.
+
+### The file outline folds
+
+A heading with anything under it now carries a twisty, the way Overleaf's
+outline does: shut a section and its subsections go with it, click the title and
+you still jump there. Titles show what the heading says rather than what the
+compiler needs — a trailing `<label>`, the markers around emphasis and the
+dollars around an inline formula are gone from the list. In automatic direction
+each entry sits on the side its own script reads from.
+
+### Double-clicking a formula in the PDF finds the formula
+
+A numbered equation says which one it is, and the source can be counted to that
+number. It used to be matched by its symbols instead, which in a paper where
+every letter of `I_nu = kappa_0 (nu/nu_0)^beta Sigma B_nu (T)` appears on every
+page is a coin toss — equation 14 landed six sections away. Repeated prose is
+settled the same way, by counting rather than guessing, in both directions.
+Double-clicking a word in the editor now shows it in the PDF, matching what the
+same gesture already did the other way round.
+
+### Wilson lines, and QCD in the diagram builder
+
+The Feynman builder gains a Wilson line — a zigzag propagator with the direction
+arrow a gauge link needs — and nine QCD templates: the three- and four-gluon
+vertices, the quark-gluon vertex, quark and gluon self-energies with quark and
+ghost loops, gluon emission off an eikonal line, the Wilson loop, and the TMD
+gauge-link staple. Insert → Physics grows a QCD group alongside them: the
+Lagrangian, the field strength, colour algebra and Casimirs, the Fierz identity,
+path-ordered exponentials, the static potential, the running coupling, DGLAP and
+factorisation.
+
+### Putting an image exactly where you want it
+
+Place Image's free mode was drawn as a drag and written out as a wrap, so the
+picture snapped to a corner instead of staying where it was dropped. Pinned mode
+writes the drop point down as it stands, for the margin notes and overlays a
+wrap cannot do. Beside it, a paired mode: two images side by side at the same
+height, which is the part that matching aspect ratios by hand never quite gets
+right.
+
+The plot studio no longer offers a Python mode. A notebook cell already runs the
+code and puts the figure in the document, and the second route was only another
+place to look for the same thing.
 
 ### Notebook plots in SVG, PDF and EPS
 
