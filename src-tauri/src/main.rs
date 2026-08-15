@@ -55,7 +55,8 @@ fn augment_path() {
     let sep = if cfg!(windows) { ";" } else { ":" };
     let mut parts: Vec<String> = extra.iter().filter(|p| p.exists()).map(|p| p.to_string_lossy().into_owned()).collect();
     parts.push(std::env::var("PATH").unwrap_or_default());
-    std::env::set_var("PATH", parts.join(sep));
+    // Called from the first lines of main, before any thread exists to read it.
+    unsafe { std::env::set_var("PATH", parts.join(sep)) };
 }
 
 // Prefer the standard port, but fall back to an ephemeral one when it's taken.
@@ -83,14 +84,12 @@ fn collab_addresses() -> Vec<String> {
     // Connecting a UDP socket selects the interface the OS would use for a
     // routed destination without sending any packet. This gives the useful
     // campus/LAN address on the common single-active-interface setup.
-    if let Ok(socket) = UdpSocket::bind(("0.0.0.0", 0)) {
-        if socket.connect(("192.0.2.1", 9)).is_ok() {
-            if let Ok(local) = socket.local_addr() {
-                if !local.ip().is_loopback() {
-                    addresses.push(local.ip().to_string());
-                }
-            }
-        }
+    if let Ok(socket) = UdpSocket::bind(("0.0.0.0", 0))
+        && socket.connect(("192.0.2.1", 9)).is_ok()
+        && let Ok(local) = socket.local_addr()
+        && !local.ip().is_loopback()
+    {
+        addresses.push(local.ip().to_string());
     }
     addresses.push("127.0.0.1".into());
     addresses.dedup();
@@ -223,8 +222,11 @@ fn set_bundled_tinymist(resource_dir: Option<&Path>) {
         return;
     }
     if let Some(tm) = find_bundled_tinymist(resource_dir) {
-        std::env::set_var("TINYMIST_BIN", tm);
-        std::env::set_var("HILBERT_TINYMIST_SOURCE", "bundled");
+        // Both callers run this while their process is still single-threaded.
+        unsafe {
+            std::env::set_var("TINYMIST_BIN", tm);
+            std::env::set_var("HILBERT_TINYMIST_SOURCE", "bundled");
+        }
     }
 }
 
@@ -372,7 +374,7 @@ fn hosted_server_main() {
         std::process::exit(2);
     };
     if std::env::var_os("HILBERT_SESSION_FILE").is_none() {
-        std::env::set_var("HILBERT_SESSION_FILE", workspace.join(".hilbert/server-session.json"));
+        unsafe { std::env::set_var("HILBERT_SESSION_FILE", workspace.join(".hilbert/server-session.json")) };
     }
     set_bundled_tinymist(None);
     let listener = TcpListener::bind((bind.as_str(), port)).unwrap_or_else(|error| {
@@ -528,12 +530,12 @@ fn capture_window_geometry(app: &tauri::AppHandle, label: &str, session: &Path) 
     let maximized = window.is_maximized().unwrap_or(false);
     // Maximized bounds are the monitor, not the size/position to return to after
     // unmaximizing. Preserve the last normal rectangle and change only the flag.
-    if maximized {
-        if let Some(mut previous) = read_window_geometry(session) {
-            previous.maximized = true;
-            write_window_geometry(session, previous);
-            return;
-        }
+    if maximized
+        && let Some(mut previous) = read_window_geometry(session)
+    {
+        previous.maximized = true;
+        write_window_geometry(session, previous);
+        return;
     }
     let Ok(size) = window.inner_size() else { return };
     if size.width < 900 || size.height < 600 { return; }
@@ -718,7 +720,7 @@ fn main() {
     // windows restore and persist independently and never overwrite the primary
     // window's remembered project. Set before anything reads the session path.
     if let Some(path) = arg_value("--session-file") {
-        std::env::set_var("HILBERT_SESSION_FILE", path);
+        unsafe { std::env::set_var("HILBERT_SESSION_FILE", path) };
     }
     if std::env::args().any(|a| a == "--hosted-server" || a == "--serve") {
         hosted_server_main();
@@ -741,123 +743,13 @@ fn main() {
         .setup(|app| {
             use tauri::Manager;
 
-            // Auto-update: on launch, check the release feed; if a newer signed
-            // build exists, ASK the user, then download + install + relaunch.
-            // Fully in Rust (the UI is served from a local http URL). Best-effort:
-            // a failed/absent check never blocks startup.
-            let up_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
-                use tauri_plugin_updater::UpdaterExt;
-                if let Ok(updater) = up_handle.updater() {
-                    if let Ok(Some(update)) = updater.check().await {
-                        let notes = update.body.clone().unwrap_or_default();
-                        let msg = format!(
-                            "Hilbert {} is available (you have {}).\n\n{}\nUpdate now? The app will restart.",
-                            update.version, update.current_version,
-                            if notes.is_empty() { String::new() } else { format!("{}\n\n", notes.chars().take(300).collect::<String>()) }
-                        );
-                        let h2 = up_handle.clone();
-                        up_handle
-                            .dialog()
-                            .message(msg)
-                            .title("Update available")
-                            .kind(MessageDialogKind::Info)
-                            .buttons(MessageDialogButtons::OkCancelCustom("Update now".into(), "Later".into()))
-                            .show(move |accepted| {
-                                if accepted {
-                                    tauri::async_runtime::spawn(async move {
-                                        use tauri::Manager;
-                                        // The download is ~16 MB, which is over a minute on a
-                                        // slow link. Without a sign of it the app looks like it
-                                        // ignored the click, so the progress goes in the title
-                                        // bar, and a failure says so rather than leaving the
-                                        // user waiting for a restart that is never coming.
-                                        let window = h2.get_webview_window("main");
-                                        let announce = |text: &str| {
-                                            if let Some(w) = &window {
-                                                let _ = w.set_title(text);
-                                            }
-                                        };
-                                        announce("Hilbert — downloading update…");
-
-                                        let progress_window = window.clone();
-                                        let installing_window = window.clone();
-                                        let mut downloaded: u64 = 0;
-                                        let mut total: Option<u64> = None;
-                                        let mut shown_percent = u64::MAX;
-                                        let outcome = update
-                                            .download_and_install(
-                                                move |chunk, content_length| {
-                                                    downloaded += chunk as u64;
-                                                    if total.is_none() {
-                                                        total = content_length;
-                                                    }
-                                                    let Some(w) = &progress_window else { return };
-                                                    match total.filter(|size| *size > 0) {
-                                                        // Retitling on every chunk is wasted work;
-                                                        // the bar only changes each whole percent.
-                                                        Some(size) => {
-                                                            let percent = downloaded * 100 / size;
-                                                            if percent != shown_percent {
-                                                                shown_percent = percent;
-                                                                let _ = w.set_title(&format!(
-                                                                    "Hilbert — downloading update… {percent}%"
-                                                                ));
-                                                            }
-                                                        }
-                                                        // A server that sends no length still gets
-                                                        // to show that something is happening.
-                                                        None => {
-                                                            let _ = w.set_title(&format!(
-                                                                "Hilbert — downloading update… {} MB",
-                                                                downloaded / (1024 * 1024)
-                                                            ));
-                                                        }
-                                                    }
-                                                },
-                                                move || {
-                                                    if let Some(w) = &installing_window {
-                                                        let _ = w.set_title("Hilbert — installing update…");
-                                                    }
-                                                },
-                                            )
-                                            .await;
-
-                                        match outcome {
-                                            Ok(()) => h2.restart(),
-                                            Err(error) => {
-                                                announce("Hilbert");
-                                                h2.dialog()
-                                                    .message(format!(
-                                                        "The update could not be installed.\n\n{error}\n\nNothing has changed and your work is safe. Try again later, or download the new version from the releases page."
-                                                    ))
-                                                    .title("Update failed")
-                                                    .kind(MessageDialogKind::Warning)
-                                                    .show(|_| {});
-                                            }
-                                        }
-                                    });
-                                }
-                            });
-                    }
-                }
-            });
-
+            // Everything that writes to the environment happens here, before the
+            // update check and the sync server below put other threads in the
+            // air. Setting a variable is not safe to do beside another thread
+            // reading one, and this is the last point where there is nothing
+            // else running to read.
             let resource_dir = app.path().resource_dir().ok();
             set_bundled_tinymist(resource_dir.as_deref());
-            start_embedded_sync_server();
-
-            // Built UI: bundled resource, overridable for development.
-            let dist = std::env::var("TYPST_DIST")
-                .map(PathBuf::from)
-                .ok()
-                .or_else(|| resource_dir.as_ref().map(|r| r.join("dist")))
-                .or_else(|| {
-                    cfg!(debug_assertions)
-                        .then(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dist"))
-                })
-                .filter(|d| d.exists());
 
             // Seed bundled Typst packages into a writable cache and point the
             // compiler (and the Packages UI) at it.
@@ -871,8 +763,124 @@ fn main() {
                     seed_packages(&res.join("typst-packages").join("preview"), &cache_root);
                 }
                 let _ = fs::create_dir_all(&cache_root);
-                std::env::set_var("TYPST_PACKAGE_CACHE_PATH", &cache_root);
+                unsafe { std::env::set_var("TYPST_PACKAGE_CACHE_PATH", &cache_root) };
             }
+
+            // Auto-update: on launch, check the release feed; if a newer signed
+            // build exists, ASK the user, then download + install + relaunch.
+            // Fully in Rust (the UI is served from a local http URL). Best-effort:
+            // a failed/absent check never blocks startup.
+            let up_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+                use tauri_plugin_updater::UpdaterExt;
+                if let Ok(updater) = up_handle.updater()
+                    && let Ok(Some(update)) = updater.check().await
+                {
+                    let notes = update.body.clone().unwrap_or_default();
+                    let msg = format!(
+                        "Hilbert {} is available (you have {}).\n\n{}\nUpdate now? The app will restart.",
+                        update.version, update.current_version,
+                        if notes.is_empty() { String::new() } else { format!("{}\n\n", notes.chars().take(300).collect::<String>()) }
+                    );
+                    let h2 = up_handle.clone();
+                    up_handle
+                        .dialog()
+                        .message(msg)
+                        .title("Update available")
+                        .kind(MessageDialogKind::Info)
+                        .buttons(MessageDialogButtons::OkCancelCustom("Update now".into(), "Later".into()))
+                        .show(move |accepted| {
+                            if accepted {
+                                tauri::async_runtime::spawn(async move {
+                                    use tauri::Manager;
+                                    // The download is ~16 MB, which is over a minute on a
+                                    // slow link. Without a sign of it the app looks like it
+                                    // ignored the click, so the progress goes in the title
+                                    // bar, and a failure says so rather than leaving the
+                                    // user waiting for a restart that is never coming.
+                                    let window = h2.get_webview_window("main");
+                                    let announce = |text: &str| {
+                                        if let Some(w) = &window {
+                                            let _ = w.set_title(text);
+                                        }
+                                    };
+                                    announce("Hilbert — downloading update…");
+
+                                    let progress_window = window.clone();
+                                    let installing_window = window.clone();
+                                    let mut downloaded: u64 = 0;
+                                    let mut total: Option<u64> = None;
+                                    let mut shown_percent = u64::MAX;
+                                    let outcome = update
+                                        .download_and_install(
+                                            move |chunk, content_length| {
+                                                downloaded += chunk as u64;
+                                                if total.is_none() {
+                                                    total = content_length;
+                                                }
+                                                let Some(w) = &progress_window else { return };
+                                                match total.filter(|size| *size > 0) {
+                                                    // Retitling on every chunk is wasted work;
+                                                    // the bar only changes each whole percent.
+                                                    Some(size) => {
+                                                        let percent = downloaded * 100 / size;
+                                                        if percent != shown_percent {
+                                                            shown_percent = percent;
+                                                            let _ = w.set_title(&format!(
+                                                                "Hilbert — downloading update… {percent}%"
+                                                            ));
+                                                        }
+                                                    }
+                                                    // A server that sends no length still gets
+                                                    // to show that something is happening.
+                                                    None => {
+                                                        let _ = w.set_title(&format!(
+                                                            "Hilbert — downloading update… {} MB",
+                                                            downloaded / (1024 * 1024)
+                                                        ));
+                                                    }
+                                                }
+                                            },
+                                            move || {
+                                                if let Some(w) = &installing_window {
+                                                    let _ = w.set_title("Hilbert — installing update…");
+                                                }
+                                            },
+                                        )
+                                        .await;
+
+                                    match outcome {
+                                        Ok(()) => h2.restart(),
+                                        Err(error) => {
+                                            announce("Hilbert");
+                                            h2.dialog()
+                                                .message(format!(
+                                                    "The update could not be installed.\n\n{error}\n\nNothing has changed and your work is safe. Try again later, or download the new version from the releases page."
+                                                ))
+                                                .title("Update failed")
+                                                .kind(MessageDialogKind::Warning)
+                                                .show(|_| {});
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                }
+            });
+
+            start_embedded_sync_server();
+
+            // Built UI: bundled resource, overridable for development.
+            let dist = std::env::var("TYPST_DIST")
+                .map(PathBuf::from)
+                .ok()
+                .or_else(|| resource_dir.as_ref().map(|r| r.join("dist")))
+                .or_else(|| {
+                    cfg!(debug_assertions)
+                        .then(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dist"))
+                })
+                .filter(|d| d.exists());
 
             // Reopen the last project if its folder still exists (session restore),
             // otherwise fall back to the default documents workspace.

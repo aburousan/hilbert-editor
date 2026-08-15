@@ -4,7 +4,10 @@ version = "0.1.21"
 description = "Hilbert — an offline editor for Typst (Unofficial), aimed at maths/physics writing."
 authors = ["Kazi Abu Rousan"]
 license = "MIT"
-edition = "2021"
+edition = "2024"
+# Let chains need 1.88, and the typst and burn crates harper pulls in need
+# 1.89 — declaring less holds those back at older versions.
+rust-version = "1.89"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -15,14 +18,22 @@ tauri-plugin-dialog = "2"
 tauri-plugin-updater = "2"
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# No provider feature of our own: rustls is already in the tree with ring, and
+# asking for reqwest's default provider instead would drag in aws-lc-rs, which
+# wants cmake and NASM to build on Windows. Roots come from the platform
+# verifier — the machine's own trust store, so a certificate the user or their
+# workplace has added works here as it does in their browser.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
+# ...and the provider itself, chosen here rather than left to reqwest, which
+# would pick aws-lc-rs. Installed once at startup by `use_ring()`.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 regex = "1"
-base64 = "0.22"
-sha2 = "0.10"
-getrandom = "0.3"
+base64 = "0.23"
+sha2 = "0.11"
+getrandom = "0.4"
 dirs = "6"
 mime_guess = "2"
 percent-encoding = "2"
@@ -33,17 +44,17 @@ open = "5"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 # Spreadsheet reading (xlsx/xls/xlsb/ods) so data import can convert Excel files
 # to CSV offline, with no runtime dependency on Excel or Python.
-calamine = "0.26"
+calamine = "0.36"
 # Pure-Rust zip writer for archiving a project on export — works identically on
 # Windows/macOS/Linux with no dependency on a system `zip` binary.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 # Proofreading: spellbook is a pure-Rust, Nuspell/Hunspell-compatible spell
 # checker; harper-core + harper-typst provide native grammar/style linting that
 # understands Typst syntax (prose only, skipping code/math).
 spellbook = "0.4"
-harper-core = "2.5"
-harper-typst = "2.5"
+harper-core = "2.8"
+harper-typst = "2.8"
 
 # Keep this LAST: a [target.…] header ends [dependencies], so anything written
 # below it would silently become unix-only.

@@ -228,6 +228,18 @@ fn release_workspace_user(path: &Path) -> bool {
     }
 }
 
+// Every TLS connection this program makes goes through rustls, which needs to be
+// told once which cryptography to use. reqwest is built without a provider of
+// its own on purpose: letting it choose pulls in aws-lc-rs, which wants cmake
+// and NASM to build on Windows, where ring needs neither and is already here for
+// the updater. Building a client without this panics, so it runs first.
+fn use_ring() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 // HMAC-SHA256. Written out rather than pulled in as a dependency: it is fifteen
 // lines, and sha2 is already here.
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
@@ -374,6 +386,7 @@ impl AppState {
     }
 
     pub fn new(workspace: PathBuf, dist: Option<PathBuf>) -> Self {
+        use_ring();
         let mut token_bytes = [0u8; 32];
         getrandom::fill(&mut token_bytes).expect("operating-system randomness for API token");
         let generated_token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
@@ -1488,10 +1501,10 @@ async fn workspace_copy(State(st): St, body: Bytes) -> Response {
     if src.is_dir() && dst.starts_with(&src) {
         return json_err(StatusCode::BAD_REQUEST, "A folder cannot be copied inside itself.");
     }
-    if let Some(parent) = dst.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
-            return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-        }
+    if let Some(parent) = dst.parent()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
     let to = jstr(&v, "to").unwrap_or("").to_string();
     match tokio::task::spawn_blocking(move || copy_workspace_entry(&src, &dst)).await {
@@ -1618,17 +1631,17 @@ async fn collab_server_info(State(st): St, headers: HeaderMap) -> Response {
     // Hosted workspaces carry the relay on the same HTTP(S) port. Deriving the
     // suggestion from the already-validated same-origin Host makes it work both
     // directly and behind a TLS reverse proxy without another exposed port.
-    if st.remote_mode() {
-        if let Some(host) = headers.get(header::HOST).and_then(|value| value.to_str().ok()) {
-            let tls = headers
-                .get("x-forwarded-proto")
-                .and_then(|value| value.to_str().ok())
-                .map(|value| value.eq_ignore_ascii_case("https"))
-                .unwrap_or(false);
-            info.urls.insert(0, format!("{}://{host}", if tls { "wss" } else { "ws" }));
-            info.urls.dedup();
-            info.available = true;
-        }
+    if st.remote_mode()
+        && let Some(host) = headers.get(header::HOST).and_then(|value| value.to_str().ok())
+    {
+        let tls = headers
+            .get("x-forwarded-proto")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.eq_ignore_ascii_case("https"))
+            .unwrap_or(false);
+        info.urls.insert(0, format!("{}://{host}", if tls { "wss" } else { "ws" }));
+        info.urls.dedup();
+        info.available = true;
     }
     Json(info).into_response()
 }
@@ -2107,10 +2120,10 @@ async fn ensure_preview_watcher(
         font_signature: font_signature(&ws.join("fonts")),
     };
     let mut guard = st.preview_watcher.lock().await;
-    if let Some(watcher) = guard.as_mut() {
-        if watcher.key == key && matches!(watcher.child.try_wait(), Ok(None)) {
-            return Ok(watcher.events.clone());
-        }
+    if let Some(watcher) = guard.as_mut()
+        && watcher.key == key && matches!(watcher.child.try_wait(), Ok(None))
+    {
+        return Ok(watcher.events.clone());
     }
     if let Some(mut old) = guard.take() {
         let _ = old.child.start_kill();
@@ -2752,10 +2765,10 @@ async fn export_native(State(st): St, body: Bytes) -> Response {
                     }
                     if kind.is_dir() {
                         walk(&path, root, files);
-                    } else if kind.is_file() {
-                        if let Ok(rel) = path.strip_prefix(root) {
-                            files.push((rel.to_string_lossy().replace('\\', "/"), path));
-                        }
+                    } else if kind.is_file()
+                        && let Ok(rel) = path.strip_prefix(root)
+                    {
+                        files.push((rel.to_string_lossy().replace('\\', "/"), path));
                     }
                 }
             }
@@ -2887,20 +2900,19 @@ fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
 
 async fn get_universe_index(st: &AppState) -> Option<Arc<Vec<Pkg>>> {
     let mut guard = st.universe.lock().await;
-    if let Some((at, idx)) = guard.as_ref() {
-        if at.elapsed() < UNIVERSE_TTL {
-            return Some(idx.clone());
-        }
+    if let Some((at, idx)) = guard.as_ref()
+        && at.elapsed() < UNIVERSE_TTL
+    {
+        return Some(idx.clone());
     }
     let mut raw: Option<String> = None;
-    if let Ok(resp) = st.http.get(UNIVERSE_INDEX_URL).timeout(Duration::from_secs(15)).send().await {
-        if resp.status().is_success() {
-            if let Ok(text) = resp.text().await {
-                let _ = fs::write(universe_cache_file(), &text);
-                raw = Some(text);
-            }
+    if let Ok(resp) = st.http.get(UNIVERSE_INDEX_URL).timeout(Duration::from_secs(15)).send().await
+        && resp.status().is_success()
+            && let Ok(text) = resp.text().await
+        {
+            let _ = fs::write(universe_cache_file(), &text);
+            raw = Some(text);
         }
-    }
     if raw.is_none() {
         raw = fs::read_to_string(universe_cache_file()).ok();
     }
@@ -3483,11 +3495,11 @@ fn detect_interpreters() -> Interpreters {
                 ]
             };
             // Windows per-user installs: %LOCALAPPDATA%\Programs\Python\Python3xx\python.exe
-            if cfg!(windows) {
-                if let Ok(rd) = fs::read_dir(home.join("AppData/Local/Programs/Python")) {
-                    for e in rd.flatten() {
-                        cands.push(e.path().join("python.exe"));
-                    }
+            if cfg!(windows)
+                && let Ok(rd) = fs::read_dir(home.join("AppData/Local/Programs/Python"))
+            {
+                for e in rd.flatten() {
+                    cands.push(e.path().join("python.exe"));
                 }
             }
             first_file(&cands)
@@ -3989,10 +4001,10 @@ fn image_stats(dir: &Path) -> HashMap<String, f64> {
         if !IMAGE_EXT.iter().any(|e| lower.ends_with(e)) {
             continue;
         }
-        if let Ok(meta) = entry.metadata() {
-            if let Ok(t) = meta.modified() {
-                m.insert(name, epoch_ms(t));
-            }
+        if let Ok(meta) = entry.metadata()
+            && let Ok(t) = meta.modified()
+        {
+            m.insert(name, epoch_ms(t));
         }
     }
     m
@@ -4039,10 +4051,11 @@ fn safe_image_name(name: &str) -> bool {
         && !name.starts_with('.')
         && !name.contains(['/', '\\', '\0'])
         && Path::new(name).components().count() == 1
-        && {
-            let lower = name.to_lowercase();
-            IMAGE_EXT.iter().any(|ext| lower.ends_with(ext))
-        }
+        &&
+    {
+        let lower = name.to_lowercase();
+        IMAGE_EXT.iter().any(|ext| lower.ends_with(ext))
+    }
 }
 
 fn promote_images(ws: &Path, run_dir: &Path, names: &[String]) -> Vec<String> {
@@ -4435,10 +4448,10 @@ async fn template_preview(State(st): St, Query(q): Q) -> Response {
     let cache_dir = ws.join(".previews");
     let _ = fs::create_dir_all(&cache_dir);
     let cached = cache_dir.join(format!("{name}-{}.png", if version.is_empty() { "latest" } else { version }));
-    if cached.exists() {
-        if let Ok(bytes) = fs::read(&cached) {
-            return ([(header::CONTENT_TYPE, "image/png")], bytes).into_response();
-        }
+    if cached.exists()
+        && let Ok(bytes) = fs::read(&cached)
+    {
+        return ([(header::CONTENT_TYPE, "image/png")], bytes).into_response();
     }
 
     let dir = std::env::temp_dir().join(format!("typst-tpl-{}-{}", std::process::id(), name));
@@ -4792,7 +4805,10 @@ async fn bib_fetch(State(st): St, body: Bytes) -> Response {
 // ---------------------------------------------------------------------------
 
 static ZOTERO_HTTP: LazyLock<reqwest::Client> =
-    LazyLock::new(|| reqwest::Client::builder().no_proxy().build().unwrap());
+    LazyLock::new(|| {
+        use_ring();
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    });
 
 fn zotero_base() -> String {
     std::env::var("ZOTERO_URL")
@@ -5136,10 +5152,10 @@ fn session_cookie(headers: &HeaderMap) -> Option<&str> {
 // browser that signed in to a hosted workspace, and it carries a signed session
 // rather than the token itself.
 fn valid_request_auth(st: &AppState, headers: &HeaderMap) -> bool {
-    if let Some(candidate) = bearer_token(headers) {
-        if constant_time_eq(candidate, &st.api_token) {
-            return true;
-        }
+    if let Some(candidate) = bearer_token(headers)
+        && constant_time_eq(candidate, &st.api_token)
+    {
+        return true;
     }
     match (&st.sessions, session_cookie(headers)) {
         (Some(sessions), Some(candidate)) => sessions.verify(candidate),
