@@ -18,12 +18,13 @@ const KIND_LABEL: Record<ProofKind, string> = {
 interface Props {
   issues: PlacedIssue[];
   busy: boolean;
+  checked: boolean;
   onJump(i: PlacedIssue): void;
   onApply(i: PlacedIssue, replacement: string): void;
   onIgnore(i: PlacedIssue): void;
 }
 
-export default function ProofreadPanel({ issues, busy, onJump, onApply, onIgnore }: Props) {
+export default function ProofreadPanel({ issues, busy, checked, onJump, onApply, onIgnore }: Props) {
   const counts = issues.reduce(
     (acc, i) => { acc[i.kind]++; return acc; },
     { spelling: 0, grammar: 0, style: 0 } as Record<ProofKind, number>,
@@ -63,7 +64,7 @@ export default function ProofreadPanel({ issues, busy, onJump, onApply, onIgnore
       <div className="proofread-list" style={{ overflowY: 'auto', padding: '6px' }}>
         {issues.length === 0 ? (
           <div style={{ padding: '10px 12px', fontSize: '0.78rem', color: 'var(--text-muted)', opacity: 0.8 }}>
-            {busy ? 'Checking…' : 'No issues — reads clean.'}
+            {busy ? 'Checking…' : checked ? 'No issues — reads clean.' : 'Not checked yet.'}
           </div>
         ) : (
           issues.map((i, idx) => (

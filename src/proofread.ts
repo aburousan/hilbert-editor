@@ -201,6 +201,7 @@ interface UseProofread {
   available: boolean;   // backend supports /lint (Tauri edition)
   issues: PlacedIssue[];
   busy: boolean;
+  checked: boolean;      // this document has been through the checker at least once
   jumpTo(issue: PlacedIssue): void;
   applySuggestion(issue: PlacedIssue, replacement: string): void;
   ignoreWord(issue: PlacedIssue): void;
@@ -219,6 +220,11 @@ export function useProofread(
   enabled: boolean,
 ): UseProofread {
   const [issues, setIssues] = useState<PlacedIssue[]>([]);
+  // Whether this document has been through the checker at all. An empty list
+  // means two different things — nothing found, or nothing looked at yet — and
+  // telling the writer their paper reads clean before it has been read is the
+  // worse of the two to get wrong.
+  const [checked, setChecked] = useState(false);
   const [available, setAvailable] = useState(true);
   const [busy, setBusy] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -283,6 +289,7 @@ export function useProofread(
       if (mine !== seq.current) return; // superseded by a newer run
       const placed = placeIssues(text, raw);
       apply(withSuggestions(placed)); // show squiggles + any already-cached fixes now
+      setChecked(true);
       setBusy(false);
 
       // Lazily enrich spelling fixes (off the hot path), then re-publish.
@@ -305,9 +312,11 @@ export function useProofread(
   useEffect(() => {
     if (!active) {
       setIssues([]);
+      setChecked(false);
       clearMarkers();
       return;
     }
+    setChecked(false);
     if (timer.current) clearTimeout(timer.current);
     timer.current = setTimeout(run, 700);
     return () => {
@@ -350,5 +359,5 @@ export function useProofread(
     [run],
   );
 
-  return { available, issues, busy, jumpTo, applySuggestion, ignoreWord, revalidate: run };
+  return { available, issues, busy, checked, jumpTo, applySuggestion, ignoreWord, revalidate: run };
 }

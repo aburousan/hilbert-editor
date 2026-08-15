@@ -6897,6 +6897,7 @@ export default function App() {
                 <ProofreadPanel
                   issues={proof.issues}
                   busy={proof.busy}
+                  checked={proof.checked}
                   onJump={proof.jumpTo}
                   onApply={proof.applySuggestion}
                   onIgnore={proof.ignoreWord}
