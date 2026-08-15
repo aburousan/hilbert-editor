@@ -708,7 +708,8 @@ fn arg_value(flag: &str) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn avoid_blank_webkit_window() {
     if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
-        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        // The first line of main, before there is a second thread to read it.
+        unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1") };
     }
 }
 
