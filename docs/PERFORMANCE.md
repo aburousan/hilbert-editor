@@ -15,6 +15,9 @@ python scripts/bench_plot.py  # writes docs/performance.png
 Test machine: Apple Silicon (arm64), macOS 15, release build, Typst 0.15.0. Averages
 over 5 to 20 iterations per figure. Re-run before each release.
 
+Section 3 was measured separately on an Apple M2 (8 cores, 8 GB, macOS 26.6.1) against
+a real paper rather than a generated one, with Typst 0.15.1.
+
 ---
 
 ## 1. Backend
@@ -79,7 +82,43 @@ from preview state.
 
 ---
 
-## 3. The optimizations behind these numbers
+## 3. A real paper
+
+The generated workspaces above vary one thing at a time. This section is a single
+document somebody actually wrote — a physics note with the mixture that goes with one:
+
+| | |
+|---|---|
+| Lines / bytes | 1365 / 62 KB |
+| Words | 11,395 |
+| Numbered equations | 42 |
+| Figures | 12 (PNG) |
+| Sections in the outline | 47 |
+
+| Metric | Value |
+|---|---|
+| Typst compile, warm | **0.26 s** |
+| Typst compile, cold | 0.67 s |
+| Editor usable | 1.5 s |
+| First PDF page on screen | 2.7 s |
+| Keystroke to a repainted preview | 2.5 s |
+| Typing 200 characters | 444 ms, i.e. **2.2 ms per character** |
+| Proofread, first call (dictionaries) | 0.4 s |
+| Proofread, whole paper, first pass | **2.1 s** |
+| Proofread, whole paper, warm | **0.7–0.8 s** (300 issues) |
+| Backend RSS after proofreading | 257 MB |
+
+The two startup figures and the typing latency come from the dev server with a debug
+backend, so they are the pessimistic end; everything else is the release binary.
+
+That distinction is not pedantic. A debug build lints the same paper in **7 s** against
+the release build's 0.8 s — a factor of ten — and measuring the wrong one has already
+sent this project chasing an imaginary performance problem while missing a real crash
+sitting in the release build's log. Benchmark what ships.
+
+---
+
+## 4. The optimizations behind these numbers
 
 **Dictionaries load on demand, cutting idle memory by 14x.** The spelling and grammar
 dictionaries (spellbook and Harper) cost about 150 MB resident. They used to be
@@ -88,6 +127,13 @@ most people carried that memory forever without ever using it. They now load the
 time `/lint` is called, which only happens once proofreading is switched on, and the
 load runs in the background so the first sentence is still checked promptly. Idle RSS
 fell from **173 MB to 12 MB**.
+
+**Harper's thesaurus rule is switched off.** `BoringWords` suggests livelier synonyms,
+which is noise in technical prose, so its output was already being discarded — but
+leaving the rule enabled still made Harper unpack the thesaurus, and in 2.8 that asks
+zstd for a 128 MB decompression window against a 100 MB limit and unwraps the error.
+The panic took the whole editor with it under the old abort-on-panic release profile.
+Panics now unwind, and the rule that reaches for the thesaurus is off.
 
 **Monaco is created once** and swaps models between tabs rather than being torn down
 and rebuilt. Models are disposed on tab close, which fixed a leak where every
@@ -114,12 +160,12 @@ runaway cell cannot fill the disk or exhaust memory.
 
 ---
 
-## 4. Where the memory actually goes
+## 5. Where the memory actually goes
 
 | Process | RSS |
 |---|---|
 | Backend, idle | 12 MB |
-| Backend, once proofreading is enabled | about 174 MB (dictionaries) |
+| Backend, once proofreading is enabled | about 174 MB (dictionaries), 257 MB after checking a 62 KB paper |
 | WebKit content process | about 200 MB |
 | tinymist language server (child) | about 33 MB |
 
@@ -133,7 +179,7 @@ belongs to the user.
 
 ---
 
-## 5. Component lifecycle
+## 6. Component lifecycle
 
 | Component | Pattern |
 |---|---|
