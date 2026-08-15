@@ -107,8 +107,9 @@ Run on two machines, both release builds, both Typst 0.15.1:
 | Typst compile, warm | **0.26 s** | **0.66 s** |
 | Typst compile, cold | 0.67 s | 0.93 s |
 | Proofread, first call (dictionaries) | 0.4 s | 0.7 s |
-| Proofread, whole paper, first pass | 2.1 s | 3.8 s |
-| Proofread, whole paper, warm | **0.7–0.8 s** | **1.4 s** |
+| Proofread, whole paper, first pass | 0.74 s | 1.4 s |
+| Proofread after one word is typed | **11 ms** | — |
+| Proofread, text unchanged | **10 ms** | — |
 | Issues found | 300 | 300 |
 | Backend RSS after proofreading | 257 MB | 253 MB |
 
@@ -143,6 +144,22 @@ most people carried that memory forever without ever using it. They now load the
 time `/lint` is called, which only happens once proofreading is switched on, and the
 load runs in the background so the first sentence is still checked promptly. Idle RSS
 fell from **173 MB to 12 MB**.
+
+**Proofreading looks at what changed, not at the whole document.** A pass over the
+paper above costs about 740 ms — 310 ms of it parsing the Typst markup, most of the
+rest running Harper's rules — and it used to run in full every time typing stopped,
+although almost nothing had changed between two of those. The document is now cut into
+pieces at blank lines, each piece's answers are kept under a hash of the piece, and
+only the pieces that changed are checked again. Editing one paragraph costs one
+paragraph: **11 ms instead of 740 ms**, a factor of sixty-five.
+
+A cut may only fall where a piece parses the same alone as it did in the document,
+which means never inside a fenced raw block or a display formula. The first pass over
+an unseen document still goes through in one piece, because parsing a document once is
+much cheaper than parsing each of its 275 paragraphs; its answers are then filed under
+the paragraphs they came from, which is what makes the second pass cheap. A test
+asserts the two routes find the same issues, and on the real paper both find the same
+300 — 243 spelling, 53 grammar, 4 style, at the same offsets.
 
 **Harper's thesaurus rule is switched off.** `BoringWords` suggests livelier synonyms,
 which is noise in technical prose, so its output was already being discarded — but

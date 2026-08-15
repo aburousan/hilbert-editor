@@ -42,6 +42,9 @@ static SPELL: LazyLock<Option<SpellDict>> = LazyLock::new(|| match SpellDict::ne
 // Personal dictionary: words the user chose to ignore. Loaded once from disk,
 // mirrored back on every addition so it persists across sessions.
 static IGNORED: LazyLock<RwLock<HashSet<String>>> = LazyLock::new(|| RwLock::new(load_user_dict()));
+// Bumped whenever a word is ignored, so cached answers from before it are not
+// reused. Cheaper than clearing the cache and safe to read from any thread.
+static IGNORED_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // Suggestion cache. `spellbook.suggest()` does an edit-distance search over the
 // whole dictionary (~90ms each), so we compute a word's suggestions once and
@@ -84,7 +87,7 @@ fn suggestions_for(dict: &SpellDict, word: &str) -> Vec<String> {
 }
 
 /// One proofreading issue, in the shape the frontend renders directly.
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct Issue {
     /// Char offsets into the source (Unicode scalar indices): start inclusive,
     /// end exclusive.
@@ -99,9 +102,158 @@ pub struct Issue {
     pub suggestions: Vec<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Only look at what changed
+// ---------------------------------------------------------------------------
+// A whole-document pass over a real paper costs about 740 ms — 310 ms of it
+// parsing the Typst markup, most of the rest running Harper's rules — and it ran
+// in full every time typing stopped, although almost nothing had changed.
+//
+// The document is cut into pieces at blank lines, each piece is linted alone,
+// and the answers are kept under a hash of the piece. Editing one paragraph then
+// costs one paragraph. A cut may only fall where a piece parses the same alone
+// as it did in the document, which means never inside a fenced raw block or a
+// display formula: a paragraph lifted out of a ``` fence would be read as prose
+// and spell-checked line by line.
+
+/// Byte ranges of the pieces the document splits into.
+fn pieces(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut fence: Option<usize> = None;
+    let mut math = false;
+    let mut at = 0usize;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if let Some(ticks) = fence {
+            if trimmed.starts_with(&"`".repeat(ticks)) {
+                fence = None;
+            }
+        } else if trimmed.starts_with("```") {
+            let ticks = trimmed.chars().take_while(|c| *c == '`').count();
+            if trimmed.len() == ticks || !trimmed[ticks..].contains(&"`".repeat(ticks)) {
+                fence = Some(ticks);
+            }
+        } else {
+            let dollars = line
+                .char_indices()
+                .filter(|(i, c)| *c == '$' && (*i == 0 || !line[..*i].ends_with('\\')))
+                .count();
+            if dollars % 2 == 1 {
+                math = !math;
+            }
+        }
+
+        if trimmed.is_empty() && fence.is_none() && !math {
+            if at > start {
+                out.push((start, at));
+            }
+            start = at + line.len();
+        }
+        at += line.len();
+    }
+    if at > start {
+        out.push((start, at));
+    }
+    out
+}
+
+/// Answers for pieces seen before, by hash. Bounded, so a long session editing
+/// its way through a book does not keep every version of every paragraph.
+static PIECE_CACHE: LazyLock<Mutex<HashMap<u64, Vec<Issue>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+const PIECE_CACHE_MAX: usize = 4096;
+
+fn piece_hash(text: &str, generation: u64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    // Ignoring a word changes what counts as a misspelling, so answers from
+    // before that must not be reused after it.
+    generation.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Lint `text` as a Typst document, returning spelling + grammar/style issues
 /// sorted by position.
 pub fn lint(text: &str) -> Vec<Issue> {
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    let generation = IGNORED_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
+    let cuts = pieces(text);
+
+    // Parsing a document once is much cheaper than parsing each of its
+    // paragraphs, so a document nobody has seen before goes through in one
+    // piece — and its answers are then filed under the paragraphs they came
+    // from, which is what makes the next pass cost one paragraph.
+    let known = {
+        let cache = PIECE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        cuts.iter().filter(|(from, to)| cache.contains_key(&piece_hash(&text[*from..*to], generation))).count()
+    };
+    if cuts.len() > 4 && known * 2 < cuts.len() {
+        let whole = lint_piece(text);
+        let mut cache = PIECE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() + cuts.len() >= PIECE_CACHE_MAX {
+            cache.clear();
+        }
+        let mut at = 0usize; // characters consumed up to the start of this piece
+        let mut rest = whole.as_slice();
+        for (from, to) in &cuts {
+            let piece = &text[*from..*to];
+            let shift = text[..*from].chars().count();
+            let len = piece.chars().count();
+            // Issues are sorted, so walk them alongside the pieces.
+            let taken = rest.iter().take_while(|i| i.start < shift + len).count();
+            let (mine, tail) = rest.split_at(taken);
+            rest = tail;
+            let owned: Vec<Issue> = mine
+                .iter()
+                .filter(|i| i.start >= shift && i.end <= shift + len)
+                .map(|i| Issue { start: i.start - shift, end: i.end - shift, ..i.clone() })
+                .collect();
+            cache.insert(piece_hash(piece, generation), owned);
+            at = shift + len;
+        }
+        let _ = at;
+        return whole;
+    }
+
+    let mut out: Vec<Issue> = Vec::new();
+    for (from, to) in cuts {
+        let piece = &text[from..to];
+        if piece.trim().is_empty() {
+            continue;
+        }
+        let key = piece_hash(piece, generation);
+        let cached = PIECE_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
+        let found = match cached {
+            Some(hit) => hit,
+            None => {
+                let fresh = lint_piece(piece);
+                let mut cache = PIECE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+                if cache.len() >= PIECE_CACHE_MAX {
+                    cache.clear();
+                }
+                cache.insert(key, fresh.clone());
+                fresh
+            }
+        };
+        // Offsets come back relative to the piece; the caller wants them in the
+        // document. Both are counted in characters, not bytes.
+        let shift = text[..from].chars().count();
+        out.extend(found.into_iter().map(|issue| Issue {
+            start: issue.start + shift,
+            end: issue.end + shift,
+            ..issue
+        }));
+    }
+    out.sort_by(|a, b| a.start.cmp(&b.start).then(a.end.cmp(&b.end)));
+    out
+}
+
+/// Lint one self-contained stretch of a document. Callers go through `lint`,
+/// which cuts the document up and keeps the answers.
+fn lint_piece(text: &str) -> Vec<Issue> {
     let mut issues: Vec<Issue> = Vec::new();
     if text.trim().is_empty() {
         return issues;
@@ -216,8 +368,12 @@ pub fn lint(text: &str) -> Vec<Issue> {
             continue;
         }
         // Require true adjacency: only whitespace between them (so "play. Play"
-        // across a sentence boundary isn't flagged).
-        if source[a.1..b.0].iter().any(|c| !c.is_whitespace()) {
+        // across a sentence boundary isn't flagged), and not across a blank
+        // line — a paragraph ending on the word the next one opens with is not
+        // a typo, and it is also the one thing a piece read on its own could
+        // not see.
+        let between: String = source[a.1..b.0].iter().collect();
+        if between.chars().any(|c| !c.is_whitespace()) || between.contains("\n\n") {
             continue;
         }
         let wa = a.2.to_lowercase();
@@ -274,6 +430,7 @@ pub fn add_ignored_word(word: &str) {
         if !g.insert(w.clone()) {
             return; // already present
         }
+        IGNORED_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     let path = user_dict_path();
     if let Some(parent) = path.parent() {
@@ -394,3 +551,62 @@ mod tests {
         assert!(!issues.is_empty(), "a document this size should raise something");
     }
 }
+
+#[cfg(test)]
+mod incremental_tests {
+    use super::*;
+
+    // Cutting the document up must not change what the checker finds. The pieces
+    // are linted alone; if a cut fell inside a code fence or a display formula,
+    // that piece would be read as prose and this would show it.
+    #[test]
+    fn pieces_find_what_the_whole_document_finds() {
+        let text = "\
+#set text(lang: \"en\")
+
+A paragraph with a mispeling in it.
+
+```python
+# teh comment inside a fence is not prose
+print(\"hello\")
+```
+
+$
+  I_nu = kappa_0 (nu\\/nu_0)^beta Sigma B_nu (T).
+$
+
+Another paragraph, with an the double article.
+
+= A heading <sec:one>
+
+Final paragraph mentioning teh same typo twice, teh same typo.
+";
+        let whole = lint_piece(text);
+        let chunked = lint(text);
+        let key = |list: &Vec<Issue>| {
+            let mut v: Vec<(usize, usize, String)> =
+                list.iter().map(|i| (i.start, i.end, i.text.clone())).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(key(&chunked), key(&whole),
+            "piece-wise lint disagreed with the whole-document lint");
+    }
+
+    #[test]
+    fn a_cut_never_falls_inside_a_block() {
+        let text = "one\n\n```\nfenced\n\nstill fenced\n```\n\ntwo\n\n$\n  a\n\n  b\n$\n\nthree\n";
+        let cuts = pieces(text);
+        for (from, to) in &cuts {
+            let piece = &text[*from..*to];
+            assert_eq!(piece.matches("```").count() % 2, 0,
+                "a piece ended inside a fence: {piece:?}");
+        }
+        // The fenced block and the formula each stay in one piece.
+        assert!(cuts.iter().any(|(f, t)| text[*f..*t].contains("still fenced")
+            && text[*f..*t].starts_with("```")));
+        assert!(cuts.iter().any(|(f, t)| text[*f..*t].starts_with('$')
+            && text[*f..*t].contains("  b")));
+    }
+}
+
