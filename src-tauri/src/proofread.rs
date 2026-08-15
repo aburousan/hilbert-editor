@@ -59,6 +59,13 @@ thread_local! {
     static LINTER: RefCell<LintGroup> = RefCell::new({
         let mut l = LintGroup::new_curated(FstDictionary::curated(), Dialect::American);
         l.set_all_rules_to(Some(true));
+        // Everything except the thesaurus rule. Its suggestions ("a livelier
+        // word than `good`") are dropped further down as noise for technical
+        // prose, but leaving the rule on still made harper unpack its
+        // thesaurus — and in 2.8 that unpacking asks zstd for a 128 MB window
+        // against a 100 MB limit and panics. That panic is what took the whole
+        // editor down the moment proofreading was switched on.
+        l.config.set_rule_enabled("BoringWords", false);
         l
     });
 }
