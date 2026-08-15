@@ -4,7 +4,7 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
-## 0.1.21
+## 0.2.0
 
 Notebook code now runs inside a real sandbox. You can write right-to-left. Plots
 can be vectors, not just pixels, and updating no longer looks like it has hung.
