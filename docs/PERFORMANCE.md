@@ -15,8 +15,8 @@ python scripts/bench_plot.py  # writes docs/performance.png
 Test machine: Apple Silicon (arm64), macOS 15, release build, Typst 0.15.0. Averages
 over 5 to 20 iterations per figure. Re-run before each release.
 
-Section 3 was measured separately on an Apple M2 (8 cores, 8 GB, macOS 26.6.1) against
-a real paper rather than a generated one, with Typst 0.15.1.
+Section 3 was measured separately against a real paper rather than a generated one, on
+an Apple M2 laptop and on a Xeon E3-1220 v5 server, both with Typst 0.15.1.
 
 ---
 
@@ -95,26 +95,42 @@ document somebody actually wrote — a physics note with the mixture that goes w
 | Figures | 12 (PNG) |
 | Sections in the outline | 47 |
 
+Run on two machines, both release builds, both Typst 0.15.1:
+
+| | laptop | server |
+|---|---|---|
+| | Apple M2, 8 cores, 8 GB | Xeon E3-1220 v5, 4 cores @ 3.0 GHz, 31 GB |
+| | macOS 26.6.1 | Ubuntu 22.04 |
+
+| Metric | laptop | server |
+|---|---:|---:|
+| Typst compile, warm | **0.26 s** | **0.66 s** |
+| Typst compile, cold | 0.67 s | 0.93 s |
+| Proofread, first call (dictionaries) | 0.4 s | 0.7 s |
+| Proofread, whole paper, first pass | 2.1 s | 3.8 s |
+| Proofread, whole paper, warm | **0.7–0.8 s** | **1.4 s** |
+| Issues found | 300 | 300 |
+| Backend RSS after proofreading | 257 MB | 253 MB |
+
+The four-year-old Xeon lands within a factor of two of the M2 on every figure and uses
+the same memory, which is the useful thing to know: the work is single-threaded and
+cache-friendly rather than something a bigger machine fixes. A server with more RAM
+buys nothing here — 8 GB is enough, and the 250 MB is the dictionaries.
+
+These are laptop-only, measured through the dev server with a debug backend, so they
+are the pessimistic end of what the app does:
+
 | Metric | Value |
 |---|---|
-| Typst compile, warm | **0.26 s** |
-| Typst compile, cold | 0.67 s |
 | Editor usable | 1.5 s |
 | First PDF page on screen | 2.7 s |
 | Keystroke to a repainted preview | 2.5 s |
 | Typing 200 characters | 444 ms, i.e. **2.2 ms per character** |
-| Proofread, first call (dictionaries) | 0.4 s |
-| Proofread, whole paper, first pass | **2.1 s** |
-| Proofread, whole paper, warm | **0.7–0.8 s** (300 issues) |
-| Backend RSS after proofreading | 257 MB |
 
-The two startup figures and the typing latency come from the dev server with a debug
-backend, so they are the pessimistic end; everything else is the release binary.
-
-That distinction is not pedantic. A debug build lints the same paper in **7 s** against
-the release build's 0.8 s — a factor of ten — and measuring the wrong one has already
-sent this project chasing an imaginary performance problem while missing a real crash
-sitting in the release build's log. Benchmark what ships.
+That debug-versus-release distinction is not pedantic. A debug build lints the same
+paper in **7 s** against the release build's 0.8 s — a factor of ten — and measuring the
+wrong one has already sent this project chasing an imaginary performance problem while
+missing a real crash sitting in the release build's log. Benchmark what ships.
 
 ---
 
