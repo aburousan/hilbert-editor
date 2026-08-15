@@ -4,8 +4,11 @@ import { API } from '../api';
 // One unified plot engine — replaces the four separate plot menu items with a
 // single tool. Built-in modes generate cetz / cetz-plot code (2D functions, 2D
 // data, 3D surface); the two heavy interactive tools (rotatable 3D studio,
-// Python/matplotlib) are launched from here so everything lives under one roof.
-type Mode = 'fn' | 'data' | 'surf' | 'interactive' | 'python';
+// rotatable 3D view) is launched from here so everything lives under one roof.
+// Plotting through Python or Julia is not one of these: a notebook cell already
+// runs the code and drops the figure in, and a second way in led to two places
+// to look for the same thing.
+type Mode = 'fn' | 'data' | 'surf' | 'interactive';
 type FnKind = 'explicit' | 'implicit' | 'parametric';
 type DataKind = 'line' | 'scatter' | 'bar';
 
@@ -14,20 +17,18 @@ const MODES: { key: Mode; label: string }[] = [
   { key: 'data', label: '2D Data' },
   { key: 'surf', label: '3D Surface' },
   { key: 'interactive', label: '3D Interactive' },
-  { key: 'python', label: 'From Python' },
 ];
 
 const CETZ = '#import "@preview/cetz:0.3.4"';
 const PLOT = '#import "@preview/cetz-plot:0.1.1": plot';
 
-export default function PlotStudio({ onClose, onInsert, onEnsureSetup, onOpenInteractive, onOpenPython }: {
+export default function PlotStudio({ onClose, onInsert, onEnsureSetup, onOpenInteractive }: {
   onClose: () => void;
   onInsert: (code: string) => void;
   // When provided, imports are hoisted to the top of the document (added once)
   // instead of being pasted inline at the cursor.
   onEnsureSetup?: (marker: string, block: string) => void;
   onOpenInteractive: () => void;
-  onOpenPython: () => void;
 }) {
   const [mode, setMode] = useState<Mode>('fn');
   // 2D function
@@ -291,7 +292,7 @@ export default function PlotStudio({ onClose, onInsert, onEnsureSetup, onOpenInt
             <>
               {field('z = f(x, y)', <input type="text" value={surfExpr} onChange={e => setSurfExpr(e.target.value)} placeholder="calc.sin(calc.sqrt(x*x + y*y))" />)}
               {field('Range (± on x and y)', <input type="text" value={surfRange} onChange={e => setSurfRange(e.target.value)} placeholder="4" />)}
-              <div className="form-hint">A wireframe surface via <code>cetz</code>. For a shaded, rotatable surface use <b>3D Interactive</b> or <b>From Python</b>.</div>
+              <div className="form-hint">A wireframe surface via <code>cetz</code>. For a shaded, rotatable surface use <b>3D Interactive</b>; for anything beyond that, run the plot in a Python or Julia cell and insert the figure it produces.</div>
             </>
           )}
 
@@ -299,13 +300,6 @@ export default function PlotStudio({ onClose, onInsert, onEnsureSetup, onOpenInt
             <div style={{ padding: '10px 2px' }}>
               <div className="form-hint" style={{ marginBottom: 12 }}>Rotate a real 3D surface to the exact angle you want, then insert that view as an image. Best for presentation-quality figures.</div>
               <button className="btn-primary" onClick={() => { onClose(); onOpenInteractive(); }}>Open 3D Interactive Studio →</button>
-            </div>
-          )}
-
-          {mode === 'python' && (
-            <div style={{ padding: '10px 2px' }}>
-              <div className="form-hint" style={{ marginBottom: 12 }}>Full control with Python / matplotlib — surfaces, heatmaps, anything. Runs your code and drops the figure into the document.</div>
-              <button className="btn-primary" onClick={() => { onClose(); onOpenPython(); }}>Open Python plot runner →</button>
             </div>
           )}
 

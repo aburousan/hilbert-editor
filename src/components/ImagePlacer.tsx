@@ -13,8 +13,12 @@ import { useState, useEffect, useMemo } from 'react';
  */
 
 const WRAP_IMPORT = '#import "@preview/wrap-it:0.1.1": wrap-content\n';
+// Two pictures rarely have the same aspect ratio, so setting both to the same
+// width leaves one taller than the other. oasis-align solves for the widths
+// that make their heights match, which is the part nobody wants to do by hand.
+const ALIGN_IMPORT = '#import "@preview/oasis-align:0.4.0": oasis-align-figures, oasis-align-images\n';
 
-type Flow = 'wrap-left' | 'wrap-right' | 'below' | 'float-top' | 'float-bottom' | 'full' | 'free';
+type Flow = 'wrap-left' | 'wrap-right' | 'below' | 'float-top' | 'float-bottom' | 'full' | 'free' | 'pinned' | 'pair';
 
 const PAPERS: Record<string, { label: string; ratio: number }> = {
   'a4': { label: 'A4', ratio: 595.28 / 841.89 },
@@ -24,7 +28,7 @@ const PAPERS: Record<string, { label: string; ratio: number }> = {
 
 // Sensible default width (% of text block) when switching mode.
 const DEFAULT_WIDTH: Record<Flow, number> = {
-  'wrap-left': 38, 'wrap-right': 38, 'below': 60, 'float-top': 60, 'float-bottom': 60, 'full': 100, 'free': 38,
+  'wrap-left': 38, 'wrap-right': 38, 'below': 60, 'float-top': 60, 'float-bottom': 60, 'full': 100, 'free': 38, 'pinned': 38, 'pair': 100,
 };
 
 
@@ -70,6 +74,8 @@ export default function ImagePlacer({
   const [paper, setPaper] = useState('a4');
   // Free-position offset as a fraction (0..1) of the text area, from its top-left.
   const [pos, setPos] = useState({ x: 0.32, y: 0.30 });
+  const [imgPath2, setImgPath2] = useState('images/figure2.png');
+  const [caption2, setCaption2] = useState('The other one');
   const [dragging, setDragging] = useState(false);
 
   // Sync initial width to the parsed flow default on first render.
@@ -99,6 +105,8 @@ export default function ImagePlacer({
       case 'float-bottom': return { x: pad + (areaW - iw) / 2, y: PH - pad - ih, w: iw, h: ih };
       case 'full':       return { x: pad, y: pad + areaH * 0.30, w: areaW, h: ih };
       case 'free':       return { x: pad + pos.x * areaW, y: pad + pos.y * areaH, w: iw, h: ih };
+      case 'pinned':     return { x: pad + pos.x * areaW, y: pad + pos.y * areaH, w: iw, h: ih };
+      case 'pair':       return { x: pad, y: pad + areaH * 0.30, w: areaW, h: Math.min(areaH * 0.34, areaW * 0.30) };
       default:           return { x: pad + (areaW - iw) / 2, y: pad + areaH * 0.30, w: iw, h: ih }; // below
     }
   })();
@@ -121,7 +129,7 @@ export default function ImagePlacer({
     // A line overlaps the image if its bottom is below the image's top AND its top is above the image's bottom
     const within = (y + lineH) > img.y && y < (img.y + img.h);
     // Block modes (below/float/full): skip lines that fall inside the image band.
-    if (within && (flow === 'below' || flow === 'float-top' || flow === 'float-bottom' || flow === 'full')) return null;
+    if (within && (flow === 'below' || flow === 'float-top' || flow === 'float-bottom' || flow === 'full' || flow === 'pair' || flow === 'pinned')) return null;
     
     let x = pad, w = areaW;
     if (within) {
@@ -146,6 +154,9 @@ export default function ImagePlacer({
     return { y, x, w: Math.max(w, 6) };
   }).filter(Boolean) as { y: number; x: number; w: number }[];
 
+  // The two modes you position by hand.
+  const draggable = flow === 'free' || flow === 'pinned';
+
   const onPageClick = (e: React.MouseEvent<HTMLDivElement>) => {
     const r = e.currentTarget.getBoundingClientRect();
     const rx = (e.clientX - r.left) / r.width;
@@ -163,6 +174,28 @@ export default function ImagePlacer({
       ? bodyText.replace(/\n/g, '\n    ')
       : '// Replace this with the text that should wrap around the figure.\n    #lorem(60)';
     let code: string;
+    if (flow === 'pinned') {
+      // Where it was dropped, in percentages of the text area, measured from
+      // the top-left corner. `place` does not reserve any space, so the text
+      // runs underneath — the white backing keeps the picture readable.
+      const dx = `${Math.round(pos.x * 100)}%`;
+      const dy = `${Math.round(pos.y * 100)}%`;
+      const inner = caption.trim() ? fig : image;
+      code = `#place(\n  top + left,\n  dx: ${dx}, dy: ${dy},\n  block(fill: white, ${inner}),\n)\n`;
+      onInsert(code);
+      onClose();
+      return;
+    }
+    if (flow === 'pair') {
+      onEnsureImport(ALIGN_IMPORT);
+      const both = caption.trim() || caption2.trim();
+      const one = caption.trim() ? `figure(image("${imgPath}"), caption: [${caption}])` : `image("${imgPath}")`;
+      const two = caption2.trim() ? `figure(image("${imgPath2}"), caption: [${caption2}])` : `image("${imgPath2}")`;
+      code = `#${both ? 'oasis-align-figures' : 'oasis-align-images'}(\n  padding: 1em,\n  ${one},\n  ${two},\n)\n`;
+      onInsert(code);
+      onClose();
+      return;
+    }
     if (flow === 'wrap-left' || flow === 'wrap-right' || flow === 'free') {
       onEnsureImport(WRAP_IMPORT);
       let al: string;
@@ -194,6 +227,8 @@ export default function ImagePlacer({
     { key: 'float-bottom', label: 'Float to bottom' },
     { key: 'full', label: 'Full width' },
     { key: 'free', label: 'Free — drag anywhere' },
+    { key: 'pinned', label: 'Pinned — exact spot' },
+    { key: 'pair', label: 'Side by side — equal heights' },
   ];
   const hints: Record<Flow, React.ReactNode> = {
     'wrap-right': <>Text flows around the image, which sits at the <b>top-right</b>. Uses the <code>wrap-it</code> package — you type the wrapping text into the placeholder.</>,
@@ -203,6 +238,8 @@ export default function ImagePlacer({
     'float-bottom': <>The figure <b>floats to the bottom</b> of its page; body text fills the space above.</>,
     'full': <>The image spans the <b>full text width</b> on its own line — good for wide plots and diagrams.</>,
     'free': <><b>Drag the image anywhere</b> — text wraps around it using <code>wrap-it</code>, automatically aligning based on where you drag it.</>,
+    'pinned': <><b>Drag it to the exact spot</b> and it stays there — <code>place</code> with the offsets you dropped it at, measured from the top-left of the text area. The text does not move out of the way, so this is for margins, corners and overlays.</>,
+    'pair': <>Two images <b>side by side with the same height</b>, using the <code>oasis-align</code> package. It works out the widths for you, which matching aspect ratios by hand never quite does.</>,
   };
 
   return (
@@ -218,11 +255,11 @@ export default function ImagePlacer({
             {/* ---------- Live page preview ---------- */}
             <div style={{ flex: '0 0 auto', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
               <div
-                onClick={flow === 'free' ? undefined : onPageClick}
-                onMouseDown={flow === 'free' ? (e) => { setDragging(true); posFromEvent(e); } : undefined}
-                onMouseMove={flow === 'free' && dragging ? posFromEvent : undefined}
-                onMouseUp={flow === 'free' ? () => setDragging(false) : undefined}
-                onMouseLeave={flow === 'free' ? () => setDragging(false) : undefined}
+                onClick={draggable ? undefined : onPageClick}
+                onMouseDown={draggable ? (e) => { setDragging(true); posFromEvent(e); } : undefined}
+                onMouseMove={draggable && dragging ? posFromEvent : undefined}
+                onMouseUp={draggable ? () => setDragging(false) : undefined}
+                onMouseLeave={draggable ? () => setDragging(false) : undefined}
                 title={flow === 'free' ? 'Drag the image anywhere' : flow.startsWith('wrap') ? 'Click left/right to move the image' : flow.startsWith('float') ? 'Click top/bottom to move the image' : undefined}
                 style={{
                   position: 'relative', width: PW, height: PH, background: 'var(--bg-color)',
@@ -302,10 +339,30 @@ export default function ImagePlacer({
                 <span>Caption</span>
                 <input type="text" value={caption} onChange={e => setCaption(e.target.value)} placeholder="Figure caption" />
               </label>
-              <label className="form-field">
-                <span>Width — {width}% of the text block</span>
-                <input type="range" min={15} max={100} step={1} value={width} onChange={e => setWidth(Number(e.target.value))} />
-              </label>
+              {flow === 'pair' ? (
+                <>
+                  <label className="form-field">
+                    <span>Second image</span>
+                    {workspaceImages.length > 0 ? (
+                      <select value={imgPath2} onChange={e => setImgPath2(e.target.value)}>
+                        {workspaceImages.map(p2 => <option key={p2} value={p2}>{p2}</option>)}
+                        {!workspaceImages.includes(imgPath2) && <option value={imgPath2}>{imgPath2}</option>}
+                      </select>
+                    ) : (
+                      <input type="text" value={imgPath2} onChange={e => setImgPath2(e.target.value)} placeholder="images/figure2.png" />
+                    )}
+                  </label>
+                  <label className="form-field">
+                    <span>Second caption</span>
+                    <input type="text" value={caption2} onChange={e => setCaption2(e.target.value)} placeholder="leave blank for a plain image" />
+                  </label>
+                </>
+              ) : (
+                <label className="form-field">
+                  <span>Width — {width}% of the text block</span>
+                  <input type="range" min={15} max={100} step={1} value={width} onChange={e => setWidth(Number(e.target.value))} />
+                </label>
+              )}
 
               <div className="form-hint">{hints[flow]}</div>
               {(flow === 'wrap-left' || flow === 'wrap-right') && (
