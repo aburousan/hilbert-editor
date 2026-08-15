@@ -18,14 +18,16 @@ export function setupTypstLanguage(monacoInstance: any) {
   monacoInstance.languages.setLanguageConfiguration(languageId, {
     comments: { lineComment: '//', blockComment: ['/*', '*/'] },
     brackets: [['{', '}'], ['[', ']'], ['(', ')']],
+    // Brackets close themselves; the markup pairs do not. In prose a quote is
+    // usually a quote — Hebrew writes its gershayim that way, as in התשפ"ו, and
+    // getting `""` for it is wrong every time — and a dollar typed mid-sentence
+    // is as often the end of a formula as the start of one. They stay in
+    // surroundingPairs below, so selecting a phrase and pressing `"` or `$`
+    // still wraps it, which is the case where the second character is wanted.
     autoClosingPairs: [
       { open: '{', close: '}' },
       { open: '[', close: ']' },
-      { open: '(', close: ')' },
-      { open: '"', close: '"' },
-      { open: '$', close: '$' },
-      { open: '*', close: '*' },
-      { open: '_', close: '_' }
+      { open: '(', close: ')' }
     ],
     surroundingPairs: [
       { open: '{', close: '}' },
@@ -52,6 +54,13 @@ export function setupTypstLanguage(monacoInstance: any) {
         // comments
         [/\/\/.*$/, 'comment'],
         [/\/\*/, 'comment', '@comment'],
+
+        // An escape is one character standing for itself, and it has to be read
+        // before anything else: without this `\"` opens a string that runs to
+        // the end of the paragraph, and `\$` opens a formula that does the
+        // same, which is how a full stop after `a fish\".` came out green.
+        [/\\u\{[0-9a-fA-F]+\}/, 'escape'],
+        [/\\./, 'escape'],
 
         // headings (= , ==, ...)
         [/^\s*=+\s.*$/, 'heading'],
@@ -127,6 +136,7 @@ export function setupTypstLanguage(monacoInstance: any) {
         { token: 'string', foreground: '86efac' },
         { token: 'string.quote', foreground: '86efac' },
         { token: 'string.escape', foreground: 'fca5a5' },
+        { token: 'escape', foreground: 'cbd5e1' },
         { token: 'number', foreground: 'fda4af' },
         { token: 'strong', foreground: 'f8fafc', fontStyle: 'bold' },
         { token: 'emph', foreground: 'cbd5e1', fontStyle: 'italic' },
@@ -148,6 +158,8 @@ export function setupTypstLanguage(monacoInstance: any) {
         { token: 'label', foreground: 'b45309' },
         { token: 'string', foreground: '15803d' },
         { token: 'string.quote', foreground: '15803d' },
+        { token: 'string.escape', foreground: 'b91c1c' },
+        { token: 'escape', foreground: '475569' },
         { token: 'number', foreground: 'be123c' },
         { token: 'strong', foreground: '0f172a', fontStyle: 'bold' },
         { token: 'emph', foreground: '334155', fontStyle: 'italic' },

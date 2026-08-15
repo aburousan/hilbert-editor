@@ -600,7 +600,7 @@ function PdfPreview(
       const { words, spans } = wordIndexFor(pages);
       if (!words.length) return false;
       const prior = Math.round(p.docFraction * words.length);
-      const res = bestMatch(words, p.words, p.focus, prior);
+      const res = bestMatch(words, p.words, p.focus, prior, p.repeat);
       if (!res) return false;
       const span = spans[res.index];
       if (!span) return false;

@@ -455,6 +455,31 @@ type SessionState = {
   pdfView?: PdfViewState;
 };
 
+// Where a word stands among its own repeats in the file. A document that says
+// the same thing twice — a heading and then the sentence under it — gives the
+// matcher two candidates its context test cannot separate, and the guess from
+// how far down the file the cursor sits picks between them by eye. Counting is
+// exact whenever the PDF holds the word the same number of times.
+function wordRepeat(model: any, line: number, token: { w: string; offset: number }) {
+  let index = 0;
+  let count = 0;
+  for (let at = 1; at <= model.getLineCount(); at++) {
+    for (const found of tokenizeLine(model.getLineContent(at))) {
+      if (found.w !== token.w) continue;
+      if (at < line || (at === line && found.offset < token.offset)) index++;
+      count++;
+    }
+  }
+  return { index, count };
+}
+
+// A blob URL nobody should be reading any more. The delay is for the reader
+// that has not noticed yet — pdf.js keeps fetching the document it was given
+// until it is handed another one.
+function releaseLater(url: string) {
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
 export default function App() {
   const editorRef = useRef<any>(null);
   // Bumped every time a new Monaco editor mounts. Focusing an image or a PDF
@@ -1025,8 +1050,12 @@ export default function App() {
   const isResizingProblems = useRef(false);
   const problemsResizeStart = useRef({ y: 0, height: 0 });
   const sidebarRef = useRef<HTMLDivElement | null>(null);
-  const resizeLayoutRef = useRef({ sidebarVisible, sidebarWidth });
-  resizeLayoutRef.current = { sidebarVisible, sidebarWidth };
+  // Under the right-to-left setting the whole editor is mirrored, not just the
+  // text in it: the writing starts at the window's right edge, which is where
+  // the line numbers, the panes and the scrollbar have to make room for it.
+  const mirrored = editorTextDir === 'rtl';
+  const resizeLayoutRef = useRef({ sidebarVisible, sidebarWidth, mirrored });
+  resizeLayoutRef.current = { sidebarVisible, sidebarWidth, mirrored };
   const toggleNumberingRef = useRef<() => void>(() => {});
   const toggleCommentRef = useRef<() => void>(() => {});
 
@@ -1311,12 +1340,15 @@ export default function App() {
       if (isResizingSidebar.current) {
         setSidebarWidth(Math.max(150, Math.min(point.x, 600)));
       } else if (isResizingEditor.current) {
-        const { sidebarVisible: sidebarIsVisible, sidebarWidth: currentSidebarWidth } = resizeLayoutRef.current;
+        const { sidebarVisible: sidebarIsVisible, sidebarWidth: currentSidebarWidth, mirrored: isMirrored } = resizeLayoutRef.current;
         const offset = (sidebarIsVisible ? currentSidebarWidth : 0) + 5;
         // Leave room for the sidebar, both resizers and a minimum preview width so
         // the PDF pane (and its toolbar) never gets pushed off-screen.
         const maxEditor = window.innerWidth - offset - 5 - 320;
-        setEditorWidth(Math.max(200, Math.min(point.x - offset, maxEditor)));
+        // Mirrored, the editor is the pane on the right, so it grows as the
+        // handle moves left rather than right.
+        const wanted = isMirrored ? window.innerWidth - point.x - 5 : point.x - offset;
+        setEditorWidth(Math.max(200, Math.min(wanted, maxEditor)));
       } else if (isResizingTree.current) {
         const top = sidebarRef.current?.getBoundingClientRect().top ?? 0;
         const total = sidebarRef.current?.clientHeight ?? 600;
@@ -1902,7 +1934,11 @@ export default function App() {
 
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
-      setPdfUrl(prev => { if (prev) URL.revokeObjectURL(prev); return url; });
+      // Let go of the old one a moment later, not now: the viewer may still be
+      // reading it. Revoking under a load in flight makes the browser fail that
+      // request outright, which is a preview that goes blank between compiles
+      // rather than one that changes over.
+      setPdfUrl(prev => { if (prev) releaseLater(prev); return url; });
       setErrorLogs(null);
       setCompileError(null);
 
@@ -2203,7 +2239,7 @@ export default function App() {
         if (!blob.size) return;
         const url = URL.createObjectURL(blob);
         // A compile may have finished while this fetch ran — its result wins.
-        setPdfUrl(prev => { if (prev) { URL.revokeObjectURL(url); return prev; } return url; });
+        setPdfUrl(prev => { if (prev) { releaseLater(url); return prev; } return url; });
       } catch {}
     })();
   }, [backendReady]);
@@ -2923,7 +2959,7 @@ export default function App() {
     loadedDirsRef.current.clear();
     setHistory([]);
     setErrorLogs(null);
-    setPdfUrl(prev => { if (prev) URL.revokeObjectURL(prev); return null; });
+    setPdfUrl(prev => { if (prev) releaseLater(prev); return null; });
     if (projectDisplayName) setProjectName(projectDisplayName);
     const tree: FileNode[] = await (await fetch(`${API}/workspace`)).json();
     setFileTree(tree);
@@ -4978,7 +5014,10 @@ export default function App() {
     let focus = 0, bestD = Infinity;
     const anchorCol = line === pos.lineNumber ? pos.column : 1;
     toks.forEach((t, i) => { const d = Math.abs(t.offset + 1 - anchorCol); if (d < bestD) { bestD = d; focus = i; } });
-    const ok = pdfRef.current.revealSource({ words: toks.map(t => t.w), focus, docFraction: (line - 0.5) / total });
+    const ok = pdfRef.current.revealSource({
+      words: toks.map(t => t.w), focus, docFraction: (line - 0.5) / total,
+      repeat: wordRepeat(model, line, toks[focus]),
+    });
     if (!ok) setErrorLogs('Couldn’t find this line in the current PDF. Recompile if the preview is stale.');
   }, [getCompiledMathMap]);
 
@@ -6613,7 +6652,7 @@ export default function App() {
         </div>
       </div>
 
-      <div className="workspace" style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+      <div className={`workspace${mirrored ? ' mirrored' : ''}`} style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         {sidebarVisible && (
           <>
             <div ref={sidebarRef} className="sidebar" style={{ width: sidebarWidth, minWidth: sidebarWidth, maxWidth: sidebarWidth, flex: 'none', display: 'flex', flexDirection: 'column' }}>
@@ -6687,11 +6726,26 @@ export default function App() {
                   {outline.length === 0 && (
                     <div style={{ color: 'var(--text-muted)', fontSize: '12px', textAlign: 'center', marginTop: '20px' }}>No headings found.</div>
                   )}
-                  {outline.map((item, i) => (
-                    <div key={i} onClick={() => jumpToLine(item.line)} style={{ padding: '4px 0', paddingLeft: `${(item.level - 1) * 12}px`, cursor: 'pointer', fontSize: '13px', color: 'var(--text-main)', borderBottom: '1px solid transparent' }} className="outline-item">
-                      {item.text}
-                    </div>
-                  ))}
+                  {outline.map((item, i) => {
+                    // A Hebrew heading belongs against the right edge of the
+                    // list and an English one against the left, the same way
+                    // each reads in the file itself.
+                    const side = editorTextDir === 'auto'
+                      ? (HAS_RTL.test(item.text) ? lineDirection(item.text) : 'ltr')
+                      : editorTextDir;
+                    const indent = `${(item.level - 1) * 12}px`;
+                    return (
+                      <div key={i} onClick={() => jumpToLine(item.line)} dir={side} style={{
+                        padding: '4px 0', cursor: 'pointer', fontSize: '13px', color: 'var(--text-main)',
+                        borderBottom: '1px solid transparent',
+                        textAlign: side === 'rtl' ? 'right' : 'left',
+                        paddingLeft: side === 'rtl' ? 0 : indent,
+                        paddingRight: side === 'rtl' ? indent : 0,
+                      }} className="outline-item">
+                        {item.text}
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
               )}
@@ -6765,6 +6819,7 @@ export default function App() {
             : { flex: 1, minWidth: 0 }),
           display: panels.editor ? 'flex' : 'none',
           flexDirection: 'column',
+          order: mirrored ? 3 : 0,
         }}>
           <div className="tabs">
             {tabs.map(tab => (
@@ -6978,6 +7033,20 @@ export default function App() {
                         const before = model.getLineContent(pos.lineNumber).slice(0, pos.column - 1);
                         if (/\bimage\(\s*"[^"]*$/.test(before)) e.trigger('image-path', 'editor.action.triggerSuggest', {});
                       });
+                      // Double-clicking a word selects it and shows it in the
+                      // PDF, the way the same gesture works the other way round
+                      // already. Only for a click that landed on the text, so
+                      // double-clicking the gutter or a scrollbar does nothing,
+                      // and only while the preview is on screen.
+                      // The browser's own double-click, rather than Monaco's
+                      // mouse events: it reports the click count reliably, and
+                      // the editor has no double-click of its own to listen to.
+                      e.getDomNode()?.addEventListener('dblclick', (native: MouseEvent) => {
+                        const target = native.target;
+                        if (!(target instanceof Element) || !target.closest('.view-lines')) return;
+                        if (!pdfRef.current) return;
+                        forwardSyncRef.current();
+                      });
                       monacoInstance.editor.setTheme(theme);
                       e.updateOptions({ hover: { enabled: true, delay: 300 } });
                       e.addCommand(monacoInstance.KeyMod.CtrlCmd | monacoInstance.KeyCode.KeyY, () => e.trigger('keyboard', 'redo', null));
@@ -7029,14 +7098,14 @@ export default function App() {
           </div>
         </div>
         {panels.editor && panels.preview && (
-        <div className="resizer" onPointerDown={(e) => {
+        <div className="resizer" style={{ order: mirrored ? 2 : 0 }} onPointerDown={(e) => {
           e.preventDefault();
           isResizingEditor.current = true;
           document.body.style.cursor = 'col-resize';
           document.body.classList.add('is-resizing');
         }} />
         )}
-        <div className="preview-pane" style={{ flex: 1, minWidth: 0, overflow: 'hidden', display: panels.preview ? 'flex' : 'none', flexDirection: 'column', position: 'relative', backgroundColor: '#ffffff' }}>
+        <div className="preview-pane" style={{ flex: 1, minWidth: 0, overflow: 'hidden', display: panels.preview ? 'flex' : 'none', flexDirection: 'column', position: 'relative', backgroundColor: '#ffffff', order: mirrored ? 1 : 0 }}>
           <div style={{ flex: 1, minWidth: 0, position: 'relative', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
             {/* PDF stays mounted whenever it exists, so its scroll/zoom survive
                 switching to the Problems view and back. */}

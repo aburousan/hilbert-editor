@@ -10,6 +10,10 @@
 // a lone "the" occurs everywhere, but "the the cat sat" almost never does. When
 // the phrase can't be pinned down we say so (low score) rather than guess.
 
+// Which of a word's repeats this is, and how many there are in the document it
+// came from. Only useful when the other side has the same number.
+export type WordRepeat = { index: number; count: number };
+
 export type SyncPayload = {
   words: string[]; // normalized words around the focus, in reading order
   focus: number;   // index into `words` of the clicked / cursor word
@@ -21,6 +25,8 @@ export type SyncPayload = {
   // True when the clicked PDF span contains a mathematical glyph/operator.
   // Repeated formulas need their compiled coordinate to break text-match ties.
   mathHint?: boolean;
+  // Which repeat of the focus word this is, counted through the source.
+  repeat?: WordRepeat | null;
 };
 
 const WORD_RE = /[\p{L}\p{N}][\p{L}\p{N}\p{M}_'’-]*/gu;
@@ -119,7 +125,9 @@ function sideScore(hay: string[], phrase: string[], hayStart: number, phraseStar
 
 /**
  * Find the haystack index that best aligns with `phrase[focus]`.
- * `priorIndex` (if given) breaks ties toward the geometrically-expected spot.
+ * `priorIndex` (if given) breaks ties toward the geometrically-expected spot,
+ * and `repeat` settles them outright when both sides hold the same word the
+ * same number of times.
  * Returns null when the focus word doesn't occur in the haystack at all.
  */
 export function bestMatch(
@@ -127,6 +135,7 @@ export function bestMatch(
   phrase: string[],
   focus: number,
   priorIndex: number | null,
+  repeat?: WordRepeat | null,
 ): MatchResult | null {
   const target = phrase[focus];
   if (!target) return null;
@@ -134,6 +143,16 @@ export function bestMatch(
   const candidates: number[] = [];
   for (let i = 0; i < hay.length; i++) if (hay[i] === target) candidates.push(i);
   if (candidates.length === 0) return null;
+
+  // The same word, the same number of times on both sides: then the nth one
+  // here is the nth one there, and nothing else needs deciding. Repeated text
+  // is exactly where the surrounding words stop telling the candidates apart —
+  // `Hellow world` written twice scores the same both times — and where the
+  // guess from how far down the document it sits lands on the wrong one.
+  if (repeat && repeat.count === candidates.length && candidates[repeat.index] !== undefined) {
+    const index = candidates[repeat.index];
+    return { index, score: contextScore(hay, phrase, index, focus), ambiguous: false };
+  }
   if (candidates.length === 1) return { index: candidates[0], score: contextScore(hay, phrase, candidates[0], focus), ambiguous: false };
 
   let best = candidates[0];
