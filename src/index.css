@@ -1483,22 +1483,20 @@ body.is-resizing .editor-container {
    they come apart: `$1+1=2$` in a Hebrew line renders as `2$=$1+1`, the two
    dollar signs pulled into the middle of the sum.
 
-   embed rather than isolate, which is the tempting one. Monaco puts a
-   decoration's class on every token span the range covers, not on one span
-   around the range, so an isolate makes each token its own atom and the atoms
-   reorder against each other — the formula above came back reversed whole, as
-   `$2=1+1$`. Embedded runs at one level stay contiguous instead, so it stops
-   mattering how many spans the highlighter decided to use. The cost is that
-   two of these side by side in one right-to-left line order as runs rather
-   than as isolates, which swaps them; one island in a sentence, the ordinary
-   case, is identical either way.
-
-   Same specificity as the rule above and written after it, so a code span that
-   happens to contain Hebrew still gets this one. */
-.monaco-editor .view-line span.bidi-isolate {
-  direction: ltr !important;
-  unicode-bidi: embed !important;
-}
+   Each such stretch is fenced with the isolate characters themselves, drawn as
+   generated content at either end of it. Styling cannot do this job. Monaco
+   puts a decoration's class on every token span the range covers rather than
+   on one span around the whole range, so `unicode-bidi: isolate` makes each
+   token an atom and the atoms then reorder against each other — the formula
+   above came back reversed whole, as `$2=1+1$`. `embed` holds a stretch
+   together but lets two of them side by side merge into a single run, which
+   swaps them against what the standard says. Generated content counts as part
+   of the line to the bidi algorithm and as no part of it to the editor, so
+   these do their work without being in the document, without taking up width,
+   and without Monaco swapping them for a visible `[U+2066]` box the way it
+   does to an isolate that is really in the text. */
+.monaco-editor .view-line span.bidi-open::before { content: "\2066"; }
+.monaco-editor .view-line span.bidi-close::after { content: "\2069"; }
 
 /* Where an invisible character sits. It has no width of its own, so the
    hairline is a border rather than a background — enough to see that something

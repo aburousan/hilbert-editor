@@ -1154,7 +1154,14 @@ export default function App() {
           if (!segment.code) continue;
           decorations.push({
             range: new monaco.Range(line, segment.start + 1, line, segment.end + 1),
-            options: { description: 'bidi-isolate', inlineClassName: 'bidi-isolate' },
+            // An empty span at either end carries the isolate character as
+            // generated content, so the stretch is fenced by the character the
+            // standard uses rather than by a style that only approximates it.
+            options: {
+              description: 'bidi-isolate',
+              beforeContentClassName: 'bidi-open',
+              afterContentClassName: 'bidi-close',
+            },
           });
         }
       }

@@ -91,7 +91,10 @@ lives in the editor and never touches the file — a directional mark before
 Those Latin islands are also fenced off from the reordering itself, so a formula
 in a Hebrew sentence stays whole. `$1+1=2$` used to come back as `2$=$1+1`, its
 two dollar signs dragged into the middle of the sum; the same happened to
-`@labels`, raw spans and `#calls`. And an English line with one Hebrew word in it
+`@labels`, raw spans and `#calls`. Two of them next to each other keep their own
+order as well — a reference followed by its label, `@sec:intro <sec:intro>`, or
+two short formulas — which is the case where anything short of the real Unicode
+isolate gets it wrong. And an English line with one Hebrew word in it
 was being turned round in its entirety, `The word שלום here` reading as
 `here שלום The word`, because the editor let a syntax-highlighting token decide
 the direction of a whole line rather than the other way round.
