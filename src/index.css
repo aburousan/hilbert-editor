@@ -151,6 +151,13 @@ body {
   overflow: hidden;
 }
 
+/* No global scrollbar styling, deliberately. Both webviews here default to
+   overlay scrollbars that cost the layout nothing — measured at a 0px gutter in
+   WebKitGTK 2.50 — and styling `::-webkit-scrollbar` at all switches them to
+   custom ones that do take space. A rule meant to make bars tidier would take
+   twelve pixels from every panel in the app. Where a bar is genuinely in the
+   way, turn it off for that element (see `.tabs`). */
+
 .app-container {
   display: flex;
   flex-direction: column;
@@ -1678,7 +1685,19 @@ details > summary::-webkit-details-marker {
   background: var(--panel-bg);
   border-bottom: 1px solid var(--border-color);
   overflow-x: auto;
+  /* No scrollbar, in a 34-pixel-tall row where there is nowhere for one to go.
+     Which of the two ways it got in the way depends on the desktop: with GTK's
+     overlay scrolling on, the default, the bar is painted over the tabs and
+     lands across the close buttons; with it off, measured in WebKitGTK 2.50, it
+     takes 22 real pixels and the strip grows from 34 to 56. Both are the
+     "suddenly a scroll bar appears and I can't hit the tab" report. Scrolling
+     still works: the wheel is remapped in App.tsx and the active tab is kept in
+     view. Both properties are needed — the webkit one alone leaves Chromium's,
+     and `scrollbar-width` alone leaves WebKit's. */
+  scrollbar-width: none;
+  overscroll-behavior-x: contain;
 }
+.tabs::-webkit-scrollbar { display: none; }
 
 .tab {
   padding: 8px 16px;

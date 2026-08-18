@@ -4,6 +4,99 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.2.1
+
+### "File changed outside Hilbert" when nothing outside Hilbert had touched it
+
+Hilbert saves as you type, and it could have two saves of the same file in the
+air at once — the one compile-on-type started, and the one the next keystroke or
+a `Ctrl+S` started before the first had answered. The second carried a
+precondition the first had already made obsolete, and the server answers that
+the same way it answers a genuine outside edit. So the app announced that the
+file had changed outside Hilbert, showed you its own two versions to choose
+between — which is why the two panes looked identical — and offered to put the
+older one back.
+
+It took a slow write to make this common, which is why it was reported from a
+Google Drive folder: anything that holds a write for a moment, a synced folder,
+a network share, an antivirus filter driver, leaves the next save alongside the
+last one every time. On a plain local disk the window is narrow, which is why
+others saw it only now and then.
+
+Saves for one file now go one at a time, and only the newest one waiting is
+kept: the others were only going to write text it already contains. That also
+fixed a lag nobody had reported — with writes taking a second each, the file
+used to trail the editor by fifteen seconds after typing stopped, and now
+settles in one. The file-watcher no longer inspects a file while a save of our
+own is on its way to it, since the write reaches the disk before its reply
+reaches us and in that gap our own text looks like somebody else's.
+
+A real outside edit still stops and asks, and the version it offers to keep is
+now what is in the editor at that moment rather than a snapshot from when the
+save started — that snapshot could be a few keystrokes behind, so the button
+meant to protect your work could undo the last thing you typed.
+
+### Shared sessions no longer ask you to resolve your collaborators' text
+
+The same conflict prompt could appear during a shared session, where it made
+even less sense: everyone's edits are already merged in the buffer, so there
+were never two sides to choose between. A save rejected in a session was retried
+against the file's new hash, but in a session the file is being written by
+everybody, so it could change again before the retry landed — and that second
+rejection reached the person as a prompt. The session's buffer is now written
+straight out, which is the decision the app had already made. In a two-person
+test, twelve characters typed at once from each side: before, both people got
+the prompt and only half the text ever reached disk; now neither does and all of
+it does.
+
+### A scrollbar no longer lands on top of the document tabs
+
+Open enough files that the tabs overflow and moving the pointer over them made a
+horizontal scrollbar appear across the row, in a row thirty-four pixels tall
+with nowhere to put one. Which way it got in the way depends on the desktop:
+with GTK's overlay scrolling on, the default, the bar is painted over the tabs
+and comes down across the close buttons; with it off it takes twenty-two real
+pixels and pushes the strip to fifty-six. The bar is gone in both cases. The
+wheel scrolls the strip instead, and selecting a file that has scrolled out of
+sight brings it back into view.
+
+### Moving between open files without the mouse
+
+`Ctrl+Tab` steps forward through the open files and `Ctrl+Shift+Tab` back;
+`⌘/Ctrl+PageDown` and `PageUp` do the same, as does `⌘⌥←/→` on macOS. `⌘1` to
+`⌘8` jump straight to a file by position and `⌘9` is always the last one,
+wrapping round at either end. None of them fire while a dialog is open.
+
+### Slide Studio keeps up with long decks
+
+Moving anything on a slide used to re-render every thumbnail in the rail, so the
+cost of a drag grew with the size of the deck: at 120 slides a single frame took
+14 ms of a 16.7 ms budget, and it showed. Now only the slide being edited
+re-renders, and a drag costs the same whether the deck has six slides or a
+hundred and twenty — 6.3 ms at 120 slides, down from 14.1.
+
+Undo got two fixes along the way. Dragging a slider used to push one history
+entry per pixel of travel, so a single gesture flushed everything you had done
+before it out of the sixty-entry history; one drag is now one entry. And typing
+into an element on the canvas made no entry at all, so undo skipped straight
+past whatever you had written.
+
+### Two pictures, one height — on slides, and correctly
+
+The Slide Studio's Image tool now shows the actual picture rather than a hatched
+box with a filename in it, at the aspect ratio the file really has, so the
+rectangle you drag is the one that ends up on the slide. Pairing two images side
+by side at matching heights, which the document Image Placer gained in 0.2.0, is
+now on slides too, with a template to start from.
+
+The document version needed fixing while this was being built. It came out
+right only when both pictures happened to be more than 100pt wide — narrower
+ones measured at their own size, which threw off the widths and left the heights
+visibly unequal — and filling in only one of the two captions made the document
+fail to compile at all. Both are fixed.
+
+---
+
 ## 0.2.0
 
 Notebook code now runs inside a real sandbox. You can write right-to-left. Plots

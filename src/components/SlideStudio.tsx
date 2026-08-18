@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { API } from '../api';
 
 // Everything is measured in Typst page points: presentation-16-9 is
@@ -15,7 +15,10 @@ type Align = 'left' | 'center' | 'right';
 // before this existed have no field at all, and keep the default.
 type TextEl = { id: number, type: 'text', x: number, y: number, w: number, size: number, color: string, align: Align, text: string, font?: string };
 type MathEl = { id: number, type: 'math', x: number, y: number, size: number, color: string, tex: string, font?: string };
-type ImgEl = { id: number, type: 'image', x: number, y: number, w: number, path: string };
+// `path2` turns one picture into a pair laid out side by side at the same
+// height — the widths are solved from the two aspect ratios rather than set by
+// hand, which is the part that never comes out right when you eyeball it.
+type ImgEl = { id: number, type: 'image', x: number, y: number, w: number, path: string, path2?: string, gap?: number };
 type TypstEl = { id: number, type: 'typst', x: number, y: number, w: number, code: string };
 type HlEl = { id: number, type: 'hl', x: number, y: number, w: number, h: number, color: string };
 type ShapeEl = { id: number, type: 'rect' | 'ellipse', x: number, y: number, w: number, h: number, fill: string, stroke: string, sw: number, radius: number };
@@ -32,8 +35,75 @@ const typstAspect = new Map<number, number>();
 // Measured size (pt) of each math element's rendered preview — maths has no
 // user-set width, it is as wide as the typeset formula.
 const mathDim = new Map<number, { w: number, h: number }>();
+// height/width of each workspace image, learned the first time one loads.
+// Keyed by path, so the same picture on twenty slides is measured once, and the
+// box you drag matches the one Typst will draw instead of a guessed 0.68.
+const imgAspect = new Map<string, number>();
+const DEFAULT_ASPECT = 0.68;
+// A ratio outside this range means something went wrong in the measurement, and
+// letting it through would give the element a height of nearly zero — which is
+// also its hit area, so it could no longer be selected or deleted.
+const aspectOf = (path: string) => {
+  const measured = imgAspect.get(path);
+  return measured && measured > 0.02 && measured < 50 ? measured : DEFAULT_ASPECT;
+};
+const IMG_GAP = 10;
+
+// Two pictures at one height: w1·a1 = w2·a2 and w1 + gap + w2 = W.
+const pairWidths = (e: ImgEl) => {
+  const gap = e.gap ?? IMG_GAP;
+  const a1 = aspectOf(e.path), a2 = aspectOf(e.path2 || '');
+  const usable = Math.max(1, e.w - gap);
+  const w1 = usable / (1 + a1 / a2);
+  return { gap, w1, w2: usable - w1, h: w1 * a1 };
+};
 
 export type SlideCapture = { insert: (code: string) => void, ensure: (marker: string, rule: string) => void };
+
+const slideTitle = (item: Slide, index: number) => {
+  const text = item.els.find((element): element is TextEl => element.type === 'text')?.text;
+  const title = text?.split('\n').map(line => line.replace(/^[=* _-]+|[*_]$/g, '').trim()).find(Boolean);
+  return title || `Slide ${index + 1}`;
+};
+
+// One row of the slide rail. Dragging an element rewrites the current slide's
+// object and leaves every other slide's identity alone, so memoising on it
+// keeps a long rail from re-rendering itself sixty times a second while you
+// move a box. `previews` and `tick` are not read here — they are what `render`
+// depends on, and listing them is how the shallow comparison learns to let a
+// freshly compiled equation through.
+const RailItem = React.memo(function RailItem({ slide, index, current, render, onPick, onDragFrom, onDropOn }: {
+  slide: Slide,
+  index: number,
+  current: boolean,
+  render: (e: El) => React.ReactNode,
+  previews: Record<number, string>,
+  tick: number,
+  onPick: (index: number) => void,
+  onDragFrom: (index: number | null) => void,
+  onDropOn: (index: number) => void,
+}) {
+  return (
+    <div draggable
+      onDragStart={event => { onDragFrom(index); event.dataTransfer.effectAllowed = 'move'; }}
+      onDragOver={event => { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; }}
+      onDrop={event => { event.preventDefault(); onDropOn(index); }}
+      onDragEnd={() => onDragFrom(null)}
+      onClick={() => onPick(index)}
+      title="Drag to reorder"
+      style={{ cursor: 'grab', flex: 'none' }}>
+      <div style={{
+        position: 'relative', width: PW * TS, height: PH * TS, background: slide.fill,
+        border: current ? '2px solid #7c3aed' : '1px solid #cbd5e1', borderRadius: 3, overflow: 'hidden',
+      }}>
+        {slide.els.map(e => render(e))}
+      </div>
+      <div style={{ fontSize: '0.68rem', opacity: 0.7, textAlign: 'center', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', padding: '1px 3px' }}>
+        {index + 1}. {slideTitle(slide, index)}
+      </div>
+    </div>
+  );
+});
 
 let idSeq = 1;
 const nid = () => idSeq++;
@@ -59,7 +129,7 @@ const unpackState = (tok: string): { slides: Slide[], imports: string[] } | null
 const textH = (e: TextEl) => Math.max(1, e.text.split('\n').length) * e.size * 1.35;
 const mathW = (e: MathEl) => mathDim.get(e.id)?.w ?? Math.max(60, e.tex.length * e.size * 0.52);
 const mathH = (e: MathEl) => mathDim.get(e.id)?.h ?? e.size * 1.7;
-const imgH = (e: ImgEl) => e.w * 0.68;
+const imgH = (e: ImgEl) => e.path2 ? pairWidths(e).h : e.w * aspectOf(e.path);
 const typstH = (e: TypstEl) => Math.max(24, e.w * (typstAspect.get(e.id) ?? 0.4));
 
 const bounds = (e: El): { x: number, y: number, w: number, h: number } => {
@@ -220,6 +290,16 @@ const TEMPLATES: { name: string, make: () => Slide }[] = [
     }),
   },
   {
+    name: 'Two images, same height', make: () => ({
+      id: nid(), fill: '#ffffff', els: [
+        { id: nid(), type: 'text', x: 52, y: 34, w: 740, size: 32, color: '#111827', align: 'left', text: '= Before and after' },
+        { id: nid(), type: 'image', x: 52, y: 110, w: 740, path: 'images/figure.png', path2: 'images/figure2.png', gap: 16 },
+        { id: nid(), type: 'text', x: 52, y: 410, w: 360, size: 17, color: '#64748b', align: 'center', text: 'Left: what we started with' },
+        { id: nid(), type: 'text', x: 432, y: 410, w: 360, size: 17, color: '#64748b', align: 'center', text: 'Right: what came out' },
+      ],
+    }),
+  },
+  {
     name: 'Quote / key message', make: () => ({
       id: nid(), fill: '#0f172a', els: [
         { id: nid(), type: 'rect', x: 72, y: 92, w: 7, h: 276, fill: '#38bdf8', stroke: '#38bdf8', sw: 0, radius: 3 },
@@ -296,7 +376,19 @@ function elCode(e: El): string {
     return `#absolute-place(dx: ${pt(e.x)}, dy: ${pt(e.y)}, box(width: ${pt(e.w)}, ${aligned}))`;
   }
   if (e.type === 'math') return `#absolute-place(dx: ${pt(e.x)}, dy: ${pt(e.y)}, box(text(${fontArg(e.font)}size: ${pt(e.size)}, fill: ${rgb(e.color)})[$ ${e.tex} $]))`;
-  if (e.type === 'image') return `#absolute-place(dx: ${pt(e.x)}, dy: ${pt(e.y)}, image("${e.path}", width: ${pt(e.w)}))`;
+  if (e.type === 'image') {
+    if (e.path2) {
+      // Widths are left to oasis-align, which solves them from the real
+      // pictures at compile time — closer than the canvas can measure. Both
+      // images need `width: 100%`: the package measures them in a 100pt probe
+      // box, and one narrower than that reports its own size instead, which
+      // throws the solution off. The space between them is the grid gutter,
+      // set inside the block so it does not escape into the rest of the deck.
+      const gap = pt(e.gap ?? IMG_GAP);
+      return `#absolute-place(dx: ${pt(e.x)}, dy: ${pt(e.y)}, box(width: ${pt(e.w)}, { set grid(column-gutter: ${gap}); oasis-align-images(image("${e.path}", width: 100%), image("${e.path2}", width: 100%)) }))`;
+    }
+    return `#absolute-place(dx: ${pt(e.x)}, dy: ${pt(e.y)}, image("${e.path}", width: ${pt(e.w)}))`;
+  }
   if (e.type === 'typst') return `#absolute-place(dx: ${pt(e.x)}, dy: ${pt(e.y)}, box(width: ${pt(e.w)})[\n${e.code}\n])`;
   // 8-digit hex = translucent marker stroke over whatever sits underneath
   if (e.type === 'hl') return `#absolute-place(dx: ${pt(e.x)}, dy: ${pt(e.y)}, rect(width: ${pt(e.w)}, height: ${pt(e.h)}, fill: rgb("${e.color}73"), radius: 3pt))`;
@@ -337,6 +429,11 @@ function deckCode(slides: Slide[], imports: string[]): string {
   // Only the two arrow helpers are used, so name them rather than dumping every
   // pinit export into the document's scope.
   lines.push('#import "@preview/pinit:0.2.2": absolute-place, simple-arrow, double-arrow');
+  // Pull in oasis-align only if a paired image is actually on a slide, so a
+  // deck without one needs nothing extra installed.
+  if (slides.some(s => s.els.some(e => e.type === 'image' && e.path2))) {
+    lines.push('#import "@preview/oasis-align:0.4.0": oasis-align-images');
+  }
   for (const imp of imports) if (!imp.includes('@preview/pinit')) lines.push(imp);
   lines.push('#set page(paper: "presentation-16-9", margin: 0pt)');
   lines.push('#set text(size: 20pt)');
@@ -457,21 +554,42 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], w
   const slidesRef = useRef(slides); slidesRef.current = slides;
   const curRef = useRef(cur); curRef.current = cur;
 
-  const snapshot = () => {
-    undoRef.current.push(JSON.parse(JSON.stringify(slidesRef.current)));
-    if (undoRef.current.length > 60) undoRef.current.shift();
+  // Every edit replaces the objects it touches instead of writing through them,
+  // so the array that was state a moment ago still describes that moment — no
+  // copy needed. It used to deep-clone the whole deck on each call, which a
+  // 60-slide deck felt on every drag.
+  //
+  // `key` groups a run of edits to the same field into one history entry.
+  // Without it a slider pushed one entry per pixel of travel and the 60-entry
+  // cap swallowed everything the user had done before.
+  const lastSnap = useRef<{ key: string, at: number } | null>(null);
+  const COALESCE_MS = 900;
+  const snapshot = (key?: string) => {
+    const now = Date.now();
+    const same = key && lastSnap.current?.key === key && now - lastSnap.current.at < COALESCE_MS;
+    lastSnap.current = key ? { key, at: now } : null;
     redoRef.current = [];
+    if (same) return;
+    undoRef.current.push(slidesRef.current);
+    if (undoRef.current.length > 60) undoRef.current.shift();
   };
   const setEls = (els: El[]) => setSlides(ss => ss.map((s, i) => i === cur ? { ...s, els } : s));
   const updateEl = (id: number, patch: Partial<El>) =>
     setEls(slide.els.map(e => e.id === id ? { ...e, ...patch } as El : e));
-  const patchSel = (patch: any) => { if (selected != null) { snapshot(); updateEl(selected, patch); } };
+  // Nudging one control — a size slider, a colour, the text of a caption —
+  // counts as one edit however many change events it fires along the way.
+  const patchSel = (patch: any) => {
+    if (selected == null) return;
+    snapshot(`${selected}:${Object.keys(patch).join(',')}`);
+    updateEl(selected, patch);
+  };
   const snapValue = (value: number) => snapEnabled ? snap(value) : Math.round(value * 10) / 10;
 
   const restoreHistory = (from: React.MutableRefObject<Slide[][]>, to: React.MutableRefObject<Slide[][]>) => {
     const previous = from.current.pop();
     if (!previous) return;
-    to.current.push(JSON.parse(JSON.stringify(slidesRef.current)));
+    lastSnap.current = null;   // the next edit starts a fresh history entry
+    to.current.push(slidesRef.current);
     if (to.current.length > 60) to.current.shift();
     setSlides(previous);
     setSelected(null);
@@ -551,12 +669,27 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], w
   // Render typst blocks server-side (transparent PNG at the block's width) so
   // the canvas shows the actual diagram/equation, not the code behind it.
   const [previews, setPreviews] = useState<Record<number, string>>({});
-  const [, bump] = useState(0);  // re-render once a preview reports its real size
+  const [tick, bump] = useState(0);  // re-render once a preview reports its real size
+  // Pictures the browser could not fetch, tracked here rather than by hiding
+  // the <img> through the DOM — React does not know about that and would never
+  // undo it, so a path that started working would stay invisible. Scoped to the
+  // studio, so adding the missing file and reopening it tries again.
+  const brokenImages = useRef(new Set<string>()).current;
   const prevKeys = useRef<Record<number, string>>({});
   const prevUrls = useRef<Record<number, string>>({});
   useEffect(() => {
     const timer = setTimeout(() => {
       const els = slides.flatMap(s => s.els).filter((e): e is TypstEl | MathEl => e.type === 'typst' || e.type === 'math');
+      // Deleting an element leaves its rendered PNG behind as a blob URL the
+      // page still holds; over a long editing session those add up.
+      const alive = new Set(els.map(e => e.id));
+      for (const id of Object.keys(prevUrls.current).map(Number)) {
+        if (alive.has(id)) continue;
+        URL.revokeObjectURL(prevUrls.current[id]);
+        delete prevUrls.current[id];
+        delete prevKeys.current[id];
+        setPreviews(p => { const { [id]: _gone, ...rest } = p; return rest; });
+      }
       for (const el of els) {
         const key = el.type === 'typst'
           ? `${Math.round(el.w)}|${imports.join(';')}|${el.code}`
@@ -844,12 +977,6 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], w
     setCur(Math.max(0, reordered.findIndex(item => item.id === currentId)));
     setSelected(null);
   };
-  const slideTitle = (item: Slide, index: number) => {
-    const text = item.els.find((element): element is TextEl => element.type === 'text')?.text;
-    const title = text?.split('\n').map(line => line.replace(/^[=* _-]+|[*_]$/g, '').trim()).find(Boolean);
-    return title || `Slide ${index + 1}`;
-  };
-
   // --- rendering ---
   const renderEl = (e: El, k: number, live: boolean) => {
     const isSel = live && e.id === selected;
@@ -896,15 +1023,41 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], w
       );
     }
     if (e.type === 'image') {
+      const pair = e.path2 ? pairWidths(e) : null;
+      // The picture itself, not a hatched box with a filename in it: the point
+      // of dragging things around a canvas is seeing what you are arranging.
+      // A path that does not resolve keeps the old placeholder look.
+      const shot = (path: string, w: number) => (
+        <img key={path} src={`${API}/workspace/raw?path=${encodeURIComponent(path)}`}
+          alt="" draggable={false}
+          onLoad={ev => {
+            const im = ev.currentTarget;
+            if (!im.naturalWidth || !im.naturalHeight) return;
+            const ratio = im.naturalHeight / im.naturalWidth;
+            const changed = Math.abs((imgAspect.get(path) ?? -1) - ratio) >= 1e-4;
+            imgAspect.set(path, ratio);
+            const recovered = brokenImages.delete(path);
+            if (changed || recovered) bump(v => v + 1);
+          }}
+          onError={() => { if (!brokenImages.has(path)) { brokenImages.add(path); bump(v => v + 1); } }}
+          style={{
+            width: w * k, display: 'block', pointerEvents: 'none',
+            visibility: brokenImages.has(path) ? 'hidden' : 'visible',
+          }} />
+      );
       return (
         <div key={e.id} style={{
           position: 'absolute', left: e.x * k, top: e.y * k, width: e.w * k, height: imgH(e) * k,
           border: isSel ? '1.5px solid #7c3aed' : '1.5px dashed #94a3b8', borderRadius: 4,
           background: 'repeating-linear-gradient(45deg, #f8fafc, #f8fafc 8px, #f1f5f9 8px, #f1f5f9 16px)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          fontSize: live ? 11 : 5, color: '#64748b', overflow: 'hidden',
+          display: 'flex', alignItems: 'flex-start', justifyContent: 'flex-start',
+          gap: pair ? pair.gap * k : 0, overflow: 'hidden', boxSizing: 'border-box',
           userSelect: 'none', cursor: live ? 'move' : undefined,
-        }}>{live ? (e.path.split('/').pop() || 'image') : ''}</div>
+        }}>
+          {pair
+            ? <>{shot(e.path, pair.w1)}{shot(e.path2!, pair.w2)}</>
+            : shot(e.path, e.w)}
+        </div>
       );
     }
     if (e.type === 'typst') {
@@ -963,6 +1116,24 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], w
   // always paint them above every box and label — Forward/Backward would reorder
   // the array and change nothing on screen. Each one gets its own transparent,
   // full-slide SVG rendered in element order instead, so stacking just works.
+  // Handed to the memoised thumbnails, so it has to keep the same identity for
+  // the life of the studio; the ref is what lets it still see current state.
+  const renderElRef = useRef(renderEl);
+  renderElRef.current = renderEl;
+  const renderThumbEl = useCallback((e: El) => renderElRef.current(e, TS, false), []);
+
+  // The rail's callbacks have to be stable for the same reason: a fresh arrow
+  // function on every render would make each row look changed and undo the
+  // memoisation.
+  const reorderRef = useRef(reorderSlide);
+  reorderRef.current = reorderSlide;
+  const pickSlide = useCallback((index: number) => { setCur(index); setSelected(null); setEditing(null); }, []);
+  const markDragged = useCallback((index: number | null) => { draggedSlideRef.current = index; }, []);
+  const dropSlideOn = useCallback((index: number) => {
+    if (draggedSlideRef.current != null) reorderRef.current(draggedSlideRef.current, index);
+    draggedSlideRef.current = null;
+  }, []);
+
   const renderConn = (e: El, k: number, live: boolean) => (
     <svg key={e.id} width={PW * k} height={PH * k} style={{ position: 'absolute', left: 0, top: 0, pointerEvents: 'none' }}>
       {connShape(e, k, live)}
@@ -1014,7 +1185,13 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], w
     const e = slide.els.find(x => x.id === editing);
     if (!e || (e.type !== 'text' && e.type !== 'math' && e.type !== 'typst')) return null;
     const value = e.type === 'text' ? e.text : e.type === 'math' ? e.tex : e.code;
-    const patch = (v: string) => updateEl(e.id, e.type === 'text' ? { text: v } : e.type === 'math' ? { tex: v } : { code: v });
+    // Typing used to bypass the history entirely, so undo after editing a
+    // caption jumped back past the whole edit. Coalescing makes one entry per
+    // editing session rather than one per keystroke.
+    const patch = (v: string) => {
+      snapshot(`${e.id}:inline`);
+      updateEl(e.id, e.type === 'text' ? { text: v } : e.type === 'math' ? { tex: v } : { code: v });
+    };
     const isText = e.type === 'text';
     return (
       <textarea
@@ -1132,7 +1309,7 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], w
         )}
         {sel.type === 'image' && (
           <>
-            {field(`Width — ${Math.round(sel.w)}pt`, <input type="range" min="40" max="800" step="4" value={sel.w} onChange={e => patchSel({ w: Number(e.target.value) })} />)}
+            {field(`${sel.path2 ? 'Total width' : 'Width'} — ${Math.round(sel.w)}pt`, <input type="range" min="40" max="800" step="4" value={sel.w} onChange={e => patchSel({ w: Number(e.target.value) })} />)}
             {field('File', (
               <>
                 {workspaceImages.length > 0 && (
@@ -1144,6 +1321,29 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], w
                 <input type="text" value={sel.path} onChange={e => patchSel({ path: e.target.value })} style={{ width: '100%' }} />
               </>
             ))}
+            {sel.path2 == null ? (
+              <button className="btn-ghost" style={{ marginTop: 6 }}
+                onClick={() => patchSel({ path2: workspaceImages.find(p => p !== sel.path) || workspaceImages[0] || 'images/figure2.png', w: Math.min(760, Math.round(sel.w * 2)) })}>
+                Pair with a second image
+              </button>
+            ) : (
+              <>
+                {field('Second file', (
+                  <>
+                    {workspaceImages.length > 0 && (
+                      <select value={workspaceImages.includes(sel.path2) ? sel.path2 : ''} onChange={e => { if (e.target.value) patchSel({ path2: e.target.value }); }} style={{ width: '100%', marginBottom: 4 }}>
+                        <option value="" disabled>Pick from workspace…</option>
+                        {workspaceImages.map(p => <option key={p} value={p}>{p}</option>)}
+                      </select>
+                    )}
+                    <input type="text" value={sel.path2} onChange={e => patchSel({ path2: e.target.value })} style={{ width: '100%' }} />
+                  </>
+                ))}
+                {field(`Gap — ${Math.round(sel.gap ?? IMG_GAP)}pt`, <input type="range" min="0" max="60" step="2" value={sel.gap ?? IMG_GAP} onChange={e => patchSel({ gap: Number(e.target.value) })} />)}
+                <button className="btn-ghost" onClick={() => patchSel({ path2: undefined, gap: undefined })}>Drop the second image</button>
+                <div className="form-hint">Both pictures end up the <b>same height</b>, whatever shape they are — <code>oasis-align</code> works the widths out at compile time, and the deck imports it for you.</div>
+              </>
+            )}
           </>
         )}
         {sel.type === 'typst' && (
@@ -1273,24 +1473,9 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], w
               <button className="btn-ghost" title="Delete slide" onClick={delSlide} disabled={slides.length <= 1}>✕</button>
             </div>
             {slides.map((s, i) => (
-              <div key={s.id} draggable
-                onDragStart={event => { draggedSlideRef.current = i; event.dataTransfer.effectAllowed = 'move'; }}
-                onDragOver={event => { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; }}
-                onDrop={event => { event.preventDefault(); if (draggedSlideRef.current != null) reorderSlide(draggedSlideRef.current, i); draggedSlideRef.current = null; }}
-                onDragEnd={() => { draggedSlideRef.current = null; }}
-                onClick={() => { setCur(i); setSelected(null); setEditing(null); }}
-                title="Drag to reorder"
-                style={{ cursor: 'grab', flex: 'none' }}>
-                <div style={{
-                  position: 'relative', width: PW * TS, height: PH * TS, background: s.fill,
-                  border: i === cur ? '2px solid #7c3aed' : '1px solid #cbd5e1', borderRadius: 3, overflow: 'hidden',
-                }}>
-                  {s.els.map(e => renderEl(e, TS, false))}
-                </div>
-                <div style={{ fontSize: '0.68rem', opacity: 0.7, textAlign: 'center', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', padding: '1px 3px' }}>
-                  {i + 1}. {slideTitle(s, i)}
-                </div>
-              </div>
+              <RailItem key={s.id} slide={s} index={i} current={i === cur}
+                render={renderThumbEl} previews={previews} tick={tick}
+                onPick={pickSlide} onDragFrom={markDragged} onDropOn={dropSlideOn} />
             ))}
           </div>
 
@@ -1321,6 +1506,7 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], w
             <div ref={fitRef} style={{ flex: 1, minHeight: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}>
               <div
                 ref={canvasRef}
+                className="slide-canvas"
                 onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onDoubleClick={onDbl}
                 onContextMenu={ev => { if (curvePts) { ev.preventDefault(); finishCurve(); } }}
                 onMouseLeave={() => setCurveHover(null)}

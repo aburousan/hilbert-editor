@@ -552,6 +552,7 @@ export default function App() {
   const [activeTabPath, setActiveTabPath] = useState<string>('');
   const activeTabPathRef = useRef('');
   activeTabPathRef.current = activeTabPath;
+  const tabStripRef = useRef<HTMLDivElement | null>(null);
   const modelUseClockRef = useRef(0);
   const modelLastUsedRef = useRef(new Map<string, number>());
   const [externalConflict, setExternalConflict] = useState<ExternalConflict | null>(null);
@@ -1582,9 +1583,19 @@ export default function App() {
 
   const showExternalConflict = (tab: Tab, disk: { content: string; hash?: string }) => {
     if (!disk.hash) return;
+    // Whatever is in the editor now, not the snapshot whoever noticed the
+    // conflict was holding. That snapshot can be several keystrokes behind by
+    // the time a slow write comes back, and it is the text "Keep mine and
+    // overwrite" writes — so the button meant to preserve the user's work was
+    // able to undo the last thing they typed.
+    const live = tabsRef.current.find(item => item.path === tab.path);
+    const local = live ? live.content : tab.content;
+    // Both sides identical means there is nothing to choose between and no
+    // question worth interrupting anyone with.
+    if (local === disk.content) return;
     setExternalConflict(current => current || {
       path: tab.path,
-      local: tab.content,
+      local,
       disk: disk.content,
       diskHash: disk.hash!,
     });
@@ -1706,6 +1717,12 @@ export default function App() {
   // the collaborators' work away. Outside a session it is a real outside edit
   // and the user decides.
   const resolveDiskChange = (tab: Tab, disk: { content: string; hash?: string }) => {
+    // The file already holds what this tab holds. However the two got there,
+    // they agree, so record the hash and say nothing.
+    if (disk.hash && disk.content === tab.content) {
+      adoptDiskVersion(tab.path, disk.content, disk.hash);
+      return;
+    }
     const shared = collabRef.current?.workspace;
     // The active Monaco buffer is already the CRDT document. Hosted browsers
     // also share one physical server workspace, so another participant's
@@ -1735,7 +1752,48 @@ export default function App() {
     if (!projectSessionRef.current) notify(`Reloaded ${path} after an external change.`);
   };
 
-  const writeTabNow = async (tab: Tab): Promise<string> => {
+  // Files with a save on the way to disk, and the queue that keeps those saves
+  // one at a time. Two writes of the same file could otherwise be in the air
+  // together — the debounced compile starts one, then Ctrl+S or the next
+  // compile starts another before the first has answered — and the second one
+  // carries a precondition the first has already made obsolete. The server
+  // answers that with the same 409 it uses for a genuine outside edit, so the
+  // app announced that the file had "changed outside Hilbert" about a change it
+  // had made itself, and offered to put the older of its own two versions back.
+  // Any delay on the write makes this the normal case rather than a rare one: a
+  // folder synced by Google Drive, a network share, an antivirus filter driver.
+  const savesInFlight = useRef(new Map<string, Promise<unknown>>());
+  const saveGeneration = useRef(new Map<string, number>());
+
+  const writeTabNow = (tab: Tab): Promise<string> => {
+    const generation = (saveGeneration.current.get(tab.path) ?? 0) + 1;
+    saveGeneration.current.set(tab.path, generation);
+    const queued = (savesInFlight.current.get(tab.path) ?? Promise.resolve())
+      .then(() => writeIfStillWanted(tab, generation), () => writeIfStillWanted(tab, generation));
+    // Settled or not, this file is free again — but only if nothing newer has
+    // taken its place in the queue behind us.
+    const done = queued.catch(() => {}).then(() => {
+      if (savesInFlight.current.get(tab.path) === done) savesInFlight.current.delete(tab.path);
+    });
+    savesInFlight.current.set(tab.path, done);
+    return queued;
+  };
+
+  // Waiting saves collapse to the newest one. Compile-on-type asks for a save
+  // every hundred milliseconds, so a write that takes a second — which is what
+  // a synced folder costs — leaves ten of them queued, each about to put text
+  // on disk that the next one immediately replaces. Left to drain, the file
+  // trailed the editor by fifteen seconds after typing stopped; the last of
+  // those saves carries every keystroke the others were going to write anyway.
+  const writeIfStillWanted = (tab: Tab, generation: number): Promise<string> => {
+    if (saveGeneration.current.get(tab.path) !== generation) {
+      const known = lastWrittenRef.current.get(tab.path);
+      return Promise.resolve(known?.hash || tab.diskHash || '');
+    }
+    return writeTabExclusive(tab);
+  };
+
+  const writeTabExclusive = async (tab: Tab): Promise<string> => {
     const authored = lastWrittenRef.current.get(tab.path);
     let expected = authored?.hash || tab.diskHash;
     if (!expected) {
@@ -1764,9 +1822,16 @@ export default function App() {
       return { response, data: await response.json().catch(() => ({} as any)) };
     };
     let { response, data } = await post(expected);
-    if (response.status === 409 && data.hash && data.content === authored?.content) {
-      // The file holds this app's own previous save; only our note of its hash
-      // was stale. Nothing outside Hilbert happened, so save against it.
+    // Read the note of our own last write again rather than trusting the one
+    // taken before the round trip: writes to other files, or one this queue does
+    // not cover, can have landed in between.
+    const wrote = lastWrittenRef.current.get(tab.path);
+    if (response.status === 409 && data.hash
+      && (data.content === authored?.content || data.content === wrote?.content
+        || data.content === tab.content)) {
+      // The file holds this app's own previous save, or already holds the very
+      // text this save is carrying; only our note of its hash was stale.
+      // Nothing outside Hilbert happened, so save against what is there.
       ({ response, data } = await post(data.hash));
     }
     if (response.status === 409) {
@@ -1774,9 +1839,13 @@ export default function App() {
       if (data.hash && (isBoundToSession(tab.path) || shared?.metaOf(tab.path)?.kind === 'text')) {
         if (isBoundToSession(tab.path)) {
           // This buffer is the session's merged document, so it is the version
-          // to keep — save it against what the file actually holds now rather
-          // than discarding either side.
-          ({ response, data } = await post(data.hash));
+          // to keep, and nothing is being discarded by writing it. Saving it
+          // against the hash the rejection carried looks more careful but is
+          // the wrong shape here: the file is being written by everyone in the
+          // session, so it can change again between the rejection and the
+          // retry, and that second rejection was reaching the person as a
+          // conflict prompt over their collaborators' text.
+          ({ response, data } = await post());
         } else {
           // A shared file this editor is not holding: what is on disk is the
           // merged document the session wrote, and this buffer is a snapshot
@@ -2171,6 +2240,23 @@ export default function App() {
     }
   }, [activeTab, currentMain, compileTypst, snapshotHistory, webdavAutoSync]);
 
+  // Move through the open files without reaching for the tab strip. Both read
+  // the live refs rather than the rendered values, because the key handler is
+  // installed once and would otherwise be looking at the first render's tabs.
+  const stepTab = useCallback((delta: number) => {
+    const open = tabsRef.current;
+    if (open.length < 2) return;
+    const at = open.findIndex(t => t.path === activeTabPathRef.current);
+    const next = (((at < 0 ? 0 : at + delta) % open.length) + open.length) % open.length;
+    setActiveTabPath(open[next].path);
+  }, []);
+  // ⌘9 means the last file, as it does in a browser, however many are open.
+  const gotoTab = useCallback((n: number) => {
+    const open = tabsRef.current;
+    if (!open.length) return;
+    setActiveTabPath(open[n >= 8 ? open.length - 1 : Math.min(n, open.length - 1)].path);
+  }, []);
+
   // Global shortcuts. Routed through a ref so the handler never captures stale
   // state; ⌘S is intercepted so the browser "Save As" dialog never appears.
   // ⌘B/⌘I/⌘E only fire inside the code editor (they'd be rude in modal inputs);
@@ -2198,6 +2284,21 @@ export default function App() {
       const key = e.key.toLowerCase();
       if (key === 's' && !e.shiftKey) { e.preventDefault(); saveActiveFile(); return; }
       if (key === 'k' && !e.shiftKey) { e.preventDefault(); setShowPalette(v => !v); return; }
+      // Switching files. Ctrl+Tab and Ctrl/⌘+PageUp/PageDown work everywhere;
+      // ⌘⌥←/→ is the macOS habit. These have to beat Monaco, which takes Tab
+      // for indentation, so they stop the event as well as consuming it. Not
+      // while a dialog is up: changing the file underneath an open tool is
+      // never what the key was meant for.
+      const cycles = e.key === 'Tab' || e.key === 'PageUp' || e.key === 'PageDown'
+        || (e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight'));
+      const jumps = /^[1-9]$/.test(e.key) && !e.shiftKey && !e.altKey;
+      if ((cycles || jumps) && !document.querySelector('.modal-overlay')) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (jumps) gotoTab(Number(e.key) - 1);
+        else stepTab(e.key === 'PageUp' || e.key === 'ArrowLeft' || (e.key === 'Tab' && e.shiftKey) ? -1 : 1);
+        return;
+      }
       if (key === 'n' && e.shiftKey) { e.preventDefault(); toggleNumberingRef.current(); return; }
       // Comment toggle, handled here rather than inside the editor. Monaco binds
       // it to the physical US slash key, so it never fires on a layout where "/"
@@ -2322,6 +2423,12 @@ export default function App() {
         } catch { return; }
         for (const tab of watched) {
           if (projectSessionRef.current?.sync.applyingRemote) return;
+          // A save of our own is on its way to this file. It reaches the disk
+          // before its reply reaches us, so between those two moments the file
+          // holds text we wrote while our note of what we wrote is still the
+          // previous one — and reading it here would report our own save as an
+          // outside edit. Leave the file to the next tick.
+          if (savesInFlight.current.has(tab.path)) continue;
           const hash = states[tab.path];
           const current = tabsRef.current.find(item => item.path === tab.path);
           if (!hash || stopped || !current || (current.diskHash && hash === current.diskHash)) continue;
@@ -2332,7 +2439,7 @@ export default function App() {
           // below also skip dirty tabs for the same reason — a tab that turned
           // dirty mid-flight gets the conflict prompt on the next tick instead.
           const fresh = tabsRef.current.find(item => item.path === tab.path);
-          if (!fresh) continue;
+          if (!fresh || savesInFlight.current.has(tab.path)) continue;
           // The batched hashes above are a screening pass, and a save of our own
           // can land between that request and this read. Judge the conflict on
           // what the file holds now: if it matches the tab's baseline, or the
@@ -5367,6 +5474,45 @@ export default function App() {
       if (retryTimer) clearTimeout(retryTimer);
     };
   }, [booted, fileTree, expandedDirs, loadingDirs, activeTabPath]);
+
+  // The tab strip scrolls sideways but shows no scrollbar, so the wheel has to
+  // drive it. A plain mouse only reports deltaY; leave a trackpad's own
+  // sideways gesture alone.
+  useEffect(() => {
+    const strip = tabStripRef.current;
+    if (!strip) return;
+    const onWheel = (event: WheelEvent) => {
+      if (event.deltaX !== 0) return;
+      if (strip.scrollWidth <= strip.clientWidth) return;
+      event.preventDefault();
+      // deltaY is in pixels for a trackpad but in lines (or pages) for plenty
+      // of mice, where taking it literally would move the strip by three pixels
+      // a notch.
+      const unit = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16
+        : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? strip.clientWidth
+        : 1;
+      strip.scrollLeft += event.deltaY * unit;
+    };
+    strip.addEventListener('wheel', onWheel, { passive: false });
+    return () => strip.removeEventListener('wheel', onWheel);
+  }, []);
+
+  // Switching to a tab that has scrolled off the end has to bring it back
+  // itself now that there is no bar to drag. Nudging scrollLeft rather than
+  // calling scrollIntoView keeps the movement inside the strip — the latter
+  // walks up the ancestors and can shift the whole editor pane. Measured off
+  // rectangles because offsetLeft is relative to whichever ancestor happens to
+  // be positioned, which is not this one.
+  useEffect(() => {
+    const strip = tabStripRef.current;
+    const tab = strip?.querySelector<HTMLElement>('.tab.active');
+    if (!strip || !tab) return;
+    const view = strip.getBoundingClientRect();
+    const box = tab.getBoundingClientRect();
+    if (box.left < view.left) strip.scrollLeft -= view.left - box.left;
+    else if (box.right > view.right) strip.scrollLeft += box.right - view.right;
+  }, [activeTabPath, tabs.length]);
+
   const outline = useMemo(() => (sidebarVisible && panels.outline ? getOutline() : []), [activeTab?.content, sidebarVisible, panels.outline]);
 
   const toggleMenu = (e: React.MouseEvent, menuName: string) => {
@@ -6929,7 +7075,7 @@ export default function App() {
           flexDirection: 'column',
           order: mirrored ? 3 : 0,
         }}>
-          <div className="tabs">
+          <div className="tabs" ref={tabStripRef}>
             {tabs.map(tab => (
               <div key={tab.path} className={`tab ${activeTabPath === tab.path ? 'active' : ''}`} onClick={() => setActiveTabPath(tab.path)}>
                 {tab.path} {tab.isDirty && '*'}
@@ -6939,7 +7085,7 @@ export default function App() {
             {pdfUrl && activeTabPath.endsWith('.typ') && (
               <button
                 className="tab-sync-btn"
-                style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5, padding: '0 10px', background: 'transparent', border: 'none', borderLeft: '1px solid var(--border-color)', color: 'var(--text-muted)', cursor: 'pointer', fontSize: '0.72rem', whiteSpace: 'nowrap' }}
+                style={{ marginLeft: 'auto', flex: '0 0 auto', display: 'flex', alignItems: 'center', gap: 5, padding: '0 10px', background: 'transparent', border: 'none', borderLeft: '1px solid var(--border-color)', color: 'var(--text-muted)', cursor: 'pointer', fontSize: '0.72rem', whiteSpace: 'nowrap' }}
                 onClick={() => forwardSync()}
                 title="Reveal the cursor's line in the PDF preview (Ctrl/Cmd+Alt+J). Double-click a word in the PDF to jump back to the source."
               >

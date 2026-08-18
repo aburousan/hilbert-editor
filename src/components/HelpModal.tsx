@@ -14,6 +14,7 @@ const SECTIONS: Section[] = [
     name: 'Writing & Editing',
     features: [
       { title: 'Command Palette', where: 'Edit menu, or anywhere', keys: '⌘K', desc: 'Search and run every command in the app — inserts, tools, export, settings — without hunting through menus.' },
+      { title: 'Switch between open files', where: 'Anywhere', keys: 'Ctrl+Tab · ⌘/Ctrl+PageUp/PageDown · ⌘1…⌘9', desc: 'Step through the open tabs, or jump straight to one by number — ⌘9 is always the last. Shift reverses the direction, and ⌘⌥←/→ does the same on macOS. The tab you land on scrolls itself into view.' },
       { title: 'Live preview', where: 'Right pane', desc: 'The PDF recompiles as you type. On errors the last good preview stays visible; errors go to the Problems tab instead of taking over.' },
       { title: 'Find & Replace', where: 'Edit menu', keys: '⌘F', desc: 'Monaco search with regex and replace-all across the open file.' },
       { title: 'Typst code intelligence', where: 'Edit menu / editor context menu', keys: 'F2', desc: 'Tinymist-powered go to definition, find references, symbol rename, quick fixes and whole-document formatting with the bundled typstyle formatter.' },

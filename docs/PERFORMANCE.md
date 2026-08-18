@@ -135,6 +135,37 @@ missing a real crash sitting in the release build's log. Benchmark what ships.
 
 ---
 
+## 3a. Slide Studio, as the deck gets longer
+
+`npm run bench:slides` starts its own Vite, mounts the studio on a synthetic deck of
+ten elements per slide, grabs one of them and walks the pointer across sixty frames.
+The figure to watch is Chrome's own task time per frame — script, style, layout and
+paint together — since that is what a dropped frame is made of. A 16.7 ms budget is one
+frame at 60 Hz.
+
+| Slides | Before | After | Worst frame, before → after |
+|---|---|---|---|
+| 6 | 6.0 ms | 5.7 ms | 6.9 → 5.1 ms |
+| 24 | 6.8 ms | 6.2 ms | 11.2 → 5.9 ms |
+| 60 | 9.6 ms | 6.3 ms | 24.6 → 7.1 ms |
+| 120 | 14.9 ms | 6.5 ms | 40.2 → 7.9 ms |
+
+Dragging one element rewrote the whole rail of thumbnails, so the cost of moving a box
+grew with the number of slides you had — at 120 slides a frame took 14.9 ms of the 16.7
+available and the worst one took 40, which is three frames on the floor. Each rail row
+is now memoised on its slide object, which only the edited slide replaces, so a drag
+costs the same whatever the deck's length. The "after" column also carries the new
+image previews, which are real pictures rather than hatched placeholders, so it is
+paying for more on screen (4157 DOM nodes against 3387) and still comes out ahead.
+
+One warning, learned here at some cost. React's `<Profiler>` reports the *opposite*
+result at small deck sizes: by its `actualDuration` the memoised version looks slower
+at 24 slides (4.84 ms against 3.86), because it measures only React's own render phase
+and not the DOM reconciliation that dominates this workload. The script reports both so
+the disagreement stays visible. Trust the engine's number.
+
+---
+
 ## 4. The optimizations behind these numbers
 
 **Dictionaries load on demand, cutting idle memory by 14x.** The spelling and grammar

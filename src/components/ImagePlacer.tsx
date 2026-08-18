@@ -188,10 +188,21 @@ export default function ImagePlacer({
     }
     if (flow === 'pair') {
       onEnsureImport(ALIGN_IMPORT);
-      const both = caption.trim() || caption2.trim();
-      const one = caption.trim() ? `figure(image("${imgPath}"), caption: [${caption}])` : `image("${imgPath}")`;
-      const two = caption2.trim() ? `figure(image("${imgPath2}"), caption: [${caption2}])` : `image("${imgPath2}")`;
-      code = `#${both ? 'oasis-align-figures' : 'oasis-align-images'}(\n  padding: 1em,\n  ${one},\n  ${two},\n)\n`;
+      // Three things this has to get right, all of them learned the hard way:
+      //  • `width: 100%` — the package sizes each picture by measuring it in a
+      //    100pt probe box, and an image narrower than that measures at its own
+      //    size instead, which makes the solved widths (and so the heights)
+      //    wrong. It also has to fill the column it is finally given.
+      //  • the gap between the two is the grid gutter, not `padding`, which is
+      //    the space around the outside. Set inside a block so it stays local.
+      //  • oasis-align-figures refuses anything that is not a figure, so one
+      //    caption means both sides become figures.
+      const captioned = !!(caption.trim() || caption2.trim());
+      const pic = (path: string) => `image("${path}", width: 100%)`;
+      const wrap = (path: string, text: string) => captioned
+        ? `figure(${pic(path)}, caption: ${text.trim() ? `[${text}]` : 'none'})`
+        : pic(path);
+      code = `#{\n  set grid(column-gutter: 1em)\n  ${captioned ? 'oasis-align-figures' : 'oasis-align-images'}(\n    ${wrap(imgPath, caption)},\n    ${wrap(imgPath2, caption2)},\n  )\n}\n`;
       onInsert(code);
       onClose();
       return;
