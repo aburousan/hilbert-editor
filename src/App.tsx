@@ -1285,6 +1285,71 @@ export default function App() {
   const tinymist = useTinymistDiagnostics(monaco, editorRef, activeTab?.path, activeTab?.content);
 
   useEffect(() => { if (monaco) setupTypstLanguage(monaco); }, [monaco]);
+
+  // What the buffer holds, so an ordinary keystroke can be told from text
+  // arriving behind the editor's back without reading the whole document out
+  // again on every key.
+  const editorTextRef = useRef<string | null>(null);
+  // Set while the reconciliation below is writing, so the editor's change
+  // handler can tell that edit apart from a keystroke. Without it, text the app
+  // pushed into the buffer — the version just read back from disk, say — would
+  // come straight back as "the user typed something", marking a file dirty that
+  // had only this moment been brought level with the disk.
+  const reconcilingRef = useRef(false);
+  // Monaco's React wrapper keeps the editor in step with the `value` prop by
+  // replacing the entire document in one edit whenever the two disagree. Monaco
+  // reads that as every line being new: it drops the tokens for the whole file
+  // and every marker in it, so the text goes flat — no syntax colours, no
+  // spell-check underlines — until it has tokenised the file again. On a short
+  // file that is a frame or two; on a manuscript, with a compile and a PDF
+  // re-render competing for the same thread, it is long enough to watch, and it
+  // arrives on the beat of auto-compile, because saving is what makes the app's
+  // copy of the text and the editor's copy disagree in the first place.
+  //
+  // So reconcile first, and only across the span that actually differs. A
+  // layout effect runs before the wrapper's own effect, so by the time that one
+  // compares prop against buffer they already match and it does nothing.
+  useLayoutEffect(() => {
+    const editor = editorRef.current;
+    const text = activeTab?.content;
+    if (!editor || !activeTab || text === undefined) return;
+    // A shared session's buffer belongs to the CRDT binding, which writes it
+    // directly; React's copy is deliberately a beat behind there.
+    if (collab && isProjectTextPath(activeTab.path)) return;
+    if (text === editorTextRef.current) return;
+    const model = editor.getModel();
+    if (!model || model.uri.path.replace(/^\//, '') !== activeTab.path) return;
+    const current = model.getValue();
+    editorTextRef.current = text;
+    if (current === text) return;
+    // Shared head and tail stay put; only the middle is rewritten. Splitting a
+    // surrogate pair would turn one character into two broken halves, so step
+    // back off a lone high surrogate at either boundary.
+    const limit = Math.min(current.length, text.length);
+    let head = 0;
+    while (head < limit && current.charCodeAt(head) === text.charCodeAt(head)) head++;
+    if (head > 0 && head < limit && current.charCodeAt(head - 1) >= 0xd800 && current.charCodeAt(head - 1) <= 0xdbff) head--;
+    let tail = 0;
+    while (tail < limit - head
+      && current.charCodeAt(current.length - 1 - tail) === text.charCodeAt(text.length - 1 - tail)) tail++;
+    if (tail > 0 && current.charCodeAt(current.length - tail) >= 0xdc00 && current.charCodeAt(current.length - tail) <= 0xdfff) tail--;
+    const from = model.getPositionAt(head);
+    const to = model.getPositionAt(current.length - tail);
+    reconcilingRef.current = true;
+    try {
+      editor.executeEdits('hilbert-reconcile', [{
+        range: {
+          startLineNumber: from.lineNumber, startColumn: from.column,
+          endLineNumber: to.lineNumber, endColumn: to.column,
+        },
+        text: text.slice(head, text.length - tail),
+        forceMoveMarkers: true,
+      }]);
+      editor.pushUndoStop();
+    } finally {
+      reconcilingRef.current = false;
+    }
+  });
   const lspModelHashesRef = useRef<Record<string, string | undefined>>({});
   useEffect(() => {
     const onModelOpened = (event: Event) => {
@@ -2372,11 +2437,13 @@ export default function App() {
   // Stable so @monaco-editor/react doesn't dispose+resubscribe the content
   // listener on every render; identity only changes when the active tab does.
   const handleEditorChange = useCallback((value: string | undefined) => {
+    if (reconcilingRef.current) return;
     if (value !== undefined && activeTabPath) {
       // The user is editing, so any cursor position still waiting to be restored
       // from the last session is stale — applying it now would move them
       // mid-keystroke, which is exactly the jump this used to cause.
       pendingCursorRef.current = null;
+      editorTextRef.current = value;
       setTabs(prev => prev.map(t => t.path === activeTabPath ? { ...t, content: value, isDirty: true } : t));
     }
   }, [activeTabPath]);

@@ -1,5 +1,6 @@
 import { API } from './api';
 
+let languageDefined = false;
 let themesDefined = false;
 let providersRegistered = false;
 
@@ -11,34 +12,43 @@ export function setWorkspaceImages(paths: string[]) { workspaceImagePaths = path
 export function setupTypstLanguage(monacoInstance: any) {
   const languageId = 'typst';
 
-  // Avoid re-registering on every mount.
-  const already = monacoInstance.languages.getLanguages().some((l: any) => l.id === languageId);
-  if (!already) monacoInstance.languages.register({ id: languageId });
+  // Defining the language again is not free. A new tokens provider tells Monaco
+  // that every token in every open model is stale, and until it has tokenised the
+  // file afresh it paints the whole thing flat — no syntax colours at all. This
+  // function runs twice for every editor that mounts, once from beforeMount and
+  // once from the effect waiting on the Monaco instance, so do it the first time
+  // and leave it alone after that.
+  if (!languageDefined) {
+    languageDefined = true;
+    if (!monacoInstance.languages.getLanguages().some((l: any) => l.id === languageId)) {
+      monacoInstance.languages.register({ id: languageId });
+    }
 
-  monacoInstance.languages.setLanguageConfiguration(languageId, {
-    comments: { lineComment: '//', blockComment: ['/*', '*/'] },
-    brackets: [['{', '}'], ['[', ']'], ['(', ')']],
-    // Brackets close themselves; the markup pairs do not. In prose a quote is
-    // usually a quote — Hebrew writes its gershayim that way, as in התשפ"ו, and
-    // getting `""` for it is wrong every time — and a dollar typed mid-sentence
-    // is as often the end of a formula as the start of one. They stay in
-    // surroundingPairs below, so selecting a phrase and pressing `"` or `$`
-    // still wraps it, which is the case where the second character is wanted.
-    autoClosingPairs: [
-      { open: '{', close: '}' },
-      { open: '[', close: ']' },
-      { open: '(', close: ')' }
-    ],
-    surroundingPairs: [
-      { open: '{', close: '}' },
-      { open: '[', close: ']' },
-      { open: '(', close: ')' },
-      { open: '"', close: '"' },
-      { open: '$', close: '$' },
-      { open: '*', close: '*' },
-      { open: '_', close: '_' }
-    ]
-  });
+    monacoInstance.languages.setLanguageConfiguration(languageId, {
+      comments: { lineComment: '//', blockComment: ['/*', '*/'] },
+      brackets: [['{', '}'], ['[', ']'], ['(', ')']],
+      // Brackets close themselves; the markup pairs do not. In prose a quote is
+      // usually a quote — Hebrew writes its gershayim that way, as in התשפ"ו, and
+      // getting `""` for it is wrong every time — and a dollar typed mid-sentence
+      // is as often the end of a formula as the start of one. They stay in
+      // surroundingPairs below, so selecting a phrase and pressing `"` or `$`
+      // still wraps it, which is the case where the second character is wanted.
+      autoClosingPairs: [
+        { open: '{', close: '}' },
+        { open: '[', close: ']' },
+        { open: '(', close: ')' }
+      ],
+      surroundingPairs: [
+        { open: '{', close: '}' },
+        { open: '[', close: ']' },
+        { open: '(', close: ')' },
+        { open: '"', close: '"' },
+        { open: '$', close: '$' },
+        { open: '*', close: '*' },
+        { open: '_', close: '_' }
+      ]
+    });
+  }
 
   monacoInstance.languages.setMonarchTokensProvider(languageId, {
     defaultToken: '',

@@ -4,6 +4,38 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.2.2
+
+### Syntax colours going flat for a moment on every auto-compile
+
+On a long document the editor would blink to plain, unhighlighted text as
+auto-compile fired — colours gone, spell-check underlines gone, letters
+appearing to shift — and come back a fraction of a second later. At a
+half-second compile interval it was happening often enough to be hard to write
+through.
+
+The editor takes its text from the app as a property, and the layer between the
+two brings them back into step by replacing the whole document in a single edit
+whenever they disagree. Monaco reads a whole-document replacement as every line
+being new, so it throws away the tokens for the entire file and every marker in
+it, then paints plain text until it has worked through the file again. On a
+short file that is a frame; on a manuscript, with a compile and a PDF re-render
+already on the same thread, it is long enough to watch. And it landed on the
+beat of auto-compile because saving is what makes the app's copy of the text and
+the editor's copy disagree in the first place.
+
+Now the two are reconciled before that layer looks, and only across the span
+that actually differs — the same kind of edit typing a character makes. The
+shared head and tail of the document are left alone, so their tokens and markers
+survive. Measured on a 62-page document with a word changed behind the editor's
+back: before, the file went to a single colour and lost all its underlines for
+about a second; after, neither changes at all.
+
+Registering the Typst language a second time had the same effect on colours, and
+that happened once for every editor that opened. It now happens once.
+
+---
+
 ## 0.2.1
 
 ### "File changed outside Hilbert" when nothing outside Hilbert had touched it
