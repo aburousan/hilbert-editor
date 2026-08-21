@@ -6115,7 +6115,31 @@ export default function App() {
     try {
       const res = await fetch(`${API}/diagnostics`);
       if (!res.ok) throw new Error(`${res.status}`);
-      if (!await writeClipboard(await res.text())) throw new Error('clipboard-unavailable');
+      const backend = await res.text();
+      // Everything above comes from the engine; the rest only the window knows.
+      // Each line here is something a bug report has had to be asked for by
+      // hand: which auto-compile interval was set, how big the document is,
+      // which webview is drawing it, and what the log says the machine's own
+      // timings look like.
+      const main = tabs.find(t => t.path === currentMain);
+      const timings = (label: string, re: RegExp) => {
+        const all = [...backend.matchAll(re)].map(m => Number(m[1])).filter(Number.isFinite).sort((a, b) => a - b);
+        if (!all.length) return `${label} none recorded`;
+        const at = (q: number) => all[Math.min(all.length - 1, Math.floor(all.length * q))];
+        return `${label} ${all.length} runs, median ${Math.round(at(0.5))} ms, slowest ${Math.round(all[all.length - 1])} ms`;
+      };
+      const client = [
+        '',
+        `settings:  auto-compile ${compileDelay} ms · proofreading ${proofreadEnabled ? 'on' : 'off'}`
+          + ` · theme ${theme} · editor ${editorFontSize}px · text ${editorTextDir}`,
+        `document:  main ${currentMain}${main ? ` (${Math.round(main.content.length / 1024)} kB, ${main.content.split('\n').length} lines)` : ''}`
+          + ` · ${tabs.length} file${tabs.length === 1 ? '' : 's'} open · ${document.querySelectorAll('.pdf-page').length || '?'} pages in the preview`,
+        `display:   ${window.innerWidth}×${window.innerHeight} at ${window.devicePixelRatio}x`,
+        `webview:   ${navigator.userAgent}`,
+        timings('compiles:  ', /compiled successfully in ([\d.]+) ms/g),
+        timings('preview:   ', /served the watcher's PDF \([\d]+ bytes\) in ([\d.]+) ms/g),
+      ].join('\n');
+      if (!await writeClipboard(backend + client)) throw new Error('clipboard-unavailable');
       notify('Diagnostics copied — paste them into the issue.');
     } catch (error) {
       notify(error instanceof Error && error.message === 'clipboard-unavailable'
