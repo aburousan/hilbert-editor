@@ -2616,14 +2616,43 @@ fn collapse_pages(dir: &Path, stem: &str, ext: &str) -> (usize, String) {
 
 // Export directly into a caller-supplied folder (the "save to folder" path).
 // Show a file selected in Finder / Explorer, rather than opening it.
+// Windows: Explorer reads everything after `/select,` itself rather than as an
+// ordinary argument, so the argument has to arrive exactly as written. Rust's
+// normal quoting wraps the whole thing in quotes the moment the path contains a
+// space — and a real one does: a log from a Windows user shows a project at
+// C:\Users\...\Documents\Hilbert\Sample holding a file called `main .typ`.
+// Explorer does not recognise that form and opens the default folder instead.
+// Not gated to Windows so it can be tested anywhere; only its use is.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn explorer_argument(target: &Path, is_dir: bool) -> String {
+    let path = target.to_string_lossy().replace('/', "\\");
+    // A folder is shown by opening it. Asking Explorer to *select* a folder
+    // opens its parent with the folder highlighted, which for a workspace kept
+    // directly under Documents looks exactly like "it always opens Documents" —
+    // which is how it was reported.
+    if is_dir { format!("\"{path}\"") } else { format!("/select,\"{path}\"") }
+}
+
 fn reveal_in_file_manager(target: &Path) {
+    let is_dir = target.is_dir();
     #[cfg(target_os = "macos")]
-    { let _ = std::process::Command::new("open").arg("-R").arg(target).spawn(); }
+    {
+        // Same rule as the other two: show a folder by opening it, and a file by
+        // revealing it in the folder that holds it.
+        let mut cmd = std::process::Command::new("open");
+        if !is_dir { cmd.arg("-R"); }
+        let _ = cmd.arg(target).spawn();
+    }
     #[cfg(target_os = "windows")]
-    { let _ = std::process::Command::new("explorer").arg(format!("/select,{}", target.display())).spawn(); }
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("explorer.exe")
+            .raw_arg(explorer_argument(target, is_dir))
+            .spawn();
+    }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let dir = if target.is_dir() { target.to_path_buf() } else { target.parent().map(Path::to_path_buf).unwrap_or_else(|| target.to_path_buf()) };
+        let dir = if is_dir { target.to_path_buf() } else { target.parent().map(Path::to_path_buf).unwrap_or_else(|| target.to_path_buf()) };
         let _ = open::that_detached(dir);
     }
 }
@@ -6999,5 +7028,44 @@ mod tests {
 
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&other).ok();
+    }
+}
+
+#[cfg(test)]
+mod reveal_tests {
+    use super::explorer_argument;
+    use std::path::Path;
+
+    // The path is a real one, from a Windows user's diagnostics log: a project
+    // under Documents holding a file whose name contains a space. That space is
+    // what made Rust quote the whole argument, which Explorer answers by opening
+    // the default folder rather than the file.
+    const FILE: &str = r"C:\Users\think\Documents\Hilbert\Sample\main .typ";
+    const DIR: &str = r"C:\Users\think\Documents\Hilbert\Sample";
+
+    #[test]
+    fn a_file_is_selected_inside_its_folder() {
+        let arg = explorer_argument(Path::new(FILE), false);
+        assert_eq!(arg, "/select,\"C:\\Users\\think\\Documents\\Hilbert\\Sample\\main .typ\"");
+        // Explorer parses the switch itself, so it must lead — nothing may be
+        // wrapped around it.
+        assert!(arg.starts_with("/select,\""));
+        assert!(arg.ends_with('"'));
+    }
+
+    #[test]
+    fn a_folder_is_opened_rather_than_selected() {
+        // Selecting a folder opens its parent with the folder highlighted, and a
+        // workspace under Documents then looks like "it always opens Documents".
+        let arg = explorer_argument(Path::new(DIR), true);
+        assert_eq!(arg, "\"C:\\Users\\think\\Documents\\Hilbert\\Sample\"");
+        assert!(!arg.contains("/select"));
+    }
+
+    #[test]
+    fn forward_slashes_become_the_separator_explorer_understands() {
+        let arg = explorer_argument(Path::new("C:/Users/think/Documents/a b/main .typ"), false);
+        assert!(!arg.contains('/') || arg.starts_with("/select,"));
+        assert!(arg.contains(r"C:\Users\think\Documents\a b\main .typ"));
     }
 }

@@ -143,7 +143,11 @@ function replaceNode(nodes: FileNode[], path: string, update: (node: FileNode) =
   });
 }
 
-type Tab = { path: string; content: string; isDirty: boolean; diskHash?: string; binaryRevision?: number };
+// editorVersion marks content that came from the editor itself. React commits a
+// render a beat after the keystroke that caused it, so while someone types fast
+// the content on a committed tab can already be one or two keystrokes behind
+// what the buffer holds. Writing that back would undo what they just typed.
+type Tab = { path: string; content: string; isDirty: boolean; diskHash?: string; binaryRevision?: number; editorVersion?: number };
 const IMG_EXT = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp'];
 
 // The panels the View menu and the status bar can show and hide.
@@ -1296,6 +1300,9 @@ export default function App() {
   // come straight back as "the user typed something", marking a file dirty that
   // had only this moment been brought level with the disk.
   const reconcilingRef = useRef(false);
+  // Counts edits made in the editor. A tab carrying anything but the newest
+  // number holds text the buffer has already moved past.
+  const editorVersionRef = useRef(0);
   // Monaco's React wrapper keeps the editor in step with the `value` prop by
   // replacing the entire document in one edit whenever the two disagree. Monaco
   // reads that as every line being new: it drops the tokens for the whole file
@@ -1317,6 +1324,9 @@ export default function App() {
     // directly; React's copy is deliberately a beat behind there.
     if (collab && isProjectTextPath(activeTab.path)) return;
     if (text === editorTextRef.current) return;
+    // This tab's text came from the editor, and the editor has typed since.
+    // It is an echo of an older keystroke, not something to write back.
+    if (activeTab.editorVersion !== undefined && activeTab.editorVersion < editorVersionRef.current) return;
     const model = editor.getModel();
     if (!model || model.uri.path.replace(/^\//, '') !== activeTab.path) return;
     const current = model.getValue();
@@ -2439,12 +2449,14 @@ export default function App() {
   const handleEditorChange = useCallback((value: string | undefined) => {
     if (reconcilingRef.current) return;
     if (value !== undefined && activeTabPath) {
+      const version = ++editorVersionRef.current;
       // The user is editing, so any cursor position still waiting to be restored
       // from the last session is stale — applying it now would move them
       // mid-keystroke, which is exactly the jump this used to cause.
       pendingCursorRef.current = null;
       editorTextRef.current = value;
-      setTabs(prev => prev.map(t => t.path === activeTabPath ? { ...t, content: value, isDirty: true } : t));
+      setTabs(prev => prev.map(t => t.path === activeTabPath
+        ? { ...t, content: value, isDirty: true, editorVersion: version } : t));
     }
   }, [activeTabPath]);
 
@@ -5239,12 +5251,12 @@ export default function App() {
             best = candidate;
           }
         }
-        if (best && best.score >= 0.35 && pdfRef.current?.revealPosition(best.equation.position)) return;
+        if (best && best.score >= 0.35 && await pdfRef.current?.revealPosition(best.equation.position)) return;
       }
       // If Typst could not query a temporarily invalid document, the cached PDF
       // text can still resolve simple math names and variables.
       if (sourceWords.length) {
-        const ok = pdfRef.current?.revealSource({
+        const ok = await pdfRef.current?.revealSource({
           words: sourceWords,
           focus: Math.min(sourceWords.length - 1, Math.floor(sourceWords.length / 2)),
           docFraction: (pos.lineNumber - 0.5) / total,
@@ -5268,7 +5280,7 @@ export default function App() {
     let focus = 0, bestD = Infinity;
     const anchorCol = line === pos.lineNumber ? pos.column : 1;
     toks.forEach((t, i) => { const d = Math.abs(t.offset + 1 - anchorCol); if (d < bestD) { bestD = d; focus = i; } });
-    const ok = pdfRef.current.revealSource({
+    const ok = await pdfRef.current.revealSource({
       words: toks.map(t => t.w), focus, docFraction: (line - 0.5) / total,
       repeat: wordRepeat(model, line, toks[focus]),
     });
@@ -7264,17 +7276,15 @@ export default function App() {
                     </Boundary>
                   );
                 }
-                // In a shared session the merged document owns this buffer, not
-                // React. The editor takes its text as a prop and re-applies it
-                // whenever the prop and the buffer disagree — as one edit
-                // spanning the whole file, which the binding reports to everyone
-                // as "delete all of it, now insert this". React's copy is always
-                // a beat behind an edit that just arrived over the network, so
-                // the two disagree exactly while both people are typing, and a
-                // collaborator's last few keystrokes get overwritten and their
-                // text rearranged. Seed the buffer instead and let the binding
-                // be its only writer.
-                const shared = !!collab && isProjectTextPath(activeTab.path);
+                // The buffer is seeded here and written by nothing else. This was
+                // already true in a shared session, where the merged document owns
+                // the text and React's copy is a beat behind whatever just arrived
+                // over the network. It turns out to be true of one person typing
+                // quickly as well: React commits a render after the keystroke that
+                // caused it, so the text React holds is regularly a character or two
+                // behind the buffer, and handing that back would take those
+                // characters away and reinsert them a moment later — which is what
+                // "the text rearranges itself" looks like from the outside.
                 return (
                   <Editor
                     height="100%"
@@ -7282,7 +7292,12 @@ export default function App() {
                     theme={theme}
                     path={activeTab.path}
                     defaultValue={activeTab.content}
-                    value={shared ? undefined : activeTab.content}
+                    // No `value` prop. The wrapper reconciles a changed value by
+                    // replacing the whole document, and during fast typing the value
+                    // it is handed is a keystroke behind the buffer — so it would
+                    // take the newest characters away and put them back a moment
+                    // later, out of order. The effect above is the only writer, and
+                    // it can tell a stale echo from text that genuinely arrived.
                     onChange={handleEditorChange}
                     beforeMount={(monacoInstance) => setupTypstLanguage(monacoInstance)}
                     onMount={(e, monacoInstance) => {

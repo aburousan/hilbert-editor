@@ -6,6 +6,52 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ## 0.2.2
 
+### Typing quickly rearranged the text
+
+Reported on Windows with auto-compile at 0.1 s and again at 1 s: letters
+swapping places as you write, and the syntax colouring dropping out for a
+moment at the same time. Typing "for good measure." could leave "for god
+measure.o" in the file — the o moved to the end of the sentence.
+
+The editor and the app keep separate copies of the text, and the app's copy is
+committed a render after the keystroke that caused it. Type slowly and it
+catches up before anything notices. Type at speed and it doesn't, and the app
+was writing its older copy back over the buffer — removing the character just
+typed, which then reappeared wherever the cursor had got to. The fix in the
+previous build made this quieter rather than better: it changed a visible
+whole-document flash into a single character moving silently, which is worse.
+
+The buffer is now seeded once and written by nothing else, the way a shared
+session already worked. Text arriving from disk or from a collaborator still
+reaches the editor; an echo of the writer's own keystrokes does not. Measured
+on a 228-page document, typing at 60 ms a key: before, 30 frames with the
+colouring gone, 495 with the spell-check underlines gone, and the sentence
+scrambled; after, none, none, and every character in order.
+
+### Reveal in File Manager opened the Documents folder
+
+On Windows this went to Documents instead of the file, every time. Two separate
+causes. Revealing the *workspace* asked Explorer to select the project folder,
+and selecting a folder opens its parent — which for a project under Documents
+is Documents. Revealing a *file* broke whenever the path contained a space,
+because Explorer reads everything after `/select,` itself and does not
+recognise the quoted form Rust produces for an argument with a space in it.
+
+A folder now opens, and a file is highlighted inside the folder that holds it.
+macOS and Linux follow the same rule, since revealing a folder there had the
+same off-by-one-level behaviour.
+
+### A long document no longer stalls while you type
+
+The preview rebuilt every page's text layer and re-read every page's text for
+the word count on each compile. On a 228-page document that was about eight and
+a half seconds of work per keystroke burst, for pages nobody was looking at.
+Pages now get their text when they come into view, the rest are filled in
+quietly once the typing stops, and the word count waits for a pause. Typing
+latency on that document went from 130 ms a keystroke to 28 ms, and the
+window no longer stops responding at all.
+
+
 ### Syntax colours going flat for a moment on every auto-compile
 
 On a long document the editor would blink to plain, unhighlighted text as

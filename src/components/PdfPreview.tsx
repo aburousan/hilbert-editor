@@ -5,8 +5,8 @@ import { bestMatch, tokenizeRenderedText, type SyncPayload } from '../syncMatch'
 import { MAX_PDF_PAGE_WORD_INDEXES } from '../performanceLimits';
 
 export type PdfHandle = {
-  revealSource(p: SyncPayload): boolean;
-  revealPosition(position: NonNullable<SyncPayload['documentPosition']>): boolean;
+  revealSource(p: SyncPayload): Promise<boolean>;
+  revealPosition(position: NonNullable<SyncPayload['documentPosition']>): Promise<boolean>;
 };
 export type PdfViewState = {
   page: number;
@@ -16,7 +16,7 @@ export type PdfViewState = {
   dark: boolean;
 };
 
-type Slot = { div: HTMLDivElement; textDiv: HTMLDivElement; rendered: boolean };
+type Slot = { div: HTMLDivElement; textDiv: HTMLDivElement; rendered: boolean; textRendered: boolean };
 type WordIndex = { words: string[]; spans: HTMLElement[] };
 
 // Walk a text-layer subtree (a page, or the whole document) into a flat list of
@@ -253,37 +253,91 @@ function PdfPreview(
     slot.div.style.height = '';   // real bitmap now dictates the height
   };
 
-  // (Re)build the transparent text layers at the current scale so cursor↔PDF sync
-  // can locate words even on pages whose bitmap isn't drawn yet.
-  //
   // Each zoom step starts a fresh pass while the previous one may still be
   // walking the pages, so passes are numbered and a superseded one stops: without
   // that, an older pass finishing last leaves layers built for the old scale, and
   // then double-click-to-source lands on the wrong word.
   const textPassRef = useRef(0);
-  const renderTextLayers = async (token: number) => {
-    const doc = docCache.current.doc, slots = slotsRef.current;
-    if (!doc) return;
-    const pass = ++textPassRef.current;
+
+  // Build one page's transparent text layer at the current scale. This is what
+  // cursor↔PDF sync reads, and what lets a word be selected off the page.
+  //
+  // It used to run for every page of the document on every recompile, to keep
+  // sync working on pages whose bitmap hadn't been drawn. On a 228-page document
+  // that measured eight and a half seconds of main-thread work per compile —
+  // typed while the compile itself took one and a half — so the editor spent most
+  // of its time rebuilding text for pages nobody was looking at. Now a page gets
+  // its layer when it comes into view, alongside its bitmap, and the two places
+  // that need text from a page that isn't on screen ask for it directly.
+  const buildTextLayer = async (i: number, token: number, pass: number) => {
+    const doc = docCache.current.doc;
+    const slot = slotsRef.current[i - 1];
+    if (!doc || !slot) return;
+    let page;
+    try { page = await doc.getPage(i); } catch { return; }
+    if (token !== renderTokenRef.current || pass !== textPassRef.current) return;
+    const td = slot.textDiv;
+    pageWordIndexesRef.current.delete(td);
+    documentWordIndexRef.current = null;
+    td.replaceChildren();
+    td.style.setProperty('--scale-factor', String(scaleRef.current.dScale));
+    const tl = new TextLayer({
+      textContentSource: page.streamTextContent(),
+      container: td,
+      viewport: page.getViewport({ scale: scaleRef.current.dScale }),
+    });
+    await tl.render();
+    if (token !== renderTokenRef.current || pass !== textPassRef.current) return;
+    // pdf.js writes a pixel width/height onto the container. Drop them so the
+    // stylesheet's inset:0 keeps the layer exactly on its page — an oversized
+    // one is invisible but still widens the scroll area.
+    td.style.width = '';
+    td.style.height = '';
+    slot.textRendered = true;
+  };
+
+  const ensureTextLayer = async (i: number, token: number) => {
+    const slot = slotsRef.current[i - 1];
+    if (!slot || slot.textRendered) return;
+    await buildTextLayer(i, token, textPassRef.current);
+  };
+
+  // Every page's text, for the one caller that has to search the whole document:
+  // forward sync, which is looking for a phrase that may be anywhere. Only the
+  // pages still missing a layer are built, so after the first search it costs
+  // nothing until the next compile or zoom.
+  const ensureAllTextLayers = async (token: number) => {
+    const pass = textPassRef.current;
+    for (let i = 1; i <= slotsRef.current.length; i++) {
+      if (token !== renderTokenRef.current || pass !== textPassRef.current) return;
+      if (slotsRef.current[i - 1]?.textRendered) continue;
+      await buildTextLayer(i, token, pass);
+    }
+  };
+
+  // A new document or a new scale invalidates every layer. Empty them all —
+  // stale spans left on an off-screen page would give sync the wrong answer —
+  // and let the observer put back the ones actually in view.
+  const invalidateTextLayers = () => {
+    textPassRef.current++;
     documentWordIndexRef.current = null;
     pageWordIndexesRef.current.clear();
-    const dScale = scaleRef.current.dScale;
-    for (let i = 1; i <= slots.length; i++) {
-      const page = await doc.getPage(i);
+    for (const slot of slotsRef.current) {
+      slot.textRendered = false;
+      slot.textDiv.replaceChildren();
+    }
+  };
+
+  // Redraw the layers that exist, at the scale that now applies. Pages without
+  // one stay without one until they scroll into view.
+  const refreshTextLayers = async (token: number) => {
+    const built: number[] = [];
+    slotsRef.current.forEach((slot, i) => { if (slot.textRendered) built.push(i + 1); });
+    invalidateTextLayers();
+    const pass = textPassRef.current;
+    for (const i of built) {
       if (token !== renderTokenRef.current || pass !== textPassRef.current) return;
-      const td = slots[i - 1].textDiv;
-      pageWordIndexesRef.current.delete(td);
-      td.replaceChildren();
-      td.style.setProperty('--scale-factor', String(dScale));
-      const tl = new TextLayer({ textContentSource: page.streamTextContent(), container: td, viewport: page.getViewport({ scale: dScale }) });
-      await tl.render();
-      if (pass !== textPassRef.current) return;
-      // pdf.js writes a pixel width/height onto the container. Drop them so the
-      // stylesheet's inset:0 keeps the layer exactly on its page — an oversized
-      // one is invisible but still widens the scroll area.
-      td.style.width = '';
-      td.style.height = '';
-      documentWordIndexRef.current = null;
+      await buildTextLayer(i, token, pass);
     }
   };
 
@@ -395,7 +449,7 @@ function PdfPreview(
       for (const e of entries) {
         if (e.isIntersecting) {
           const idx = slotsRef.current.findIndex(s => s.div === e.target);
-          if (idx >= 0) drawPage(idx + 1, tok);
+          if (idx >= 0) { drawPage(idx + 1, tok); ensureTextLayer(idx + 1, tok); }
         }
       }
     }, { root: scrollEl, rootMargin: '800px 0px' });
@@ -465,13 +519,17 @@ function PdfPreview(
           slot.div.style.width = `${displayW}px`;
           if (!slot.rendered) slot.div.style.height = `${displayW * aspect}px`;
         }
+        // The text on these pages belongs to the document we just replaced, so
+        // it goes before the observer is attached; attaching one fires it for
+        // everything already on screen, which puts the visible layers straight
+        // back.
+        invalidateTextLayers();
         attachObserver(token, scrollEl);
         // Redraw the pages that already hold a bitmap; the rest refresh lazily
         // through the observer as they scroll into view.
         for (let i = 0; i < prevSlots.length; i++) {
           if (prevSlots[i].rendered) drawPage(i + 1, token, true);
         }
-        await renderTextLayers(token);
         if (restoreInitialView()) requestAnimationFrame(() => reportViewStateRef.current());
         return;
       }
@@ -489,7 +547,7 @@ function PdfPreview(
         textDiv.style.setProperty('--scale-factor', String(dScale));
         pageDiv.appendChild(textDiv);
         frag.appendChild(pageDiv);
-        slots.push({ div: pageDiv, textDiv, rendered: false });
+        slots.push({ div: pageDiv, textDiv, rendered: false, textRendered: false });
       }
       pagesEl.replaceChildren(frag);
       slotsRef.current = slots;
@@ -499,8 +557,8 @@ function PdfPreview(
       // the document got shorter than the page we were on.
       if (!restoreInitialView() && !restoreAnchor(prevAnchor)) scrollEl.scrollTop = prevScroll;
 
+      invalidateTextLayers();
       attachObserver(token, scrollEl);
-      await renderTextLayers(token);
     })();
 
     return () => { ioRef.current?.disconnect(); };
@@ -525,16 +583,30 @@ function PdfPreview(
     }
     restoreAnchor(anchor);
     for (let i = 0; i < slots.length; i++) if (slots[i].rendered) drawPage(i + 1, token, true);
-    renderTextLayers(token);
+    refreshTextLayers(token);
   }, [rasterTick, zoomFactor]);
 
   // Word count from the RENDERED document (the PDF's text), not the Typst source —
-  // so `#set`, `#import`, function names and markup syntax don't inflate it. Runs
-  // once per compile (keyed on url), independent of zoom/resize re-rasterisation.
+  // so `#set`, `#import`, function names and markup syntax don't inflate it.
+  //
+  // Reading every page's text is the most expensive thing this component does —
+  // eight and a half seconds on a 228-page document — and it produces one number
+  // in a corner of the toolbar. Running it on each compile meant every keystroke
+  // paid for it. So it waits for a pause in the typing, and then for a moment
+  // when the browser has nothing better to do; a count that arrives a second
+  // late is worth nobody's editing being slow. Each new compile cancels the
+  // one waiting, so a long stretch of typing does the work once, at the end.
   useEffect(() => {
     if (!url || !onWordCount) return;
     let cancelled = false;
-    (async () => {
+    let idle = 0;
+    const timer = setTimeout(() => {
+      const start = () => { if (!cancelled) void count(); };
+      const ric = (window as unknown as { requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => number }).requestIdleCallback;
+      if (ric) idle = ric(start, { timeout: 3000 });
+      else start();
+    }, 1200);
+    const count = async () => {
       let doc: any = null, temp = false;
       try {
         if (docCache.current.url === url && docCache.current.doc) {
@@ -557,9 +629,55 @@ function PdfPreview(
         if (!cancelled) onWordCount((text.match(/[^\s]+/g) || []).length);
       } catch { /* leave the last known count in place */ }
       finally { if (temp && doc) { try { await doc.destroy(); } catch {} } }
-    })();
-    return () => { cancelled = true; };
+    };
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      const cancelIdle = (window as unknown as { cancelIdleCallback?: (h: number) => void }).cancelIdleCallback;
+      if (idle && cancelIdle) cancelIdle(idle);
+    };
   }, [url, onWordCount]);
+
+  // Building a page's text costs about as much as drawing it, so none of it
+  // happens while you type. But forward sync has to search the whole document,
+  // and making it build all of that on the spot turned a jump that used to be
+  // instant into a four-second wait on this machine and nearly ten on a slower
+  // one. So the pages nobody has looked at are filled in quietly instead: after
+  // the typing stops, one page per idle slice, abandoned the moment the next
+  // compile arrives. Sync stays instant, and the work happens when the editor
+  // has nothing else to do.
+  useEffect(() => {
+    if (!url) return;
+    let cancelled = false;
+    let idle = 0;
+    const ric = (window as unknown as { requestIdleCallback?: (cb: (d: { timeRemaining(): number }) => void, o?: { timeout: number }) => number }).requestIdleCallback;
+    const cancelIdle = (window as unknown as { cancelIdleCallback?: (h: number) => void }).cancelIdleCallback;
+    const fill = async () => {
+      if (cancelled) return;
+      const token = renderTokenRef.current;
+      const pass = textPassRef.current;
+      for (let i = 1; i <= slotsRef.current.length; i++) {
+        if (cancelled || token !== renderTokenRef.current || pass !== textPassRef.current) return;
+        if (slotsRef.current[i - 1]?.textRendered) continue;
+        await buildTextLayer(i, token, pass);
+        // Back to the queue between pages: a keystroke, a scroll or the next
+        // compile all get to go first.
+        await new Promise<void>(resolve => {
+          if (ric) ric(() => resolve(), { timeout: 500 });
+          else setTimeout(resolve, 0);
+        });
+      }
+    };
+    const timer = setTimeout(() => {
+      if (ric) idle = ric(() => { void fill(); }, { timeout: 5000 });
+      else void fill();
+    }, 2500);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      if (idle && cancelIdle) cancelIdle(idle);
+    };
+  }, [url]);
 
   // Destroy the last-held PDF document when the preview unmounts (workspace
   // switch, app close) so it doesn't linger with its worker transport.
@@ -594,9 +712,14 @@ function PdfPreview(
   // text, scroll it into view and flash it. Returns false if it couldn't be
   // located (so the caller can stay quiet rather than jump somewhere wrong).
   useImperativeHandle(ref, (): PdfHandle => ({
-    revealSource(p: SyncPayload): boolean {
+    async revealSource(p: SyncPayload): Promise<boolean> {
       const pages = pagesRef.current;
       if (!pages) return false;
+      // The phrase can be on any page, including one that has never been on
+      // screen, so this is the caller that pays for the whole document's text —
+      // once per compile, and only if sync is actually used.
+      await ensureAllTextLayers(renderTokenRef.current);
+      if (!pagesRef.current) return false;
       const { words, spans } = wordIndexFor(pages);
       if (!words.length) return false;
       const prior = Math.round(p.docFraction * words.length);
@@ -608,10 +731,12 @@ function PdfPreview(
       flashSpan(span);
       return true;
     },
-    revealPosition(position): boolean {
+    async revealPosition(position): Promise<boolean> {
       const slot = slotsRef.current[position.page - 1];
       const dimensions = pageInfoRef.current;
       if (!slot || !dimensions) return false;
+      // One known page — build just that one if it hasn't been on screen.
+      await ensureTextLayer(position.page, renderTokenRef.current);
       const pageRect = slot.div.getBoundingClientRect();
       let nearest: { span: HTMLElement; score: number; vertical: number } | null = null;
       for (const span of Array.from(slot.textDiv.querySelectorAll<HTMLElement>('span'))) {
