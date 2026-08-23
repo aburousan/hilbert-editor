@@ -521,19 +521,21 @@ cd hilbert-editor ; npm install ; npm run dev   # then open http://localhost:517
 
 As an alternative you can run in Docker. Isn't perfect but it's functional for most of the stuff. The original application was design for Desktop so it sometimes will show errors that can be cleared with a cache deletion (.mjs files are extremly aggressively cached). I would recommend setting a volume to avoid lossing your work. This is just a quick beta option for a quick setup:
 
-Build the image:
+Build and tag the image:
 
 ```
 docker build -t hilbert-editor:latest .
 ```
-
+Run it!
 ```
 docker run -d \
   --name hilbert-editor \
-  -p 8082:80 \
+  -p 8080:80 \
   -v $(pwd)/hilbert-workspace:/app/data \
   hilbert-editor:latest
 ```
+
+Everything will be exposed in [http://localhost:8080](http://localhost:8080/)
 
 ## A few tips
 
