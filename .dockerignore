@@ -5,3 +5,8 @@ node_modules
 .git
 releases
 linux-build/release
+
+# Not needed in the image, and editing them should not rebuild the compiler.
+Dockerfile
+.dockerignore
+README.md

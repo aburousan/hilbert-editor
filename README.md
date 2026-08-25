@@ -517,6 +517,51 @@ cd hilbert-editor ; npm install ; npm run dev   # then open http://localhost:517
 
 ---
 
+## Run from Docker
+
+If you would rather not install anything, the repository builds a container that
+runs Hilbert's hosted mode: the browser is the editor, the compiler and the
+project live in the container, and the folder you mount is the project.
+
+```sh
+docker build -t hilbert-editor:latest .
+```
+
+```sh
+docker run -d \
+  --name hilbert-editor \
+  -p 127.0.0.1:8080:3001 \
+  -e HILBERT_SERVER_TOKEN="a-random-secret-of-at-least-32-characters" \
+  -v "$(pwd)/hilbert-workspace:/app/data" \
+  hilbert-editor:latest
+```
+
+Then open [http://localhost:8080](http://localhost:8080/) and sign in with that
+token. Leave `HILBERT_SERVER_TOKEN` out and the container prints a fresh one to
+`docker logs hilbert-editor` at every start, which is fine for a look around but
+throws away your sessions and the live-collaboration room key each time.
+
+Mount a folder you actually want edited. Without `-v` the project lives inside
+the container and `docker rm` takes it with it. The mounted folder must be
+writable by uid 1000; if yours is not, add `--user "$(id -u):$(id -g)"`.
+
+`-p 127.0.0.1:8080:3001` keeps the port on your own machine. Anyone who can
+reach it can sign in with the token, edit the project and run code in it, so
+before putting it on a network read the hosted-workspace section of
+[docs/COLLABORATION.md](docs/COLLABORATION.md) — in particular, browsers only
+hand out the encryption API over HTTPS or on localhost, so a plain-HTTP LAN
+address can edit and compile but cannot collaborate.
+
+Code cells are confined by the container and nothing else. Hilbert normally
+confines them with bubblewrap, but bubblewrap cannot work inside an ordinary
+container, so the image sets `HILBERT_SANDBOX=off` and relies on the container
+boundary instead. Code you run therefore reaches the whole container filesystem
+and the network, though not your machine beyond the folder you mounted.
+`-e ALLOW_CODE_EXECUTION=0` turns code cells off entirely.
+
+Python, NumPy, Matplotlib and SymPy are in the image. Anything else, Julia or a
+LaTeX toolchain or your own Python packages, is not, and needs its own layer.
+
 ## A few tips
 
 - Compile: edits recompile after a short pause; ⌘S saves and recompiles now.
