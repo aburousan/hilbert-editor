@@ -4,6 +4,42 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.2.3
+
+This carries the same fixes as 0.2.2 and nothing else. 0.2.2 went out as a
+pre-release for one tester, which means the updater never offered it to anyone
+— so if you are on 0.2.1, this is the build that actually reaches you, and
+everything in the 0.2.2 section below is new to you.
+
+The short version: typing quickly no longer rearranges your text, the syntax
+colouring no longer goes flat every time auto-compile fires, a long document no
+longer stalls while you type, and Reveal in File Manager opens the right folder
+on Windows.
+
+What is new since 0.2.2 is only in the repository, not in the app: Hilbert now
+has a Dockerfile, contributed by Héctor Flores, for running it in a browser
+without installing anything. It wraps the hosted mode the binary already had
+(`hilbert --serve`), so the container signs you in, serves the interface and
+runs the compiler on one port. See the README.
+
+Both of the typing fixes are now covered by a test that drives a real editor at
+30 ms a keystroke and checks every character landed where it was typed
+(`npm run test:typing`). The bug it guards against passed every unit test we
+had, so the test deliberately uses a document heavy enough to reproduce the
+conditions it needs.
+
+### Worth knowing, if you missed it
+
+Hilbert has been able to write right-to-left since 0.2.0, and people who
+upgraded straight past it may not know. Each line takes its direction from the
+first real letter in it, so Hebrew, Arabic, Persian and Urdu lines start at the
+right edge with their punctuation on the correct side, while an English line in
+the same file is unaffected. There is a switch in the settings if you would
+rather force one direction, and the bidi marks are on the Insert menu for the
+lines the heuristic gets wrong.
+
+---
+
 ## 0.2.2
 
 ### Typing quickly rearranged the text
