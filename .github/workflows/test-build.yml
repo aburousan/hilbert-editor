@@ -18,6 +18,8 @@ on:
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
+      - 'Dockerfile'
+      - 'docker/**'
       - '.github/workflows/build.yml'
 
 permissions:
