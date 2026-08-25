@@ -22,7 +22,8 @@ machine, works offline, and can execute your Python, Julia, or Wolfram snippets 
 drop the result straight into the document.
 
 ![Hilbert](docs/screenshot.png)
-![Uploading image.png…]()
+<img width="1698" height="939" alt="image" src="https://github.com/user-attachments/assets/9bc14c61-ea26-4f3a-858b-16423f4fcf32" />
+
 
 ---
 
