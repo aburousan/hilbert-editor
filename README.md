@@ -22,6 +22,7 @@ machine, works offline, and can execute your Python, Julia, or Wolfram snippets 
 drop the result straight into the document.
 
 ![Hilbert](docs/screenshot.png)
+![Uploading image.png…]()
 
 ---
 
