@@ -1,0 +1,31 @@
+name: Feature request
+description: Something Hilbert should be able to do and cannot.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Requests from people actually writing papers are the ones that get built first, so
+        it helps to hear what you were trying to write, not only which button is missing.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do
+      description: The writing task behind the request, and where Hilbert makes you stop.
+      placeholder: |
+        I typeset a lot of commutative diagrams and end up drawing each one by hand in
+        cetz because ...
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help
+      description: How you picture it working. A rough sketch is fine.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: How you work around it now
+      description: What you do today instead, in Hilbert or elsewhere. Optional.

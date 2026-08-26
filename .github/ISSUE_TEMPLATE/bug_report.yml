@@ -1,0 +1,65 @@
+name: Bug report
+description: Something in Hilbert is broken or behaves the wrong way.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before you start:** open Hilbert and run **Help → Copy Diagnostics**. It puts the
+        version, the Typst and tinymist it found, the `PATH` it searched and the last few
+        thousand lines of engine log on your clipboard, and there is a box for it below.
+
+        On Windows especially a windowed app has nowhere to print, so without that text a
+        report can only describe the symptom.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, and what Hilbert did instead of what you expected.
+      placeholder: |
+        I pressed ⌘S with a two-chapter document open and the preview went blank.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to reproduce it
+      description: >
+        The shortest sequence that brings it back. If it needs a particular document, a
+        cut-down `.typ` that still shows the problem is the most useful thing you can attach.
+      placeholder: |
+        1. Open a folder with main.typ and chapter1.typ
+        2. #include "chapter1.typ" from main.typ
+        3. Save
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: >
+        **Help → Copy Diagnostics**, then paste here. It names the paths of the documents you
+        had open, so trim anything you would rather not post. If the app will not start at
+        all, say so instead and describe how it fails.
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS, Apple Silicon
+        - macOS, Intel
+        - Linux (AppImage)
+        - Linux (.deb / apt)
+        - Linux (.rpm)
+        - Docker / hosted mode
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Screenshots, a recording, or what you had already tried. Optional.

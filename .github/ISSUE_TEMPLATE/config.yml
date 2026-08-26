@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or idea
+    url: https://github.com/aburousan/hilbert-editor/discussions
+    about: Anything that is not a bug or a concrete feature request starts better here.
+  - name: Every feature, in one place
+    url: https://github.com/aburousan/hilbert-editor/blob/main/docs/FEATURES.md
+    about: Worth a look first — the tool you want may already be in the menus.
+  - name: Installing, settings and security
+    url: https://github.com/aburousan/hilbert-editor/blob/main/docs/CONFIGURATION.md
+    about: Environment variables, where Hilbert keeps its files, and what runs where.
