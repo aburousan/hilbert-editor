@@ -5,15 +5,6 @@
 > the Typst team. "Typst" is a trademark of its respective owners; this project
 > merely builds on top of the open-source Typst compiler.
 
-> **Website:** [rousan.netlify.app/hilbert](https://rousan.netlify.app/hilbert/). The
-> landing page has a feature overview and download links.
-
-> **Automatic updates:** Hilbert updates itself. Install it once and every future
-> version arrives on its own (it asks before installing). Grab it from the
-> [latest release](https://github.com/aburousan/hilbert-editor/releases/latest).
-> On Linux the AppImage auto-updates; the `.deb` does not.
-> [What changed in each version](docs/RELEASE_NOTES.md).
-
 It started as "an offline, Overleaf-feeling place to write physics and maths," and
 grew into a full scientific-writing IDE: a real code editor on the left, a live PDF
 on the right. Equations, matrices, plots, diagrams, theorems, citations, and running
@@ -24,19 +15,16 @@ drop the result straight into the document.
 ![Hilbert](docs/screenshot.png)
 <img width="1698" height="939" alt="image" src="https://github.com/user-attachments/assets/9bc14c61-ea26-4f3a-858b-16423f4fcf32" />
 
+**[Download](https://github.com/aburousan/hilbert-editor/releases/latest)** ·
+[Website](https://rousan.netlify.app/hilbert/) ·
+[What changed](docs/RELEASE_NOTES.md) ·
+[Every feature](docs/FEATURES.md) ·
+[Collaboration](docs/COLLABORATION.md) ·
+[Configuration and security](docs/CONFIGURATION.md)
 
----
-
-## Contents
-
-- [What it's like to use](#what-its-like-to-use)
-- [Feature tour (with demos)](#feature-tour)
-- [Everything in the box](#everything-in-the-box): the full list
-- [What you need](#what-you-need)
-- [Get it (downloads & install)](#get-it)
-- [Run from source](#run-from-source)
-- [Tips](#a-few-tips) · [Troubleshooting](#troubleshooting) · [Configuration](#configuration) · [Security](#security-model)
-- [What's next](#whats-next)
+Hilbert updates itself. Install it once and every future version arrives on its own,
+asking before it installs. On Linux the AppImage auto-updates; the `.deb` gets its
+updates from the apt repository below.
 
 ---
 
@@ -45,14 +33,28 @@ drop the result straight into the document.
 The PDF re-renders as you type. The editor is Monaco, the same one VS Code runs on,
 with Typst hover-docs and autocomplete. It opens and is usable in well under a second.
 
+![Live preview](docs/gifs/live-preview.gif)
+
 Most of the syntax you'd otherwise have to memorise is a click away: equations,
 matrices, tables, figures, theorem boxes, citations by DOI or arXiv, 2D and 3D plots,
 commutative and Feynman diagrams. Each drops in as clean, editable Typst that stays
 yours. Press ⌘K and you can search every one of them by name.
 
+![Physics equations](docs/physics-gallery.png)
+
 It will also do the actual maths. Run a Python, Julia, or Wolfram snippet and get the
 result back as a typeset equation, or highlight an expression and simplify, solve, or
-integrate it where it sits.
+integrate it where it sits. Run Notebook goes further and executes every code block in
+the document as one session, so variables carry from cell to cell and the output is
+written back under each block.
+
+![Python and Julia notebook cells](docs/notebook-python-julia.png)
+
+Plot Studio is one tool for every plot: 2D functions, 2D data, 3D surfaces, plus a
+one-click launch into the interactive 3D studio and the Python/matplotlib runner. It
+emits `cetz` and `cetz-plot`.
+
+![Plot Studio](docs/plot-studio.png)
 
 Underneath it behaves like a real workspace. Open any folder the way you would in VS
 Code, split a document across `#include`d chapters, drag files around the tree, search
@@ -64,327 +66,14 @@ a comparable Electron editor costs, and a thousand-file project only takes it to
 crashes contained: a broken tool shows an error rather than blanking the editor. On
 Windows it never flashes a console window at you.
 
----
-
-## Feature tour
-
-A live PDF preview recompiles as you type, with zoom, fit-to-width, and a dark mode.
-Double-click any word in the PDF to jump to it in the source. It keeps your place when
-you resize the window or the panes — on a fifty-page document you stay on the
-paragraph you were reading rather than being thrown half the document away.
-
-![Live preview](docs/gifs/live-preview.gif)
-
-Plot Studio is one tool for every plot: 2D functions (`y=f(x)`, implicit, parametric),
-2D data (line, scatter, bar), and 3D surfaces, plus a one-click launch into the
-interactive 3D studio and the Python/matplotlib runner. It emits `cetz` and
-`cetz-plot`.
-
-![Plot Studio](docs/plot-studio.png)
-
-cetz Canvas lets you draw diagrams visually. Click shapes from a palette onto a live
-preview, then set each one's position, size, rotation, and colour, without guessing at
-coordinates.
-
-![cetz Canvas](docs/gifs/cetz-canvas.gif)
-
-Commutative diagrams are drawn in a bundled, offline copy of
-[quiver](https://github.com/varkor/quiver), which produces editable `fletcher` code.
-
-![Commutative diagram with quiver](docs/gifs/quiver-diagram.gif)
-
-Write Python and Julia straight into the document and press Run Notebook. Every code
-block in the file runs as one session, so variables carry from cell to cell, and the
-output is written back underneath each block. The compiled PDF marks each block with
-its language logo.
-
-![Python and Julia notebook cells](docs/notebook-python-julia.png)
-
-Run Python, Julia, or Wolfram in a scratchpad instead, and insert the result as text, a
-figure, or a typeset equation.
-
-![Run code to equation](docs/gifs/run-code-equation.gif)
-
-Colour anything with a draggable colour-grid picker.
-
-![Text colour picker](docs/gifs/text-colour.gif)
-
-Sketch a symbol and get its Typst code.
-
-![Draw a symbol](docs/gifs/draw-symbol.gif)
-
-Cite by DOI or arXiv id: Hilbert looks the paper up, saves it to `refs.bib`, and cites
-it.
-
-![Citations](docs/gifs/citations.gif)
-
-Browse Typst Universe templates with a rendered preview.
-
-![Template preview](docs/gifs/template-preview.gif)
-
-Toggle a dark PDF preview, like Overleaf.
-
-![Dark PDF](docs/gifs/dark-pdf.gif)
-
-### More visual builders
-
-Feynman diagrams support fermion, photon, gluon, scalar, and ghost propagators, loops
-with fermion-flow arrows, hatched or shaded blobs, vertices, and labels, all producing
-editable `cetz`.
-
-![Feynman diagram builder](docs/feynman-builder.png)
-
-Matrix Studio is a visual grid with fills, borders, brackets, and a code-array mode.
-
-![Matrix Studio](docs/matrix-studio.png)
-
-3D Plot Studio lets you rotate a surface to the exact angle you want, then insert that
-view.
-
-![3D Plot Studio](docs/plot3d-studio.png)
-
-Flowchart to Code: draw the logic, and it writes the `while`, `if`, and `for`.
-
-![Flowchart to code](docs/flowchart-code.png)
-
 > Everything happens on your computer. A small local server drives the Typst compiler
 > and (optional) code execution. Nothing leaves the machine unless you deliberately
 > turn on Google Drive or WebDAV sync.
 
----
-
-## Everything in the box
-
-The full list, grouped by what you're doing.
-
-### Editing and preview
-
-The Monaco editor handles Typst highlighting, and
-[tinymist](https://github.com/Myriad-Dreamin/tinymist) supplies hover documentation
-and autocomplete, plus live errors, warnings, information, and hints in Monaco and
-the Problems panel. Hover any function for its signature and docs, and get completions
-for every builtin, package export, and label. There's `@`-reference autocomplete, and
-image-path autocomplete inside `image("…")`. Control-flow completions offer both the
-`{ }` code body and the `[ ]` content body for `if`, `for`, and `while`. The same
-engine drives code intelligence from the Edit menu and the editor's right-click menu:
-go to definition, find references, rename a symbol across the file, quick fixes, and
-whole-document formatting (F2) with the bundled typstyle formatter.
-
-The PDF preview recompiles as you type, with zoom, fit-to-width, a dark PDF mode, and
-double-click-to-source (it reads the surrounding words to land on the right
-occurrence). When a compile fails you keep the last good preview and the errors move
-to their own Problems tab, so a typo mid-sentence doesn't blank the page — the last
-good render stays up from the moment you open a project, with a slim strip at the
-bottom you click for the full error list. There's also an experimental **HTML Preview**
-(View menu) that renders the document through Typst's HTML export.
-
-Slide Studio builds editable 16:9 decks with templates, drag-and-drop positioning,
-shapes, curves with optional arrowheads, equations, app-tool inserts, alignment controls, copy/paste,
-undo/redo, optional grid snapping, and drag-reorderable slide thumbnails. Its layout
-is stored inside ordinary Typst source, so an existing deck can be reopened and edited.
-
-Multi-file projects compile from the project root (`main.typ`, or the `typst.toml`
-entrypoint), so `#include`d chapters that share a bibliography or labels render as a
-whole. The root file shows a MAIN badge; right-click any `.typ` and choose
-**Set as main file** to change it.
-
-Five interface themes, chosen from the sun/moon button in the header or in
-**App Settings → Interface theme**, and they dress the whole window rather than the
-editor pane alone: **Ink** (the default charcoal), **Paper**, **Sepia** for long
-low-blue sessions, **Midnight** for a dark room or an OLED panel, and **High
-Contrast**. The PDF preview keeps its own light/dark toggle, since paper is not
-always what you want the page itself to be.
-
-There's also a clickable Problems panel, a File Outline, resizable panes, a ⌘K command
-palette covering every menu action, a Help window listing the features, and a live
-word count of the rendered document (read from the PDF, so `#set` and `#import` lines
-don't inflate it). The View menu and a status bar along the bottom switch the file
-tree, outline, problems, editor, and preview on and off individually — hide the editor
-to read, hide the preview to write. **File → New Window** opens another project in a
-second window; it's one app (a single Dock icon) with independent windows, each with
-its own preview, and comment/uncomment works on the current line or selection (⌘/ or
-Ctrl+/, in Typst, Python, Julia, `.bib`, and more).
-
-### Projects and files (VS Code style)
-
-**Open Folder** makes any folder on disk the workspace, with edits saved straight back
-on the desktop app and in Chrome/Edge, plus **File → Open Recent**. The file tree does
-multi-select, drag-and-drop moves, rename, duplicate, delete, cut, copy, paste, a
-right-click menu, new file and folder, asset upload, compress to `.zip`, and
-reveal-in-file-manager. Full-text search across the workspace jumps you to the line.
-Files changed on disk by Git or another editor are picked up automatically; if you had
-unsaved edits, Hilbert shows both versions side by side and lets you choose rather than
-silently overwriting either one.
-
-### Inserting the annoying stuff
-
-Title blocks, headings, abstracts, authors, and institutes. Inline, block, aligned,
-and numbered equations, with numbering on by default (toggle it under the cursor with
-⌘⇧N). Matrices through the visual Matrix Studio, plus tables, figures, images, and
-lists, most with a *center on page* toggle.
-
-The Page Setup builder (Formatting → Page Setup) writes the `#set page(...)` rule for
-paper size, per-side margins, header and footer, and page numbers. Text formatting
-covers bold, italic, super- and subscript, a draggable colour picker, underline,
-highlight, strike-through, boxed selections with fill and border and texture, a
-font-size dropdown, alignment, rotation, small caps, and a full-width horizontal rule
-(⌘⇧H).
-
-Cross-references work by adding a label (`= Intro <sec:intro>`), typing `@`, and
-picking it. The image editor crops and rotates PNGs and JPGs before inserting; SVGs
-open as a safe preview.
-
-### Maths and physics
-
-A maths and physics symbol picker backed by `physica`, and a draw-a-symbol pad that
-matches your sketch against the glyph shapes offline.
-
-Theorems, proofs, and lemmas, plain or in coloured boxes, each kind numbered
-separately. A Physics & Cosmology menu of ready-made, compile-checked equations:
-bra-kets, commutators, the Dirac and Klein-Gordon equations, the QED Lagrangian,
-Einstein's field equations, Christoffel symbols, the FRW metric, and the Friedmann
-equations. An equation gallery of fill-in templates sits alongside it.
-
-### Plots and diagrams
-
-Plot Studio is the unified plotting tool: 2D functions (explicit, implicit,
-parametric), 2D data (line, scatter, bar), 3D `cetz` surfaces, and launchers for the
-interactive 3D studio and the Python/matplotlib runner.
-
-cetz Canvas is a visual shape builder with 13 primitives (circle, ellipse, rectangle,
-triangle, hexagon, line, arrow, arc, curve, grid, point, axes, label), a live preview,
-and per-shape position, size, rotation, and colour. It can also plot a curve straight
-from a data file once you pick the X and Y columns.
-
-3D Plot Studio gives you a surface you rotate by hand, then insert exactly that view.
-Commutative diagrams come from the bundled offline copy of
-[quiver](https://github.com/varkor/quiver) as editable `fletcher`. Feynman diagrams are
-drawn visually and come out as editable `cetz`. Flowchart to Code turns drawn logic
-into `while`, `if`, and `for`. General 2D plotting runs through `cetz` and `cetz-plot`.
-
-### Maths that computes
-
-Run code and insert the result (Python, Julia, or Wolfram) as text output, a generated
-figure, or, in *equation mode*, write plain maths like `diff(sin(x**2), x)` and get a
-typeset equation back.
-
-Run Notebook executes every ```` ```python ```` and ```` ```julia ```` block in the
-document as one session, so variables persist between cells. Output and plots land
-below each block, and the compiled PDF badges each block with its language logo.
-
-Figures are saved as PNG by default; App Settings → Interpreters switches that to SVG
-or PDF, so plots stay vector and print sharp. Asking for a format in the code wins over
-the setting — Julia's `plot(x; fmt = :pdf)`, or naming the file yourself with
-`savefig("figure.svg")`. EPS is there for journals that insist on it: Typst cannot embed
-EPS, so those runs also write a PDF of each figure and the document points at that one.
-
-Compute on a selection: highlight an expression and simplify, solve, differentiate,
-integrate, or evaluate it with sympy, dropped back in as an equation.
-
-The runner ships with physics examples: General Relativity with
-[xAct](http://www.xact.es/) (Schwarzschild curvature through to the Ricci tensor and
-the Kretschmann scalar), Penrose diagrams, and Clebsch-Gordan and Wigner 3-j
-coefficients, as a rendered image or a typeset equation.
-
-### References and bibliography
-
-A reference and label manager lists every label and `@reference`, flagging the
-undefined, duplicated, and unused ones. The citation manager looks a paper up by DOI
-or arXiv id, saves it to `refs.bib`, and cites it with `@key`, adding the bibliography
-section for you.
-
-### Getting things in and out
-
-Import data from CSV, TSV, or Excel with a preview, then insert it as a Typst table, a
-plot with the columns you choose, or a variable. JSON, YAML, and TOML come in with the
-matching Typst reader wired up. Import your own fonts (`.ttf` / `.otf`) via
-File → Import Font.
-
-Templates come from Typst Universe with a rendered preview, and six ship with the app
-for offline use, including a two-column journal paper and a LaPreprint-style preprint
-with margin notes, ORCID links and a running footer. Export goes to PDF (with page
-ranges, PDF/A standards, tagging, and pretty-printing), PNG, SVG, HTML, plain `.typ`,
-or the whole project folder, through your system's save dialog. Git support covers
-init, commit, and push to GitHub. There's also sync to a local folder, Google Drive,
-or WebDAV (Nextcloud and ownCloud), and a package manager to search, download, and
-remove Typst packages.
-
-Live collaboration is **experimental** — it works, but expect rough edges, so keep your
-own backup of anything important. **Read [docs/COLLABORATION.md](docs/COLLABORATION.md)
-before your first session**: it covers hosting, joining, rejoining, the network setups
-(one router, campus, dedicated relay), and troubleshooting. It is offline-first and
-account-free. From the command
-palette, share the whole project (text, images, fonts and whiteboards) on the detected
-campus/LAN address and pass on the generated invitation, or paste an invitation to join
-and receive the project into a folder of your choosing. Hilbert starts a separate collaboration-only
-listener (port 3020 when available); it never exposes the workspace API. Yjs updates,
-presence, and cursors are encrypted end to end with the one-session key in the
-invitation. A user-operated relay can be selected instead by setting its `ws://` or
-`wss://` address. The standalone relay is:
-
-```sh
-hilbert --sync-server --port 3020
-```
-
-For an Overleaf-like browser workspace, the same binary can serve the built Hilbert UI,
-one fixed server-side project, the compiler, and automatic live collaboration:
-
-```sh
-HILBERT_SERVER_TOKEN="a-random-secret-of-at-least-32-characters" \
-  TYPST_DIST=/path/to/dist \
-  hilbert --hosted-server --bind 127.0.0.1 --port 3001 \
-  --workspace /srv/hilbert/project
-```
-
-Use `--bind 0.0.0.0` for network access. Encrypted browser collaboration requires HTTPS
-(including on a LAN) or a localhost SSH tunnel; plain LAN HTTP can edit and compile but
-browsers withhold the encryption API there. In this mode the server workspace is
-authoritative, so browser visitors do not silently get an offline folder on their own
-device. Code running is available to signed-in users, and a hosted server will not run
-any unless the kernel can confine it — install `bubblewrap`, or set
-`HILBERT_SANDBOX=off` to accept running it unconfined. See the hosted-workspace section in
-[docs/COLLABORATION.md](docs/COLLABORATION.md) for the security and backup details.
-Keeping the same server token and workspace path also keeps authenticated sessions and
-the encrypted live room stable through an ordinary hosted-server restart.
-Unsaved text is additionally kept in device-local browser recovery storage until the
-server confirms it. After an outage Hilbert safely replays a draft whose base is still
-current, or asks before replacing a server copy that changed separately. This protects
-in-flight edits but does not replace normal server backups or create a full offline
-project clone.
-For a routed campus connection, keep the server on loopback and forward it with
-`ssh -N -L 3001:127.0.0.1:3001 user@server`, then browse to
-`http://127.0.0.1:3001`.
-
-The host must remain online for a direct session. Everyone's ordinary project file
-continues to save locally, and reconnection merges live CRDT updates while the session
-is active. For step-by-step setup, including the single-router, campus, and dedicated
-relay cases, see [docs/COLLABORATION.md](docs/COLLABORATION.md).
-
-### Reliability and platform
-
-The auto-updater (Tauri build) checks on launch and asks before installing. If the
-check can't run, the app still starts normally.
-
-Heavy tools (3D studio, Plot Studio, whiteboard, code runner) are isolated, so an
-error in one shows a dismissible message instead of blanking the editor. A failed
-compile keeps your last good preview. On Windows, background tools never flash a
-console window. Closing a secondary window also stops its private local server and
-preview watcher; language-server processes shared with another open window remain alive
-until the last window using that project closes. Bundled Typst packages are cached
-locally, so documents compile with no network and no downloads.
-
-What you set is what you come back to. The interface theme, editor font size,
-auto-compile delay, which panels are showing, the pane sizes, and the interpreter you
-picked for each language are all kept in a file next to the session, so they survive
-a restart, a reboot, and a second window. They used to live in the webview's storage,
-which is tied to the port the app happens to get — and losing that port meant the
-editor reopening at 14pt as though you had never told it otherwise.
-
-The app keeps an activity log, and **Help → Copy Diagnostics** puts it on the
-clipboard together with the Typst and tinymist it found and the `PATH` it searched.
-Worth reaching for before filing a bug: on Windows especially, a windowed app has no
-console to print to, so without it there is nothing to look at afterwards. The same
-content is on disk — see [Configuration](#configuration) for where.
+**[docs/FEATURES.md](docs/FEATURES.md) is the full list** — visual builders for
+matrices, Feynman diagrams, commutative diagrams and flowcharts, slide decks, the
+reference and citation managers, templates, every export format, live collaboration
+and the hosted browser workspace.
 
 ---
 
@@ -397,38 +86,32 @@ must be on your `PATH`:
   Install it with `brew install typst`, `winget install Typst.Typst`,
   `cargo install typst-cli`, or a release binary. Verify with `typst --version`.
 - [tinymist](https://github.com/Myriad-Dreamin/tinymist), the Typst language server,
-  is optional but recommended, for diagnostics, hover docs, and autocomplete.
-  - macOS: `brew install tinymist`
-  - Windows: `winget install Myriad-Dreamin.tinymist` (or `scoop install tinymist`)
-  - Linux, or any OS with Rust: `cargo install tinymist`
-
-  Hilbert checks `TINYMIST_BIN` first (bundled builds set it automatically), then its
-  managed app-data location, and finally `PATH`. The exact path, source, version, running state, and
-  restart control are shown under **App Settings → General**. Without Tinymist the
-  editor still compiles and previews normally; language-server features stay quiet.
+  is optional but recommended, for diagnostics, hover docs, and autocomplete:
+  `brew install tinymist`, `winget install --exact --id Myriad-Dreamin.Tinymist`,
+  or `cargo install tinymist`. Without it the editor still compiles and previews
+  normally; language-server features stay quiet. The path, version and running state
+  are shown under **App Settings → General**.
 - For running code, optionally: Python 3 (with `numpy`, `matplotlib`, `sympy`), Julia
   (`Latexify` for equation mode), and WolframScript.
 - Node.js 18+ and a [Rust toolchain](https://rustup.rs) (stable), only if you run
-  from source — the backend is compiled by `cargo` on first run.
+  from source.
 
 ---
 
 ## Get it
 
-The [landing page](https://rousan.netlify.app/hilbert/) has an overview and download
-links. Prebuilt installers are on the
-[Releases](https://github.com/aburousan/hilbert-editor/releases) page. The app is
-small, light on memory, and auto-updates.
+Prebuilt installers are on the
+[Releases](https://github.com/aburousan/hilbert-editor/releases) page.
 
 | Platform | Download |
 | --- | --- |
-| Windows | `.exe` / `.msi` |
+| Windows | `winget install Aburousan.Hilbert`, or `.exe` / `.msi` |
 | macOS, Apple Silicon | `…-macOS-arm64.dmg` |
 | macOS, Intel | `…-macOS-x64.dmg` |
-| Linux | `.AppImage` (auto-updates) / `.deb` |
+| Linux | `.AppImage` (auto-updates) / `.deb` / `.rpm` |
 
 On a Mac, pick Apple Silicon for M-series chips and Intel for older Macs (*About This
-Mac* tells you which). The desktop app still needs the Typst CLI on your `PATH`.
+Mac* tells you which).
 
 > **macOS, first launch.** The app isn't notarised (there's no paid Apple developer
 > account), so macOS quarantines it, and renaming or moving the `.app` can break its
@@ -440,44 +123,31 @@ Mac* tells you which). The desktop app still needs the Typst CLI on your `PATH`.
 > ```
 > **Run these as two separate commands, one per line.** If you paste them joined onto
 > a single line, the shell reads `--force` as an option to `xattr` and reports it as
-> unrecognised. Enter the first line, press return, then the second. (Adjust the path
-> if the app is elsewhere, e.g. `~/Downloads`.) The code is open, so you can audit or
-> build it yourself. This is a one-time step.
+> unrecognised. (Adjust the path if the app is elsewhere.) This is a one-time step.
 
-### macOS (Homebrew)
+**macOS, Homebrew.** `brew install --cask aburousan/hilbert/hilbert`, then
+`brew upgrade --cask hilbert` later. Gatekeeper may still refuse the first launch;
+either add `--no-quarantine` to the install, or follow the note above.
 
-Install and keep it updated through a Homebrew tap:
+**Windows, winget.** Hilbert is in the Microsoft package repository, so you can
+install it and everything it needs without visiting a download page:
 
-```bash
-brew install --cask aburousan/hilbert/hilbert
+```powershell
+winget install --exact --id Aburousan.Hilbert
+winget install --exact --id Typst.Typst
+winget install --exact --id Myriad-Dreamin.Tinymist
 ```
 
-Because the app isn't notarised, Gatekeeper may refuse the first launch. Either add
-`--no-quarantine`:
+That installs per user and asks for no administrator rights. `winget upgrade
+Aburousan.Hilbert` picks up a new release if the app hasn't already updated itself.
+Or download the `.exe` (or `.msi`) from Releases and run it — same application.
 
-```bash
-brew install --cask --no-quarantine aburousan/hilbert/hilbert
-```
+Hilbert also looks where the Windows package managers actually put things — winget's
+`Links` and `Packages` folders, scoop's shims, chocolatey's `bin` — so a Typst or
+tinymist installed after the app was last started is still found.
 
-or use the `.dmg` from Releases and follow the first-launch note above. Update later with
-`brew upgrade --cask hilbert`.
-
-### Windows
-
-Download the `.exe` (or `.msi`) from Releases and run it. It behaves like a normal
-Windows app: launching tools never flashes a console window, and a failed compile
-shows an error panel instead of closing. You still need the Typst CLI on `PATH`.
-
-Hilbert also looks where the Windows package managers actually put things —
-winget's `Links` and `Packages` folders, scoop's shims, chocolatey's `bin` — so a
-Typst or Tinymist installed after the app was last started is still found. A
-running program keeps the environment it was launched with, and the desktop hands
-every app the copy it captured at login, which is why a fresh `winget install` can
-be on your `PATH` and invisible to an app at the same time.
-
-### Linux (Debian / Ubuntu)
-
-Install from the apt repository so `apt upgrade` keeps it current:
+**Linux (Debian / Ubuntu).** Install from the apt repository so `apt upgrade` keeps it
+current:
 
 ```bash
 curl -fsSL https://aburousan.github.io/hilbert-apt/hilbert-archive-keyring.asc \
@@ -486,8 +156,6 @@ echo "deb [arch=amd64 signed-by=/usr/share/keyrings/hilbert-archive-keyring.gpg]
   | sudo tee /etc/apt/sources.list.d/hilbert.list
 sudo apt update && sudo apt install hilbert
 ```
-
-Or download the `.deb`, `.AppImage`, or `.rpm` from Releases directly.
 
 ---
 
@@ -506,63 +174,35 @@ npm run dev             # Vite UI on http://localhost:5173, backend on http://12
 
 `npm run dev` serves the UI with Vite (hot reload) and starts the Rust backend in
 headless mode on port 3001. For the real desktop app, `npm run desktop` builds the
-frontend (`tsc`, Vite, and the bundled-secret strip) and opens the native window —
-that's also what a release build ships.
-
-On Windows, run from source with:
-
-```powershell
-winget install Typst.Typst
-git clone https://github.com/aburousan/hilbert-editor.git
-cd hilbert-editor ; npm install ; npm run dev   # then open http://localhost:5173
-```
-
----
+frontend and opens the native window — that's also what a release build ships. On
+Windows: `winget install Typst.Typst`, then `npm install ; npm run dev`.
 
 ## Run from Docker
 
-If you would rather not install anything, the repository builds a container that
-runs Hilbert's hosted mode: the browser is the editor, the compiler and the
-project live in the container, and the folder you mount is the project.
+The repository also builds a container that runs Hilbert's hosted mode: the browser
+is the editor, the compiler and the project live in the container, and the folder you
+mount is the project.
 
 ```sh
 docker build -t hilbert-editor:latest .
-```
-
-```sh
-docker run -d \
-  --name hilbert-editor \
+docker run -d --name hilbert-editor \
   -p 127.0.0.1:8080:3001 \
   -e HILBERT_SERVER_TOKEN="a-random-secret-of-at-least-32-characters" \
   -v "$(pwd)/hilbert-workspace:/app/data" \
   hilbert-editor:latest
 ```
 
-Then open [http://localhost:8080](http://localhost:8080/) and sign in with that
-token. Leave `HILBERT_SERVER_TOKEN` out and the container prints a fresh one to
-`docker logs hilbert-editor` at every start, which is fine for a look around but
-throws away your sessions and the live-collaboration room key each time.
-
-Mount a folder you actually want edited. Without `-v` the project lives inside
-the container and `docker rm` takes it with it. The mounted folder must be
-writable by uid 1000; if yours is not, add `--user "$(id -u):$(id -g)"`.
-
-`-p 127.0.0.1:8080:3001` keeps the port on your own machine. Anyone who can
-reach it can sign in with the token, edit the project and run code in it, so
-before putting it on a network read the hosted-workspace section of
-[docs/COLLABORATION.md](docs/COLLABORATION.md) — in particular, browsers only
-hand out the encryption API over HTTPS or on localhost, so a plain-HTTP LAN
-address can edit and compile but cannot collaborate.
-
-Code cells are confined by the container and nothing else. Hilbert normally
-confines them with bubblewrap, but bubblewrap cannot work inside an ordinary
+Open [http://localhost:8080](http://localhost:8080/) and sign in with that token.
+Leave `HILBERT_SERVER_TOKEN` out and the container prints a fresh one to
+`docker logs hilbert-editor` at every start. The mounted folder must be writable by
+uid 1000; if yours is not, add `--user "$(id -u):$(id -g)"`. Code cells are confined
+by the container and nothing else — bubblewrap cannot work inside an ordinary
 container, so the image sets `HILBERT_SANDBOX=off` and relies on the container
-boundary instead. Code you run therefore reaches the whole container filesystem
-and the network, though not your machine beyond the folder you mounted.
-`-e ALLOW_CODE_EXECUTION=0` turns code cells off entirely.
+boundary; `-e ALLOW_CODE_EXECUTION=0` turns code cells off entirely. Before putting
+the port on a network, read the hosted-workspace section of
+[docs/COLLABORATION.md](docs/COLLABORATION.md).
 
-Python, NumPy, Matplotlib and SymPy are in the image. Anything else, Julia or a
-LaTeX toolchain or your own Python packages, is not, and needs its own layer.
+---
 
 ## A few tips
 
@@ -576,118 +216,33 @@ LaTeX toolchain or your own Python packages, is not, and needs its own layer.
 - Compute: select an expression, then Insert → Math → Compute Selection.
 - Run code: the `</>` toolbar button runs every code block in the file as one session.
 
----
-
 ## Troubleshooting
 
-- **macOS says the app is "damaged" or won't open.** This is Gatekeeper quarantine, or
-  a broken signature from renaming the `.app`. Fix it with the two commands in
-  [Get it](#get-it), run **one per line, as two separate commands** (pasting them onto
-  one line makes the shell treat `--force` as an argument to `xattr`, and it errors):
-  ```bash
-  xattr -cr "/Applications/Hilbert.app"
-  codesign --force --deep --sign - "/Applications/Hilbert.app"
-  ```
+- **macOS says the app is "damaged" or won't open.** Gatekeeper quarantine, or a
+  broken signature from renaming the `.app`. Fix it with the two commands in
+  [Get it](#get-it), run one per line.
 - **Window is blank, or it says "couldn't start its local engine".** Something else is
   using port 3001. Quit it and reopen.
 - **It opens but nothing compiles.** The Typst CLI isn't installed or on `PATH`.
-  Install it and confirm `typst --version` works.
+  Confirm `typst --version` works.
 - **Tinymist works in a terminal but the app says it isn't installed.** A running
   program keeps the environment it started with, and the desktop hands every app the
-  one it captured at login — so a tinymist installed since then is on your `PATH` but
-  not on the app's. Hilbert looks in the places winget, scoop and chocolatey put their
-  shims, and in winget's package folder directly. If it still can't find it, send the
-  output of **Help → Copy Diagnostics**, which includes the `PATH` it searched.
+  one it captured at login. Send the output of **Help → Copy Diagnostics**, which
+  includes the `PATH` it searched.
 - **It sits on "Compiling…" and won't finish.** Past a few seconds the status bar says
-  *still waiting on Typst*, which means the engine has been asked and hasn't answered
-  — saving still works meanwhile. Recompile to start over. If it keeps happening,
-  **Help → Copy Diagnostics** records every line `typst watch` emitted, which is what
-  tells us where it stopped.
-- **A template fails with an error inside `@preview/…`.** That's a package
-  compatibility problem, not the editor: some Typst Universe templates pull in helper
-  packages written for an older Typst. Pick a different template, or match the Typst
-  version the template expects. Your own document is fine.
-- **`npm run dev` only prints the concurrently line and stops.** The dev dependencies
-  aren't installed. Run a full `npm install` (not `--production`).
+  *still waiting on Typst*; saving still works meanwhile. Recompile to start over, and
+  **Help → Copy Diagnostics** records every line `typst watch` emitted.
+- **A template fails with an error inside `@preview/…`.** A package compatibility
+  problem, not the editor: some Typst Universe templates pull in helper packages
+  written for an older Typst. Your own document is fine.
+- **`npm run dev` only prints the concurrently line and stops.** Run a full
+  `npm install` (not `--production`).
 
----
-
-## Configuration
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `ALLOW_CODE_EXECUTION` | `1` | Set to `0` to disable all code execution. |
-| `EXEC_TIMEOUT_MS` | `45000` | Per-run wall-clock limit. |
-| `HILBERT_SANDBOX` | `auto`, `require` when hosted | `auto` runs code unconfined where no sandbox exists; `require` refuses to run it; `off` never confines. |
-| `HILBERT_SANDBOX_NET` | `0` | `1` keeps the sandbox but gives the code back its network. |
-| `HILBERT_CODE_SCREEN` | `auto` | `always` keeps the source pattern screen on under a sandbox; `off` never screens. |
-| `HILBERT_SERVER_TOKEN` | none | Required 32+ character browser sign-in secret for `--hosted-server`. |
-| `HILBERT_SESSION_HOURS` | `24` | How long a hosted browser session lasts, 1–720. |
-| `HILBERT_PUBLIC_HOST` | none | Hosted only: the hostname this server is published as. Requests arriving under any other name are refused. |
-| `HILBERT_API_TOKEN` | generated | Optional 32+ character API-token override. Hosted mode otherwise derives a stable, separate session token from its server token and workspace. |
-
-Interpreters (including conda environments) are auto-detected; choose the default per
-language in **App Settings → Interpreters**, and the choice is remembered. Your
-documents live in `~/Documents/Hilbert`. Each workspace keeps its scratch files in a
-hidden `.hilbert/` folder, which is safe to delete.
-
-Settings, the last session, and the activity log sit together in one folder:
-
-| Platform | Folder |
-| --- | --- |
-| macOS | `~/Library/Application Support/hilbert/` |
-| Linux | `~/.config/hilbert/` |
-| Windows | `%APPDATA%\hilbert\` |
-
-`settings.json` holds the preferences, `session.json` the project and open files you
-left behind, and `hilbert.log` the last few thousand lines of what the engine has been
-doing. Deleting any of them is safe; you get the defaults back.
-
----
-
-## Security model
-
-The backend is built for local, single-user use:
-
-- It binds to `127.0.0.1` only, and CORS is limited to `localhost` and `127.0.0.1`.
-  Requests carrying a foreign `Origin` or `Host` header are rejected, so a website you
-  happen to have open cannot reach it.
-- Every API request additionally needs a random bearer token minted at launch and
-  handed only to the app's own window, so other local processes can't drive the
-  backend either. Headless/scripted use sets it explicitly:
-  `HILBERT_API_TOKEN=<32+ chars>` in the environment, then send
-  `Authorization: Bearer <token>` with each request.
-- File access is confined to the workspace, and path traversal is rejected.
-- The collaboration listener is a separate binary-only relay with bounded rooms,
-  peers, frame size, and traffic rate. Document and awareness frames are AES-GCM
-  encrypted in the clients; the relay receives only ciphertext. Invitations contain
-  the temporary decryption key, so share them only with intended collaborators.
-  Set `HILBERT_COLLAB=0` to not start the listener at all, and `HILBERT_COLLAB_PORT`
-  to move it off 3020.
-- Code execution can be turned off (`ALLOW_CODE_EXECUTION=0`). When on, it is
-  time-limited, runs in a scratch directory under `.hilbert/run/` with OS resource
-  limits on file size and CPU, and has its output capped.
-- On Linux and macOS a run is confined by the kernel: bubblewrap on Linux, Seatbelt
-  on macOS. The code can write to its own run directory and nowhere else, has no
-  network, and cannot read `~/.ssh`, `~/.gnupg`, `~/.aws` and the other credential
-  directories. Figures still reach the document — the app copies them out afterwards.
-  On Linux it also gets its own process, IPC and hostname namespaces.
-- Where a sandbox is active the older pattern screen steps aside, since the kernel is
-  enforcing the boundary the patterns were guessing at. Where there is none — Windows,
-  or `HILBERT_SANDBOX=off` — the screen still refuses process, network, shell and
-  destructive calls, and App Settings → Interpreters says which is in force.
-- Wolfram is not confined. `wolframscript` launches a separate kernel over a loopback
-  socket and decides which kernel from state outside the run directory; confining it
-  either stops it starting or silently switches it to a different Mathematica version.
-  It keeps the pattern screen instead, exactly as before.
-
-Don't expose port 3001 to a network. For running documents you genuinely do not
-trust, the sandbox is a real boundary but not the only one worth having: a container
-or a VM still costs you nothing and assumes less.
-
-Cloud credentials (Google Drive OAuth, WebDAV) live only in your browser's local
-storage. A GitHub token is used for the one push you asked for and is never written to
-`.git/config`.
+Before filing a bug, run **Help → Copy Diagnostics**. It puts the activity log on the
+clipboard together with the Typst and tinymist it found and the `PATH` it searched,
+and the bug report form has a box waiting for it. On Windows especially, a windowed
+app has no console to print to, so without that text a report can only describe the
+symptom.
 
 ---
 
