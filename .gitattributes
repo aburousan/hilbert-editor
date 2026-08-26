@@ -1,0 +1,4 @@
+# Built documents and images are binary; never diff or line-ending-convert them.
+*.pdf binary
+*.png binary
+*.gif binary

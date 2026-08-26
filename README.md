@@ -18,6 +18,7 @@ drop the result straight into the document.
 **[Download](https://github.com/aburousan/hilbert-editor/releases/latest)** ·
 [Website](https://rousan.netlify.app/hilbert/) ·
 [What changed](docs/RELEASE_NOTES.md) ·
+[Handbook (PDF)](docs/Hilbert-Handbook.pdf) ·
 [Every feature](docs/FEATURES.md) ·
 [Collaboration](docs/COLLABORATION.md) ·
 [Configuration and security](docs/CONFIGURATION.md)
