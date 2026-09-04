@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { API } from '../api';
+import { keys } from '../keys';
 
 // Everything is measured in Typst page points: presentation-16-9 is
 // 841.89pt × 473.56pt, and the canvas/thumbnails just scale that for display.
@@ -1262,7 +1263,7 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], w
             <br /><br />
             Drag the modal's bottom-right corner to resize the whole studio.
             <br /><br />
-            <b>⌫</b> delete · <b>⌘C / ⌘V</b> copy/paste · <b>⌘D</b> duplicate · arrows nudge · <b>⌘Z / ⌘⇧Z</b> undo/redo
+            <b>⌫</b> delete · <b>{keys('⌘C / ⌘V')}</b> copy/paste · <b>{keys('⌘D')}</b> duplicate · arrows nudge · <b>{keys('⌘Z / ⌘⇧Z')}</b> undo/redo
           </div>
         </>
       );
@@ -1434,9 +1435,9 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], w
           </>
         )}
         <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
-          <button className="btn-ghost" onClick={copySelected} title="Copy element (⌘C)">Copy</button>
-          <button className="btn-ghost" onClick={duplicateSelected} title="Duplicate element (⌘D)">Duplicate</button>
-          <button className="btn-ghost" onClick={pasteCopied} title="Paste copied element (⌘V)">Paste</button>
+          <button className="btn-ghost" onClick={copySelected} title={`Copy element (${keys('⌘C')})`}>Copy</button>
+          <button className="btn-ghost" onClick={duplicateSelected} title={`Duplicate element (${keys('⌘D')})`}>Duplicate</button>
+          <button className="btn-ghost" onClick={pasteCopied} title={`Paste copied element (${keys('⌘V')})`}>Paste</button>
           <button className="btn-ghost" onClick={() => zOrder(1)} title="Bring forward">Forward</button>
           <button className="btn-ghost" onClick={() => zOrder(-1)} title="Send backward">Backward</button>
           <button className="btn-ghost" onClick={removeSel}>Delete</button>
@@ -1497,8 +1498,8 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], w
                   {TOOL_LAUNCHERS.map(([k, name]) => <option key={k} value={k}>{name}</option>)}
                 </select>
               )}
-              <button className="btn-ghost" onClick={undo} title="Undo (⌘Z)">Undo</button>
-              <button className="btn-ghost" onClick={redo} title="Redo (⌘⇧Z)">Redo</button>
+              <button className="btn-ghost" onClick={undo} title={`Undo (${keys('⌘Z')})`}>Undo</button>
+              <button className="btn-ghost" onClick={redo} title={`Redo (⌘${keys('⇧Z')})`}>Redo</button>
               <button className="btn-ghost" onClick={() => setShowGrid(value => !value)} title="Show or hide the alignment grid">{showGrid ? 'Grid on' : 'Grid off'}</button>
               <button className="btn-ghost" onClick={() => setSnapEnabled(value => !value)} title="Snap moved and resized elements to the 4pt grid">{snapEnabled ? 'Snap on' : 'Snap off'}</button>
             </div>

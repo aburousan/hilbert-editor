@@ -18,7 +18,7 @@ use regex::Regex;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Component, Path, PathBuf},
     process::Stdio,
@@ -711,6 +711,15 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R) -> (Vec<u8>, boo
     (out, truncated)
 }
 
+// Every spawned tool gets a wall-clock cap. `None` used to mean "wait forever",
+// which is the wrong default when one hung typst holds `compile_gate` (a single
+// permit) and every later compile queues behind it. Callers that genuinely need
+// longer say so; nobody gets to say "never".
+const DEFAULT_CMD_TIMEOUT_MS: u64 = 120_000;
+// An export compiles every page of the document, sometimes to PDF/A with every
+// figure embedded, so it is allowed to be the slowest thing in the app.
+const EXPORT_TIMEOUT_MS: u64 = 300_000;
+
 async fn run_cmd(
     program: &str,
     args: &[&str],
@@ -733,6 +742,29 @@ async fn run_exec_cmd(
 ) -> std::io::Result<CmdOut> {
     let confined = sandbox::confine(program, args, run_dir, lang);
     run_cmd_inner(program, args, Some(run_dir), timeout_ms, true, confined).await
+}
+
+// Kill the child *and* anything it started. The child leads its own process
+// group (see the spawn above), so on Unix one signal to the negated pid reaches
+// the whole group. Windows has no process groups of that kind, so taskkill's /T
+// walks the tree instead; it is part of the OS, which beats taking a dependency
+// on the Job Object API for one call.
+fn kill_tree(child: &mut tokio::process::Child) {
+    let Some(pid) = child.id() else { return };
+    #[cfg(unix)]
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/T", "/F", "/PID", &pid.to_string()]);
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+        let _ = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = pid;
 }
 
 async fn run_cmd_inner(
@@ -791,18 +823,26 @@ async fn run_cmd_inner(
         }
     }
     let _ = limits; // (Windows: limits are enforced by the wall-clock timeout only.)
+    // Give the child its own process group, so a timeout can signal the whole
+    // tree rather than only the process we spawned. Without this a Python cell
+    // that started workers leaves them running after the cell is killed. On
+    // Linux the bubblewrap sandbox already tears its PID namespace down; this is
+    // what covers macOS, and everything that runs outside the sandbox.
+    #[cfg(unix)]
+    cmd.process_group(0);
     let mut child = cmd.spawn()?;
     let so = child.stdout.take().unwrap();
     let se = child.stderr.take().unwrap();
     let so_task = tokio::spawn(read_capped(so));
     let se_task = tokio::spawn(read_capped(se));
-    let dur = Duration::from_millis(timeout_ms.unwrap_or(u64::MAX / 1000));
+    let dur = Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_CMD_TIMEOUT_MS));
     let mut killed = false;
     let code = match tokio::time::timeout(dur, child.wait()).await {
         Ok(Ok(status)) => status.code(),
         Ok(Err(_)) => None,
         Err(_) => {
             killed = true;
+            kill_tree(&mut child);
             let _ = child.start_kill();
             let _ = child.wait().await;
             None
@@ -906,7 +946,16 @@ async fn workspace_math_locations(State(st): St, Query(q): Q) -> Response {
     let Some(typst) = which("typst") else {
         return json_err(StatusCode::SERVICE_UNAVAILABLE, TYPST_NOT_FOUND_SHORT);
     };
-    let expression = "query(math.equation).map(it => (it.location().position(), it.body))";
+    // Position and body for locating a formula by its symbols, plus whether it
+    // is a block equation and the number Typst actually printed beside it.
+    // That number is the only reliable way back to the source: counting `$ … $`
+    // in the file assumes every block equation is numbered, and in a real paper
+    // several are not, so the count runs ahead of the numbering.
+    let expression = "query(math.equation).map(it => (\
+        it.location().position(), \
+        it.body, \
+        it.block, \
+        if it.block and it.numbering != none { counter(math.equation).at(it.location()).first() } else { 0 }))";
     let main_arg = main_path.to_string_lossy().into_owned();
     let root_arg = ws.to_string_lossy().into_owned();
     let mut owned = vec![
@@ -1414,8 +1463,13 @@ async fn workspace_save_image(State(st): St, body: Bytes) -> Response {
     if let Some(parent) = full.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    match fs::write(&full, bytes) {
-        Ok(_) => Json(json!({ "ok": true, "path": path })).into_response(),
+    // Atomic, because `typst watch` is looking at this directory: a half-written
+    // PNG is a compile error the user did nothing to cause.
+    match write_atomic(&full, &bytes) {
+        Ok(_) => {
+            st.note_write();
+            Json(json!({ "ok": true, "path": path })).into_response()
+        }
         Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -1543,7 +1597,10 @@ async fn workspace_rename(State(st): St, body: Bytes) -> Response {
         let _ = fs::create_dir_all(parent);
     }
     match fs::rename(&src, &dst) {
-        Ok(_) => Json(json!({ "ok": true, "path": jstr(&v, "to").unwrap_or("") })).into_response(),
+        Ok(_) => {
+            st.note_write();
+            Json(json!({ "ok": true, "path": jstr(&v, "to").unwrap_or("") })).into_response()
+        }
         Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -1943,7 +2000,6 @@ async fn workspace_compress(State(st): St, body: Bytes) -> Response {
     }
 
     let result = tokio::task::spawn_blocking(move || -> Result<usize, String> {
-        use std::io::Write as _;
         use zip::write::{SimpleFileOptions, ZipWriter};
 
         fn collect(path: &Path, ws: &Path, output: &Path, entries: &mut Vec<(String, PathBuf, bool)>) {
@@ -1986,9 +2042,9 @@ async fn workspace_compress(State(st): St, body: Bytes) -> Response {
             if is_dir {
                 zip.add_directory(name, options).map_err(|e| e.to_string())?;
             } else {
-                let bytes = fs::read(full).map_err(|e| e.to_string())?;
+                let mut f = fs::File::open(full).map_err(|e| e.to_string())?;
                 zip.start_file(name, options).map_err(|e| e.to_string())?;
-                zip.write_all(&bytes).map_err(|e| e.to_string())?;
+                std::io::copy(&mut f, &mut zip).map_err(|e| e.to_string())?;
                 files += 1;
             }
         }
@@ -2138,6 +2194,10 @@ async fn ensure_preview_watcher(
     if ws.join("fonts").is_dir() {
         cmd.arg("--font-path").arg("fonts");
     }
+    // Typst knows exactly which files the document is built from; ask it to
+    // write them down. Which files belong to the project is what tells the
+    // editor whether a chapter should be read on its own or as part of the whole.
+    cmd.arg("--deps").arg(deps_path(ws)).arg("--deps-format").arg("make");
     cmd.arg(main_path)
         .arg(output_path)
         .current_dir(ws)
@@ -2286,6 +2346,10 @@ async fn compile_once(ws: &Path, main_path: &Path, output_path: &Path) -> Respon
         compile_args.push("--font-path".into());
         compile_args.push("fonts".into());
     }
+    compile_args.push("--deps".into());
+    compile_args.push(deps_path(ws).to_string_lossy().into_owned());
+    compile_args.push("--deps-format".into());
+    compile_args.push("make".into());
     compile_args.push(main_path.to_string_lossy().into_owned());
     compile_args.push(output_path.to_string_lossy().into_owned());
     let compile_argv: Vec<&str> = compile_args.iter().map(String::as_str).collect();
@@ -2372,21 +2436,135 @@ async fn compile(State(st): St, Query(q): Q, body: Bytes) -> Response {
     response
 }
 
+// A scratch directory nothing else can be holding. The old names were
+// `<tool>-<pid>-<name>`, which two requests for the same template share — and
+// since each one starts by deleting the directory, the second wipes the first's
+// work while it is still running.
+fn unique_temp_dir(prefix: &str) -> std::io::Result<PathBuf> {
+    // /tmp is shared, and on a multi-user box a predictable name is one someone
+    // else can create first — as a symlink pointing wherever they like. The name
+    // is random, and create_dir (not create_dir_all) fails if anything is already
+    // there, so a directory we get back is one we made.
+    let prefix: String = prefix.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')).collect();
+    for _ in 0..8 {
+        let mut bytes = [0u8; 12];
+        getrandom::fill(&mut bytes).map_err(std::io::Error::other)?;
+        let suffix = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let dir = std::env::temp_dir().join(format!("{prefix}-{suffix}"));
+        match fs::create_dir(&dir) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+                }
+                return Ok(dir);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("could not create a scratch directory"))
+}
+
+// Move everything from one directory into another. A rename is one syscall and
+// covers the usual case; when the scratch directory turns out to be on another
+// filesystem it falls back to the copy the workspace already uses elsewhere,
+// which refuses to overwrite and rejects symlinks for us.
+fn move_dir_contents(from: &Path, to: &Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if fs::rename(&src, &dst).is_ok() { continue; }
+        copy_workspace_entry(&src, &dst)?;
+        let _ = if src.is_dir() { fs::remove_dir_all(&src) } else { fs::remove_file(&src) };
+    }
+    Ok(())
+}
+
+// The app's own scratch, and the file the Finder leaves lying around. Neither is
+// the user's work, and neither should make a folder look occupied.
+fn is_app_scratch(name: &std::ffi::OsStr) -> bool {
+    matches!(name.to_string_lossy().as_ref(), ".hilbert" | ".DS_Store")
+}
+
+fn dir_entry_count(dir: &Path) -> usize {
+    fs::read_dir(dir)
+        .map(|rd| rd.flatten().filter(|e| !is_app_scratch(&e.file_name())).count())
+        .unwrap_or(0)
+}
+
+// Create a project from a Typst Universe template.
+//
+// This used to run `fs::remove_dir_all(&ws)` first, which deletes whatever the
+// user currently has open — no confirmation, no undo, and in hosted mode it
+// takes the shared project with it. Now the template is built in a scratch
+// directory and only moved in once it compiles, and a workspace that already
+// has files in it is refused unless the caller explicitly asks to replace it.
 async fn init_template(State(st): St, body: Bytes) -> Response {
     let v = parse_json(&body);
     let Some(template) = jstr(&v, "template").filter(|t| !t.is_empty()) else {
         return json_err(StatusCode::BAD_REQUEST, "Template name required");
     };
+    if template.starts_with('-') {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid template name");
+    }
+    let replace = v.get("replace").and_then(Value::as_bool).unwrap_or(false);
     let ws = st.ws();
-    let _ = fs::remove_dir_all(&ws);
-    let out = match run_cmd("typst", &["init", template, &ws.to_string_lossy()], None, None).await {
+    let _ = fs::create_dir_all(&ws);
+    let existing = dir_entry_count(&ws);
+    if existing > 0 && !replace {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "workspace-not-empty",
+                "entries": existing,
+                "workspace": ws.to_string_lossy(),
+            })),
+        )
+            .into_response();
+    }
+
+    let staging = match unique_temp_dir("typst-tpl-init") {
+        Ok(dir) => dir,
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not create a scratch directory: {e}")),
+    };
+    let target = staging.join("t");
+    let cleanup = |dir: &Path| { let _ = fs::remove_dir_all(dir); };
+    let out = match run_cmd("typst", &["init", template, &target.to_string_lossy()], None, Some(60_000)).await {
         Ok(o) => o,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return json_err(StatusCode::INTERNAL_SERVER_ERROR, TYPST_NOT_FOUND),
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            cleanup(&staging);
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, TYPST_NOT_FOUND);
+        }
+        Err(e) => {
+            cleanup(&staging);
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
     };
     if out.code != Some(0) {
+        cleanup(&staging);
         return json_err(StatusCode::BAD_REQUEST, out.stderr);
     }
+
+    // The template built. Only now is it safe to touch the workspace.
+    if replace {
+        if let Ok(rd) = fs::read_dir(&ws) {
+            for entry in rd.flatten() {
+                if is_app_scratch(&entry.file_name()) { continue; }
+                let path = entry.path();
+                let _ = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
+            }
+        }
+    }
+    if let Err(e) = move_dir_contents(&target, &ws) {
+        cleanup(&staging);
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not write the template into the workspace: {e}"));
+    }
+    cleanup(&staging);
+    st.note_write();
+
     let files: Vec<String> = fs::read_dir(&ws)
         .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
         .unwrap_or_default();
@@ -2531,7 +2709,7 @@ async fn run_typst_export(ws: &Path, main_abs: &Path, out_path: &Path, v: &Value
     for o in &opts { args.push(o); }
     args.push(&main_s);
     args.push(&out_s);
-    match run_cmd("typst", &args, Some(ws), None).await {
+    match run_cmd("typst", &args, Some(ws), Some(EXPORT_TIMEOUT_MS)).await {
         Ok(o) if o.code == Some(0) => Ok(()),
         Ok(o) => Err(if o.stderr.is_empty() { "Compilation failed.".into() } else { o.stderr }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(TYPST_NOT_FOUND_SHORT.into()),
@@ -2878,16 +3056,15 @@ async fn export_project_native(State(st): St, body: Bytes) -> Response {
 
     let target = chosen.clone();
     let res = tokio::task::spawn_blocking(move || -> std::io::Result<usize> {
-        use std::io::Write as _;
         use zip::write::{SimpleFileOptions, ZipWriter};
         let f = fs::File::create(&target)?;
         let mut zip = ZipWriter::new(f);
         let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         let mut n = 0usize;
         for (rel, full) in &files {
-            let Ok(bytes) = fs::read(full) else { continue };
+            let Ok(mut f) = fs::File::open(full) else { continue };
             zip.start_file(rel.as_str(), opts)?;
-            zip.write_all(&bytes)?;
+            std::io::copy(&mut f, &mut zip)?;
             n += 1;
         }
         zip.finish()?;
@@ -4043,6 +4220,8 @@ fn image_stats(dir: &Path) -> HashMap<String, f64> {
 // here (hidden, since it's a dotfile), so they never clutter the user's files —
 // and it's the future home for per-workspace settings and logs.
 fn hilbert_dir(ws: &Path) -> PathBuf { ws.join(".hilbert") }
+// Where typst writes the list of files the document is built from.
+fn deps_path(ws: &Path) -> PathBuf { hilbert_dir(ws).join("deps.make") }
 fn hilbert_run(ws: &Path) -> PathBuf { hilbert_dir(ws).join("run") }
 
 // Python/Julia logos used to badge code blocks in the compiled PDF. Written into
@@ -4483,9 +4662,9 @@ async fn template_preview(State(st): St, Query(q): Q) -> Response {
         return ([(header::CONTENT_TYPE, "image/png")], bytes).into_response();
     }
 
-    let dir = std::env::temp_dir().join(format!("typst-tpl-{}-{}", std::process::id(), name));
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::create_dir_all(&dir);
+    let Ok(dir) = unique_temp_dir(&format!("typst-tpl-{name}")) else {
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, "Could not create a scratch directory.");
+    };
     let target = dir.join("t");
     let spec = if version.is_empty() { format!("@preview/{name}") } else { format!("@preview/{name}:{version}") };
     let cleanup = |dir: &Path| {
@@ -4569,9 +4748,9 @@ async fn builtin_preview(body: Bytes) -> Response {
         return ([(header::CONTENT_TYPE, "image/png")], bytes).into_response();
     }
 
-    let dir = std::env::temp_dir().join(format!("typst-editor-bp-{}-{key}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::create_dir_all(&dir);
+    let Ok(dir) = unique_temp_dir(&format!("typst-editor-bp-{key}")) else {
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, "Could not create a scratch directory.");
+    };
     for f in files {
         let (Some(p), Some(c)) = (
             f.get("path").and_then(|x| x.as_str()),
@@ -4672,9 +4851,9 @@ async fn packages_download(State(_st): St, body: Bytes) -> Response {
     if !PKG_NAME_RE.is_match(name) || !PKG_VER_RE.is_match(version) {
         return json_err(StatusCode::BAD_REQUEST, "Invalid package name/version.");
     }
-    let dir = std::env::temp_dir().join(format!("typst-pkg-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::create_dir_all(&dir);
+    let Ok(dir) = unique_temp_dir(&format!("typst-pkg-{name}")) else {
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, "Could not create a scratch directory.");
+    };
     let file = dir.join("t.typ");
     let _ = fs::write(&file, format!("#import \"@preview/{name}:{version}\"\n"));
     let out = run_cmd("typst", &["compile", &file.to_string_lossy(), &dir.join("o.pdf").to_string_lossy()], None, None).await;
@@ -5373,6 +5552,9 @@ struct LspProxy {
     diagnostics: Arc<Mutex<LspDiagnosticState>>,
     capabilities: Value,
     instance: u64,
+    /// The file tinymist is treating as the document's entrypoint, if any.
+    /// Kept so the command is only sent when the answer actually changes.
+    pinned: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -5667,6 +5849,7 @@ async fn ensure_lsp(ws: &Path) -> bool {
         diagnostics,
         capabilities: Value::Null,
         instance,
+        pinned: None,
     };
 
     // initialize → (await result) → initialized
@@ -5718,6 +5901,37 @@ async fn ensure_lsp(ws: &Path) -> bool {
     true
 }
 
+impl LspProxy {
+    /// Tell tinymist which file is the document's entrypoint, or `None` to let
+    /// it read each file on its own again.
+    ///
+    /// Without this, a chapter opened on its own is compiled on its own, and
+    /// every `@label` and `@citation` living in another file of the same
+    /// document is reported as missing. The chapter is fine; it is the question
+    /// that was wrong.
+    async fn pin_main(&mut self, main: Option<&Path>) {
+        if self.pinned.as_deref() == main {
+            return;
+        }
+        let argument = match main {
+            Some(path) => json!(path.to_string_lossy()),
+            None => Value::Null,
+        };
+        // Sent without waiting for the reply. Every request here is made while
+        // the map of language servers is locked, and there is nothing in the
+        // reply to act on anyway — a refusal comes back as the same null the
+        // acceptance does.
+        drop(
+            self.begin_request("workspace/executeCommand", json!({
+                "command": "tinymist.pinMain",
+                "arguments": [argument],
+            }))
+            .await,
+        );
+        self.pinned = main.map(Path::to_path_buf);
+    }
+}
+
 fn lsp_pos(v: &Value) -> Option<(String, i64, i64)> {
     let file = jstr(v, "file")?.to_string();
     let line = v.get("line")?.as_i64()?;
@@ -5765,6 +5979,253 @@ fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
     #[cfg(not(windows))]
     let path = decoded.as_ref();
     Some(PathBuf::from(path))
+}
+
+/// The files the compiled document is built from, as workspace-relative paths.
+///
+/// Typst writes them in Make's format — `out.pdf: a.typ b.bib` — where a space
+/// inside a path is backslash-escaped and a `$` is doubled. Anything outside the
+/// workspace (a package from the cache) is left out; the question this answers
+/// is only ever about files the editor can open.
+fn project_files(ws: &Path) -> Arc<HashSet<String>> {
+    // Asked on every diagnostics request, which is every pause in typing, and
+    // the answer only changes when typst recompiles. Keyed on the file's write
+    // time so a recompile is picked up and nothing else costs a read.
+    static CACHE: LazyLock<Mutex<HashMap<PathBuf, (Option<SystemTime>, Arc<HashSet<String>>)>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let path = deps_path(ws);
+    let stamp = fs::metadata(&path).and_then(|m| m.modified()).ok();
+    if let Some(hit) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&path)
+        && hit.0 == stamp
+    {
+        return hit.1.clone();
+    }
+    let files = Arc::new(read_project_files(ws));
+    CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path, (stamp, files.clone()));
+    files
+}
+
+fn read_project_files(ws: &Path) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let Ok(text) = fs::read_to_string(deps_path(ws)) else { return out };
+    for (index, token) in make_tokens(&text).into_iter().enumerate() {
+        // The first token is the target — the PDF — and carries the colon.
+        if index == 0 && token.ends_with(':') {
+            continue;
+        }
+        let path = PathBuf::from(&token);
+        let relative = if path.is_absolute() {
+            match path.strip_prefix(ws) {
+                Ok(rest) => rest.to_path_buf(),
+                Err(_) => continue, // a package, or something outside the project
+            }
+        } else {
+            path
+        };
+        let name = relative.to_string_lossy().replace('\\', "/");
+        if !name.is_empty() {
+            out.insert(name);
+        }
+    }
+    out
+}
+
+/// Split a Make dependency line into paths, honouring its escapes.
+fn make_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // A backslash escapes a space or another backslash; at the end of a
+            // line it is Make's line continuation and the newline goes with it.
+            '\\' => match chars.next() {
+                Some('\n') => {}
+                Some(next) => current.push(next),
+                None => {}
+            },
+            // `$$` is how Make spells a literal dollar.
+            '$' if chars.peek() == Some(&'$') => {
+                chars.next();
+                current.push('$');
+            }
+            c if c.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+#[cfg(test)]
+mod label_graph_tests {
+    use super::*;
+
+    fn graph_of(source: &str) -> Value {
+        let dir = unique_temp_dir("hilbert-labels-test").unwrap();
+        let ws = dir.join("project");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("main.typ"), source).unwrap();
+        let graph = read_label_graph(&ws, "main.typ");
+        let _ = fs::remove_dir_all(&dir);
+        graph
+    }
+    fn ids(graph: &Value, key: &str) -> Vec<String> {
+        graph[key].as_array().unwrap().iter()
+            .map(|n| n["id"].as_str().unwrap().to_string()).collect()
+    }
+
+    #[test]
+    fn a_reference_belongs_to_the_section_it_appears_in() {
+        // The obvious rule — attribute a reference to the nearest label above it
+        // — is wrong, because a label is discussed in the paragraphs directly
+        // beneath it and every reference then points at itself.
+        let graph = graph_of("\
+= First
+
+$ a = b $ <eq:one>
+
+As @eq:one shows, this follows.
+
+= Second
+
+And @eq:one again.
+");
+        let edges = graph["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 2, "one edge per section that refers to it: {edges:?}");
+        assert!(edges.iter().all(|e| e["to"] == "eq:one"));
+        let sections: Vec<&str> = graph["nodes"].as_array().unwrap().iter()
+            .filter(|n| n["kind"] == "section")
+            .map(|n| n["title"].as_str().unwrap()).collect();
+        assert!(sections.contains(&"First") && sections.contains(&"Second"), "got {sections:?}");
+
+        let one = graph["nodes"].as_array().unwrap().iter()
+            .find(|n| n["id"] == "eq:one").unwrap();
+        assert_eq!(one["referenced"], 2);
+    }
+
+    #[test]
+    fn punctuation_after_a_reference_is_not_part_of_the_name() {
+        // `@eq:one.` ends a sentence; the full stop is not in the label.
+        let graph = graph_of("= S\n\n$ a $ <eq:one>\n\nSee @eq:one. And @eq:one:\n");
+        assert!(graph["missing"].as_array().unwrap().is_empty(),
+            "nothing should look broken: {:?}", graph["missing"]);
+        let one = graph["nodes"].as_array().unwrap().iter()
+            .find(|n| n["id"] == "eq:one").unwrap();
+        assert_eq!(one["referenced"], 2);
+    }
+
+    #[test]
+    fn a_reference_to_nothing_is_reported() {
+        let graph = graph_of("= S\n\nSee @eq:missing for details.\n");
+        let missing = graph["missing"].as_array().unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0]["id"], "eq:missing");
+        assert_eq!(missing[0]["line"], 3);
+    }
+
+    #[test]
+    fn code_comments_and_strings_are_not_prose() {
+        // Every one of these looks like a label or a reference and is not one.
+        let graph = graph_of("\
+= S
+
+#import \"@preview/cetz:0.3.0\"
+// a comment mentioning @eq:ghost and <eq:phantom>
+Inline `@eq:raw` and \"@eq:instring\" are code, not references.
+
+$ a $ <eq:real>
+
+But @eq:real is.
+");
+        assert_eq!(ids(&graph, "nodes").iter().filter(|id| id.starts_with("eq:")).count(), 1,
+            "only the real label: {:?}", ids(&graph, "nodes"));
+        assert!(graph["missing"].as_array().unwrap().is_empty(),
+            "nothing invented: {:?}", graph["missing"]);
+        let real = graph["nodes"].as_array().unwrap().iter()
+            .find(|n| n["id"] == "eq:real").unwrap();
+        assert_eq!(real["referenced"], 1);
+    }
+
+    #[test]
+    fn the_same_reference_twice_is_one_edge_that_counts_two() {
+        let graph = graph_of("= S\n\n$ a $ <eq:one>\n\n@eq:one and @eq:one again.\n");
+        let edges = graph["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0]["uses"], 2);
+    }
+
+    #[test]
+    fn a_label_defined_twice_is_counted_once_and_flagged() {
+        let graph = graph_of("= S\n\n$ a $ <eq:one>\n\n$ b $ <eq:one>\n");
+        let nodes: Vec<&Value> = graph["nodes"].as_array().unwrap().iter()
+            .filter(|n| n["id"] == "eq:one").collect();
+        assert_eq!(nodes.len(), 1, "drawn once");
+        assert_eq!(nodes[0]["defined"], 2, "and known to be defined twice");
+    }
+}
+
+#[cfg(test)]
+mod dependency_list_tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_paths_out_of_a_make_dependency_line() {
+        let dir = unique_temp_dir("hilbert-deps-test").unwrap();
+        let ws = dir.join("project");
+        fs::create_dir_all(hilbert_dir(&ws)).unwrap();
+
+        // What typst writes: the target first, carrying the colon, then the
+        // files. A space in a path is escaped, a dollar is doubled, and a long
+        // list is broken across lines with a trailing backslash.
+        let line = format!(
+            "out.pdf: main.typ chapters/one\\ two.typ \\\n  refs.bib money$$.typ {}\n",
+            ws.join("assets/logo.svg").display(),
+        );
+        fs::write(deps_path(&ws), line).unwrap();
+
+        let files = project_files(&ws);
+        for expected in ["main.typ", "chapters/one two.typ", "refs.bib", "money$.typ", "assets/logo.svg"] {
+            assert!(files.contains(expected), "missing {expected:?} in {files:?}");
+        }
+        // The PDF it produced is not one of the document's sources.
+        assert!(!files.iter().any(|f| f.ends_with(".pdf")), "the target leaked in: {files:?}");
+        assert_eq!(files.len(), 5, "unexpected extras: {files:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_package_outside_the_workspace_is_not_a_project_file() {
+        let dir = unique_temp_dir("hilbert-deps-outside").unwrap();
+        let ws = dir.join("project");
+        fs::create_dir_all(hilbert_dir(&ws)).unwrap();
+        fs::write(
+            deps_path(&ws),
+            "out.pdf: main.typ /opt/typst-packages/preview/cetz/0.3.0/lib.typ\n",
+        )
+        .unwrap();
+
+        let files = project_files(&ws);
+        assert_eq!(*files, HashSet::from(["main.typ".to_string()]), "got {files:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_compile_yet_means_no_claims_about_the_project() {
+        let dir = unique_temp_dir("hilbert-deps-empty").unwrap();
+        assert!(project_files(&dir.join("project")).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 // Whether two file: URIs name the same file. tinymist doesn't echo back the URI
@@ -6189,12 +6650,24 @@ async fn lsp_diagnostics(State(st): St, body: Bytes) -> Response {
     if !ensure_lsp(&ws).await {
         return Json(json!({ "available": false, "diagnostics": [] })).into_response();
     }
+    // A file that is part of the compiled document has to be read as part of it.
+    // Anything else — a stray note, a snippet, a scratch file — is read on its
+    // own, which is both correct and the only way it gets diagnostics at all,
+    // since it belongs to no project for tinymist to compile. The entrypoint
+    // counts as part of its own project: unpinning to look at it would make
+    // tinymist throw the analysis away and build it again on the way back.
+    let main = jstr(&v, "main").unwrap_or("");
+    let pin = (!main.is_empty() && (main == file || project_files(&ws).contains(file)))
+        .then(|| safe_workspace_path(&ws, main))
+        .flatten()
+        .filter(|path| path.is_file());
     let uri = file_uri(&full_path);
     let (target_version, changed, state, baseline) = {
         let mut guard = LSPS.lock().await;
         let Some(proxy) = guard.get_mut(&ws) else {
             return Json(json!({ "available": false, "diagnostics": [] })).into_response();
         };
+        proxy.pin_main(pin.as_deref()).await;
         let state = proxy.diagnostics.clone();
         let baseline = state.lock().unwrap().revision;
         let (version, changed) = proxy.sync_file(&uri, &content).await;
@@ -6244,6 +6717,290 @@ async fn lsp_diagnostics(State(st): St, body: Bytes) -> Response {
     .into_response()
 }
 
+// ---------------------------------------------------------------------------
+// The label graph — what the document names, and what refers to what
+// ---------------------------------------------------------------------------
+// A paper's labels are its skeleton: an equation is derived from two others, a
+// section leans on a figure. Typst knows all of it and shows none of it, so we
+// read the sources for `<label>` definitions and `@label` references and hand
+// the shape back for drawing.
+//
+// A reference is attributed to the section it appears in, so the graph answers
+// the question a writer actually has: which parts of the paper lean on this
+// equation. Attributing it to the nearest label above instead looked tempting
+// and was wrong — a label is discussed in the paragraphs directly beneath it,
+// so almost every reference came out pointing at itself.
+
+static LABEL_DEF_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<([A-Za-z0-9_][A-Za-z0-9_:.\-]*)>").unwrap());
+static LABEL_REF_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"@([A-Za-z][A-Za-z0-9_:.\-]*)").unwrap());
+static HEADING_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(=+)\s+(.*?)\s*$").unwrap());
+
+/// `@eq:mapdef.` at the end of a sentence names `eq:mapdef`; the full stop is
+/// punctuation, and Typst reads it that way too. Same for a trailing colon or
+/// dash left over from `@sec:results:`.
+fn trim_label(name: &str) -> &str {
+    name.trim_end_matches(['.', ':', '-'])
+}
+
+struct LabelSite {
+    name: String,
+    file: String,
+    line: usize,
+    section: String,
+}
+
+/// A heading, as a node the references from its prose can hang off.
+struct SectionSite {
+    id: String,
+    title: String,
+    file: String,
+    line: usize,
+}
+
+/// Strip what a label or reference must never be read out of: line comments,
+/// inline raw spans, and string literals (which is where `@preview/…` lives).
+fn prose_only(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.char_indices().peekable();
+    let mut in_string = false;
+    let mut in_raw = false;
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' if in_string => {
+                out.push(' ');
+                if chars.next().is_some() {
+                    out.push(' ');
+                }
+            }
+            '"' => {
+                in_string = !in_string;
+                out.push(' ');
+            }
+            '`' => {
+                in_raw = !in_raw;
+                out.push(' ');
+            }
+            '/' if !in_string && !in_raw && line[i..].starts_with("//") => break,
+            _ if in_string || in_raw => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Everything the project's sources name and refer to.
+fn read_label_graph(ws: &Path, main: &str) -> Value {
+    let mut files: Vec<String> = project_files(ws)
+        .iter()
+        .filter(|f| f.ends_with(".typ"))
+        .cloned()
+        .collect();
+    // Before the first compile there is no dependency list; fall back to every
+    // Typst file in the workspace so the view is never empty for no good reason.
+    if files.is_empty() {
+        files = list_typ_files(ws);
+    }
+    if !main.is_empty() && !files.iter().any(|f| f == main) {
+        files.push(main.to_string());
+    }
+    files.sort();
+
+    let mut defs: Vec<LabelSite> = Vec::new();
+    let mut sections: Vec<SectionSite> = Vec::new();
+    let mut refs: Vec<(String, String, String, usize)> = Vec::new(); // from section, to label, file, line
+    let mut fenced = false;
+
+    for file in &files {
+        let Some(path) = safe_workspace_path(ws, file) else { continue };
+        let Ok(text) = fs::read_to_string(&path) else { continue };
+        let mut section = String::new();
+        // Anything referenced before the first heading belongs to the preamble,
+        // which is a real place in the document and worth naming as one.
+        let mut owner = format!("§{file}:0");
+        sections.push(SectionSite {
+            id: owner.clone(),
+            title: format!("{file} — before the first heading"),
+            file: file.clone(),
+            line: 1,
+        });
+        for (index, raw) in text.lines().enumerate() {
+            let line = index + 1;
+            let trimmed = raw.trim_start();
+            if trimmed.starts_with("```") {
+                fenced = !fenced;
+                continue;
+            }
+            if fenced {
+                continue;
+            }
+            if let Some(head) = HEADING_RE.captures(raw) {
+                section = head[2].trim().to_string();
+                if let Some(cut) = section.find(" <") {
+                    section.truncate(cut);
+                }
+                section = section.trim().to_string();
+                // Sections are named by their own heading, and two headings can
+                // read the same, so the id carries where it is.
+                owner = format!("§{}:{line}", file);
+                sections.push(SectionSite {
+                    id: owner.clone(),
+                    title: section.clone(),
+                    file: file.clone(),
+                    line,
+                });
+            }
+            let clean = prose_only(raw);
+            for found in LABEL_DEF_RE.captures_iter(&clean) {
+                let name = trim_label(&found[1]).to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                defs.push(LabelSite { name, file: file.clone(), line, section: section.clone() });
+            }
+            for found in LABEL_REF_RE.captures_iter(&clean) {
+                let to = trim_label(&found[1]).to_string();
+                // `@preview` is a package, not a label the writer can jump to.
+                if to.is_empty() || to.starts_with("preview") {
+                    continue;
+                }
+                refs.push((owner.clone(), to, file.clone(), line));
+            }
+        }
+    }
+
+    let defined: HashSet<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+    let mut incoming: HashMap<&str, usize> = HashMap::new();
+    for (_, to, _, _) in &refs {
+        *incoming.entry(to.as_str()).or_insert(0) += 1;
+    }
+
+    // A label defined twice is an error in the document; keep the first and say
+    // how many there were rather than drawing the same node again.
+    let mut times_defined: HashMap<&str, usize> = HashMap::new();
+    for d in &defs {
+        *times_defined.entry(d.name.as_str()).or_insert(0) += 1;
+    }
+    let mut drawn: HashSet<&str> = HashSet::new();
+    let nodes: Vec<Value> = defs
+        .iter()
+        .filter(|d| drawn.insert(d.name.as_str()))
+        .map(|d| {
+            json!({
+                "id": d.name,
+                "kind": d.name.split_once(':').map(|(k, _)| k).unwrap_or(""),
+                "file": d.file,
+                "line": d.line,
+                "section": d.section,
+                "referenced": incoming.get(d.name.as_str()).copied().unwrap_or(0),
+                "defined": times_defined.get(d.name.as_str()).copied().unwrap_or(1),
+            })
+        })
+        .collect();
+
+    // A reference to something no file defines is a broken cross-reference, and
+    // worth saying so rather than drawing an edge into nothing.
+    let missing: Vec<Value> = {
+        let mut seen: HashMap<&str, (usize, &str, usize)> = HashMap::new();
+        for (_, to, file, line) in &refs {
+            if defined.contains(to.as_str()) {
+                continue;
+            }
+            let entry = seen.entry(to.as_str()).or_insert((0, file.as_str(), *line));
+            entry.0 += 1;
+        }
+        let mut list: Vec<Value> = seen
+            .into_iter()
+            .map(|(name, (count, file, line))| json!({ "id": name, "uses": count, "file": file, "line": line }))
+            .collect();
+        list.sort_by_key(|v| v.get("id").and_then(Value::as_str).unwrap_or("").to_string());
+        list
+    };
+
+    // One edge per pair, however many times the pair occurs; the count travels
+    // with it so a heavily used reference can be drawn heavier.
+    let mut pairs: Vec<(String, String, String, usize, usize)> = Vec::new();
+    for (from, to, file, line) in &refs {
+        if from.is_empty() || from == to || !defined.contains(to.as_str()) {
+            continue;
+        }
+        match pairs.iter_mut().find(|(f, t, _, _, _)| f == from && t == to) {
+            Some(existing) => existing.4 += 1,
+            None => pairs.push((from.clone(), to.clone(), file.clone(), *line, 1)),
+        }
+    }
+    let edges: Vec<Value> = pairs
+        .into_iter()
+        .map(|(from, to, file, line, uses)| json!({ "from": from, "to": to, "file": file, "line": line, "uses": uses }))
+        .collect();
+
+    let used: HashSet<&str> = pairs_from(&edges);
+    let section_nodes: Vec<Value> = sections
+        .iter()
+        .filter(|s| used.contains(s.id.as_str()))
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "title": s.title,
+                "kind": "section",
+                "file": s.file,
+                "line": s.line,
+                "section": s.title,
+                "referenced": 0,
+                "defined": 1,
+            })
+        })
+        .collect();
+
+    json!({
+        "nodes": nodes.into_iter().chain(section_nodes).collect::<Vec<Value>>(),
+        "edges": edges,
+        "missing": missing,
+        "files": files,
+    })
+}
+
+/// The section ids that actually have a reference hanging off them.
+fn pairs_from(edges: &[Value]) -> HashSet<&str> {
+    edges.iter().filter_map(|e| e.get("from").and_then(Value::as_str)).collect()
+}
+
+/// Every `.typ` in the workspace, for a project that has not been compiled yet.
+fn list_typ_files(ws: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![ws.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || name == "node_modules" {
+                continue;
+            }
+            if path.is_dir() {
+                if out.len() < 4000 {
+                    stack.push(path);
+                }
+            } else if name.ends_with(".typ")
+                && let Ok(rel) = path.strip_prefix(ws)
+            {
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    out
+}
+
+async fn label_graph(State(st): St, Query(q): Q) -> Response {
+    let ws = st.ws();
+    let main = q.get("main").cloned().unwrap_or_default();
+    let graph = tokio::task::spawn_blocking(move || read_label_graph(&ws, &main))
+        .await
+        .unwrap_or_else(|_| json!({ "nodes": [], "edges": [], "missing": [], "files": [] }));
+    Json(graph).into_response()
+}
+
 // Proofreading: spelling (spellbook / Nuspell-compatible) + grammar & style
 // (harper-core with a Typst-aware parser). Runs on a blocking thread so the
 // dictionary work never stalls the async runtime.
@@ -6260,11 +7017,49 @@ async fn lint_text(body: Bytes) -> Response {
 
     let v = parse_json(&body);
     let text = jstr(&v, "text").unwrap_or("").to_string();
+    // The document says what language it is in; `#set text(lang: "fr")` is read
+    // by the client and passed through here.
+    let how = crate::proofread::Reading::of(jstr(&v, "lang").unwrap_or("en"), jstr(&v, "region").unwrap_or(""));
+    let reading = reading_json(&how);
     if text.trim().is_empty() {
-        return Json(json!({ "issues": [] })).into_response();
+        return Json(json!({ "issues": [], "reading": reading })).into_response();
     }
-    let issues = tokio::task::spawn_blocking(move || crate::proofread::lint(&text)).await.unwrap_or_default();
-    Json(json!({ "issues": issues })).into_response()
+    let issues = tokio::task::spawn_blocking(move || crate::proofread::lint(&text, &how)).await.unwrap_or_default();
+    Json(json!({ "issues": issues, "reading": reading })).into_response()
+}
+
+/// What the checker can actually do with this document, so the panel can say so
+/// rather than leaving the writer to guess why nothing is being flagged.
+fn reading_json(how: &crate::proofread::Reading) -> Value {
+    // A document that asks for British English and is read by the American
+    // dictionary will be told that "colour" is a misspelling until somebody
+    // explains why. Name the dictionary it wanted, so the panel can offer it.
+    let wanted = (!how.region.is_empty())
+        .then(|| format!("{}_{}", how.lang, how.region))
+        .filter(|code| how.dictionary.as_deref() != Some(code.as_str()))
+        .and_then(|code| crate::dict_catalog::CATALOG.iter().find(|c| c.code == code))
+        .map(|c| json!({ "code": c.code, "name": c.name }));
+    json!({
+        "lang": how.lang,
+        "dictionary": how.dictionary,
+        "dictionaryName": how.dictionary.as_deref().and_then(dictionary_name),
+        "languageName": language_name(&how.lang),
+        "grammar": how.grammar.is_some(),
+        "wanted": wanted,
+    })
+}
+
+fn dictionary_name(code: &str) -> Option<&'static str> {
+    crate::dict_catalog::CATALOG.iter().find(|c| c.code == code).map(|c| c.name)
+}
+
+/// The language's own name, for a message about a language we cannot check.
+/// Taken from the catalog, whose names are already "French (France)" shaped.
+fn language_name(lang: &str) -> Option<&'static str> {
+    crate::dict_catalog::CATALOG
+        .iter()
+        .find(|c| c.code.split('_').next() == Some(lang))
+        .map(|c| c.name.split(" (").next().unwrap_or(c.name))
 }
 
 // Lazy spelling suggestions for the words the client actually displays. Kept
@@ -6279,7 +7074,8 @@ async fn lint_suggest(body: Bytes) -> Response {
     if words.is_empty() {
         return Json(json!({ "suggestions": {} })).into_response();
     }
-    let pairs = tokio::task::spawn_blocking(move || crate::proofread::suggest_words(&words)).await.unwrap_or_default();
+    let how = crate::proofread::Reading::of(jstr(&v, "lang").unwrap_or("en"), jstr(&v, "region").unwrap_or(""));
+    let pairs = tokio::task::spawn_blocking(move || crate::proofread::suggest_words(&words, &how)).await.unwrap_or_default();
     let map: serde_json::Map<String, Value> = pairs.into_iter().map(|(w, s)| (w, json!(s))).collect();
     Json(json!({ "suggestions": map })).into_response()
 }
@@ -6287,8 +7083,134 @@ async fn lint_suggest(body: Bytes) -> Response {
 async fn lint_ignore(body: Bytes) -> Response {
     let v = parse_json(&body);
     let word = jstr(&v, "word").unwrap_or("").to_string();
+    let lang = jstr(&v, "lang").unwrap_or("en").to_string();
     if !word.trim().is_empty() {
-        let _ = tokio::task::spawn_blocking(move || crate::proofread::add_ignored_word(&word)).await;
+        let _ = tokio::task::spawn_blocking(move || crate::proofread::add_ignored_word(&word, &lang)).await;
+    }
+    Json(json!({ "ok": true })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Spelling dictionaries — what is installed, and fetching the rest
+// ---------------------------------------------------------------------------
+// English is built into the binary. Every other language is a Hunspell pair
+// downloaded once, on request, from the LibreOffice dictionary collection,
+// together with the licence files it ships under.
+
+async fn dictionaries_list() -> Response {
+    let have = crate::proofread::installed();
+    let list: Vec<Value> = crate::dict_catalog::CATALOG
+        .iter()
+        .map(|c| {
+            json!({
+                "code": c.code,
+                "name": c.name,
+                "kb": c.kb,
+                "installed": have.iter().any(|h| h == c.code),
+                "builtin": c.code == crate::proofread::BUILTIN,
+            })
+        })
+        .collect();
+    // A dictionary the writer dropped in themselves is real even though the
+    // catalog has never heard of it.
+    let extra: Vec<Value> = have
+        .iter()
+        .filter(|h| !crate::dict_catalog::CATALOG.iter().any(|c| c.code == h.as_str()))
+        .map(|h| json!({ "code": h, "name": h, "kb": 0, "installed": true, "builtin": false }))
+        .collect();
+    Json(json!({
+        "dictionaries": list.into_iter().chain(extra).collect::<Vec<Value>>(),
+        "folder": crate::proofread::dict_dir().to_string_lossy(),
+    }))
+    .into_response()
+}
+
+async fn dictionaries_install(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let code = jstr(&v, "code").unwrap_or("");
+    let Some(entry) = crate::dict_catalog::CATALOG.iter().find(|c| c.code == code) else {
+        return json_err(StatusCode::BAD_REQUEST, "No dictionary with that language tag.");
+    };
+    let dir = crate::proofread::dict_dir();
+    if let Err(e) = fs::create_dir_all(&dir) {
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not create {}: {e}", dir.display()));
+    }
+
+    // Fetch everything first, then write: a half-downloaded dictionary that
+    // still parses would quietly mark good words wrong.
+    let base = format!("{}{}", crate::dict_catalog::SOURCE, entry.path);
+    let mut files: Vec<(PathBuf, Bytes)> = Vec::new();
+    for ext in ["aff", "dic"] {
+        match fetch_dictionary_file(&st.http, &format!("{base}.{ext}")).await {
+            Ok(bytes) => files.push((dir.join(format!("{}.{ext}", entry.code)), bytes)),
+            Err(e) => return json_err(StatusCode::BAD_GATEWAY, e),
+        }
+    }
+    // Licence and readme files travel with the dictionary. Their absence is not
+    // worth failing the install over, but their presence is worth keeping.
+    let folder = entry.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    for name in entry.extra {
+        let url = format!("{}{folder}/{name}", crate::dict_catalog::SOURCE);
+        if let Ok(bytes) = fetch_dictionary_file(&st.http, &url).await {
+            files.push((dir.join(format!("{}.{name}", entry.code)), bytes));
+        }
+    }
+    for (path, bytes) in files {
+        if let Err(e) = write_atomic(&path, &bytes) {
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not save {}: {e}", path.display()));
+        }
+    }
+    crate::proofread::unload(entry.code);
+    Json(json!({ "ok": true, "code": entry.code })).into_response()
+}
+
+// 60 MB is comfortably over the largest dictionary in the collection (Turkish,
+// about 35 MB) and well under anything that would hurt to hold in memory.
+const DICT_MAX_BYTES: u64 = 60 * 1024 * 1024;
+
+async fn fetch_dictionary_file(http: &reqwest::Client, url: &str) -> Result<Bytes, String> {
+    let res = http
+        .get(url)
+        .timeout(Duration::from_secs(300))
+        .send()
+        .await
+        .map_err(|e| if e.is_timeout() { "The download timed out.".to_string() } else { e.to_string() })?;
+    if !res.status().is_success() {
+        return Err(format!("{} returned {}", url, res.status()));
+    }
+    if res.content_length().is_some_and(|n| n > DICT_MAX_BYTES) {
+        return Err("That dictionary is implausibly large.".to_string());
+    }
+    let bytes = res.bytes().await.map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > DICT_MAX_BYTES {
+        return Err("That dictionary is implausibly large.".to_string());
+    }
+    Ok(bytes)
+}
+
+async fn dictionaries_remove(body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let code = jstr(&v, "code").unwrap_or("");
+    if !crate::proofread::valid_code(code) || code == crate::proofread::BUILTIN {
+        return json_err(StatusCode::BAD_REQUEST, "That dictionary cannot be removed.");
+    }
+    let dir = crate::proofread::dict_dir();
+    let mut removed = 0;
+    if let Ok(rd) = fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // `fr_FR.aff`, `fr_FR.dic`, `fr_FR.README_dict_fr.txt` — the files
+            // this dictionary brought with it, and nothing else.
+            if name == format!("{code}.aff") || name == format!("{code}.dic") || name.starts_with(&format!("{code}.")) {
+                if entry.path().is_file() && fs::remove_file(entry.path()).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    crate::proofread::unload(code);
+    if removed == 0 {
+        return json_err(StatusCode::NOT_FOUND, "That dictionary is not installed.");
     }
     Json(json!({ "ok": true })).into_response()
 }
@@ -6535,9 +7457,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/lsp/format", post(lsp_format))
         .route("/lsp/code-actions", post(lsp_code_actions))
         .route("/lsp/diagnostics", post(lsp_diagnostics))
+        .route("/workspace/labels", get(label_graph))
         .route("/lint", post(lint_text))
         .route("/lint/suggest", post(lint_suggest))
         .route("/lint/ignore", post(lint_ignore))
+        .route("/dictionaries", get(dictionaries_list))
+        .route("/dictionaries/install", post(dictionaries_install))
+        .route("/dictionaries/remove", post(dictionaries_remove))
         .route("/session", get(session_get).post(session_post))
         .route("/settings", get(settings_get).post(settings_post))
         .route("/clipboard", get(clipboard_get).post(clipboard_post).layer(DefaultBodyLimit::max(16 * 1024 * 1024)))
@@ -6716,6 +7642,92 @@ mod tests {
         fs::create_dir(ws.join("chapters")).unwrap();
         assert_eq!(safe_workspace_path(&ws, "chapters/new.typ"), Some(ws.join("chapters/new.typ")));
         assert!(safe_workspace_path(&ws, "../outside.typ").is_none());
+        fs::remove_dir_all(ws).unwrap();
+    }
+
+    // Killing the process we spawned is not the same as killing what it started.
+    // The shell here backgrounds a sleep that would touch a marker file: if only
+    // the shell dies, the marker still appears.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timeout_takes_the_childs_children_with_it() {
+        let marker = std::env::temp_dir().join(format!("hilbert-killtree-{}.marker", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        let script = format!("(sleep 2; touch '{}') & wait", marker.display());
+
+        let out = run_cmd("sh", &["-c", &script], None, Some(300)).await.unwrap();
+        assert!(out.killed, "the command should have hit its timeout");
+
+        tokio::time::sleep(Duration::from_millis(2600)).await;
+        let survived = marker.exists();
+        let _ = fs::remove_file(&marker);
+        assert!(!survived, "a grandchild outlived the timeout that killed its parent");
+    }
+
+    // Two requests for the same template used to be handed the same directory,
+    // and each one began by deleting it.
+    #[test]
+    fn scratch_directories_are_unique_per_request() {
+        let a = unique_temp_dir("typst-tpl-ieee").unwrap();
+        let b = unique_temp_dir("typst-tpl-ieee").unwrap();
+        assert_ne!(a, b, "two requests for one template must not share a directory");
+        assert!(a.file_name().unwrap().to_string_lossy().starts_with("typst-tpl-ieee-"));
+        assert!(a.is_dir() && b.is_dir(), "the directory is created, exclusively, by the helper");
+        // Created exclusively: a second attempt on the same path must not succeed.
+        assert!(fs::create_dir(&a).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&a).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        fs::remove_dir_all(a).unwrap();
+        fs::remove_dir_all(b).unwrap();
+    }
+
+    // A template is built in a scratch directory and moved in afterwards, so the
+    // move has to carry nested folders and survive a cross-filesystem rename.
+    #[test]
+    fn moving_a_built_template_carries_its_whole_tree() {
+        let root = temp_workspace("move");
+        let from = root.join("staged");
+        let to = root.join("workspace");
+        fs::create_dir_all(from.join("chapters")).unwrap();
+        fs::create_dir_all(&to).unwrap();
+        fs::write(from.join("main.typ"), "= Paper").unwrap();
+        fs::write(from.join("chapters/one.typ"), "= One").unwrap();
+
+        move_dir_contents(&from, &to).unwrap();
+
+        assert_eq!(fs::read_to_string(to.join("main.typ")).unwrap(), "= Paper");
+        assert_eq!(fs::read_to_string(to.join("chapters/one.typ")).unwrap(), "= One");
+        assert_eq!(dir_entry_count(&from), 0, "the staging directory should be left empty");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // The app writes .hilbert into a project the first time it compiles one, so
+    // counting it would make an empty folder ask "delete 1 item?" — and a user
+    // who sees that on every new project learns to click through it.
+    #[test]
+    fn the_apps_own_scratch_does_not_make_a_folder_look_occupied() {
+        let ws = temp_workspace("scratch");
+        fs::create_dir_all(ws.join(".hilbert/run")).unwrap();
+        fs::write(ws.join(".DS_Store"), "finder").unwrap();
+        assert_eq!(dir_entry_count(&ws), 0, "an empty project is empty even after it has compiled");
+        fs::write(ws.join("main.typ"), "= Real work").unwrap();
+        assert_eq!(dir_entry_count(&ws), 1);
+        fs::remove_dir_all(ws).unwrap();
+    }
+
+    // The count is what the handler refuses on: a workspace with anything in it
+    // is somebody's project, and a template must not delete it unasked.
+    #[test]
+    fn a_workspace_with_files_in_it_is_not_empty() {
+        let ws = temp_workspace("count");
+        assert_eq!(dir_entry_count(&ws), 0);
+        fs::write(ws.join("thesis.typ"), "years of work").unwrap();
+        assert_eq!(dir_entry_count(&ws), 1);
+        fs::create_dir(ws.join("figures")).unwrap();
+        assert_eq!(dir_entry_count(&ws), 2);
         fs::remove_dir_all(ws).unwrap();
     }
 

@@ -2,6 +2,7 @@
 // the built UI in a native window — the Electron main.cjs, replicated.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod dict_catalog;
 mod proofread;
 mod sandbox;
 mod server;
@@ -210,10 +211,13 @@ mod package_seed_tests {
 // app small) — drop a binary in bin/ and re-add the tauri.conf resource entry.
 fn find_bundled_tinymist(resource_dir: Option<&Path>) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
+    // Windows names it tinymist.exe; looking only for the bare name would make a
+    // bundled copy invisible there and fall back to PATH without saying why.
+    let exe = if cfg!(windows) { "tinymist.exe" } else { "tinymist" };
     if let Some(r) = resource_dir {
-        candidates.push(r.join("bin").join("tinymist"));
+        candidates.push(r.join("bin").join(exe));
     }
-    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin").join("tinymist"));
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin").join(exe));
     candidates.into_iter().find(|p| p.exists())
 }
 
@@ -230,9 +234,19 @@ fn set_bundled_tinymist(resource_dir: Option<&Path>) {
     }
 }
 
+// A relative workspace path reaches Typst as a relative `--root` and reaches
+// tinymist inside a `file://` URI built by string formatting, where it is simply
+// malformed. Resolve it once, here, so nothing downstream has to think about it.
+fn absolutise(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    std::env::current_dir().map(|cwd| cwd.join(&path)).unwrap_or(path)
+}
+
 fn workspace_dir(default_docs: Option<PathBuf>) -> PathBuf {
     if let Ok(ws) = std::env::var("TYPST_WORKSPACE") {
-        return PathBuf::from(ws);
+        return absolutise(PathBuf::from(ws));
     }
     let docs = default_docs
         .or_else(dirs::document_dir)
@@ -352,10 +366,12 @@ fn hosted_server_main() {
     ));
     let bind = arg_value("--bind").unwrap_or_else(|| "127.0.0.1".into());
     let port: u16 = arg_value("--port").and_then(|value| value.parse().ok()).unwrap_or(3001);
-    let workspace = arg_value("--workspace")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var("TYPST_WORKSPACE").ok().map(PathBuf::from))
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("workspace"));
+    let workspace = absolutise(
+        arg_value("--workspace")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var("TYPST_WORKSPACE").ok().map(PathBuf::from))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("workspace")),
+    );
     if let Err(error) = fs::create_dir_all(&workspace) {
         eprintln!("Could not create hosted workspace {}: {error}", workspace.display());
         std::process::exit(2);

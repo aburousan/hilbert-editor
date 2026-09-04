@@ -7,12 +7,28 @@
 // `/lint` route, so the first call 404s and the whole feature quietly disables
 // itself — the shared UI stays identical either way.
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { MutableRefObject } from 'react';
 import { API } from './api';
 import { snapUtf16RangeToGraphemes } from './unicodeRanges';
+import { documentLanguage } from './documentLanguage';
+
+export { documentLanguage };
 
 export type ProofKind = 'spelling' | 'grammar' | 'style';
+
+// What the checker can do with the document in front of it: which dictionary is
+// reading it, and whether grammar rules apply at all (they are English-only).
+export interface Reading {
+  lang: string;
+  dictionary: string | null;
+  dictionaryName: string | null;
+  languageName: string | null;
+  grammar: boolean;
+  // The dictionary the document asked for by region and did not get, so a
+  // British paper is not left wondering why "colour" is underlined.
+  wanted: { code: string; name: string } | null;
+}
 
 interface ProofIssue {
   start: number;          // char offset (Unicode scalar index) into the source
@@ -156,45 +172,58 @@ function ensureProvider(monaco: any) {
   monaco.languages.registerCodeActionProvider('plaintext', { provideCodeActions: provide });
 }
 
-async function requestLint(text: string): Promise<ProofIssue[]> {
+async function requestLint(text: string, lang: string, region: string): Promise<{ issues: ProofIssue[]; reading: Reading }> {
   const res = await fetch(`${API}/lint`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify({ text, lang, region }),
   });
   if (!res.ok) throw new Error(`lint ${res.status}`);
   const data = await res.json();
-  return (data.issues || []) as ProofIssue[];
+  return {
+    issues: (data.issues || []) as ProofIssue[],
+    reading: (data.reading || { lang, dictionary: null, dictionaryName: null, languageName: null, grammar: false, wanted: null }) as Reading,
+  };
 }
 
 // Spelling suggestions are computed lazily by the backend (each is a
 // dictionary-wide search), so lint stays fast regardless of misspelling count.
 // We fetch them for the words on screen and cache per word for the session.
+// Keyed by language too: `pain` is a misspelling in one language and a word in
+// the next, and the suggestions differ even where the word does not.
 const suggestCache = new Map<string, string[]>();
+const cacheKey = (lang: string, word: string) => `${lang}\u0000${word}`;
 
-async function fetchSuggestions(words: string[]): Promise<void> {
-  const missing = Array.from(new Set(words)).filter((w) => !suggestCache.has(w));
+async function fetchSuggestions(words: string[], lang: string, region: string): Promise<void> {
+  const missing = Array.from(new Set(words)).filter((w) => !suggestCache.has(cacheKey(lang, w)));
   if (!missing.length) return;
   try {
     const res = await fetch(`${API}/lint/suggest`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ words: missing }),
+      body: JSON.stringify({ words: missing, lang, region }),
     });
     if (!res.ok) return;
     const data = await res.json();
     const map = (data.suggestions || {}) as Record<string, string[]>;
-    for (const w of missing) suggestCache.set(w, map[w] || []);
+    for (const w of missing) suggestCache.set(cacheKey(lang, w), map[w] || []);
   } catch { /* leave uncached; a later pass retries */ }
 }
 
 // Fill in cached spelling suggestions on a freshly-placed issue list.
-function withSuggestions(placed: PlacedIssue[]): PlacedIssue[] {
+function withSuggestions(placed: PlacedIssue[], lang: string): PlacedIssue[] {
   return placed.map((i) =>
-    i.kind === 'spelling' && i.suggestions.length === 0 && suggestCache.has(i.text)
-      ? { ...i, suggestions: suggestCache.get(i.text)! }
+    i.kind === 'spelling' && i.suggestions.length === 0 && suggestCache.has(cacheKey(lang, i.text))
+      ? { ...i, suggestions: suggestCache.get(cacheKey(lang, i.text))! }
       : i,
   );
+}
+
+// An issue the writer has waved away. Keyed by the rule and the words it fired
+// on, so dismissing one `PCs` dismisses the other four as well — which is the
+// whole point of asking.
+export function dismissKey(issue: ProofIssue): string {
+  return `${issue.rule}\u0000${issue.text.toLowerCase()}`;
 }
 
 interface UseProofread {
@@ -202,9 +231,14 @@ interface UseProofread {
   issues: PlacedIssue[];
   busy: boolean;
   checked: boolean;      // this document has been through the checker at least once
+  reading: Reading | null;
+  dismissedCount: number;
   jumpTo(issue: PlacedIssue): void;
   applySuggestion(issue: PlacedIssue, replacement: string): void;
+  applyToAll(issues: PlacedIssue[], replacement: string): void;
   ignoreWord(issue: PlacedIssue): void;
+  dismiss(issue: PlacedIssue): void;
+  restoreDismissed(): void;
   revalidate(): void;
 }
 
@@ -219,7 +253,12 @@ export function useProofread(
   activeTabContent: string | undefined,
   enabled: boolean,
 ): UseProofread {
-  const [issues, setIssues] = useState<PlacedIssue[]>([]);
+  const [raw, setRaw] = useState<PlacedIssue[]>([]);
+  // Issues waved away for this session. Not written to disk: "+ Dictionary" is
+  // the button that means forever, and the two would be indistinguishable if
+  // this one persisted too.
+  const [dismissed, setDismissed] = useState<ReadonlySet<string>>(() => new Set());
+  const [reading, setReading] = useState<Reading | null>(null);
   // Whether this document has been through the checker at all. An empty list
   // means two different things — nothing found, or nothing looked at yet — and
   // telling the writer their paper reads clean before it has been read is the
@@ -229,6 +268,12 @@ export function useProofread(
   const [busy, setBusy] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const seq = useRef(0);
+
+  const issues = useMemo(
+    () => (dismissed.size ? raw.filter((i) => !dismissed.has(dismissKey(i))) : raw),
+    [raw, dismissed],
+  );
+  const dismissedCount = raw.length - issues.length;
 
   const isTyp = !!activeTabPath && activeTabPath.endsWith('.typ');
   const active = enabled && available && isTyp;
@@ -259,60 +304,66 @@ export function useProofread(
     if (!monaco || !editorRef.current) return;
     const model = editorRef.current.getModel?.();
     if (!model) return;
-    const uri = model.uri.toString();
     const text = model.getValue();
     const mine = ++seq.current;
     setBusy(true);
 
-    // Publish a placed issue list: markers + panel state + code-action source.
-    const apply = (placed: PlacedIssue[]) => {
-      placedByUri.set(uri, placed);
-      ensureProvider(monaco);
-      monaco.editor.setModelMarkers(
-        model,
-        MARKER_OWNER,
-        placed.map((i) => ({
-          severity: severityFor(monaco, i.kind),
-          message: `${i.message}${i.suggestions.length ? `\nSuggestions: ${i.suggestions.slice(0, 5).join(', ')}` : ''}`,
-          source: `Hilbert · ${i.kind}`,
-          startLineNumber: i.range.startLineNumber,
-          startColumn: i.range.startColumn,
-          endLineNumber: i.range.endLineNumber,
-          endColumn: i.range.endColumn,
-        })),
-      );
-      setIssues(placed);
-    };
+    const { lang, region } = documentLanguage(text);
 
     try {
-      const raw = await requestLint(text);
+      const answer = await requestLint(text, lang, region);
       if (mine !== seq.current) return; // superseded by a newer run
-      const placed = placeIssues(text, raw);
-      apply(withSuggestions(placed)); // show squiggles + any already-cached fixes now
+      const placed = placeIssues(text, answer.issues);
+      setReading(answer.reading);
+      setRaw(withSuggestions(placed, lang)); // squiggles + any already-cached fixes now
       setChecked(true);
       setBusy(false);
 
       // Lazily enrich spelling fixes (off the hot path), then re-publish.
       const spellingWords = placed.filter((i) => i.kind === 'spelling').map((i) => i.text);
-      if (spellingWords.some((w) => !suggestCache.has(w))) {
-        await fetchSuggestions(spellingWords);
-        if (mine === seq.current) apply(withSuggestions(placed));
+      if (spellingWords.some((w) => !suggestCache.has(cacheKey(lang, w)))) {
+        await fetchSuggestions(spellingWords, lang, region);
+        if (mine === seq.current) setRaw(withSuggestions(placed, lang));
       }
     } catch {
       if (mine === seq.current) {
         setAvailable(false); // no /lint route (Electron) — disable silently
-        setIssues([]);
+        setRaw([]);
         clearMarkers();
         setBusy(false);
       }
     }
   }, [monaco, editorRef, clearMarkers]);
 
+  // Squiggles and the quick-fix list follow what the panel shows, so an issue
+  // waved away stops being underlined too.
+  useEffect(() => {
+    if (!monaco) return;
+    const model = editorRef.current?.getModel?.();
+    if (!model) return;
+    placedByUri.set(model.uri.toString(), issues);
+    ensureProvider(monaco);
+    monaco.editor.setModelMarkers(
+      model,
+      MARKER_OWNER,
+      issues.map((i) => ({
+        severity: severityFor(monaco, i.kind),
+        message: `${i.message}${i.suggestions.length ? `\nSuggestions: ${i.suggestions.slice(0, 5).join(', ')}` : ''}`,
+        source: `Hilbert · ${i.kind}`,
+        startLineNumber: i.range.startLineNumber,
+        startColumn: i.range.startColumn,
+        endLineNumber: i.range.endLineNumber,
+        endColumn: i.range.endColumn,
+      })),
+    );
+  }, [monaco, editorRef, issues]);
+
   // Debounced re-lint whenever the active content changes.
   useEffect(() => {
     if (!active) {
-      setIssues([]);
+      setRaw([]);
       setChecked(false);
+      setReading(null);
       clearMarkers();
       return;
     }
@@ -346,18 +397,46 @@ export function useProofread(
     [editorRef, run],
   );
 
+  // Apply the same replacement everywhere an issue repeats, in one undo step.
+  // The ranges come from one pass over one document version and never overlap,
+  // so they can go in together.
+  const applyToAll = useCallback(
+    (group: PlacedIssue[], replacement: string) => {
+      const ed = editorRef.current;
+      if (!ed || !group.length) return;
+      const edits = [...group]
+        .sort((a, b) =>
+          b.range.startLineNumber - a.range.startLineNumber || b.range.startColumn - a.range.startColumn,
+        )
+        .map((i) => ({ range: i.range, text: replacement, forceMoveMarkers: true }));
+      ed.executeEdits('proofread', edits);
+      ed.focus();
+      run();
+    },
+    [editorRef, run],
+  );
+
   const ignoreWord = useCallback(
     (issue: PlacedIssue) => {
       fetch(`${API}/lint/ignore`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ word: issue.text }),
+        body: JSON.stringify({ word: issue.text, lang: reading?.lang || 'en' }),
       })
         .then(() => run())
         .catch(() => {});
     },
-    [run],
+    [run, reading],
   );
 
-  return { available, issues, busy, checked, jumpTo, applySuggestion, ignoreWord, revalidate: run };
+  const dismiss = useCallback((issue: PlacedIssue) => {
+    setDismissed((prev) => new Set(prev).add(dismissKey(issue)));
+  }, []);
+
+  const restoreDismissed = useCallback(() => setDismissed(new Set()), []);
+
+  return {
+    available, issues, busy, checked, reading, dismissedCount,
+    jumpTo, applySuggestion, applyToAll, ignoreWord, dismiss, restoreDismissed, revalidate: run,
+  };
 }

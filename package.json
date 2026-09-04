@@ -34,9 +34,14 @@
     "lint": "oxlint",
     "preview": "vite preview",
     "test:sync": "node scripts/test-workspace-sync.mjs",
+    "test:sync-match": "node scripts/test-sync-match.mjs",
     "test:binary": "node scripts/test-binary-transfer.mjs",
     "test:project": "node scripts/test-project-collab.mjs",
-    "test:sync-all": "npm run test:collab && npm run test:sync && npm run test:binary && npm run test:project"
+    "test:sync-all": "npm run test:collab && npm run test:sync && npm run test:sync-match && npm run test:binary && npm run test:project && npm run test:language && npm run test:equation && npm run test:graph",
+    "test:language": "node scripts/test-doc-language.mjs",
+    "test:dictionaries": "bash scripts/test-dictionaries.sh",
+    "test:equation": "node scripts/test-equation-sync.mjs",
+    "test:graph": "node scripts/test-graph-drag.mjs"
   },
   "dependencies": {
     "@excalidraw/excalidraw": "^0.18.1",

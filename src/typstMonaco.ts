@@ -9,6 +9,12 @@ let providersRegistered = false;
 let workspaceImagePaths: string[] = [];
 export function setWorkspaceImages(paths: string[]) { workspaceImagePaths = paths.slice(); }
 
+// Safari gained lookbehind late, and Hilbert runs inside whatever WebKit the
+// machine has. Probe once rather than assume.
+const SUPPORTS_LOOKBEHIND = (() => {
+  try { new RegExp('(?<=a)b'); return true; } catch { return false; }
+})();
+
 export function setupTypstLanguage(monacoInstance: any) {
   const languageId = 'typst';
 
@@ -83,16 +89,31 @@ export function setupTypstLanguage(monacoInstance: any) {
 
         // labels <name> and references @name
         [/<[a-zA-Z_][\w-]*>/, 'label'],
+        // A reference had no rule of its own, so `@label_123` fell through to
+        // the number rule below and came out with pink digits. It has to sit
+        // after the package rule above, which claims `@preview/name:version`.
+        [/@[a-zA-Z_][\w-]*/, 'label'],
 
         // code mode keywords / functions starting with #
         [/#\s*([a-zA-Z_][\w-]*)/, {
           cases: { '$1@keywords': 'keyword', '@default': 'function' }
         }],
 
-        // bare keywords inside code blocks
-        [/\b([a-zA-Z_][\w-]*)\b(?=\s*[:(])/, {
+        // A call: the name of something immediately followed by its arguments.
+        [/\b([a-zA-Z_][\w-]*)\b(?=\s*\()/, {
           cases: { '$1@keywords': 'keyword', '@default': 'function.call' }
         }],
+
+        // A named argument — but only in argument position. This used to match
+        // any word before a colon, which coloured ordinary prose: the sentence
+        // "this is some python:" came out with `python` highlighted as code.
+        // Lookbehind is what keeps it honest; where the engine lacks it, the
+        // rule is simply dropped rather than allowed to fire on prose.
+        ...(SUPPORTS_LOOKBEHIND
+          ? [[/(?<=[(,]\s*)([a-zA-Z_][\w-]*)(?=\s*:)/, {
+              cases: { '$1@keywords': 'keyword', '@default': 'function.call' }
+            }] as any]
+          : []),
 
         // math mode
         [/\$/, { token: 'math.delim', next: '@math' }],

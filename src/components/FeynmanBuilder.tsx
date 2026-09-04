@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { keys } from '../keys';
 
 // Visual Feynman-diagram builder: draw propagators (fermion / photon / gluon /
 // scalar / ghost), loops (plain, wavy or coiled circles), hatched or shaded
@@ -721,7 +722,7 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
             </svg>
             <div className="form-hint" style={{ marginTop: '6px' }}>
               <b>Line / Circle</b>: click &amp; drag to draw. <b>Select</b>: click an element, then drag it or its handles
-              (line endpoints snap to nearby vertices; the middle handle bends the line into an arc). <b>⌫</b> deletes, <b>⌘Z</b> undoes.
+              (line endpoints snap to nearby vertices; the middle handle bends the line into an arc). <b>⌫</b> deletes, <b>{keys('⌘Z')}</b> undoes.
               The grid (bold lines = 1 unit) is a drawing guide only and is never added to the diagram.
             </div>
           </div>

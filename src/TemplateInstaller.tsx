@@ -82,15 +82,30 @@ export function TemplateInstaller({ onInsert, onUseBuiltin, onClose }: TemplateI
 
   const handleSearch = (e: React.FormEvent) => { e.preventDefault(); if (query.trim()) fetchPackages(query); };
 
-  const handleInitTemplate = async (pkg: Template) => {
+  // A Universe template arrives as a whole project, so it needs the folder to
+  // itself. The backend refuses a folder that already has files in it and says
+  // how many; ask before replacing them, because that is somebody's work.
+  const handleInitTemplate = async (pkg: Template, replace = false) => {
     setLoading(true);
     try {
       const res = await fetch(`${API}/init-template`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ template: `@preview/${pkg.name}:${pkg.version}` })
+        body: JSON.stringify({ template: `@preview/${pkg.name}:${pkg.version}`, replace })
       });
-      if (res.ok) onInsert(await res.json());
-      else notify('Failed to initialize template. It may contain complex multi-file dependencies.');
+      if (res.ok) { onInsert(await res.json()); return; }
+      if (res.status === 409) {
+        const info = await res.json().catch(() => ({}));
+        const count = info.entries ?? 0;
+        const where = info.workspace ? `\n\n${info.workspace}` : '';
+        const ok = confirm(
+          `“${pkg.name}” is a whole project, so it needs an empty folder.\n\n`
+          + `This folder already has ${count} item${count === 1 ? '' : 's'} in it, and they would be `
+          + `deleted permanently.${where}\n\nReplace everything in this folder?`
+        );
+        if (ok) await handleInitTemplate(pkg, true);
+        return;
+      }
+      notify('Failed to initialize template. It may contain complex multi-file dependencies.');
     } catch { notify('Network error initializing template'); } finally { setLoading(false); }
   };
 

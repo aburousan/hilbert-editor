@@ -1,0 +1,127 @@
+// The spelling dictionaries Hilbert can fetch, and where they come from.
+//
+// Only en_US ships inside the binary. Everything else is downloaded when the
+// writer asks for it, from the LibreOffice dictionary collection — the same
+// Hunspell files LibreOffice itself installs, each under its own upstream
+// licence, which is why `extra` names the licence and readme files that get
+// saved beside the dictionary.
+//
+// `code` is what Hilbert files the dictionary under: the language tag Typst
+// writes in `#set text(lang: …, region: …)`, joined by an underscore. `path` is
+// the upstream location without its extension; `.aff` and `.dic` hang off it.
+//
+// Generated from the upstream file tree, so the table stays in step with what
+// is actually there rather than with what the language list says should be.
+
+pub struct Cat {
+    pub code: &'static str,
+    pub name: &'static str,
+    pub path: &'static str,
+    /// Size of the word list in KiB, so the UI can warn before a 35 MB download.
+    pub kb: u32,
+    /// Licence and readme files kept alongside the dictionary.
+    pub extra: &'static [&'static str],
+}
+
+pub const SOURCE: &str = "https://raw.githubusercontent.com/LibreOffice/dictionaries/master/";
+
+pub const CATALOG: &[Cat] = &[
+    Cat { code: "af_ZA", name: "Afrikaans (South Africa)", path: "af_ZA/af_ZA", kb: 1186, extra: &["README_af_ZA.txt"] },
+    Cat { code: "sq_AL", name: "Albanian (Albania)", path: "sq_AL/sq_AL", kb: 2662, extra: &["README.txt", "README_hyph_sq_AL.txt"] },
+    Cat { code: "ar", name: "Arabic", path: "ar/ar", kb: 7048, extra: &["COPYING.txt", "README_ar.txt"] },
+    Cat { code: "an_ES", name: "Aragonese (Spain)", path: "an_ES/an_ES", kb: 240, extra: &["LICENSES-en.txt"] },
+    Cat { code: "as_IN", name: "Assamese (India)", path: "as_IN/as_IN", kb: 1867, extra: &["README_as_IN.txt"] },
+    Cat { code: "be_BY", name: "Belarusian (Belarus)", path: "be_BY/be-official", kb: 10358, extra: &["README_be_BY.txt"] },
+    Cat { code: "bn_BD", name: "Bengali (Bangladesh)", path: "bn_BD/bn_BD", kb: 2185, extra: &["COPYING"] },
+    Cat { code: "bs_BA", name: "Bosnian (Bosnia)", path: "bs_BA/bs_BA", kb: 331, extra: &["README.txt"] },
+    Cat { code: "br_FR", name: "Breton (France)", path: "br_FR/br_FR", kb: 3875, extra: &["LICENSES-en.txt"] },
+    Cat { code: "bg_BG", name: "Bulgarian (BG)", path: "bg_BG/bg_BG", kb: 1529, extra: &["COPYING", "README_hyph_bg_BG.txt"] },
+    Cat { code: "ca", name: "Catalan", path: "ca/dictionaries/ca", kb: 3013, extra: &[] },
+    Cat { code: "ca_valencia", name: "Catalan (Valencian)", path: "ca/dictionaries/ca-valencia", kb: 3018, extra: &[] },
+    Cat { code: "ckb", name: "Central Kurdish", path: "ckb/dictionaries/ckb", kb: 696, extra: &[] },
+    Cat { code: "hr_HR", name: "Croatian (Croatia)", path: "hr_HR/hr_HR", kb: 714, extra: &["README_hr_HR.txt", "README_hyph_hr_HR.txt"] },
+    Cat { code: "cs_CZ", name: "Czech (Czechia)", path: "cs_CZ/cs_CZ", kb: 3570, extra: &["README_cs.txt", "README_en.txt"] },
+    Cat { code: "da_DK", name: "Danish (Denmark)", path: "da_DK/da_DK", kb: 3802, extra: &["README_da_DK.txt"] },
+    Cat { code: "nl_NL", name: "Dutch (Netherlands)", path: "nl_NL/nl_NL", kb: 2429, extra: &["LICENSE.txt", "README.md"] },
+    Cat { code: "en_AU", name: "English (Australia)", path: "en/en_AU", kb: 541, extra: &["README.txt", "README_en_AU.txt"] },
+    Cat { code: "en_CA", name: "English (Canada)", path: "en/en_CA", kb: 538, extra: &["README.txt", "README_en_AU.txt"] },
+    Cat { code: "en_ZA", name: "English (South Africa)", path: "en/en_ZA", kb: 974, extra: &["README.txt", "README_en_AU.txt"] },
+    Cat { code: "en_GB", name: "English (United Kingdom)", path: "en/en_GB", kb: 1201, extra: &["README.txt", "README_en_AU.txt"] },
+    Cat { code: "en_US", name: "English (United States)", path: "en/en_US", kb: 538, extra: &["README.txt", "README_en_AU.txt"] },
+    Cat { code: "eo", name: "Esperanto", path: "eo/eo", kb: 369, extra: &["license-en.txt"] },
+    Cat { code: "et_EE", name: "Estonian (Estonia)", path: "et_EE/et_EE", kb: 4281, extra: &["README_et_EE.txt", "README_hyph_et_EE.txt"] },
+    Cat { code: "fr_FR", name: "French (France)", path: "fr_FR/dictionaries/fr", kb: 1207, extra: &["README_dict_fr.txt", "README_hyph_fr.txt"] },
+    Cat { code: "gl_ES", name: "Galician (Spain)", path: "gl/gl_ES", kb: 8130, extra: &["COPYING_th_gl", "README"] },
+    Cat { code: "de_AT", name: "German (Austria)", path: "de/de_AT_frami", kb: 4257, extra: &["COPYING_GPLv2", "COPYING_GPLv3"] },
+    Cat { code: "de_DE", name: "German (Germany)", path: "de/de_DE_frami", kb: 4254, extra: &["COPYING_GPLv2", "COPYING_GPLv3"] },
+    Cat { code: "de_CH", name: "German (Switzerland)", path: "de/de_CH_frami", kb: 4256, extra: &["COPYING_GPLv2", "COPYING_GPLv3"] },
+    Cat { code: "el_GR", name: "Greek (Greece)", path: "el_GR/el_GR", kb: 9888, extra: &["README_el_GR.txt", "README_hyph_el_GR.txt"] },
+    Cat { code: "gug", name: "Guarani", path: "gug/gug", kb: 32, extra: &["README_th_gug_PY.txt"] },
+    Cat { code: "gu_IN", name: "Gujarati (India)", path: "gu_IN/gu_IN", kb: 3703, extra: &["README_gu_IN.txt"] },
+    Cat { code: "he_IL", name: "Hebrew (Israel)", path: "he_IL/he_IL", kb: 7613, extra: &["README_he_IL.txt"] },
+    Cat { code: "hi_IN", name: "Hindi (India)", path: "hi_IN/hi_IN", kb: 4887, extra: &["COPYING", "README_hi_IN.txt"] },
+    Cat { code: "hu_HU", name: "Hungarian (Hungary)", path: "hu_HU/hu_HU", kb: 1744, extra: &["README_hu_HU.txt", "README_hyph_hu_HU.txt"] },
+    Cat { code: "is", name: "Icelandic", path: "is/is", kb: 2396, extra: &["license.txt"] },
+    Cat { code: "id_ID", name: "Indonesian (Indonesia)", path: "id/id_ID", kb: 443, extra: &["LICENSE-dict", "LICENSE-thes"] },
+    Cat { code: "it_IT", name: "Italian (Italy)", path: "it_IT/it_IT", kb: 1264, extra: &["README_hyph_it_IT.txt", "README_it_IT.txt"] },
+    Cat { code: "kn_IN", name: "Kannada (India)", path: "kn_IN/kn_IN", kb: 91, extra: &["README-kn_IN.txt"] },
+    Cat { code: "ko_KR", name: "Korean (Korea)", path: "ko_KR/ko_KR", kb: 2797, extra: &["README_ko_KR.txt"] },
+    Cat { code: "kmr_Latn", name: "Kurmanji Kurdish (Latin script)", path: "kmr_Latn/kmr_Latn", kb: 40, extra: &["README_kmr_Latn.txt", "license.txt"] },
+    Cat { code: "lo_LA", name: "Lao (Laos)", path: "lo_LA/lo_LA", kb: 655, extra: &["README_lo_LA.txt"] },
+    Cat { code: "lv_LV", name: "Latvian (Latvia)", path: "lv_LV/lv_LV", kb: 1801, extra: &["README_hyph_lv_LV.txt", "README_lv_LV.txt"] },
+    Cat { code: "lt_LT", name: "Lithuanian (Lithuania)", path: "lt_LT/lt", kb: 1153, extra: &["COPYING", "README"] },
+    Cat { code: "mr_IN", name: "Marathi (India)", path: "mr_IN/mr_IN", kb: 1012, extra: &["COPYING"] },
+    Cat { code: "mn_MN", name: "Mongolian (Mongolia)", path: "mn_MN/mn_MN", kb: 17651, extra: &["README_mn_MN.txt"] },
+    Cat { code: "ne_NP", name: "Nepali (Nepal)", path: "ne_NP/ne_NP", kb: 853, extra: &["README_ne_NP.txt", "README_th_ne_NP_v2.txt"] },
+    Cat { code: "nb_NO", name: "Norwegian Bokmal (Norway)", path: "no/nb_NO", kb: 9117, extra: &["COPYING", "README"] },
+    Cat { code: "nn_NO", name: "Norwegian Nynorsk (Norway)", path: "no/nn_NO", kb: 6316, extra: &["COPYING", "README"] },
+    Cat { code: "oc_FR", name: "Occitan (France)", path: "oc_FR/oc_FR", kb: 2701, extra: &["LICENCES-fr.txt", "LICENSES-en.txt"] },
+    Cat { code: "or_IN", name: "Odia (India)", path: "or_IN/or_IN", kb: 20, extra: &[] },
+    Cat { code: "fa_IR", name: "Persian (Iran)", path: "fa_IR/fa-IR", kb: 2515, extra: &["LICENSE", "README_fa_IR.txt"] },
+    Cat { code: "pl_PL", name: "Polish (Poland)", path: "pl_PL/pl_PL", kb: 5129, extra: &["README_en.txt", "README_pl.txt"] },
+    Cat { code: "pt_BR", name: "Portuguese (Brazil)", path: "pt_BR/pt_BR", kb: 4372, extra: &["README_Lightproof_pt_BR.txt", "README_en.txt"] },
+    Cat { code: "pt_PT", name: "Portuguese (Portugal)", path: "pt_PT/pt_PT", kb: 1451, extra: &["LICENSES.txt", "README_hyph_pt_PT.txt"] },
+    Cat { code: "pa_IN", name: "Punjabi (India)", path: "pa_IN/pa_IN", kb: 36, extra: &[] },
+    Cat { code: "ro_RO", name: "Romanian (Romania)", path: "ro/ro_RO", kb: 2150, extra: &["COPYING.GPL", "COPYING.LGPL"] },
+    Cat { code: "ru_RU", name: "Russian (Russia)", path: "ru_RU/ru_RU", kb: 3391, extra: &["README_Lightproof_ru_RU.txt", "README_ru_RU.txt"] },
+    Cat { code: "sa_IN", name: "Sanskrit (India)", path: "sa_IN/sa_IN", kb: 15165, extra: &[] },
+    Cat { code: "gd_GB", name: "Scottish Gaelic (United Kingdom)", path: "gd_GB/gd_GB", kb: 4694, extra: &["LICENSES-en.txt", "README_gd_GB.txt"] },
+    Cat { code: "sr", name: "Serbian", path: "sr/sr", kb: 5740, extra: &["README.txt"] },
+    Cat { code: "sr_Latn", name: "Serbian (Latin script)", path: "sr/sr-Latn", kb: 3728, extra: &["README.txt"] },
+    Cat { code: "si_LK", name: "Sinhala (Sri Lanka)", path: "si_LK/si_LK", kb: 831, extra: &["LICENSES-en.txt"] },
+    Cat { code: "sk_SK", name: "Slovak (Slovakia)", path: "sk_SK/sk_SK", kb: 3283, extra: &["LICENSE.txt", "README_en.txt"] },
+    Cat { code: "sl_SI", name: "Slovenian (Slovenia)", path: "sl_SI/sl_SI", kb: 2898, extra: &["README_hyph_sl_SI.txt", "README_sl_SI.txt"] },
+    Cat { code: "es_AR", name: "Spanish (Argentina)", path: "es/es_AR", kb: 691, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_BO", name: "Spanish (Bolivia)", path: "es/es_BO", kb: 686, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_CL", name: "Spanish (Chile)", path: "es/es_CL", kb: 689, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_CO", name: "Spanish (Colombia)", path: "es/es_CO", kb: 733, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_CR", name: "Spanish (Costa Rica)", path: "es/es_CR", kb: 684, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_CU", name: "Spanish (Cuba)", path: "es/es_CU", kb: 686, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_DO", name: "Spanish (Dominican Republic)", path: "es/es_DO", kb: 683, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_EC", name: "Spanish (Ecuador)", path: "es/es_EC", kb: 685, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_SV", name: "Spanish (El Salvador)", path: "es/es_SV", kb: 684, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_GQ", name: "Spanish (Equatorial Guinea)", path: "es/es_GQ", kb: 815, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_GT", name: "Spanish (Guatemala)", path: "es/es_GT", kb: 684, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_HN", name: "Spanish (Honduras)", path: "es/es_HN", kb: 686, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_MX", name: "Spanish (Mexico)", path: "es/es_MX", kb: 706, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_NI", name: "Spanish (Nicaragua)", path: "es/es_NI", kb: 685, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_PA", name: "Spanish (Panama)", path: "es/es_PA", kb: 683, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_PY", name: "Spanish (Paraguay)", path: "es/es_PY", kb: 683, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_PE", name: "Spanish (Peru)", path: "es/es_PE", kb: 698, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_PH", name: "Spanish (Philippines)", path: "es/es_PH", kb: 778, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_PR", name: "Spanish (Puerto Rico)", path: "es/es_PR", kb: 683, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_ES", name: "Spanish (Spain)", path: "es/es_ES", kb: 699, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_US", name: "Spanish (United States)", path: "es/es_US", kb: 679, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_UY", name: "Spanish (Uruguay)", path: "es/es_UY", kb: 686, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "es_VE", name: "Spanish (Venezuela)", path: "es/es_VE", kb: 687, extra: &["LICENSE.md", "README_hunspell_es.txt"] },
+    Cat { code: "sw_TZ", name: "Swahili (Tanzania)", path: "sw_TZ/sw_TZ", kb: 616, extra: &["README_sw_TZ.txt"] },
+    Cat { code: "sv_FI", name: "Swedish (Finland)", path: "sv_SE/dictionaries/sv_FI", kb: 2284, extra: &[] },
+    Cat { code: "sv_SE", name: "Swedish (Sweden)", path: "sv_SE/dictionaries/sv_SE", kb: 2289, extra: &[] },
+    Cat { code: "ta_IN", name: "Tamil (India)", path: "ta_IN/ta_IN", kb: 2365, extra: &["COPYING"] },
+    Cat { code: "te_IN", name: "Telugu (India)", path: "te_IN/te_IN", kb: 3322, extra: &["README_hyph_te_IN.txt", "README_te_IN.txt"] },
+    Cat { code: "th_TH", name: "Thai (Thailand)", path: "th_TH/th_TH", kb: 1210, extra: &["README_hyph_th_TH.txt", "README_th_TH.txt"] },
+    Cat { code: "bo", name: "Tibetan", path: "bo/bo", kb: 4, extra: &["README.md"] },
+    Cat { code: "tr_TR", name: "Turkish (Turkey)", path: "tr_TR/tr_TR", kb: 35289, extra: &["LICENSE", "README.txt"] },
+    Cat { code: "uk_UA", name: "Ukrainian (Ukraine)", path: "uk_UA/uk_UA", kb: 8710, extra: &["README_hyph_uk_UA.txt", "README_th_uk_UA.txt"] },
+    Cat { code: "vi_VN", name: "Vietnamese (Vietnam)", path: "vi/vi_VN", kb: 38, extra: &["LICENSES-en.txt", "LICENSES-vi.txt"] },
+];

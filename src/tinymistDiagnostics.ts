@@ -55,6 +55,7 @@ export function useTinymistDiagnostics(
   editorRef: MutableRefObject<any>,
   activeTabPath: string | undefined,
   activeTabContent: string | undefined,
+  mainFile: string | undefined,
 ) {
   const [problems, setProblems] = useState<EditorProblem[]>([]);
   const [available, setAvailable] = useState<boolean | null>(null);
@@ -95,7 +96,10 @@ export function useTinymistDiagnostics(
           const response = await fetch(`${API}/lsp/diagnostics`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ file: activeTabPath, content: activeTabContent }),
+            // Which file the preview compiles. A chapter has to be checked as
+            // part of its document, or every cross-file reference in it reads
+            // as missing.
+            body: JSON.stringify({ file: activeTabPath, content: activeTabContent, main: mainFile }),
             signal: controller.signal,
           });
           if (!response.ok) throw new Error(`Tinymist diagnostics ${response.status}`);
@@ -160,7 +164,7 @@ export function useTinymistDiagnostics(
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [monaco, editorRef, activeTabPath, activeTabContent, restartRevision]);
+  }, [monaco, editorRef, activeTabPath, activeTabContent, restartRevision, mainFile]);
 
   return { available, problems, busy };
 }

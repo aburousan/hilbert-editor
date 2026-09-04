@@ -192,7 +192,11 @@ const server = http.createServer((req, res) => {
 });
 await new Promise(resolve => server.listen(0, resolve));
 
-const browser = await puppeteer.launch({ headless: 'new' });
+// `--no-sandbox` for the same reason the typing test passes it: this loads only
+// local files, and Chromium's sandbox needs privileges that Ubuntu's AppArmor
+// policy and most CI containers do not grant, so without it the test cannot run
+// at all on Linux.
+const browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox'] });
 const page = await browser.newPage();
 await page.goto(`http://127.0.0.1:${server.address().port}/`);
 // Where every character of an element ended up, left to right. Asking each one

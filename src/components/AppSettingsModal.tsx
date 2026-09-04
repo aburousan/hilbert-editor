@@ -4,6 +4,7 @@ import { TEXT_DIRECTIONS, type TextDirection } from '../textDirection';
 import { getInterpreter, getPlotFormat, setInterpreter, setPlotFormat, type PlotFormat } from '../prefs';
 
 import { API } from '../api';
+import { keys } from '../keys';
 
 type GitStatus = {
   initialized: boolean;
@@ -47,16 +48,21 @@ function listLangs(langs?: string[]): string {
   return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
 }
 
+type Dictionary = { code: string; name: string; kb: number; installed: boolean; builtin: boolean };
+
 type SettingsProps = {
   onClose: () => void,
+  initialTab?: 'general' | 'spelling',
+  initialSearch?: string,
+  onDictionaryChange?: () => void,
   theme: ThemeId, onTheme: (t: ThemeId) => void,
   fontSize: number, onFontSize: (n: number) => void,
   textDirection: TextDirection, onTextDirection: (d: TextDirection) => void,
   compileDelay: number, onCompileDelay: (n: number) => void,
 };
 
-export default function AppSettingsModal({ onClose, theme, onTheme, fontSize, onFontSize, textDirection, onTextDirection, compileDelay, onCompileDelay }: SettingsProps) {
-  const [activeTab, setActiveTab] = useState<'general' | 'interpreters' | 'git' | 'cloud'>('general');
+export default function AppSettingsModal({ onClose, initialTab, initialSearch, onDictionaryChange, theme, onTheme, fontSize, onFontSize, textDirection, onTextDirection, compileDelay, onCompileDelay }: SettingsProps) {
+  const [activeTab, setActiveTab] = useState<'general' | 'spelling' | 'interpreters' | 'git' | 'cloud'>(initialTab || 'general');
   const [tools, setTools] = useState<Tools | null>(null);
   const [tinymist, setTinymist] = useState<TinymistStatus | null>(null);
   const [toolchain, setToolchain] = useState<ToolchainStatus | null>(null);
@@ -205,6 +211,44 @@ export default function AppSettingsModal({ onClose, theme, onTheme, fontSize, on
 
   useEffect(() => { if (activeTab === 'git') refreshGit(); }, [activeTab]);
 
+  // Spelling dictionaries: what is on hand, and what can be fetched.
+  const [dicts, setDicts] = useState<Dictionary[] | null>(null);
+  const [dictFolder, setDictFolder] = useState('');
+  const [dictBusy, setDictBusy] = useState('');
+  const [dictError, setDictError] = useState('');
+  const [dictFilter, setDictFilter] = useState(initialSearch || '');
+
+  const refreshDicts = () => {
+    fetch(`${API}/dictionaries`)
+      .then(r => r.json())
+      .then(d => { setDicts(d.dictionaries || []); setDictFolder(d.folder || ''); })
+      .catch(() => setDicts([]));
+  };
+  useEffect(() => { if (activeTab === 'spelling' && !dicts) refreshDicts(); }, [activeTab]);
+
+  const dictAction = async (code: string, what: 'install' | 'remove') => {
+    setDictBusy(code);
+    setDictError('');
+    try {
+      const res = await fetch(`${API}/dictionaries/${what}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `Could not ${what} that dictionary.`);
+      refreshDicts();
+      // The open document was checked against the dictionaries that existed a
+      // moment ago. Check it again rather than making the writer type a
+      // character to find out whether it worked.
+      onDictionaryChange?.();
+    } catch (e: any) {
+      setDictError(e?.message || String(e));
+    } finally {
+      setDictBusy('');
+    }
+  };
+
   const call = async (path: string, body?: object) => {
     setBusy(true);
     setLog('Working...');
@@ -233,12 +277,12 @@ export default function AppSettingsModal({ onClose, theme, onTheme, fontSize, on
       <div className="modal-content" style={{ width: '640px', maxWidth: '94vw', display: 'flex', flexDirection: 'row', height: '480px', maxHeight: '86vh', padding: 0, overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
         <div style={{ width: '180px', flex: '0 0 180px', background: 'var(--panel-bg)', borderRight: '1px solid var(--border-color)', display: 'flex', flexDirection: 'column' }}>
           <div style={{ padding: '15px', fontWeight: 'bold', borderBottom: '1px solid var(--border-color)' }}>App Settings</div>
-          {(['general', 'interpreters', 'git', 'cloud'] as const).map(t => (
+          {(['general', 'spelling', 'interpreters', 'git', 'cloud'] as const).map(t => (
             <div key={t}
               style={{ padding: '10px 15px', cursor: 'pointer', background: activeTab === t ? 'var(--accent)' : 'transparent', color: activeTab === t ? 'white' : 'var(--text-main)' }}
               onClick={() => setActiveTab(t)}
             >
-              {t === 'general' ? 'General' : t === 'interpreters' ? 'Interpreters' : t === 'git' ? 'Git & GitHub' : 'Cloud Accounts'}
+              {t === 'general' ? 'General' : t === 'spelling' ? 'Spelling' : t === 'interpreters' ? 'Interpreters' : t === 'git' ? 'Git & GitHub' : 'Cloud Accounts'}
             </div>
           ))}
         </div>
@@ -343,9 +387,90 @@ export default function AppSettingsModal({ onClose, theme, onTheme, fontSize, on
                 </div>
                 {tinymistLog && <div style={{ padding: '9px 10px', background: 'var(--bg-color)', borderRadius: 4, fontSize: 12, color: 'var(--text-muted)' }}>{tinymistLog}</div>}
                 <p style={{ fontSize: '12px', color: 'var(--text-muted)', margin: 0 }}>
-                  All settings apply immediately and are remembered on this machine. ⌘S always compiles right away.
+                  All settings apply immediately and are remembered on this machine. {keys('⌘S')} always compiles right away.
                 </p>
               </div>
+            </div>
+          )}
+
+          {activeTab === 'spelling' && (
+            <div>
+              <h2 style={{ marginTop: 0 }}>Spelling</h2>
+              <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', lineHeight: 1.6 }}>
+                Hilbert reads the language your document declares — <code>#set text(lang: "fr")</code> —
+                and checks it against the dictionary for that language. English is built in.
+                Everything else is downloaded once and then works offline.
+              </p>
+              <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', lineHeight: 1.6 }}>
+                Grammar and style are English only.
+              </p>
+
+              <input
+                style={{ ...inputStyle, width: '100%', boxSizing: 'border-box', marginTop: 6 }}
+                placeholder="Search languages…"
+                value={dictFilter}
+                onChange={e => setDictFilter(e.target.value)}
+              />
+
+              {dictError && (
+                <div style={{ marginTop: 10, fontSize: '0.82rem', color: '#f87171' }}>{dictError}</div>
+              )}
+
+              <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 2 }}>
+                {dicts === null ? (
+                  <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Loading…</div>
+                ) : (
+                  dicts
+                    .filter(d => {
+                      const q = dictFilter.trim().toLowerCase();
+                      return !q || d.name.toLowerCase().includes(q) || d.code.toLowerCase().includes(q);
+                    })
+                    // Installed first: what you have is what you want to see.
+                    .sort((a, b) => Number(b.installed) - Number(a.installed) || a.name.localeCompare(b.name))
+                    .map(d => (
+                      <div key={d.code} style={{
+                        display: 'flex', alignItems: 'center', gap: 10, padding: '7px 8px', borderRadius: 5,
+                        background: d.installed ? 'var(--panel-bg)' : 'transparent',
+                      }}>
+                        <span style={{ flex: 1, fontSize: '0.86rem' }}>
+                          {d.name}
+                          <span style={{ color: 'var(--text-muted)', fontSize: '0.76rem', marginLeft: 7 }}>
+                            {d.code}{d.kb > 0 && !d.installed ? ` · ${d.kb > 1024 ? `${(d.kb / 1024).toFixed(1)} MB` : `${d.kb} KB`}` : ''}
+                          </span>
+                        </span>
+                        {d.builtin ? (
+                          <span style={{ fontSize: '0.76rem', color: 'var(--text-muted)' }}>built in</span>
+                        ) : d.installed ? (
+                          <button
+                            style={{ ...btn('transparent'), color: 'var(--text-muted)', border: '1px solid var(--border-color)', padding: '4px 10px', fontSize: '0.78rem' }}
+                            disabled={!!dictBusy}
+                            onClick={() => dictAction(d.code, 'remove')}
+                          >
+                            {dictBusy === d.code ? 'Removing…' : 'Remove'}
+                          </button>
+                        ) : (
+                          <button
+                            style={{ ...btn('var(--accent)'), padding: '4px 10px', fontSize: '0.78rem' }}
+                            disabled={!!dictBusy}
+                            onClick={() => dictAction(d.code, 'install')}
+                          >
+                            {dictBusy === d.code ? 'Getting…' : 'Get'}
+                          </button>
+                        )}
+                      </div>
+                    ))
+                )}
+              </div>
+
+              <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.6, marginTop: 18 }}>
+                Dictionaries come from the LibreOffice collection, each under its own licence,
+                which is saved beside it in:
+              </p>
+              <code style={{ fontSize: '0.75rem', wordBreak: 'break-all', color: 'var(--text-muted)' }}>{dictFolder}</code>
+              <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.6, marginTop: 10 }}>
+                Any Hunspell pair dropped into that folder works too — name the files after the
+                language tag, as in <code>cy_GB.aff</code> and <code>cy_GB.dic</code>.
+              </p>
             </div>
           )}
 
@@ -516,7 +641,7 @@ export default function AppSettingsModal({ onClose, theme, onTheme, fontSize, on
               <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12, fontSize: 13, cursor: 'pointer' }}>
                 <input type="checkbox" defaultChecked={localStorage.getItem('webdav_autosync') === 'true'}
                   onChange={e => localStorage.setItem('webdav_autosync', e.target.checked ? 'true' : 'false')} />
-                Auto-sync to WebDAV on every save (⌘S)
+                Auto-sync to WebDAV on every save ({keys('⌘S')})
               </label>
 
               <h2 style={{ fontSize: '1rem', marginTop: 22 }}>Google Drive</h2>

@@ -16,6 +16,7 @@
 // the copy of Hilbert you use.
 
 import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -80,10 +81,23 @@ const server = spawn(binary, ['--headless'], {
 });
 
 let browser;
+// Tidying up must never decide the outcome. Chromium keeps writing to its
+// profile for a moment after close() returns, so a straight recursive delete
+// races it and throws ENOTEMPTY — which used to turn three clean trials into
+// "could not run". Give the processes a moment to go, try a few times, and if a
+// scratch directory outlives us, let it: the operating system clears /tmp.
 const cleanup = async () => {
   try { await browser?.close(); } catch {}
   server.kill();
-  await rm(dir, { recursive: true, force: true });
+  try { await once(server, 'exit'); } catch {}
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      await rm(dir, { recursive: true, force: true });
+      return;
+    } catch {
+      await sleep(250);
+    }
+  }
 };
 
 try {

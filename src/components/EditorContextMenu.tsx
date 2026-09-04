@@ -5,6 +5,7 @@ import {
   pasteEditorClipboard,
   type ClipboardEditor,
 } from '../editorClipboard';
+import { keys } from '../keys';
 
 // Monaco's own right-click menu is turned off in favour of this one, because
 // its Cut/Copy/Paste entries cannot work inside a webview — see clipboard.ts.
@@ -12,10 +13,9 @@ import {
 // ids, so the only thing that changes is that the clipboard entries do what
 // they say.
 
-const isMac = /mac/i.test(navigator.platform) || /Mac OS X/.test(navigator.userAgent);
-const mod = isMac ? '⌘' : 'Ctrl+';
-const alt = isMac ? '⌥' : 'Alt+';
-const shift = isMac ? '⇧' : 'Shift+';
+const mod = keys('⌘');
+const alt = keys('⌥');
+const shift = keys('⇧');
 
 type Item =
   | { kind: 'divider' }

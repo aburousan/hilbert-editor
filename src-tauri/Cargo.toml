@@ -53,6 +53,11 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 # checker; harper-core + harper-typst provide native grammar/style linting that
 # understands Typst syntax (prose only, skipping code/math).
 spellbook = "0.4"
+# Downloaded dictionaries are not all UTF-8 — German, Polish and Brazilian
+# Portuguese are still Latin-1/Latin-2 — and a word list decoded wrongly reports
+# every accented word in the language as a misspelling. Already in the tree via
+# reqwest, so naming it here costs nothing.
+encoding_rs = "0.8"
 harper-core = "2.8"
 harper-typst = "2.8"
 

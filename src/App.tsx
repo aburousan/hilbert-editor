@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo, lazy, Suspense } from 'react';
 import { API, useWorkspaceAsset } from './api';
+import { keys } from './keys';
 import { THEMES, DEFAULT_THEME, isThemeId, themeInfo, themeAttribute, nextTheme, type ThemeId } from './themes';
 import { BIDI_MARKS, HAS_RTL, INVISIBLE, INVISIBLE_ALL, blockAfter, invisibleName, isolateMarks, isTextDirection, lineDirection, segmentLine, type OpenBlock, type TextDirection } from './textDirection';
 import { allInterpreters, applyInterpreters, applyPlotFormat, embeddableInTypst, getInterpreter, getPlotFormat, PREFS_CHANGED } from './prefs';
@@ -8,7 +9,7 @@ import { setupTypstLanguage, setWorkspaceImages } from './typstMonaco';
 import { useProofread } from './proofread';
 import { useTinymistDiagnostics, type EditorProblem } from './tinymistDiagnostics';
 import ProofreadPanel from './components/ProofreadPanel';
-import { tokenizeLine, tokenizeRenderedText, tokenizeTypstMathSource, bestMatch, type SyncPayload } from './syncMatch';
+import { tokenizeLine, tokenizeRenderedText, tokenizeTypstMathSource, bestMatch, blockEquationStart, usableFocus, type SyncPayload } from './syncMatch';
 import { commentEdits, commentTokenFor } from './commentLines';
 import { snapUtf16OffsetToGrapheme, snapUtf16RangeToGraphemes } from './unicodeRanges';
 import type { PdfHandle, PdfViewState } from './components/PdfPreview';
@@ -54,6 +55,7 @@ const ImageEditor = lazy(() => import('./ImageEditor'));
 const DiagramBuilder = lazy(() => import('./components/DiagramBuilder'));
 const FigureBuilder = lazy(() => import('./components/FigureBuilder'));
 const QuiverDiagram = lazy(() => import('./components/QuiverDiagram'));
+const LabelGraph = lazy(() => import('./components/LabelGraph'));
 const EditSettings = lazy(() => import('./components/EditSettings'));
 const SymbolPicker = lazy(() => import('./components/SymbolPicker'));
 const DriveSyncModal = lazy(() => import('./components/DriveSyncModal'));
@@ -165,18 +167,27 @@ const RIGHT_PANEL_KEYS: PanelKey[] = ['preview'];
 
 // The rest of the menus spell shortcuts with ⌘ throughout; the ones added here
 // are shown with the modifier the user's keyboard actually has.
-const IS_MAC = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+
 
 
 // Show rule injected once when a notebook runs: badges each python/julia code
 // block in the compiled PDF with its language logo (files under .hilbert/logos/,
 // created by the backend on compile).
 const NB_LOGO_MARKER = '#show raw.where(block: true, lang: "python")';
+// The leading slash matters: Typst resolves an image path relative to the file
+// that names it, so ".hilbert/logos/…" only found the logos for a document
+// sitting in the project root. A rooted path works at any depth.
 const NB_LOGO_SHOW_RULE = `// Language logo beside python/julia code blocks (Hilbert)
-#show raw.where(block: true, lang: "python"): it => block(width: 100%, breakable: false, { place(top + right, dy: -3pt, box(height: 1.15em, image(".hilbert/logos/python.svg"))); it })
-#show raw.where(block: true, lang: "julia"): it => block(width: 100%, breakable: false, { place(top + right, dy: -3pt, box(height: 1.15em, image(".hilbert/logos/julia.svg"))); it })
+#show raw.where(block: true, lang: "python"): it => block(width: 100%, breakable: false, { place(top + right, dy: -3pt, box(height: 1.15em, image("/.hilbert/logos/python.svg"))); it })
+#show raw.where(block: true, lang: "julia"): it => block(width: 100%, breakable: false, { place(top + right, dy: -3pt, box(height: 1.15em, image("/.hilbert/logos/julia.svg"))); it })
 
 `;
+
+// Documents written before that fix carry the file-relative path and break as
+// soon as they are moved into a subfolder. Repair them in passing.
+const NB_LOGO_LEGACY = /image\("(\.\/)*(\.\.\/)*\.hilbert\/logos\/(python|julia)\.svg"\)/g;
+const repairLogoPaths = (text: string) =>
+  text.replace(NB_LOGO_LEGACY, (_m, _dot, _up, lang) => `image("/.hilbert/logos/${lang}.svg")`);
 
 const DEFAULT_CODE = `#set page(paper: "a4", numbering: "1")
 #set text(font: "New Computer Modern", size: 11pt)
@@ -333,6 +344,14 @@ type CompiledEquation = {
   position: DocumentPosition;
   words: string[];
   equationIndex: number;
+  /// A block equation, as opposed to one set inline in a sentence.
+  block: boolean;
+  /// The number Typst printed beside it, or null where it printed none.
+  number: number | null;
+  /// Which block equation this is, counting from one — the same thing a scan of
+  /// the source counts, so a printed number can be turned back into a place in
+  /// the file.
+  blockOrdinal: number;
 };
 
 function collectCompiledMathGlyphs(node: any, glyphs: string[]) {
@@ -405,39 +424,6 @@ function headingTitle(raw: string): string {
     .replace(/\$([^$]*)\$/g, (_all, body) => body.replace(/["\\]/g, '').trim())
     .replace(/\s+/g, ' ')
     .trim();
-}
-
-function blockEquationStart(model: any, ordinal: number): { line: number; column: number; text: string } | null {
-  let seen = 0;
-  let open: { line: number; column: number } | null = null;
-  let body = '';
-  let blockish = false;
-  for (let line = 1; line <= model.getLineCount(); line++) {
-    const raw = model.getLineContent(line).replace(/\/\/.*$/, '');
-    for (let i = 0; i < raw.length; i++) {
-      if (raw[i] !== '$' || raw[i - 1] === '\\') {
-        if (open) body += raw[i];
-        continue;
-      }
-      if (!open) {
-        // A dollar followed by a space (or by nothing more on this line) opens
-        // a block equation; `$x$` glued to its content is inline and unnumbered.
-        open = { line, column: i + 1 };
-        blockish = i + 1 >= raw.length || raw[i + 1] === ' ' || raw[i + 1] === '\t';
-        body = '';
-        continue;
-      }
-      const closesBlock = blockish && (i === 0 || raw[i - 1] === ' ' || raw[i - 1] === '\t' || body.trim() === '');
-      if (closesBlock) {
-        seen++;
-        if (seen === ordinal) return { ...open, text: body };
-      }
-      open = null;
-      body = '';
-    }
-    if (open) body += ' ';
-  }
-  return null;
 }
 
 function cursorIsInMath(model: any, line: number, column: number): boolean {
@@ -686,6 +672,11 @@ export default function App() {
   }, [hiddenToolbarTools, hiddenToolbarSet]);
 
   const activeTab = tabs.find(t => t.path === activeTabPath);
+  // Run Notebook lives in a toolbar of icons, and a tester writing his first
+  // notebook only found it by reading the manual. When the open document
+  // actually has cells in it, give the action a named button beside Recompile —
+  // where someone looking for "the run button" looks first.
+  const hasCodeCells = /```\s*(python|julia)\b/.test(activeTab?.content || '');
   // Mirrored so callbacks that outlive a render (the editor's mount handler)
   // read the current tab rather than the one captured when they were created.
   const activeTabRef = useRef(activeTab);
@@ -852,10 +843,15 @@ export default function App() {
   const [showAbout, setShowAbout] = useState(false);
   const [showFigureBuilder, setShowFigureBuilder] = useState(false);
   const [showQuiver, setShowQuiver] = useState(false);
+  const [showLabelGraph, setShowLabelGraph] = useState(false);
   const [showEditSettings, setShowEditSettings] = useState(false);
   const [showDriveSync, setShowDriveSync] = useState(false);
   const [showHistoryModal, setShowHistoryModal] = useState(false);
   const [showAppSettings, setShowAppSettings] = useState(false);
+  // Which page App Settings opens on, so "Get one" in the proofread panel lands
+  // on the dictionaries rather than on General.
+  const [settingsTab, setSettingsTab] = useState<'general' | 'spelling'>('general');
+  const [settingsSearch, setSettingsSearch] = useState('');
   const [activeMenu, setActiveMenu] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, node?: FileNode, type: 'file' | 'folder' | 'empty' } | null>(null);
   const [editorMenu, setEditorMenu] = useState<{ x: number, y: number } | null>(null);
@@ -1040,6 +1036,21 @@ export default function App() {
     // did nothing, because the bidi algorithm never saw it. Hilbert marks these
     // with a hairline decoration instead, which leaves the character in place.
     renderControlCharacters: false,
+    // ...and for the same reason Monaco's own unicode warnings are off. In a
+    // Hebrew or Arabic document its "ambiguous character" boxes fire on ordinary
+    // prose — a tester reasonably asked what the yellow boxes around their
+    // Hebrew were supposed to mean. Hilbert marks the characters that genuinely
+    // reorder text (bidi controls) with its own hairline, and nothing else.
+    unicodeHighlight: {
+      ambiguousCharacters: false,
+      invisibleCharacters: false,
+      nonBasicASCII: false,
+    },
+    // Hover and suggestion popups are positioned inside the editor by default,
+    // so on the first line or two they are drawn off the top of the window and
+    // the message is unreadable. Rendering them as overflow widgets lets them
+    // escape the editor's box and flip below the line instead.
+    fixedOverflowWidgets: true,
   }), [editorFontSize]);
   const [codeRunner, setCodeRunner] = useState<null | { initialLang?: 'python' | 'julia' | 'wolfram'; initialCode?: string; initialMode?: 'text' | 'equation' }>(null);
   const [showSaveAs, setShowSaveAs] = useState(false);
@@ -1286,7 +1297,6 @@ export default function App() {
   // file, which is what Insert → Text Direction does on a selection.
 
   const proof = useProofread(monaco, editorRef, activeTab?.path, activeTab?.content, PROOFREAD_FEATURE_ENABLED && proofreadEnabled);
-  const tinymist = useTinymistDiagnostics(monaco, editorRef, activeTab?.path, activeTab?.content);
 
   useEffect(() => { if (monaco) setupTypstLanguage(monaco); }, [monaco]);
 
@@ -2231,6 +2241,11 @@ export default function App() {
     treeHasPath('main.typ') ? 'main.typ' :
     (activeTabPath && activeTabPath.endsWith('.typ') ? activeTabPath : (lastTypPath || 'main.typ')),
     [mainOverride, detectedEntry, activeTabPath, lastTypPath, treeHasPath]);
+  // Declared after currentMain because tinymist has to be told which file the
+  // document is compiled from: a chapter checked on its own reports every
+  // reference that lives in another file as missing.
+  const tinymist = useTinymistDiagnostics(monaco, editorRef, activeTab?.path, activeTab?.content, currentMain);
+
   const [lastCompiledPath, setLastCompiledPath] = useState<string>('');
 
   // Remember how the tree was left — which folders stood open, and which file was
@@ -3666,6 +3681,7 @@ export default function App() {
       }
       // Once, add the show rule that badges python/julia code blocks with their
       // language logo in the compiled PDF (logos live in .hilbert/logos/).
+      next = repairLogoPaths(next);
       if (!next.includes(NB_LOGO_MARKER)) next = NB_LOGO_SHOW_RULE + next;
 
       editor.executeEdits('notebook', [{ range: model.getFullModelRange(), text: next, forceMoveMarkers: true }]);
@@ -5086,8 +5102,15 @@ export default function App() {
       if (!response.ok) throw new Error(`math locations ${response.status}`);
       const data = await response.json();
       const raw: any[] = Array.isArray(data?.equations) ? data.equations : [];
+      // Counted over everything the query returned, not over what survives the
+      // checks below, so it stays in step with a scan of the source.
+      let blocks = 0;
       return raw.flatMap((entry, equationIndex): CompiledEquation[] => {
         if (!Array.isArray(entry) || entry.length < 2) return [];
+        const block = entry[2] === true;
+        if (block) blocks++;
+        const printed = Number(entry[3]);
+        const number = block && Number.isFinite(printed) && printed > 0 ? printed : null;
         const page = Number(entry[0]?.page);
         const x = Number.parseFloat(String(entry[0]?.x));
         const y = Number.parseFloat(String(entry[0]?.y));
@@ -5098,6 +5121,9 @@ export default function App() {
           position: { page, x, y },
           words: tokenizeRenderedText(glyphs.join(' ')),
           equationIndex,
+          block,
+          number,
+          blockOrdinal: blocks,
         }];
       });
     })().catch(() => {
@@ -5113,19 +5139,36 @@ export default function App() {
   const reverseSync = useCallback(async (p: SyncPayload) => {
     const editor = editorRef.current; const model = editor?.getModel();
     if (!editor || !model) return;
-    let focusWord = p.words[p.focus] || '';
+    // Not always the token under the pointer: a digit is no use as an anchor,
+    // because the PDF hands them over one span at a time and the source keeps
+    // its numbers whole.
+    const focusIndex = usableFocus(p.words, p.focus);
+    let focusWord = p.words[focusIndex] || '';
 
-    // A numbered equation says which one it is, right there on the page.
-    // Counting the source's block equations to that number beats any amount of
-    // symbol matching, so it goes first — with a check that the formula found
-    // that way really is the one on the page, in case the document numbers its
-    // equations by section or hides a dollar somewhere the scanner misreads.
+    // A numbered equation says which one it is, right there on the page — and
+    // that beats any amount of symbol matching, provided the number is turned
+    // back into the right place.
+    //
+    // The obvious way, jumping to the nth `$ … $` in the file, assumes every
+    // block equation is numbered. Papers are full of ones that are not, so the
+    // count runs ahead of the numbering and the jump lands several equations
+    // early. Typst knows what it printed, so ask it: the compiled map carries
+    // each equation's number alongside which block equation it is.
     if (p.equationNumber) {
-      const counted = blockEquationStart(model, p.equationNumber);
+      const equations = await getCompiledMathMap();
+      const printed = equations.find(equation => equation.number === p.equationNumber);
+      const counted = blockEquationStart(model.getLinesContent(), printed ? printed.blockOrdinal : p.equationNumber);
       if (counted) {
         const sourceWords = new Set(tokenizeTypstMathSource(counted.text));
         const shown = p.words.filter(word => sourceWords.has(word)).length;
-        if (!p.words.length || shown > 0) {
+        const distinct = new Set(p.words).size;
+        // Typst's own numbering can be taken at its word. A guessed ordinal has
+        // to earn it, or a formula sharing a `nu` with the right one is enough
+        // to send the jump to the wrong page.
+        const agrees = printed
+          ? shown > 0
+          : shown >= Math.max(2, Math.round(distinct * 0.34));
+        if (!p.words.length || agrees) {
           flashSourceRange(counted.line, counted.column, 1);
           return;
         }
@@ -5134,7 +5177,11 @@ export default function App() {
 
     const src = tokenizeSourceModel(model);
     const prior = Math.round(p.docFraction * src.length);
-    const res = focusWord ? bestMatch(src.map(s => s.w), p.words, p.focus, prior) : null;
+    // The repeat counts occurrences of the word that was clicked, so it only
+    // applies while that is still the word being matched.
+    const res = focusWord
+      ? bestMatch(src.map(s => s.w), p.words, focusIndex, prior, focusIndex === p.focus ? p.repeat : null)
+      : null;
     const repeatedMathFocus = !!(p.mathHint && focusWord
       && src.reduce((count, token) => count + Number(token.w === focusWord), 0) > 1);
     if (res && !repeatedMathFocus) {
@@ -6266,7 +6313,7 @@ export default function App() {
     { category: 'File', title: 'Import Folder into Project...', run: openFolderFromDisk },
     { category: 'File', title: 'Import Font (.ttf / .otf)...', run: importFont },
     { category: 'File', title: 'New from Template...', run: () => setShowTemplateInstaller(true) },
-    { category: 'File', title: 'Save', hint: '⌘S', run: saveActiveFile },
+    { category: 'File', title: 'Save', hint: keys('⌘S'), run: saveActiveFile },
     { category: 'File', title: 'Save As / Export...', run: () => setShowSaveAs(true) },
     { category: 'File', title: 'Sync / Share (Drive, WebDAV)...', run: () => setShowDriveSync(true) },
     { category: 'Edit', title: 'Undo', run: () => editorRef.current?.trigger('palette', 'undo', null) },
@@ -6278,13 +6325,13 @@ export default function App() {
     { category: 'Code', title: 'Rename Symbol', hint: 'F2', run: () => editorRef.current?.getAction('editor.action.rename')?.run() },
     { category: 'Code', title: 'Quick Fix / Code Actions', run: () => editorRef.current?.getAction('editor.action.quickFix')?.run() },
     { category: 'Code', title: 'Format Typst Document', run: formatActiveDocument },
-    { category: 'Edit', title: 'Comment / Uncomment Lines', hint: IS_MAC ? '⌘/' : 'Ctrl+/', run: toggleComment },
-    { category: 'Edit', title: 'Toggle Numbering (at cursor)', hint: '⌘⇧N', run: toggleNumbering },
+    { category: 'Edit', title: 'Comment / Uncomment Lines', hint: keys('⌘/'), run: toggleComment },
+    { category: 'Edit', title: 'Toggle Numbering (at cursor)', hint: keys('⌘⇧N'), run: toggleNumbering },
     { category: 'Edit', title: 'Toggle Equation Numbering (all)', run: toggleEquationNumbering },
     { category: 'Edit', title: 'Customize Toolbar...', run: () => setShowToolbarPreferences(true) },
     ...(recoveryConflicts.length ? [{ category: 'Edit', title: `Review Local Recovery Copies (${recoveryConflicts.length})...`, run: () => setShowRecoveryDrafts(true) }] : []),
     { category: 'Edit', title: 'Document Settings...', run: () => setShowEditSettings(true) },
-    { category: 'Edit', title: 'Flip This Line’s Text Direction', hint: IS_MAC ? '⌘⇧X' : 'Ctrl+Shift+X', run: flipLineDirection },
+    { category: 'Edit', title: 'Flip This Line’s Text Direction', hint: keys('⌘⇧X'), run: flipLineDirection },
     { category: 'Insert', title: 'Keep Selection Right-to-Left', run: () => isolateSelection('rtl') },
     { category: 'Insert', title: 'Keep Selection Left-to-Right', run: () => isolateSelection('ltr') },
     { category: 'Insert', title: 'Keep Selection Together (direction isolate)', run: () => isolateSelection('auto') },
@@ -6338,6 +6385,7 @@ export default function App() {
     { category: 'View', title: 'Version History...', run: () => setShowHistoryModal(true) },
     { category: 'View', title: 'Recompile Document', run: () => compileTypst(currentMain) },
     { category: 'View', title: 'Preview HTML (experimental)', run: () => setShowHtmlPreview(true) },
+    { category: 'View', title: 'Label Graph — what refers to what...', run: () => setShowLabelGraph(true) },
     { category: 'View', title: 'App Settings (interpreters, git, cloud)...', run: () => setShowAppSettings(true) },
     { category: 'Insert', title: 'Title Block...', run: insertTitleBlock },
     { category: 'Insert', title: 'Author...', run: insertAuthor },
@@ -6345,20 +6393,20 @@ export default function App() {
     { category: 'Insert', title: 'Abstract', run: insertAbstract },
     { category: 'Insert', title: 'Heading...', run: insertHeading },
     { category: 'Insert', title: 'Theorem / Proof / Lemma...', run: insertTheorem },
-    { category: 'Math', title: 'Inline Equation', hint: '⌘E', run: () => wrapSelection('$', '$') },
+    { category: 'Math', title: 'Inline Equation', hint: keys('⌘E'), run: () => wrapSelection('$', '$') },
     { category: 'Math', title: 'Block Equation', run: () => insertCode('\n$ E = m c^2 $\n\n') },
     { category: 'Math', title: 'Multiline / Aligned Equation', run: insertMultilineEquation },
-    { category: 'Math', title: 'Numbered Equation...', hint: '⌘⇧E', run: insertNumberedEquation },
-    { category: 'Math', title: 'Equation Templates...', hint: '⌘⇧G', run: () => setShowEqGallery(true) },
+    { category: 'Math', title: 'Numbered Equation...', hint: keys('⌘⇧E'), run: insertNumberedEquation },
+    { category: 'Math', title: 'Equation Templates...', hint: keys('⌘⇧G'), run: () => setShowEqGallery(true) },
     { category: 'Math', title: 'Insert Physics (physica)...', run: () => setShowPhysics(true) },
-    { category: 'Math', title: 'Matrix Studio...', hint: '⌘⇧M', run: () => setShowMatrixStudio(true) },
+    { category: 'Math', title: 'Matrix Studio...', hint: keys('⌘⇧M'), run: () => setShowMatrixStudio(true) },
     { category: 'Math', title: 'Matrix (augmentation lines)...', run: insertMatrix },
     { category: 'Math', title: 'Conditional / Piecewise (cases)...', run: insertCases },
     { category: 'Math', title: 'Over / Under Brace...', run: insertBrace },
     { category: 'Math', title: 'Cancel / Strike Term...', run: insertCancel },
-    { category: 'Math', title: 'Math & Physics Symbols...', hint: '⌘⇧P', run: () => setShowSymbolPicker(true) },
-    { category: 'Math', title: 'Draw a Symbol → Typst...', hint: '⌘⇧Y', run: () => setShowSymbolDraw(true) },
-    { category: 'Math', title: 'Compute Selection (simplify / solve)...', hint: '⌘⇧U', run: computeSelection },
+    { category: 'Math', title: 'Math & Physics Symbols...', hint: keys('⌘⇧P'), run: () => setShowSymbolPicker(true) },
+    { category: 'Math', title: 'Draw a Symbol → Typst...', hint: keys('⌘⇧Y'), run: () => setShowSymbolDraw(true) },
+    { category: 'Math', title: 'Compute Selection (simplify / solve)...', hint: keys('⌘⇧U'), run: computeSelection },
     { category: 'Lists', title: 'Bullet List', run: () => makeList('-') },
     { category: 'Lists', title: 'Numbered List', run: () => makeList('+') },
     { category: 'Lists', title: 'Nested List', run: insertNestedList },
@@ -6367,13 +6415,13 @@ export default function App() {
     { category: 'Text', title: 'Block Quote...', run: insertBlockQuote },
     { category: 'Text', title: 'Footnote', run: insertFootnote },
     { category: 'Text', title: 'Margin / Side Note...', run: insertSideNote },
-    { category: 'Text', title: 'Horizontal Line (full width)', hint: '⌘⇧H', run: insertHRule },
+    { category: 'Text', title: 'Horizontal Line (full width)', hint: keys('⌘⇧H'), run: insertHRule },
     { category: 'Figures', title: 'Figure...', run: () => setShowFigureBuilder(true) },
     { category: 'Figures', title: 'Image...', run: insertImage },
     { category: 'Figures', title: 'Whiteboard / Sketch (Excalidraw)...', run: insertWhiteboard },
     { category: 'Figures', title: 'Table...', run: insertTable },
     { category: 'Figures', title: 'Import Data (CSV/Excel/JSON)...', run: insertDataFile },
-    { category: 'Figures', title: 'Code Block', hint: '⌘⇧B', run: insertCodeBlock },
+    { category: 'Figures', title: 'Code Block', hint: keys('⌘⇧B'), run: insertCodeBlock },
     { category: 'Figures', title: 'Subfigures (side-by-side)...', run: insertSubfigures },
     { category: 'Slides', title: 'Slide Studio (drag & drop deck builder)...', run: openSlideStudio },
     { category: 'Slides', title: 'Pin highlight + arrow note (pinit)', run: insertPinHighlight },
@@ -6381,11 +6429,11 @@ export default function App() {
     { category: 'Plots', title: 'Plot Studio (2D · data · 3D · Python)...', run: () => setShowPlotStudio(true) },
     { category: 'Plots', title: 'cetz Canvas (shapes & grid)...', run: () => setShowDiagramBuilder(true) },
     { category: 'Plots', title: 'Commutative Diagram (quiver)...', run: () => setShowQuiver(true) },
-    { category: 'Plots', title: 'Feynman Diagram...', hint: '⌘⇧F', run: () => setShowFeynman(true) },
+    { category: 'Plots', title: 'Feynman Diagram...', hint: keys('⌘⇧F'), run: () => setShowFeynman(true) },
     { category: 'Plots', title: 'Flow diagram (fletcher)...', run: insertFletcher },
-    { category: 'Compute', title: 'Flowchart → Code...', hint: '⌘⇧L', run: () => setShowFlowchart(true) },
+    { category: 'Compute', title: 'Flowchart → Code...', hint: keys('⌘⇧L'), run: () => setShowFlowchart(true) },
     { category: 'Compute', title: 'Run Notebook (all code cells)', run: () => runNotebook() },
-    { category: 'Compute', title: 'Run Python...', hint: '⌘⇧K', run: () => setCodeRunner({ initialLang: 'python' }) },
+    { category: 'Compute', title: 'Run Python...', hint: keys('⌘⇧K'), run: () => setCodeRunner({ initialLang: 'python' }) },
     { category: 'Compute', title: 'Run Julia...', run: () => setCodeRunner({ initialLang: 'julia' }) },
     { category: 'Compute', title: 'Run Wolfram...', run: () => setCodeRunner({ initialLang: 'wolfram' }) },
     { category: 'References', title: 'Link (Web)...', run: insertWebLink },
@@ -6393,8 +6441,8 @@ export default function App() {
     { category: 'References', title: 'Label...', run: insertLabel },
     { category: 'References', title: 'Reference & Label Manager...', run: () => setShowRefManager(true) },
     { category: 'References', title: 'Citations & Bibliography (DOI/arXiv/Zotero)...', run: () => setShowBibManager(true) },
-    { category: 'Format', title: 'Bold', hint: '⌘B', run: () => wrapSelection('*', '*') },
-    { category: 'Format', title: 'Italic', hint: '⌘I', run: () => wrapSelection('_', '_') },
+    { category: 'Format', title: 'Bold', hint: keys('⌘B'), run: () => wrapSelection('*', '*') },
+    { category: 'Format', title: 'Italic', hint: keys('⌘I'), run: () => wrapSelection('_', '_') },
     { category: 'Format', title: 'Underline', run: () => wrapSelection('#underline[', ']') },
     { category: 'Format', title: 'Superscript', run: () => wrapSelection('#super[', ']') },
     { category: 'Format', title: 'Subscript', run: () => wrapSelection('#sub[', ']') },
@@ -6470,7 +6518,7 @@ export default function App() {
                   <div className="dropdown-item" onClick={() => { importFont(); setActiveMenu(null); }}>Import Font (.ttf / .otf)...</div>
                   <div className="dropdown-item" onClick={() => setShowTemplateInstaller(true)}>New from Template...</div>
                   <div className="dropdown-divider"></div>
-                  <div className="dropdown-item" onClick={() => { saveActiveFile(); setActiveMenu(null); }}>Save <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘S</span></div>
+                  <div className="dropdown-item" onClick={() => { saveActiveFile(); setActiveMenu(null); }}>Save <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘S')}</span></div>
                   <div className="dropdown-item" onClick={() => { setShowSaveAs(true); setActiveMenu(null); }}>Save As / Export...</div>
                 </div>
               )}
@@ -6479,14 +6527,14 @@ export default function App() {
               Edit
               {activeMenu === 'edit' && (
                 <div className="dropdown">
-                  <div className="dropdown-item" onClick={() => { setShowPalette(true); setActiveMenu(null); }}>Command Palette... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘K</span></div>
+                  <div className="dropdown-item" onClick={() => { setShowPalette(true); setActiveMenu(null); }}>Command Palette... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘K')}</span></div>
                   <div className="dropdown-divider"></div>
                   <div className="dropdown-item" onClick={() => { editorRef.current?.trigger('menu', 'undo', null); setActiveMenu(null); }}>Undo</div>
                   <div className="dropdown-item" onClick={() => { editorRef.current?.trigger('menu', 'redo', null); setActiveMenu(null); }}>Redo</div>
                   <div className="dropdown-divider"></div>
-                  <div className="dropdown-item" onClick={() => { if (editorRef.current) void cutEditorSelection(editorRef.current); setActiveMenu(null); }}>Cut <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{IS_MAC ? '⌘X' : 'Ctrl+X'}</span></div>
-                  <div className="dropdown-item" onClick={() => { if (editorRef.current) void copyEditorSelection(editorRef.current); setActiveMenu(null); }}>Copy <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{IS_MAC ? '⌘C' : 'Ctrl+C'}</span></div>
-                  <div className="dropdown-item" onClick={() => { if (editorRef.current) void pasteEditorClipboard(editorRef.current); setActiveMenu(null); }}>Paste <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{IS_MAC ? '⌘V' : 'Ctrl+V'}</span></div>
+                  <div className="dropdown-item" onClick={() => { if (editorRef.current) void cutEditorSelection(editorRef.current); setActiveMenu(null); }}>Cut <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘X')}</span></div>
+                  <div className="dropdown-item" onClick={() => { if (editorRef.current) void copyEditorSelection(editorRef.current); setActiveMenu(null); }}>Copy <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘C')}</span></div>
+                  <div className="dropdown-item" onClick={() => { if (editorRef.current) void pasteEditorClipboard(editorRef.current); setActiveMenu(null); }}>Paste <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘V')}</span></div>
                   <div className="dropdown-divider"></div>
                   <div className="dropdown-item" onClick={() => { editorRef.current?.getAction('actions.find')?.run(); setActiveMenu(null); }}>Find...</div>
                   <div className="dropdown-item" onClick={() => { editorRef.current?.getAction('editor.action.startFindReplaceAction')?.run(); setActiveMenu(null); }}>Find &amp; Replace...</div>
@@ -6498,9 +6546,9 @@ export default function App() {
                   <div className="dropdown-item" onClick={() => { editorRef.current?.getAction('editor.action.quickFix')?.run(); setActiveMenu(null); }}>Quick Fix / Code Actions</div>
                   <div className="dropdown-item" onClick={() => { formatActiveDocument(); setActiveMenu(null); }}>Format Typst Document</div>
                   <div className="dropdown-divider"></div>
-                  <div className="dropdown-item" onClick={() => { toggleComment(); setActiveMenu(null); }}>Comment / Uncomment Lines <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{IS_MAC ? '⌘/' : 'Ctrl+/'}</span></div>
+                  <div className="dropdown-item" onClick={() => { toggleComment(); setActiveMenu(null); }}>Comment / Uncomment Lines <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘/')}</span></div>
                   <div className="dropdown-divider"></div>
-                  <div className="dropdown-item" onClick={() => { toggleNumbering(); setActiveMenu(null); }}>Toggle Numbering (at cursor) <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧N</span></div>
+                  <div className="dropdown-item" onClick={() => { toggleNumbering(); setActiveMenu(null); }}>Toggle Numbering (at cursor) <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘⇧N')}</span></div>
                   <div className="dropdown-item" onClick={() => { toggleEquationNumbering(); setActiveMenu(null); }}>Toggle Equation Numbering (all)</div>
                   <div className="dropdown-divider"></div>
                   <div className="dropdown-item" onClick={() => { setShowToolbarPreferences(true); setActiveMenu(null); }}>Customize Toolbar...</div>
@@ -6519,6 +6567,9 @@ export default function App() {
                 // Clicks here don't close the menu (the app-level handler is
                 // stopped), so several panels can be toggled in one visit.
                 <div className="dropdown" onClick={e => e.stopPropagation()}>
+                  <div className="dropdown-item" onClick={() => { setShowLabelGraph(true); setActiveMenu(null); }}>
+                    <span className="dropdown-check"></span>Label Graph...
+                  </div>
                   <div className="dropdown-item" onClick={() => { setShowHtmlPreview(true); setActiveMenu(null); }}>
                     <span className="dropdown-check"></span>HTML Preview
                     <span style={{ marginLeft: 'auto', color: '#d97706', fontSize: '0.65rem' }}>experimental</span>
@@ -6565,22 +6616,22 @@ export default function App() {
                     <span>Math</span><span className="submenu-arrow">›</span>
                     <div className="submenu">
                       <div className="dropdown-header">Equations</div>
-                      <div className="dropdown-item" onClick={() => { wrapSelection('$', '$'); setActiveMenu(null); }}>Inline Equation <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘E</span></div>
+                      <div className="dropdown-item" onClick={() => { wrapSelection('$', '$'); setActiveMenu(null); }}>Inline Equation <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘E')}</span></div>
                       <div className="dropdown-item" onClick={() => { insertCode('\n$ E = m c^2 $\n\n'); setActiveMenu(null); }}>Block Equation</div>
                       <div className="dropdown-item" onClick={() => { insertMultilineEquation(); setActiveMenu(null); }}>Multiline / Aligned Equation</div>
-                      <div className="dropdown-item" onClick={() => { insertNumberedEquation(); setActiveMenu(null); }}>Numbered Equation... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧E</span></div>
+                      <div className="dropdown-item" onClick={() => { insertNumberedEquation(); setActiveMenu(null); }}>Numbered Equation... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘⇧E')}</span></div>
                       <div className="dropdown-header">Templates &amp; Structures</div>
-                      <div className="dropdown-item" onClick={() => { setShowEqGallery(true); setActiveMenu(null); }}>Equation Templates... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧G</span></div>
+                      <div className="dropdown-item" onClick={() => { setShowEqGallery(true); setActiveMenu(null); }}>Equation Templates... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘⇧G')}</span></div>
                       <div className="dropdown-item" onClick={() => { setShowPhysics(true); setActiveMenu(null); }}>Insert Physics... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>physica</span></div>
-                      <div className="dropdown-item" onClick={() => { setShowMatrixStudio(true); setActiveMenu(null); }}>Matrix Studio (fill, borders, code array)... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧M</span></div>
+                      <div className="dropdown-item" onClick={() => { setShowMatrixStudio(true); setActiveMenu(null); }}>Matrix Studio (fill, borders, code array)... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘⇧M')}</span></div>
                       <div className="dropdown-item" onClick={() => { insertMatrix(); setActiveMenu(null); }}>Matrix (augmentation lines)...</div>
                       <div className="dropdown-item" onClick={() => { insertCases(); setActiveMenu(null); }}>Conditional / Piecewise (cases)...</div>
                       <div className="dropdown-item" onClick={() => { insertBrace(); setActiveMenu(null); }}>Over / Under Brace...</div>
                       <div className="dropdown-item" onClick={() => { insertCancel(); setActiveMenu(null); }}>Cancel / Strike Term...</div>
                       <div className="dropdown-header">Symbols &amp; Compute</div>
-                      <div className="dropdown-item" onClick={() => { setShowSymbolPicker(true); setActiveMenu(null); }}>Math &amp; Physics Symbols... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧P</span></div>
-                      <div className="dropdown-item" onClick={() => { setShowSymbolDraw(true); setActiveMenu(null); }}>Draw a Symbol → Typst (experimental)... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧Y</span></div>
-                      <div className="dropdown-item" onClick={() => { computeSelection(); setActiveMenu(null); }}>Compute Selection (simplify / solve)... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧U</span></div>
+                      <div className="dropdown-item" onClick={() => { setShowSymbolPicker(true); setActiveMenu(null); }}>Math &amp; Physics Symbols... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘⇧P')}</span></div>
+                      <div className="dropdown-item" onClick={() => { setShowSymbolDraw(true); setActiveMenu(null); }}>Draw a Symbol → Typst (experimental)... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘⇧Y')}</span></div>
+                      <div className="dropdown-item" onClick={() => { computeSelection(); setActiveMenu(null); }}>Compute Selection (simplify / solve)... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘⇧U')}</span></div>
                     </div>
                   </div>
                   <div className="dropdown-item has-submenu">
@@ -6604,8 +6655,8 @@ export default function App() {
                       <div className="dropdown-item" onClick={() => { insertNestedList(); setActiveMenu(null); }}>Nested List (list-in-list)</div>
                       <div className="dropdown-item" onClick={() => { insertTermList(); setActiveMenu(null); }}>Term / Definition List</div>
                       <div className="dropdown-divider"></div>
-                      <div className="dropdown-item" onClick={() => { shiftIndent(1); setActiveMenu(null); }}>Indent → nest deeper <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘]</span></div>
-                      <div className="dropdown-item" onClick={() => { shiftIndent(-1); setActiveMenu(null); }}>Outdent → nest shallower <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘[</span></div>
+                      <div className="dropdown-item" onClick={() => { shiftIndent(1); setActiveMenu(null); }}>Indent → nest deeper <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘]')}</span></div>
+                      <div className="dropdown-item" onClick={() => { shiftIndent(-1); setActiveMenu(null); }}>Outdent → nest shallower <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘[')}</span></div>
                     </div>
                   </div>
                   <div className="dropdown-item has-submenu">
@@ -6615,13 +6666,13 @@ export default function App() {
                       <div className="dropdown-item" onClick={() => { insertBlockQuote(); setActiveMenu(null); }}>Block Quote...</div>
                       <div className="dropdown-item" onClick={() => { insertFootnote(); setActiveMenu(null); }}>Footnote</div>
                       <div className="dropdown-item" onClick={() => { insertSideNote(); setActiveMenu(null); }}>Margin / Side Note...</div>
-                      <div className="dropdown-item" onClick={() => { insertHRule(); setActiveMenu(null); }}>Horizontal Line (full width) <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧H</span></div>
+                      <div className="dropdown-item" onClick={() => { insertHRule(); setActiveMenu(null); }}>Horizontal Line (full width) <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘⇧H')}</span></div>
                     </div>
                   </div>
                   <div className="dropdown-item has-submenu">
                     <span>Text Direction</span><span className="submenu-arrow">›</span>
                     <div className="submenu">
-                      <div className="dropdown-item" onClick={() => { flipLineDirection(); setActiveMenu(null); }}>Flip This Line <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{IS_MAC ? '⌘⇧X' : 'Ctrl+Shift+X'}</span></div>
+                      <div className="dropdown-item" onClick={() => { flipLineDirection(); setActiveMenu(null); }}>Flip This Line <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘⇧X')}</span></div>
                       <div className="dropdown-divider"></div>
                       <div className="dropdown-item" onClick={() => { isolateSelection('rtl'); setActiveMenu(null); }}>Keep Selection Right-to-Left</div>
                       <div className="dropdown-item" onClick={() => { isolateSelection('ltr'); setActiveMenu(null); }}>Keep Selection Left-to-Right</div>
@@ -6644,7 +6695,7 @@ export default function App() {
                       <div className="dropdown-item" onClick={() => { insertWhiteboard(); setActiveMenu(null); }}>Whiteboard / Sketch (Excalidraw)...</div>
                       <div className="dropdown-item" onClick={() => { insertTable(); setActiveMenu(null); }}>Table...</div>
                       <div className="dropdown-item" onClick={() => { insertDataFile(); setActiveMenu(null); }}>Import Data (CSV/Excel/JSON)...</div>
-                      <div className="dropdown-item" onClick={() => { insertCodeBlock(); setActiveMenu(null); }}>Code Block <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧B</span></div>
+                      <div className="dropdown-item" onClick={() => { insertCodeBlock(); setActiveMenu(null); }}>Code Block <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘⇧B')}</span></div>
                     </div>
                   </div>
                   <div className="dropdown-item" onClick={() => { const sel = editorRef.current?.getSelection(); const model = editorRef.current?.getModel(); const code = sel && model && !sel.isEmpty() ? model.getValueInRange(sel).trim() : ''; setShowImagePlacer(code ? code : true); setActiveMenu(null); }}>Place Image (wrap your text / float / below)...</div>
@@ -6656,7 +6707,7 @@ export default function App() {
                       <div className="dropdown-item" onClick={() => { setShowDiagramBuilder(true); setActiveMenu(null); }}>cetz Canvas (shapes &amp; grid)...</div>
                       <div className="dropdown-header">Diagrams</div>
                       <div className="dropdown-item" onClick={() => { setShowQuiver(true); setActiveMenu(null); }}>Commutative Diagram (quiver)...</div>
-                      <div className="dropdown-item" onClick={() => { setShowFeynman(true); setActiveMenu(null); }}>Feynman Diagram (visual)... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧F</span></div>
+                      <div className="dropdown-item" onClick={() => { setShowFeynman(true); setActiveMenu(null); }}>Feynman Diagram (visual)... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘⇧F')}</span></div>
                       <div className="dropdown-header">Slides</div>
                       <div className="dropdown-item" onClick={() => { insertFloatingBox(); setActiveMenu(null); }}>Floating text box (place anywhere)...</div>
                       <div className="dropdown-item" onClick={() => { insertFletcher(); setActiveMenu(null); }}>Flow diagram (fletcher)...</div>
@@ -6667,10 +6718,10 @@ export default function App() {
                   <div className="dropdown-item has-submenu">
                     <span>Compute</span><span className="submenu-arrow">›</span>
                     <div className="submenu">
-                      <div className="dropdown-item" onClick={() => { setShowFlowchart(true); setActiveMenu(null); }}>Flowchart → Code (build logic visually)... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧L</span></div>
+                      <div className="dropdown-item" onClick={() => { setShowFlowchart(true); setActiveMenu(null); }}>Flowchart → Code (build logic visually)... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘⇧L')}</span></div>
                       <div className="dropdown-divider"></div>
                       <div className="dropdown-item" onClick={() => { runNotebook(); setActiveMenu(null); }}>Run Notebook (all ```python / ```julia cells, variables persist)</div>
-                      <div className="dropdown-item" onClick={() => { setCodeRunner({ initialLang: 'python' }); setActiveMenu(null); }}>Run Python... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘⇧K</span></div>
+                      <div className="dropdown-item" onClick={() => { setCodeRunner({ initialLang: 'python' }); setActiveMenu(null); }}>Run Python... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘⇧K')}</span></div>
                       <div className="dropdown-item" onClick={() => { setCodeRunner({ initialLang: 'julia' }); setActiveMenu(null); }}>Run Julia...</div>
                       <div className="dropdown-item" onClick={() => { setCodeRunner({ initialLang: 'wolfram' }); setActiveMenu(null); }}>Run Wolfram...</div>
                     </div>
@@ -6694,8 +6745,8 @@ export default function App() {
               {activeMenu === 'formatting' && (
                 <div className="dropdown">
                   <div className="dropdown-header">Text</div>
-                  <div className="dropdown-item" onClick={() => { wrapSelection('*', '*'); setActiveMenu(null); }}>Bold <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘B</span></div>
-                  <div className="dropdown-item" onClick={() => { wrapSelection('_', '_'); setActiveMenu(null); }}>Italic <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘I</span></div>
+                  <div className="dropdown-item" onClick={() => { wrapSelection('*', '*'); setActiveMenu(null); }}>Bold <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘B')}</span></div>
+                  <div className="dropdown-item" onClick={() => { wrapSelection('_', '_'); setActiveMenu(null); }}>Italic <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘I')}</span></div>
                   <div className="dropdown-item" onClick={() => { wrapSelection('#underline[', ']'); setActiveMenu(null); }}>Underline</div>
                   <div className="dropdown-item" onClick={() => { wrapSelection('#super[', ']'); setActiveMenu(null); }}>Superscript</div>
                   <div className="dropdown-item" onClick={() => { wrapSelection('#sub[', ']'); setActiveMenu(null); }}>Subscript</div>
@@ -6746,7 +6797,7 @@ export default function App() {
               {activeMenu === 'help' && (
                 <div className="dropdown">
                   <div className="dropdown-item" onClick={() => { setShowHelp(true); setActiveMenu(null); }}>Features &amp; Help...</div>
-                  <div className="dropdown-item" onClick={() => { setShowPalette(true); setActiveMenu(null); }}>Command Palette... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>⌘K</span></div>
+                  <div className="dropdown-item" onClick={() => { setShowPalette(true); setActiveMenu(null); }}>Command Palette... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘K')}</span></div>
                   <div className="dropdown-item" onClick={() => { copyDiagnostics(); setActiveMenu(null); }}>Copy Diagnostics</div>
                 </div>
               )}
@@ -6867,8 +6918,8 @@ export default function App() {
           {toolbarToolVisible('undo') && <button className="tool-btn" onClick={() => editorRef.current?.trigger('source', 'undo', null)} title="Undo"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="9 14 4 9 9 4"></polyline><path d="M20 20v-7a4 4 0 0 0-4-4H4"></path></svg></button>}
           {toolbarToolVisible('redo') && <button className="tool-btn" onClick={() => editorRef.current?.trigger('source', 'redo', null)} title="Redo"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="15 14 20 9 15 4"></polyline><path d="M4 20v-7a4 4 0 0 1 4-4h12"></path></svg></button>}
           {toolbarDividerBefore('text') && <div className="toolbar-divider"></div>}
-          {toolbarToolVisible('bold') && <button className="tool-btn" onClick={() => wrapSelection('*', '*')} title="Bold  (⌘B)"><b>B</b></button>}
-          {toolbarToolVisible('italic') && <button className="tool-btn" onClick={() => wrapSelection('_', '_')} title="Italic  (⌘I)"><i>I</i></button>}
+          {toolbarToolVisible('bold') && <button className="tool-btn" onClick={() => wrapSelection('*', '*')} title={`Bold  (${keys('⌘B')})`}><b>B</b></button>}
+          {toolbarToolVisible('italic') && <button className="tool-btn" onClick={() => wrapSelection('_', '_')} title={`Italic  (${keys('⌘I')})`}><i>I</i></button>}
           {toolbarToolVisible('underline') && <button className="tool-btn" onClick={() => wrapSelection('#underline[', ']')} title="Underline — for a coloured/offset underline use Formatting ▸ Underline…"><span style={{ textDecoration: 'underline' }}>U</span></button>}
           {toolbarToolVisible('font-size') && <button className="tool-btn" title="Text size — resize the selected text"
             onClick={(e) => {
@@ -6949,13 +7000,13 @@ export default function App() {
           )}
           {toolbarDividerBefore('math') && <div className="toolbar-divider"></div>}
           {/* Math — the core of physics/maths note-taking */}
-          {toolbarToolVisible('inline-math') && <button className="tool-btn" onClick={() => wrapSelection('$', '$')} title="Inline math — a symbol in running text   $x$   (⌘E)"><span style={{ fontFamily: "'iA Writer Mono', ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12.5, fontWeight: 600, letterSpacing: '-0.5px' }}>$x$</span></button>}
+          {toolbarToolVisible('inline-math') && <button className="tool-btn" onClick={() => wrapSelection('$', '$')} title={`Inline math — a symbol in running text   $x$   (${keys('⌘E')})`}><span style={{ fontFamily: "'iA Writer Mono', ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12.5, fontWeight: 600, letterSpacing: '-0.5px' }}>$x$</span></button>}
           {toolbarToolVisible('display-equation') && <button className="tool-btn" onClick={insertMultilineEquation} title="Display / aligned equation (its own line)"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><rect x="3" y="5" width="18" height="14" rx="2.5"></rect><line x1="8" y1="10.5" x2="16" y2="10.5" strokeWidth="2"></line><line x1="8" y1="13.5" x2="16" y2="13.5" strokeWidth="2"></line></svg></button>}
           {toolbarToolVisible('equation-numbering') && <button className="tool-btn" onClick={toggleEquationNumbering} title="Toggle equation numbering for the whole document  (1), (2), … on/off"><span style={{ fontWeight: 700, fontSize: 12.5, letterSpacing: '-0.5px' }}>(1)</span></button>}
           {toolbarToolVisible('single-equation-number') && <button className="tool-btn" onClick={toggleThisEquationNumber} title="Number / un-number THIS equation (the selection or current line)"><span style={{ fontWeight: 700, fontSize: 14 }}>№</span></button>}
           {toolbarToolVisible('center') && <button className="tool-btn" onClick={() => wrapSelection('#align(center)[', ']')} title="Center the selection on the page"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="6"></line><line x1="21" y1="12" x2="3" y2="12"></line><line x1="18" y1="18" x2="6" y2="18"></line></svg></button>}
-          {toolbarToolVisible('matrix') && <button className="tool-btn" onClick={() => setShowMatrixStudio(true)} title="Matrix — visual grid editor  (⌘⇧M)"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9"><path d="M7 3H4v18h3"></path><path d="M17 3h3v18h-3"></path><circle cx="9.5" cy="9" r="1.15" fill="currentColor" stroke="none"></circle><circle cx="14.5" cy="9" r="1.15" fill="currentColor" stroke="none"></circle><circle cx="9.5" cy="15" r="1.15" fill="currentColor" stroke="none"></circle><circle cx="14.5" cy="15" r="1.15" fill="currentColor" stroke="none"></circle></svg></button>}
-          {toolbarToolVisible('symbols') && <button className="tool-btn" onClick={() => setShowSymbolPicker(true)} title="Greek &amp; physics symbols  (⌘⇧P)"><b style={{ fontSize: 15 }}>Ω</b></button>}
+          {toolbarToolVisible('matrix') && <button className="tool-btn" onClick={() => setShowMatrixStudio(true)} title={`Matrix — visual grid editor  (${keys('⌘⇧M')})`}><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9"><path d="M7 3H4v18h3"></path><path d="M17 3h3v18h-3"></path><circle cx="9.5" cy="9" r="1.15" fill="currentColor" stroke="none"></circle><circle cx="14.5" cy="9" r="1.15" fill="currentColor" stroke="none"></circle><circle cx="9.5" cy="15" r="1.15" fill="currentColor" stroke="none"></circle><circle cx="14.5" cy="15" r="1.15" fill="currentColor" stroke="none"></circle></svg></button>}
+          {toolbarToolVisible('symbols') && <button className="tool-btn" onClick={() => setShowSymbolPicker(true)} title={`Greek &amp; physics symbols  (${keys('⌘⇧P')})`}><b style={{ fontSize: 15 }}>Ω</b></button>}
           {toolbarToolVisible('draw-symbol') && <button className="tool-btn" onClick={() => setShowSymbolDraw(true)} title="Draw a symbol → find its Typst name (sketch it with the mouse)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 19l7-7 3 3-7 7-3-3z"></path><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z"></path><path d="M2 2l7.586 7.586"></path><circle cx="11" cy="11" r="2"></circle></svg></button>}
           {toolbarDividerBefore('structure') && <div className="toolbar-divider"></div>}
           {/* Structure */}
@@ -6974,7 +7025,11 @@ export default function App() {
         </div>
 
         <div className="toolbar-group">
-          {toolbarToolVisible('save') && <button className="tool-btn" onClick={saveActiveFile} title="Save (⌘S)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg></button>}
+          {toolbarToolVisible('save') && <button className="tool-btn" onClick={saveActiveFile} title={`Save (${keys('⌘S')})`}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg></button>}
+          {hasCodeCells && <button className="tool-btn primary" onClick={() => runNotebook()} disabled={notebookRunning}
+            title="Run Notebook — execute every ```python / ```julia block in this file as one session (variables persist), output written below each block">
+             {notebookRunning ? 'Running…' : 'Run Notebook'}
+          </button>}
           {toolbarToolVisible('recompile') && <button className="tool-btn primary" title={`Force Compile ${currentMain}`} onClick={() => compileTypst(currentMain)}>
              Recompile
           </button>}
@@ -7147,13 +7202,19 @@ export default function App() {
                   issues={proof.issues}
                   busy={proof.busy}
                   checked={proof.checked}
+                  reading={proof.reading}
+                  dismissedCount={proof.dismissedCount}
                   onJump={proof.jumpTo}
                   onApply={proof.applySuggestion}
+                  onApplyAll={proof.applyToAll}
                   onIgnore={proof.ignoreWord}
+                  onDismiss={proof.dismiss}
+                  onRestore={proof.restoreDismissed}
+                  onManageDictionaries={(search) => { setSettingsSearch(search || ''); setSettingsTab('spelling'); setShowAppSettings(true); }}
                 />
               )}
 
-              <div style={{ padding: '9px 14px', borderTop: '1px solid var(--border-color)', display: 'flex', alignItems: 'center', gap: '7px', cursor: 'pointer', color: 'var(--text-muted)', fontSize: '0.78rem' }} onClick={() => setShowAppSettings(true)}>
+              <div style={{ padding: '9px 14px', borderTop: '1px solid var(--border-color)', display: 'flex', alignItems: 'center', gap: '7px', cursor: 'pointer', color: 'var(--text-muted)', fontSize: '0.78rem' }} onClick={() => { setSettingsTab('general'); setShowAppSettings(true); }}>
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
                 App Settings
               </div>
@@ -7663,11 +7724,20 @@ export default function App() {
         onRetryLive={retryCollab}
         onLeaveLive={stopCollab}
       /></Suspense>}
-      {showAppSettings && <Suspense fallback={null}><AppSettingsModal onClose={() => setShowAppSettings(false)}
+      {showAppSettings && <Suspense fallback={null}><AppSettingsModal onClose={() => { setShowAppSettings(false); setSettingsTab('general'); setSettingsSearch(''); }} initialTab={settingsTab} initialSearch={settingsSearch} onDictionaryChange={proof.revalidate}
         theme={theme} onTheme={setTheme}
         fontSize={editorFontSize} onFontSize={setEditorFontSize}
         textDirection={editorTextDir} onTextDirection={setEditorTextDir}
         compileDelay={compileDelay} onCompileDelay={setCompileDelay} /></Suspense>}
+      {showLabelGraph && <Suspense fallback={null}><LabelGraph
+        mainFile={currentMain}
+        onClose={() => setShowLabelGraph(false)}
+        onOpen={(file, line) => {
+          setSelectedPaths([file]);
+          setLastSelectedPath(file);
+          void openFileRef.current(file).then(() => flashWhenFileReady(file, line));
+        }}
+      /></Suspense>}
       {showQuiver && <Suspense fallback={null}><QuiverDiagram onClose={() => setShowQuiver(false)} onInsert={insertQuiverDiagram} /></Suspense>}
       {inputModal && <InputModal {...inputModal} onClose={() => setInputModal(null)} />}
       {showDataImport && <Suspense fallback={null}><DataImportModal onClose={() => setShowDataImport(false)} onImport={handleDataImport} /></Suspense>}
@@ -7711,7 +7781,7 @@ export default function App() {
               <div style={{ color: 'var(--text-muted)', marginBottom: '15px' }}>History for {activeTabPath}</div>
               <div className="history-list" style={{ maxHeight: '400px', overflowY: 'auto' }}>
                 {history.filter(h => h.path === activeTabPath).length === 0 && (
-                  <div style={{ color: 'var(--text-muted)', fontSize: '13px', textAlign: 'center', marginTop: '20px' }}>No history for this file yet.<br/>Save the file (⌘S) to keep a version.</div>
+                  <div style={{ color: 'var(--text-muted)', fontSize: '13px', textAlign: 'center', marginTop: '20px' }}>No history for this file yet.<br/>Save the file ({keys('⌘S')}) to keep a version.</div>
                 )}
                 {history.filter(h => h.path === activeTabPath).reverse().map((h, i) => (
                   <div key={h.id} className="history-item" onClick={() => { restoreHistory(h); setShowHistoryModal(false); }} style={{ padding: '12px', borderBottom: '1px solid var(--border-color)', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>

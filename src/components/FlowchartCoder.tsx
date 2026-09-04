@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 import { API } from '../api';
+import { keys } from '../keys';
 
 // Draw a flowchart (process boxes, decision diamonds, connectors, loop-backs)
 // and turn it into real Typst scripting logic: sequences, if/else and while.
@@ -547,8 +548,8 @@ export default function FlowchartCoder({ onClose, onInsert, onSaved }: {
                 <option value="" disabled>Examples ▾</option>
                 {EXAMPLES.map(ex => <option key={ex.name} value={ex.name}>{ex.name}</option>)}
               </select>
-              <button className="btn-ghost" onClick={undo} disabled={!undoRef.current.length} title="Undo (⌘Z)">↶ Undo</button>
-              <button className="btn-ghost" onClick={redo} disabled={!redoRef.current.length} title="Redo (⌘Y)">↷ Redo</button>
+              <button className="btn-ghost" onClick={undo} disabled={!undoRef.current.length} title={`Undo (${keys('⌘Z')})`}>↶ Undo</button>
+              <button className="btn-ghost" onClick={redo} disabled={!redoRef.current.length} title={`Redo (${keys('⌘Y')})`}>↷ Redo</button>
               <button className="btn-ghost" onClick={() => { pushUndo(); setNodes([{ id: 1, type: 'start', label: 'Start', x: 340, y: 50 }, { id: 2, type: 'end', label: 'End', x: 340, y: 420 }]); setEdges([]); setSetup(''); setSel(null); idRef.current = 3; setView({ x: 0, y: 0, w: W, h: H }); }} title="Start a fresh diagram">Clear</button>
             </div>
             <div style={{ position: 'relative' }}>

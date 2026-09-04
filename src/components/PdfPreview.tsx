@@ -1,8 +1,9 @@
 import { memo, forwardRef, useEffect, useImperativeHandle, useRef, useState, type Ref } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 import { TextLayer } from 'pdfjs-dist';
-import { bestMatch, tokenizeRenderedText, type SyncPayload } from '../syncMatch';
+import { bestMatch, tokenizeRenderedText, wordAtOffset, type SyncPayload } from '../syncMatch';
 import { MAX_PDF_PAGE_WORD_INDEXES } from '../performanceLimits';
+import { keys } from '../keys';
 
 export type PdfHandle = {
   revealSource(p: SyncPayload): Promise<boolean>;
@@ -59,6 +60,51 @@ const PAPERS: Array<[string, number, number]> = [
 
 // Resolve a page's point dimensions to a human paper-size label. Falls back to
 // millimetres when the size isn't a standard one (e.g. a custom `#set page`).
+// Which of a span's words the pointer is over.
+//
+// pdf.js lays a whole phrase into one transparent span, so a click has to be
+// resolved inside it. The browser knows exactly which character sits under the
+// pointer, and asking it is both exact and free of any right-to-left special
+// case; only when it cannot answer do we read the pointer's place across the
+// box as a place in the text. Either way the character decides, never an equal
+// share per word — "rearrangement of the terms" is not four equal shares, and
+// treating it as four sent a click on the first word to the third.
+function wordUnderPointer(
+  span: HTMLElement,
+  spanIndexes: number[],
+  words: string[],
+  clientX: number,
+  clientY: number,
+): number {
+  if (!spanIndexes.length) return -1;
+  const text = span.textContent || '';
+
+  let offset = -1;
+  const doc = span.ownerDocument as Document & {
+    caretRangeFromPoint?: (x: number, y: number) => Range | null;
+    caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null;
+  };
+  const range = doc.caretRangeFromPoint?.(clientX, clientY);
+  if (range && span.contains(range.startContainer)) {
+    offset = range.startOffset;
+  } else {
+    const position = doc.caretPositionFromPoint?.(clientX, clientY);
+    if (position && span.contains(position.offsetNode)) offset = position.offset;
+  }
+
+  if (offset < 0) {
+    const rect = span.getBoundingClientRect();
+    let ratio = rect.width > 0 ? Math.max(0, Math.min(0.999, (clientX - rect.left) / rect.width)) : 0;
+    // On a right-to-left line the leftmost pixel is the last character, not the
+    // first, so the fraction has to be read from the other end.
+    if (getComputedStyle(span).direction === 'rtl') ratio = 0.999 - ratio;
+    offset = Math.floor(ratio * text.length);
+  }
+
+  const at = wordAtOffset(text, spanIndexes.map(index => words[index]), offset);
+  return at >= 0 ? spanIndexes[at] : spanIndexes[0];
+}
+
 function paperLabel(w: number, h: number): string {
   const lo = Math.min(w, h), hi = Math.max(w, h);
   const landscape = w > h;
@@ -763,6 +809,37 @@ function PdfPreview(
   // Reverse sync (PDF → source): a double-click selects a word; gather a window
   // of neighbouring words (in reading order) plus a positional prior, and let
   // the editor resolve the exact source location.
+  // Which occurrence of the clicked word this is, counted through the whole
+  // rendered PDF, and how many there are. When the source holds that word the
+  // same number of times, the nth here is the nth there and no amount of
+  // identical surrounding text can confuse it. Returns null when the document
+  // index is unavailable (not every page is rendered), and the matcher then
+  // falls back to context and position as before.
+  const repeatOfClickedWord = (
+    clickedSpan: HTMLElement,
+    spanIndexes: number[],
+    focus: number,
+  ): { index: number; count: number } | null => {
+    const pages = pagesRef.current;
+    if (!pages) return null;
+    const offsetInSpan = spanIndexes.indexOf(focus);
+    if (offsetInSpan < 0) return null;
+    const doc = wordIndexFor(pages);
+    const inSpan: number[] = [];
+    for (let i = 0; i < doc.spans.length; i++) if (doc.spans[i] === clickedSpan) inSpan.push(i);
+    const global = inSpan[offsetInSpan];
+    if (global === undefined) return null;
+    const word = doc.words[global];
+    let index = 0;
+    let count = 0;
+    for (let i = 0; i < doc.words.length; i++) {
+      if (doc.words[i] !== word) continue;
+      if (i < global) index++;
+      count++;
+    }
+    return { index, count };
+  };
+
   const handleDblClick = (event: React.MouseEvent<HTMLDivElement>) => {
     const sel = window.getSelection();
     const selectedWords = tokenizeRenderedText((sel?.toString() ?? '').trim());
@@ -795,22 +872,42 @@ function PdfPreview(
           y: Math.max(0, Math.min(pageInfo.h, (event.clientY - pageRect.top) / pageRect.height * pageInfo.h)),
         }
       : undefined;
-    // The number Typst prints beside a block equation: the last thing on the
-    // formula's line, out at the margin. It has to be the last one — digits
-    // inside the formula itself look exactly like it, and picking `8` out of
-    // `58.8` sends the jump to whichever equation happens to be eighth.
+    // The number Typst prints beside a block equation, out at the right margin.
+    //
+    // Found by looking for the nearest one rather than by asking what sits on
+    // the same line as the click, because a formula is taller than a line of
+    // prose: a fraction with a superscript in it spans two, and the glyph you
+    // click may be well above or below the line the number is on. The distance
+    // allowed is measured in the number's own height, which is ordinary text —
+    // the clicked glyph's height is not, a superscript being half of one.
+    //
+    // It has to be the last thing on its own row, or a digit inside the formula
+    // would do just as well, and `8` out of `58.8` would send the jump to
+    // whichever equation happened to be eighth.
     const equationNumber = (() => {
       if (!clickedSpan || !layer) return null;
       const rect = clickedSpan.getBoundingClientRect();
-      const line = Array.from(layer.querySelectorAll<HTMLElement>('span'))
-        .map(span => ({ span, box: span.getBoundingClientRect() }))
-        .filter(({ span, box }) => box.width > 0 && span.textContent?.trim()
-          && Math.abs(box.top - rect.top) <= rect.height * 0.9)
-        .sort((a, b) => a.box.left - b.box.left);
-      const last = line[line.length - 1];
-      if (!last || last.box.left < rect.right - 1) return null;
-      const digits = /^\(?(\d{1,4})\)?$/.exec(last.span.textContent?.trim() || '');
-      return digits ? Number(digits[1]) : null;
+      const centre = rect.top + rect.height / 2;
+      const spans = Array.from(layer.querySelectorAll<HTMLElement>('span'))
+        .map(span => ({ span, box: span.getBoundingClientRect(), text: span.textContent?.trim() || '' }))
+        .filter(entry => entry.box.width > 0 && entry.text);
+      const middle = (box: DOMRect) => box.top + box.height / 2;
+
+      let best: { value: number; distance: number } | null = null;
+      for (const entry of spans) {
+        const digits = /^\(?(\d{1,4})\)?$/.exec(entry.text);
+        if (!digits || entry.box.left < rect.right - 1) continue;
+        const rowCentre = middle(entry.box);
+        const lastOnItsRow = !spans.some(other =>
+          other !== entry
+          && other.box.left > entry.box.left
+          && Math.abs(middle(other.box) - rowCentre) <= entry.box.height * 0.6);
+        if (!lastOnItsRow) continue;
+        const distance = Math.abs(rowCentre - centre);
+        if (distance > entry.box.height * 1.5) continue;
+        if (!best || distance < best.distance) best = { value: Number(digits[1]), distance };
+      }
+      return best ? best.value : null;
     })();
 
     const pagesRect = pagesRef.current?.getBoundingClientRect();
@@ -832,14 +929,11 @@ function PdfPreview(
     }
     const selectedWord = selectedWords.find(word => spanIndexes.some(index => words[index] === word)) || selectedWords[0];
     let focus = selectedWord ? spanIndexes.find(index => words[index] === selectedWord) ?? -1 : -1;
-    // One pdf.js span can contain several formula atoms. If selection did not
-    // identify one (notably for operators), use the pointer's horizontal place
-    // inside the span instead of always choosing its first atom.
-    if (focus < 0) {
-      const rect = clickedSpan.getBoundingClientRect();
-      const ratio = rect.width > 0 ? Math.max(0, Math.min(0.999, (event.clientX - rect.left) / rect.width)) : 0;
-      focus = spanIndexes[Math.floor(ratio * spanIndexes.length)];
-    }
+    // One pdf.js span can hold a whole phrase, or several formula atoms. If the
+    // selection did not name one (notably for operators, and for any click a
+    // script rather than a person made), work out which word the pointer is
+    // actually over.
+    if (focus < 0) focus = wordUnderPointer(clickedSpan, spanIndexes, words, event.clientX, event.clientY);
     if (focus < 0) return;
     const from = Math.max(0, focus - 8);
     const to = Math.min(words.length, focus + 9);
@@ -851,7 +945,15 @@ function PdfPreview(
     // word this one click happened to select.
     const context = words.slice(from, to);
     if (selectedWord) context[focus - from] = selectedWord;
-    onReverseSync({ words: context, focus: focus - from, docFraction: docFractionOf(clickedSpan), documentPosition, mathHint, equationNumber });
+    onReverseSync({
+      words: context,
+      focus: focus - from,
+      docFraction: docFractionOf(clickedSpan),
+      documentPosition,
+      mathHint,
+      equationNumber,
+      repeat: repeatOfClickedWord(clickedSpan, spanIndexes, focus),
+    });
   };
 
   // Save the currently shown PDF to disk. Works for both the compile preview
@@ -898,7 +1000,7 @@ function PdfPreview(
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
         </button>
         <button className="pdf-btn" onClick={() => setZoom(Math.max(zoomFactor / 1.15, 0.25))} title="Zoom out">−</button>
-        <select className="pdf-zoom-select" value={selValue} title="Zoom (100% = fit width) — Ctrl/⌘ + scroll over the page also zooms"
+        <select className="pdf-zoom-select" value={selValue} title={`Zoom (100% = fit width) — Ctrl/${keys('⌘')} + scroll over the page also zooms`}
           onChange={e => setZoom(e.target.value === 'fit' ? 1 : Number(e.target.value) / 100)}>
           <option value="fit">Fit</option>
           {!PRESETS.includes(curPct) && !isFit && <option value={String(curPct)}>{curPct}%</option>}
@@ -912,7 +1014,7 @@ function PdfPreview(
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
         </button>
       </div>
-      <div className="pdf-scroll" ref={scrollRef} onDoubleClick={handleDblClick} title="Double-click a word to jump to it in the source · Ctrl/⌘ + scroll to zoom">
+      <div className="pdf-scroll" ref={scrollRef} onDoubleClick={handleDblClick} title={`Double-click a word to jump to it in the source · Ctrl/${keys('⌘')} + scroll to zoom`}>
         <div className="pdf-pages" ref={pagesRef} />
       </div>
     </div>

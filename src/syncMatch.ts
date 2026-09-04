@@ -146,22 +146,15 @@ export function bestMatch(
   for (let i = 0; i < hay.length; i++) if (hay[i] === target) candidates.push(i);
   if (candidates.length === 0) return null;
 
-  // The same word, the same number of times on both sides: then the nth one
-  // here is the nth one there, and nothing else needs deciding. Repeated text
-  // is exactly where the surrounding words stop telling the candidates apart —
-  // `Hellow world` written twice scores the same both times — and where the
-  // guess from how far down the document it sits lands on the wrong one.
-  if (repeat && repeat.count === candidates.length && candidates[repeat.index] !== undefined) {
-    const index = candidates[repeat.index];
-    return { index, score: contextScore(hay, phrase, index, focus), ambiguous: false };
-  }
   if (candidates.length === 1) return { index: candidates[0], score: contextScore(hay, phrase, candidates[0], focus), ambiguous: false };
 
   let best = candidates[0];
   let bestScore = -1;
   let bestTies = 0;
+  const scores = new Map<number, number>();
   for (const i of candidates) {
     const score = contextScore(hay, phrase, i, focus);
+    scores.set(i, score);
     const better =
       score > bestScore ||
       (score === bestScore && priorIndex != null && Math.abs(i - priorIndex) < Math.abs(best - priorIndex));
@@ -172,6 +165,23 @@ export function bestMatch(
       bestScore = score;
     }
   }
+
+  // Which repeat of the word this is settles the cases the surrounding words
+  // cannot: `Hello world` written twenty times scores the same every time, and
+  // the guess from how far down the document it sits lands on the wrong one.
+  //
+  // It only ever chooses between candidates the context already rates equally.
+  // It used to decide outright, which was wrong twice over: the count comes
+  // from the pages the preview has rendered, not from the whole document, so
+  // matching the source's total is partly luck — and when it happened by luck,
+  // a word with plainly the right neighbours lost to one picked by its ordinal.
+  if (repeat && repeat.count === candidates.length) {
+    const wanted = candidates[repeat.index];
+    if (wanted !== undefined && scores.get(wanted) === bestScore) {
+      return { index: wanted, score: bestScore, ambiguous: false };
+    }
+  }
+
   // Ambiguous when the winner earned no context and several candidates tied on
   // that empty score — the phrase simply didn't disambiguate anything.
   const ambiguous = bestScore === 0 && bestTies > 1;
@@ -180,4 +190,127 @@ export function bestMatch(
 
 function contextScore(hay: string[], phrase: string[], hayFocus: number, focus: number): number {
   return sideScore(hay, phrase, hayFocus - 1, focus - 1, -1) + sideScore(hay, phrase, hayFocus + 1, focus + 1, 1);
+}
+
+/**
+ * Which word of a rendered phrase a character offset falls in.
+ *
+ * pdf.js puts a whole phrase into one transparent span, so a click inside it
+ * has to be resolved against the text rather than against the box. Splitting
+ * the box into one equal share per word — which is what this replaced — sends a
+ * click on "rearrangement" in "rearrangement of the terms." to "the", because
+ * the words are nothing like the same length.
+ *
+ * `spanWords` are tokens, so they are lower-cased, and a maths glyph has become
+ * its name: `∑` arrives as "sum" and is nowhere to be found in the text it came
+ * from. A token that cannot be located keeps its place in the order anyway,
+ * which is what lets a click on an operator still choose it.
+ *
+ * Returns the position within `spanWords`, or -1 if there are none. An offset
+ * landing on a space picks the nearer neighbour.
+ */
+export function wordAtOffset(text: string, spanWords: string[], offset: number): number {
+  if (!spanWords.length) return -1;
+  const hay = text.toLowerCase();
+  const bounds: Array<{ at: number; start: number; end: number }> = [];
+  let cursor = 0;
+  let located = 0;
+  for (let at = 0; at < spanWords.length; at++) {
+    const word = spanWords[at];
+    const start = word ? hay.indexOf(word, cursor) : -1;
+    if (start >= 0) {
+      cursor = start + word.length;
+      bounds.push({ at, start, end: cursor });
+      located++;
+    } else {
+      // Not in the text as written. Give it the place we have reached so it
+      // still sits between its neighbours.
+      bounds.push({ at, start: cursor, end: cursor });
+    }
+  }
+  if (!located) return -1;
+
+  let best = bounds[0];
+  let bestGap = Infinity;
+  for (const entry of bounds) {
+    if (offset >= entry.start && offset < entry.end) return entry.at;
+    const gap = offset < entry.start ? entry.start - offset : offset - entry.end;
+    if (gap < bestGap) {
+      bestGap = gap;
+      best = entry;
+    }
+  }
+  return best.at;
+}
+
+/**
+ * Where the nth block equation of a Typst source begins.
+ *
+ * Counted over block equations whether or not they are numbered, because the
+ * number a reader sees is resolved separately — Typst is asked what it printed,
+ * and that answer is turned into an ordinal for this function. Counting only
+ * the numbered ones here would put the two counts back out of step.
+ */
+export function blockEquationStart(lines: string[], ordinal: number): { line: number; column: number; text: string } | null {
+  let seen = 0;
+  let open: { line: number; column: number } | null = null;
+  let body = '';
+  let blockish = false;
+  for (let line = 1; line <= lines.length; line++) {
+    const raw = lines[line - 1].replace(/\/\/.*$/, '');
+    for (let i = 0; i < raw.length; i++) {
+      if (raw[i] !== '$' || raw[i - 1] === '\\') {
+        if (open) body += raw[i];
+        continue;
+      }
+      if (!open) {
+        // A dollar followed by a space (or by nothing more on this line) opens
+        // a block equation; `$x$` glued to its content is inline and unnumbered.
+        open = { line, column: i + 1 };
+        blockish = i + 1 >= raw.length || raw[i + 1] === ' ' || raw[i + 1] === '\t';
+        body = '';
+        continue;
+      }
+      const closesBlock = blockish && (i === 0 || raw[i - 1] === ' ' || raw[i - 1] === '\t' || body.trim() === '');
+      if (closesBlock) {
+        seen++;
+        if (seen === ordinal) return { ...open, text: body };
+      }
+      open = null;
+      body = '';
+    }
+    if (open) body += ' ';
+  }
+  return null;
+}
+
+/**
+ * A word worth matching on, given where the click landed.
+ *
+ * A PDF text layer splits `6.626 × 10^-34` into one span per digit while the
+ * source keeps the number whole, so a click that lands on a digit has nothing
+ * on the other side to line up with — and `0` occurs everywhere, so the match
+ * ends up wherever the position guess happens to point. The words around it are
+ * spelled the same on both sides, so aim at the longest of those instead: same
+ * line, same sentence, and something the source actually contains.
+ *
+ * Returns the index to use as the focus, which is the index given whenever the
+ * clicked token is already a word.
+ */
+export function usableFocus(words: string[], focus: number): number {
+  const weak = (word: string) => !word || word.length < 2 || !/\p{L}/u.test(word);
+  if (!weak(words[focus])) return focus;
+  let best = focus;
+  let bestScore = -1;
+  for (let index = 0; index < words.length; index++) {
+    const word = words[index];
+    if (weak(word)) continue;
+    // Longer is more distinctive; nearer is more likely to be the same line.
+    const score = Math.min(word.length, 12) * 4 - Math.abs(index - focus);
+    if (score > bestScore) {
+      bestScore = score;
+      best = index;
+    }
+  }
+  return best;
 }
