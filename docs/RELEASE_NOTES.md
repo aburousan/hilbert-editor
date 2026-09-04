@@ -4,6 +4,91 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.2.4
+
+Spelling now follows the language you write in: say so with
+`#set text(lang: "fr")` and Hilbert fetches that dictionary once, from
+ninety-eight. Double-click in the PDF lands where you clicked — four separate
+things were sending it elsewhere. And a new view draws what your document
+refers to.
+
+### Writing in a language other than English
+
+English is built in. Everything else comes from **App Settings → Spelling**,
+which lists ninety-eight dictionaries from the LibreOffice collection and
+downloads the one you ask for, licence files and all, after which it works
+offline like the rest of the app.
+
+Fourteen of those word lists are not UTF-8 — German, Polish and Brazilian
+Portuguese among them — and a list decoded the wrong way still loads, then
+reports every accented word in the language as a misspelling. Hilbert reads the
+encoding each dictionary declares, and there is a test that downloads seven
+languages and checks each accepts a real word and rejects a near-miss.
+
+Where you have no dictionary for the language, the panel says so rather than
+staying quiet, because silence there reads as a clean bill of health. Grammar
+and style remain English only — the rules behind them are built for English —
+and the dialect follows the region, so `region: "GB"` gets British rules.
+
+### Proofreading that argues less
+
+Every finding can now be put aside, not only misspellings. **Ignore** takes the
+whole group with it, and identical findings collapse into one row with a count,
+so a complaint that repeats forty times is dismissed once. `All → …` fixes every
+occurrence in a single undo step, and **+ Dictionary** still keeps a word for
+good.
+
+Two kinds of noise are gone. Acronyms and code-style names — `CMB`, `LaTeX`,
+`arXiv` — are no longer sent to the dictionary, because no general word list
+will ever hold the vocabulary of a particular field. And a paragraph that opens
+in lower case after a display equation, a table cell or a line break is no
+longer reported as a sentence that should have been capitalised: a sentence
+starts where the last one ended. On a forty-page paper that was a sixth of
+everything the proofreader had to say.
+
+### Seeing the cross-references
+
+**View → Label Graph** draws the document's skeleton: every `<label>` as a
+point, every heading as a bar, and an arrow from a section to each label its
+prose refers to. Hover one and everything else fades to just that label and what
+touches it; double-click to open it.
+
+The panel down the side lists what is wrong rather than what is there —
+references to labels that do not exist, labels defined twice, and labels nothing
+refers to. The first two are errors a compiler either ignores or reports far
+from where you made them.
+
+### Double-click in the PDF
+
+Four separate things were sending it to the wrong place.
+
+An included chapter was read as a document of its own, so every cross-reference
+in it came back as missing and the Problems panel filled with errors that were
+not there. Hilbert now tells the language server which file the preview
+compiles.
+
+A click inside one line of rendered text was resolved by cutting the line into
+equal shares per word, so a click on the first word of "rearrangement of the
+terms." landed on the third. The character under the pointer decides now, which
+also makes right-to-left work without a special case.
+
+A numbered equation was found by counting `$ … $` in the source, which assumes
+every block equation is numbered. Papers are full of ones that are not, so the
+count ran ahead of the numbering and the jump landed several equations early.
+Typst is now asked what it actually printed. Clicking a superscript lost the
+number altogether, for its own reasons.
+
+And a repeat count read from the pages the preview happened to have rendered was
+compared against the whole source; when the two matched by coincidence it
+decided the jump outright, overruling words that plainly agreed.
+
+### Underneath
+
+A compile that has to be stopped now takes its children with it rather than
+leaving them running. Installing a template stages into a scratch directory and
+asks before replacing a folder that already has files in it. Scratch directories
+are no longer guessable, which matters on a shared machine.
+
 ## 0.2.3
 
 This carries the same fixes as 0.2.2 and nothing else. 0.2.2 went out as a

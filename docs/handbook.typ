@@ -15,7 +15,7 @@
     if counter(page).get().first() > 1 {
       set text(size: 8.5pt, fill: luma(120))
       grid(columns: (1fr, auto), align: (left, right),
-        [Hilbert Handbook], [version 0.2.3])
+        [Hilbert Handbook], [version 0.2.4])
       v(-6pt)
       line(length: 100%, stroke: 0.4pt + rule)
     }
@@ -100,7 +100,7 @@
     #v(-6pt)
     #text(size: 13pt, fill: luma(90))[An offline scientific-writing IDE for Typst]
     #v(4pt)
-    #text(size: 10pt, fill: luma(120))[Handbook for version 0.2.3 · #datetime.today().display("[day] [month repr:long] [year]")]
+    #text(size: 10pt, fill: luma(120))[Handbook for version 0.2.4 · #datetime.today().display("[day] [month repr:long] [year]")]
   ]
   #v(18pt)
   #block(radius: 4pt, clip: true, stroke: 0.5pt + rule, image("screenshot.png", width: 100%))
