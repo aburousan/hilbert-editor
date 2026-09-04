@@ -69,25 +69,24 @@ jobs:
         id: summary
         shell: bash
         run: |
-          summary=$(python3 - <<'PY'
-          import re
+          python3 - <<'PY'
+          import os, re, sys
           text = open('docs/RELEASE_NOTES.md', encoding='utf-8').read()
           sections = re.split(r'^## ', text, flags=re.M)[1:]
           body = sections[0].split('\n', 1)[1] if sections else ''
           para = next((p.strip() for p in body.split('\n\n') if p.strip() and not p.startswith('#')), '')
-          print(' '.join(para.split()))
+          summary = ' '.join(para.split())
+          if not summary:
+              sys.exit('Could not read a summary from docs/RELEASE_NOTES.md')
+          # Written straight to the step output, in UTF-8. Going through the
+          # shell instead lost every character the notes are actually written
+          # with: 0.2.4's message reached latest.json reading "you clicked <?>
+          # four separate things", because the runner's stdout is not UTF-8 and
+          # `print` quietly substituted for the em dash.
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as out:
+              out.write('text<<HILBERT_EOF\n' + summary + '\nHILBERT_EOF\n')
+          print('Update dialog will say:', summary)
           PY
-          )
-          if [ -z "$summary" ]; then
-            echo "Could not read a summary from docs/RELEASE_NOTES.md" >&2
-            exit 1
-          fi
-          {
-            echo "text<<HILBERT_EOF"
-            echo "$summary"
-            echo "HILBERT_EOF"
-          } >> "$GITHUB_OUTPUT"
-          echo "Update dialog will say: $summary"
 
       # Pinned to a commit SHA (not the mutable @v0 tag) so a compromise of the
       # action's tag can't run with the signing key. SHA is action-v1.0.0.
