@@ -75,6 +75,12 @@
   block(radius: 3pt, clip: true, stroke: 0.5pt + rule, image(path, width: 68%)),
   caption: caption,
 )
+// A tall, narrow crop — a sidebar panel — has no business taking the width of
+// the page.
+#let shot-panel(path, caption) = figure(
+  block(radius: 3pt, clip: true, stroke: 0.5pt + rule, image(path, width: 32%)),
+  caption: caption,
+)
 #let shot(path, caption) = figure(
   block(radius: 3pt, clip: true, stroke: 0.5pt + rule, image(path, width: 100%)),
   caption: caption,
@@ -481,6 +487,118 @@ source-text count would.
 #kbd("⌘K") opens a palette covering every menu action in the application, searchable
 by name. It is the fastest route to anything in this handbook, and the full catalogue
 is listed in @ch:palette.
+
+= Seeing the cross-references <ch:labelgraph>
+
+A paper's labels are its skeleton. An equation is derived from two others, a section
+leans on a figure, and by the time the thing is forty pages long nobody remembers which.
+Typst knows all of it and shows none of it.
+
+*View → Label Graph* draws it. Every `<label>` is a point, coloured by what it names —
+equations blue, figures green, sections purple — and every heading is a grey bar. An
+arrow runs from a section to each label its prose refers to. Reading left to right is
+reading the document, so an arrow pointing left is a reference backwards, which most of
+them are.
+
+#shot("/docs/label-graph.png", [The cross-references of a short paper. Bars are
+sections, dots are labels, and the arrows are the references between them. The
+list down the side is what nothing refers to.])
+
+Hover a label and everything else fades: what is left is that label, the sections that
+refer to it, and nothing else. The panel names them, along with where the label is
+defined; click to keep that in view while you look around, and double-click to open it
+in the editor.
+
+== The three mistakes it finds
+
+The panel down the right lists what is wrong rather than what is there:
+
+- *Referenced but never defined.* `@eq:mapdfe` compiles to a broken reference, and Typst
+  reports it far from where you typed it, if at all.
+- *Defined more than once.* Two `<eq:one>` in the same document; whichever loses is
+  unreachable.
+- *Never referenced.* Not an error — a numbered equation nobody refers to may still be
+  worth numbering — but a list worth reading before submitting, because the usual cause
+  is a reference you meant to write and did not.
+
+#note[References are attributed to the section they appear in, not to the label above
+them. The obvious rule is the wrong one: a label is discussed in the paragraphs directly
+beneath it, so attributing by proximity makes almost every reference point at itself.]
+
+= Proofreading, and writing in other languages <ch:proofread>
+
+The toolbar has a switch for proofreading. It is off when Hilbert starts, because the
+dictionaries it loads are the largest single piece of memory the application ever asks
+for --- about 80 MB on top of everything else, and only once you actually use it.
+
+Switched on, the Proofread panel joins the sidebar under Problems, and three things get
+underlined in the editor: spelling in red, grammar in amber, style in blue. The counts
+at the top right of the panel are per kind.
+
+#shot-panel("/docs/proofread-panel.png", [The Proofread panel. The same complaint three
+times over is one row with a count, not three rows.])
+
+== Acting on what it finds
+
+Click a row to jump to it in the editor. The chips underneath are the ways out:
+
+- A *suggestion chip* --- `PCs`, `étoiles` --- replaces the flagged text with that word.
+- *Ignore* puts the complaint aside for this session. It takes every copy of it with it,
+  so a word you use forty times is dismissed once, and the header then reads
+  `n ignored`, which is a button that brings them all back.
+- *+ Dictionary*, on spelling only, adds the word to your personal dictionary for good.
+  That file is plain text and per language, so a French word you keep will not quietly
+  excuse an English typo.
+
+When a complaint repeats, the row carries a `×n` badge and clicking it walks through the
+places in turn. The suggestion chip changes the one you are standing on; the chip beside
+it, `All → PCs`, changes all of them in a single undo step.
+
+#note[Acronyms and names written in code style --- `CMB`, `LaTeX`, `arXiv`, `HEALPix` ---
+are not sent to the dictionary at all. No general word list will ever hold the vocabulary
+of a particular field, and a spell checker that underlines every instrument in the paper
+is one you switch off.]
+
+== Writing in a language other than English
+
+Hilbert reads the language your document declares:
+
+```typst
+#set text(lang: "fr")
+```
+
+and checks it against the dictionary for that language. English is built into the
+application. Everything else is a dictionary you fetch once, from *App Settings →
+Spelling*, after which it works offline like the rest of Hilbert.
+
+#shot("/docs/spelling-settings.png", [Ninety-eight dictionaries, from the LibreOffice
+collection. Each is fetched on request, with its licence saved beside it.])
+
+The panel tells you where you stand. With no dictionary for the language, it says so
+rather than staying quiet --- silence would read as a clean bill of health --- and offers
+to fetch one. Once the dictionary is in place the document is re-read immediately.
+
+#shot-panel("/docs/proofread-french.png", [The same document once the French dictionary
+is installed.])
+
+If the document names a region as well --- `#set text(lang: "en", region: "GB")` --- and
+you have no dictionary for it, the panel names the one it fell back to and offers the
+right one. This is what stands between a British paper and being told that `colour` is a
+misspelling.
+
+#warn[Grammar and style are English only. The rules and the part-of-speech model behind
+them are built for English, and running them over French would produce confident
+nonsense, so outside English only spelling is checked and the panel says so. The dialect
+follows the region: `GB` and `IE` get British rules, `AU` Australian, `CA` Canadian,
+`IN` Indian.]
+
+== Your own dictionaries
+
+Dictionaries live in a folder named at the bottom of the Spelling page --- under
+`~/.config/hilbert/dictionaries` on Linux, the equivalent application-support folder on
+macOS and Windows. Any Hunspell pair dropped in there works, whether Hilbert offers it or
+not: name the two files after the language tag, as in `cy_GB.aff` and `cy_GB.dic`, and
+the next document that asks for that language will find them.
 
 = Files and projects
 

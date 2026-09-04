@@ -57,6 +57,21 @@ emits `cetz` and `cetz-plot`.
 
 ![Plot Studio](docs/plot-studio.png)
 
+Switch proofreading on and the sidebar gains a Proofread panel: spelling in red,
+grammar in amber, style in blue, with the fixes one click away. A complaint that
+repeats forty times is one row with a count, and Ignore takes all forty with it.
+English is built in; declare any other language with `#set text(lang: "fr")` and
+Hilbert fetches that dictionary once, from a list of ninety-eight, after which it
+works offline like the rest of the app.
+
+![Proofreading, in English and in French](docs/proofread.png)
+
+A paper's cross-references are a structure nobody normally gets to see. **View → Label
+Graph** draws it: what each section refers to, which equations everything leans on, and
+which labels nothing refers to at all.
+
+![The label graph](docs/label-graph.png)
+
 Underneath it behaves like a real workspace. Open any folder the way you would in VS
 Code, split a document across `#include`d chapters, drag files around the tree, search
 the whole project at once.

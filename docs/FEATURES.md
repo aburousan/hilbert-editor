@@ -52,6 +52,33 @@ second window; it's one app (a single Dock icon) with independent windows, each 
 its own preview, and comment/uncomment works on the current line or selection (⌘/ or
 Ctrl+/, in Typst, Python, Julia, `.bib`, and more).
 
+Proofreading is off until you switch it on, because the dictionaries are the largest
+thing Hilbert ever loads. Switched on, it checks spelling with a Hunspell dictionary
+and grammar and style with [Harper](https://github.com/Automattic/harper), which reads
+the document as Typst and so leaves code, maths, and markup alone. Findings land in a
+Proofread panel and as squiggles in the editor: click to jump, click a chip to apply a
+fix. Identical complaints collapse into one row with a count, `All → …` fixes every
+one of them in a single undo step, **Ignore** puts the whole group aside for the
+session, and **+ Dictionary** keeps a word for good. Acronyms and code-style names
+(`CMB`, `LaTeX`, `arXiv`) are never sent to the dictionary.
+
+It follows the language the document declares. `#set text(lang: "fr")` is checked
+against the French dictionary; **App Settings → Spelling** fetches any of ninety-eight
+languages from the LibreOffice collection, each with its licence saved beside it, and
+any Hunspell pair you drop into that folder yourself works too. Where no dictionary is
+installed the panel says so rather than staying quiet. Grammar and style are English
+only — the dialect follows the region, so `region: "GB"` gets British rules — and the
+personal dictionary is kept per language.
+
+**View → Label Graph** draws the document's cross-references: every `<label>` as a
+point, every section as a bar, and an arrow from a section to each label its prose
+refers to. Reading left to right is reading the document, so an arrow pointing left is a
+reference backwards, which most of them are. Hover a label to see which sections lean on
+it, click to keep that in view, double-click to open it in the editor. The side panel
+lists the labels nothing refers to, references to labels that do not exist, and labels
+defined more than once — three mistakes that a compiler either ignores or reports far
+from where they were made.
+
 ## Projects and files (VS Code style)
 
 **Open Folder** makes any folder on disk the workspace, with edits saved straight back
