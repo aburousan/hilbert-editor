@@ -65,9 +65,10 @@ export function useWorkspaceAsset(path: string | null, revision: unknown = 0): {
     }
     let active = true;
     let objectUrl = '';
+    const controller = new AbortController();
     void (async () => {
       try {
-        const response = await fetch(`${API}/workspace/raw?path=${encodeURIComponent(path)}`);
+        const response = await fetch(`${API}/workspace/raw?path=${encodeURIComponent(path)}`, { signal: controller.signal });
         if (!response.ok) {
           const detail = (await response.text()).trim();
           throw new Error(detail || `Preview failed (${response.status})`);
@@ -85,6 +86,7 @@ export function useWorkspaceAsset(path: string | null, revision: unknown = 0): {
     })();
     return () => {
       active = false;
+      controller.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [path, revision]);

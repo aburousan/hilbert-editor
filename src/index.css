@@ -276,6 +276,20 @@ body {
   gap: 12px;
 }
 
+@media (max-width: 1200px) {
+  .header {
+    height: auto;
+    min-height: 76px;
+    flex: none;
+    grid-template-columns: minmax(0, 1fr) auto;
+    row-gap: 4px;
+    padding: 6px 12px;
+  }
+  .header-left { grid-column: 1 / -1; grid-row: 2; gap: 12px; }
+  .project-center { grid-column: 1; grid-row: 1; align-items: flex-start; }
+  .header-right { grid-column: 2; grid-row: 1; gap: 8px; }
+}
+
 .logo {
   font-size: 1.1rem;
   font-weight: 600;
@@ -536,6 +550,27 @@ body {
 .about-donate:hover {
   background: rgba(219, 97, 162, 0.18);
   border-color: #db61a2;
+}
+
+/* The two donation routes sit together and wrap on a narrow window. */
+.about-donate-row {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin: 12px 0 2px;
+}
+.about-donate-row .about-donate {
+  margin: 0;
+}
+.about-donate.upi {
+  color: #5eaf8c;
+  background: rgba(94, 175, 140, 0.1);
+  border-color: rgba(94, 175, 140, 0.45);
+}
+.about-donate.upi:hover {
+  background: rgba(94, 175, 140, 0.18);
+  border-color: #5eaf8c;
 }
 
 /* Font-size quick dropdown — a compact list of sizes, click to apply. */

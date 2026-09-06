@@ -302,12 +302,15 @@ const SYNTH: { name: string; ch: string; strokes: Pt[][] }[] = [
 
 const TEMPLATE_FONT = (px: number) => `${px}px "STIX Two Math", "Cambria Math", "STIXGeneral", "Apple Symbols", "Segoe UI Symbol", serif`;
 
-function buildTemplates(): Template[] {
+let templateCache: Promise<Template[]> | null = null;
+
+async function buildTemplates(): Promise<Template[]> {
   const S = 128;
   const cv = document.createElement('canvas'); cv.width = S; cv.height = S;
   const ctx = cv.getContext('2d', { willReadFrequently: true })!;
   const out: Template[] = [];
-  for (const sym of SYMBOLS) {
+  for (const [index, sym] of SYMBOLS.entries()) {
+    if (index % 12 === 0) await new Promise(resolve => setTimeout(resolve, 0));
     ctx.clearRect(0, 0, S, S);
     ctx.fillStyle = '#000'; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
     // Fit the glyph inside the canvas: tall glyphs (∫ ∮ ∑ √) overflow 96px in a
@@ -362,14 +365,23 @@ export default function SymbolDraw({ onClose, onInsert }: { onClose: () => void;
   const templatesRef = useRef<Template[] | null>(null);
   const strokesRef = useRef<Pt[][]>([]);
   const drawingRef = useRef(false);
+  const pointerRef = useRef<number | null>(null);
+  const frameRef = useRef<number | null>(null);
   const [results, setResults] = useState<{ name: string; ch: string; score: number }[]>([]);
   const [ready, setReady] = useState(false);
   const resultsRef = useRef(results);
   resultsRef.current = results;
 
   useEffect(() => {
-    const t = setTimeout(() => { templatesRef.current = buildTemplates(); setReady(true); }, 0);
-    return () => clearTimeout(t);
+    let active = true;
+    templateCache ??= document.fonts.ready.then(() => buildTemplates());
+    void templateCache.then(templates => {
+      if (!active) return;
+      templatesRef.current = templates;
+      setReady(true);
+      recognize();
+    });
+    return () => { active = false; if (frameRef.current !== null) cancelAnimationFrame(frameRef.current); };
   }, []);
 
   // Enter inserts the best match, 1–9 pick the nth, backspace removes a stroke.
@@ -402,24 +414,43 @@ export default function SymbolDraw({ onClose, onInsert }: { onClose: () => void;
   };
 
   const pos = (e: React.PointerEvent): Pt => {
-    const r = canvasRef.current!.getBoundingClientRect();
-    return { x: e.clientX - r.left, y: e.clientY - r.top };
+    const canvas = canvasRef.current!;
+    const r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left) * canvas.width / r.width, y: (e.clientY - r.top) * canvas.height / r.height };
   };
 
   const down = (e: React.PointerEvent) => {
+    if (!e.isPrimary || e.button !== 0 || drawingRef.current) return;
     e.preventDefault();
     drawingRef.current = true;
+    pointerRef.current = e.pointerId;
+    setResults([]);
     strokesRef.current.push([pos(e)]);
     try { canvasRef.current?.setPointerCapture(e.pointerId); } catch { /* ignore */ }
   };
   const move = (e: React.PointerEvent) => {
-    if (!drawingRef.current) return;
-    strokesRef.current[strokesRef.current.length - 1].push(pos(e));
-    redraw();
+    if (!drawingRef.current || pointerRef.current !== e.pointerId) return;
+    const stroke = strokesRef.current[strokesRef.current.length - 1];
+    const point = pos(e);
+    if (!stroke || pdist(stroke[stroke.length - 1], point) < 0.75) return;
+    stroke.push(point);
+    if (frameRef.current === null) frameRef.current = requestAnimationFrame(() => { frameRef.current = null; redraw(); });
   };
-  const up = () => {
+  const up = (e: React.PointerEvent) => {
+    if (!drawingRef.current || pointerRef.current !== e.pointerId) return;
+    move(e);
+    drawingRef.current = false;
+    pointerRef.current = null;
+    if (canvasRef.current?.hasPointerCapture(e.pointerId)) canvasRef.current.releasePointerCapture(e.pointerId);
+    redraw();
+    recognize();
+  };
+  const cancel = () => {
     if (!drawingRef.current) return;
     drawingRef.current = false;
+    pointerRef.current = null;
+    strokesRef.current.pop();
+    redraw();
     recognize();
   };
 
@@ -455,7 +486,7 @@ export default function SymbolDraw({ onClose, onInsert }: { onClose: () => void;
     setResults(scored.filter(r => !seen.has(r.name) && seen.add(r.name)).slice(0, 10));
   };
 
-  const clear = () => { strokesRef.current = []; setResults([]); redraw(); };
+  const clear = () => { drawingRef.current = false; pointerRef.current = null; strokesRef.current = []; setResults([]); redraw(); };
   const undo = () => { strokesRef.current.pop(); redraw(); strokesRef.current.length ? recognize() : setResults([]); };
 
   return (
@@ -477,7 +508,8 @@ export default function SymbolDraw({ onClose, onInsert }: { onClose: () => void;
                 onPointerDown={down}
                 onPointerMove={move}
                 onPointerUp={up}
-                onPointerLeave={up}
+                onPointerCancel={cancel}
+                onLostPointerCapture={cancel}
               />
               <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'center' }}>
                 <button className="btn-ghost" onClick={clear}>Clear</button>

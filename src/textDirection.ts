@@ -272,6 +272,8 @@ export function lineDirection(line: string): 'rtl' | 'ltr' {
   for (const segment of segmentLine(line)) {
     if (segment.code) continue;
     for (const char of line.slice(segment.start, segment.end)) {
+      // Arabic digits and vowel marks are not strong direction characters.
+      if (/[\p{Number}\p{Mark}]/u.test(char)) continue;
       if (STRONG_RTL.test(char)) return 'rtl';
       if (STRONG_LTR.test(char)) return 'ltr';
     }
@@ -455,4 +457,3 @@ export function detectedDirection(source: string): { lang: string, dir: Document
   }
   return { lang: lang || 'en', dir: dir || 'auto' };
 }
-

@@ -64,7 +64,7 @@ const PRIMS: { type: PrimType; name: string; icon: React.ReactNode }[] = [
 
 let counter = 0;
 
-export default function DiagramBuilder({ onClose, onInsert, onSaveFile }: { onClose: () => void, onInsert: (code: string) => void, onSaveFile?: (filename: string, content: string) => Promise<void> }) {
+export default function DiagramBuilder({ onClose, onInsert, onSaveFile }: { onClose: () => void, onInsert: (code: string, imports?: string) => void, onSaveFile?: (filename: string, content: string) => Promise<void> }) {
   const [scene, setScene] = useState<Item[]>([{ uid: ++counter, type: 'circle', color: 'blue', x: 0, y: 0, size: 1.5, rot: 0 }]);
   const [asFigure, setAsFigure] = useState(true);
   const [caption, setCaption] = useState('Diagram');
@@ -316,8 +316,8 @@ export default function DiagramBuilder({ onClose, onInsert, onSaveFile }: { onCl
     const imports = `#import "@preview/cetz:0.3.4": canvas, draw\n`;
     const canvas = `canvas({\n  import draw: *\n${inner}\n})`;
     const tag = label.trim() ? ` <fig:${label.trim()}>` : '';
-    const body = asFigure ? `${imports}#figure(\n  ${canvas},\n  caption: [${caption}],\n)${tag}` : `${imports}#align(center)[\n${canvas}\n]`;
-    onInsert('\n' + body + '\n\n');
+    const body = asFigure ? `#figure(\n  ${canvas},\n  caption: [${caption}],\n)${tag}` : `#align(center)[\n${canvas}\n]`;
+    onInsert('\n' + body + '\n\n', imports.trim());
     onClose();
   };
 

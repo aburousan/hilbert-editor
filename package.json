@@ -1,7 +1,7 @@
 {
   "name": "hilbert-editor",
   "private": true,
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Hilbert: an offline editor for Typst (Unofficial), aimed at maths/physics writing.",
   "author": "Kazi Abu Rousan",
   "license": "MIT",
@@ -19,6 +19,7 @@
     "dev:api": "cd src-tauri && cargo run -- --headless",
     "desktop": "npm run build && cd src-tauri && cargo run",
     "build": "tsc -b && vite build && node scripts/strip-bundled-secrets.mjs",
+    "icons": "node scripts/generate-icons.mjs",
     "test:backend": "cd src-tauri && cargo test",
     "test:collab": "node scripts/test-collab-protocol.mjs",
     "test:unicode": "node scripts/test-unicode-ranges.mjs",
@@ -27,6 +28,10 @@
     "test:recovery": "node scripts/test-recovery-preferences.mjs",
     "test:status": "node scripts/test-workspace-status.mjs",
     "test:performance": "node scripts/test-performance-limits.mjs",
+    "test:memory": "node scripts/test-memory-soak.mjs",
+    "test:smoke": "node scripts/test-app-smoke.mjs",
+    "test:background": "node scripts/test-background-work.mjs",
+    "test:windows": "node scripts/test-multi-window.mjs",
     "bench:slides": "node scripts/bench-slides.mjs",
     "test:direction": "node scripts/test-text-direction.mjs",
     "test:bidi": "node scripts/test-bidi-layout.mjs",
@@ -41,7 +46,13 @@
     "test:language": "node scripts/test-doc-language.mjs",
     "test:dictionaries": "bash scripts/test-dictionaries.sh",
     "test:equation": "node scripts/test-equation-sync.mjs",
-    "test:graph": "node scripts/test-graph-drag.mjs"
+    "test:graph": "node scripts/test-graph-drag.mjs",
+    "test:history": "node scripts/test-edit-history.mjs",
+    "test:snippets": "node scripts/test-equation-library.mjs",
+    "test:preamble": "node scripts/test-preamble-insert.mjs",
+    "test:builders": "node scripts/test-builder-imports.mjs",
+    "test:symbolic": "python3 scripts/test-symbolic.py",
+    "test:webkit": "python3 scripts/test-linux-webkit.py dist"
   },
   "dependencies": {
     "@excalidraw/excalidraw": "^0.18.1",

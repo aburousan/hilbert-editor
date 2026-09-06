@@ -36,6 +36,18 @@ assert.match(bidiCss, /unicode-bidi/, 'the bidi rules moved out of index.css');
 
 const cases = [
   {
+    name: 'Arabic digits do not make English prose right-to-left',
+    source: '\u0661\u0662\u0663 English text',
+    visual: ['\u0661\u0662\u0663 English text'],
+    aligned: 'left',
+  },
+  {
+    name: 'Persian digits do not make English prose right-to-left',
+    source: '\u06f1\u06f2\u06f3 English text',
+    visual: ['\u06f1\u06f2\u06f3 English text'],
+    aligned: 'left',
+  },
+  {
     name: 'a Hebrew line starts at the right edge',
     source: 'שלום עולם',
     visual: ['םלוע םולש'],

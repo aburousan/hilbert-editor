@@ -1,5 +1,8 @@
 import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo, lazy, Suspense } from 'react';
 import { API, useWorkspaceAsset } from './api';
+import { createLatestTask } from './latestTask';
+import { preambleInsertLine } from './preamble';
+import type { WhiteboardCommands } from './ExcalidrawEditor';
 import { keys } from './keys';
 import { THEMES, DEFAULT_THEME, isThemeId, themeInfo, themeAttribute, nextTheme, type ThemeId } from './themes';
 import { BIDI_MARKS, HAS_RTL, INVISIBLE, INVISIBLE_ALL, blockAfter, invisibleName, isolateMarks, isTextDirection, lineDirection, segmentLine, type OpenBlock, type TextDirection } from './textDirection';
@@ -13,8 +16,8 @@ import { tokenizeLine, tokenizeRenderedText, tokenizeTypstMathSource, bestMatch,
 import { commentEdits, commentTokenFor } from './commentLines';
 import { snapUtf16OffsetToGrapheme, snapUtf16RangeToGraphemes } from './unicodeRanges';
 import type { PdfHandle, PdfViewState } from './components/PdfPreview';
-import { PackageInstaller } from './PackageInstaller';
-import { TemplateInstaller } from './TemplateInstaller';
+const PackageInstaller = lazy(() => import('./PackageInstaller').then(module => ({ default: module.PackageInstaller })));
+const TemplateInstaller = lazy(() => import('./TemplateInstaller').then(module => ({ default: module.TemplateInstaller })));
 import type { BuiltinTemplate } from './builtinTemplates';
 import InputModal, { type InputModalConfig } from './components/InputModal';
 import CommandPalette, { type PaletteCommand } from './components/CommandPalette';
@@ -81,6 +84,7 @@ import { isProjectTextPath } from './projectFileTypes';
 import { deriveWorkspaceStatus } from './workspaceStatus';
 import { inactiveModelsToDiscard, limitNotebookResults } from './performanceLimits';
 import './index.css';
+import './PackageInstaller.css';
 
 // Boxed theorem-like environments (showybox). Each `kind` gets its own counter.
 const THEOREM_SETUP_BOXED = `#import "@preview/showybox:2.0.4": showybox
@@ -325,7 +329,7 @@ const PHYSICS_EQS: { group: string, name: string, physica?: boolean, code: strin
   { group: 'QCD', name: 'Fierz / colour completeness', code: 't^a_(i j) t^a_(k l) = 1/2 (delta_(i l) delta_(k j) - 1/N delta_(i j) delta_(k l))' },
   { group: 'QCD', name: 'Wilson line (path-ordered exponential)', code: 'W_C [A] = cal(P) exp(i g_s integral_C dif x^mu A^a_mu (x) t^a)' },
   { group: 'QCD', name: 'Straight gauge link between two points', code: 'W(x, y) = cal(P) exp(i g_s integral_0^1 dif s space (x - y)^mu A_mu (y + s (x - y)))' },
-  { group: 'QCD', name: 'Wilson loop & the static potential', code: 'expval(W_(R times T)) prop e^(-V(R) T), quad V(R) = sigma R - (4 alpha_s)/(3 R)' },
+  { group: 'QCD', name: 'Wilson loop & the static potential', physica: true, code: 'expval(W_(R times T)) prop e^(-V(R) T), quad V(R) = sigma R - (4 alpha_s)/(3 R)' },
   { group: 'QCD', name: 'Running coupling & beta function', code: 'mu^2 (dif alpha_s)/(dif mu^2) = beta(alpha_s) = -alpha_s^2 (beta_0 + beta_1 alpha_s + ...), quad beta_0 = (11 C_A - 4 T_F n_f)/(12 pi)' },
   { group: 'QCD', name: 'Leading-order running of alpha_s', code: 'alpha_s (Q^2) = (alpha_s (mu^2))/(1 + beta_0 alpha_s (mu^2) ln(Q^2 \\/ mu^2)) = 1/(beta_0 ln(Q^2 \\/ Lambda_"QCD"^2))' },
   { group: 'QCD', name: 'DGLAP evolution', code: 'mu^2 (partial q_i (x, mu^2))/(partial mu^2) = alpha_s/(2 pi) integral_x^1 (dif z)/z [ P_(q q) (z) q_i (x\\/z, mu^2) + P_(q g) (z) g(x\\/z, mu^2) ]' },
@@ -523,6 +527,7 @@ function releaseLater(url: string) {
 
 export default function App() {
   const editorRef = useRef<any>(null);
+  const whiteboardCommandsRef = useRef<WhiteboardCommands | null>(null);
   // Bumped every time a new Monaco editor mounts. Focusing an image or a PDF
   // unmounts the editor entirely, so coming back to a text file builds a fresh
   // one — and anything that needs to hold on to the editor (the collaboration
@@ -2083,10 +2088,8 @@ export default function App() {
   };
 
 
-  // Single-flight compile: a newer compile aborts the one still running. Axum
-  // drops the handler future when the client disconnects, and run_cmd kills the
-  // child on drop, so aborting the fetch also kills the superseded `typst`
-  // process — no orphaned compiles racing to write out.pdf.
+  // Finish one compile and retain only the newest pending request. Continuous
+  // typing must not repeatedly restart a slow compile before it can finish.
   const compileAbortRef = useRef<AbortController | null>(null);
 
   // Long enough that a heavy document compiling normally never trips it, short
@@ -2098,8 +2101,7 @@ export default function App() {
   // spinner that also makes saving look dead.
   const COMPILE_CEILING_MS = 180000;
 
-  const compileTypst = useCallback(async (mainFile: string = 'main.typ') => {
-    compileAbortRef.current?.abort();
+  const performCompile = useCallback(async (mainFile: string) => {
     const ac = new AbortController();
     compileAbortRef.current = ac;
     setIsCompiling(true);
@@ -2115,24 +2117,16 @@ export default function App() {
         if (!tab.isDirty) continue;
         const hash = await writeTab(tab);
         saved.set(tab.path, { hash, content: tab.content });
-        // The tab is on disk now, so it is only still dirty if more was typed
-        // while we were writing. Leaving it marked dirty regardless is what made
-        // typing stop reaching the preview: this very update re-runs the
-        // compile-on-type effect, which schedules another compile, which begins
-        // by aborting this one. Whenever a round trip outlasts the debounce that
-        // repeats forever and nothing is ever finished — the reason a manual
-        // save appeared to be the only thing that worked, since saving clears
-        // the flag before it compiles.
+        // Edits made during the write still need a subsequent save and compile.
         setTabs(prev => prev.map(item => item.path === tab.path
           ? { ...item, diskHash: hash, isDirty: item.content !== tab.content }
           : item));
-        // A newer compile took over. Its own pass covers the remaining tabs with
-        // fresher content, so stop here — but only between saves, never by
-        // abandoning one midway.
+        // Cancellation stops between saves, never in the middle of a write.
         if (ac.signal.aborted) return;
       }
 
       const res = await fetch(`${API}/compile?main=${encodeURIComponent(mainFile)}`, { method: 'POST', signal: ac.signal });
+      if (ac.signal.aborted) return;
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         const msg = errData.error || 'Compilation failed.';
@@ -2142,6 +2136,7 @@ export default function App() {
       }
 
       const blob = await res.blob();
+      if (ac.signal.aborted) return;
       const url = URL.createObjectURL(blob);
       // Let go of the old one a moment later, not now: the viewer may still be
       // reading it. Revoking under a load in flight makes the browser fail that
@@ -2174,7 +2169,7 @@ export default function App() {
         setCompileError(msg);
         return;
       }
-      if (ac.signal.aborted) return;   // superseded by a newer compile — stay quiet
+      if (ac.signal.aborted) return;
       if (error instanceof Error && error.message === 'external-conflict') return;
       const networkFailure = error instanceof TypeError
         || (error instanceof Error && /fetch|network|load failed|connection/i.test(error.message));
@@ -2186,10 +2181,19 @@ export default function App() {
     } finally {
       window.clearTimeout(slowTimer);
       window.clearTimeout(ceilingTimer);
-      // Only the latest compile owns the spinner; a superseded one bows out.
-      if (compileAbortRef.current === ac) { setIsCompiling(false); setCompileStalled(false); }
+      // A cancelled job must not clear another job's status.
+      if (compileAbortRef.current === ac) { compileAbortRef.current = null; setIsCompiling(false); setCompileStalled(false); }
     }
   }, [tabs]);
+  const performCompileRef = useRef(performCompile);
+  performCompileRef.current = performCompile;
+  const compileQueueRef = useRef<ReturnType<typeof createLatestTask<string>> | null>(null);
+  if (!compileQueueRef.current) compileQueueRef.current = createLatestTask(main => performCompileRef.current(main));
+  const compileTypst = useCallback((main = 'main.typ') => compileQueueRef.current!.request(main), []);
+  useEffect(() => () => {
+    compileQueueRef.current?.cancelPending();
+    compileAbortRef.current?.abort();
+  }, []);
 
   const restoreHistory = async (h: HistoryEntry) => {
     if (await confirmDialog(`Restore version from ${new Date(h.timestamp).toLocaleTimeString()}?`, { confirmLabel: 'Restore' })) {
@@ -2316,11 +2320,14 @@ export default function App() {
     // there. When they disagreed the next save failed its precondition and the
     // app reported the file as changed outside Hilbert. It could also lose the
     // drawing outright, by putting the older copy back.
-    if (activeTab.path.toLowerCase().endsWith('.excalidraw')) return;
+    if (activeTab.path.toLowerCase().endsWith('.excalidraw')) {
+      await whiteboardCommandsRef.current?.save();
+      return;
+    }
     try {
       const hash = await writeTab(activeTab);
       snapshotHistory(activeTab.path, activeTab.content);   // keep a version, this save only
-      setTabs(prev => prev.map(t => t.path === activeTab.path ? { ...t, isDirty: false, diskHash: hash } : t));
+      setTabs(prev => prev.map(t => t.path === activeTab.path ? { ...t, isDirty: t.content !== activeTab.content, diskHash: hash } : t));
       fetchTree();
       compileTypst(currentMain);
       webdavAutoSync();
@@ -2483,7 +2490,7 @@ export default function App() {
     if (!backendReady) return;
     (async () => {
       try {
-        const r = await fetch(`${API}/workspace/raw?path=${encodeURIComponent('.hilbert/out.pdf')}`);
+        const r = await fetch(`${API}/preview/last`);
         if (!r.ok) return;
         const blob = await r.blob();
         if (!blob.size) return;
@@ -2499,7 +2506,7 @@ export default function App() {
     let stopped = false;
     let checking = false;
     const checkOpenFiles = async () => {
-      if (checking || stopped || projectSessionRef.current?.sync.applyingRemote) return;
+      if (document.hidden || checking || stopped || projectSessionRef.current?.sync.applyingRemote) return;
       checking = true;
       try {
         // One batched request for every open text tab, instead of a request per
@@ -2567,10 +2574,13 @@ export default function App() {
       }
     };
     const timer = window.setInterval(checkOpenFiles, 2000);
+    const visible = () => { if (!document.hidden) void checkOpenFiles(); };
+    document.addEventListener('visibilitychange', visible);
     checkOpenFiles();
     return () => {
       stopped = true;
       window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', visible);
     };
   }, [backendReady]);
 
@@ -3201,6 +3211,8 @@ export default function App() {
   // After the workspace contents change (root switch or import), reload the tree,
   // reset the editor, name the project after the folder, and open a starter file.
   const loadWorkspace = async (projectDisplayName?: string) => {
+    compileQueueRef.current?.cancelPending();
+    compileAbortRef.current?.abort();
     setTabs([]);
     setActiveTabPath('');
     // Fold state, the chosen main file and the record of which folders have been
@@ -3524,6 +3536,19 @@ export default function App() {
     insertCodeRaw(text);
   };
 
+  const insertMathSymbol = (name: string) => {
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    const selection = editor?.getSelection();
+    let context: OpenBlock = null;
+    if (model && selection) {
+      const prefix = model.getValueInRange({ startLineNumber: 1, startColumn: 1,
+        endLineNumber: selection.startLineNumber, endColumn: selection.startColumn });
+      for (const line of prefix.split('\n')) context = blockAfter(line, context);
+    }
+    insertCode(context || model?.getLanguageId() !== 'typst' ? name + ' ' : '$' + name + '$');
+  };
+
   const graphemeSafeSelection = (model: any, selection: any) => {
     if (!selection || selection.isEmpty() || !monaco) return selection;
     const source = model.getValue();
@@ -3725,12 +3750,9 @@ export default function App() {
     const model = editor?.getModel();
     if (!editor || !model) return;
     const total = model.getLineCount();
-    let line = 1;
-    for (let i = 1; i <= total; i++) {
-      const t = model.getLineContent(i).trim();
-      if (t === '' || t.startsWith('#import') || t.startsWith('#set') || t.startsWith('//')) line = i + 1;
-      else break;
-    }
+    const lines: string[] = [];
+    for (let i = 1; i <= total; i++) lines.push(model.getLineContent(i));
+    const line = preambleInsertLine(lines);
     editor.executeEdits('insert-top', [{
       range: { startLineNumber: line, startColumn: 1, endLineNumber: line, endColumn: 1 } as any,
       text: text.startsWith('\n') ? text.slice(1) : text,
@@ -3787,79 +3809,11 @@ export default function App() {
     insertCode('\nFrom here#pin(1) #h(6em) #pin(2)to there.\n#pinit-arrow(1, 2, end-dy: -0.4em)\n');
   };
 
-  // Insert LaTeX (e.g. Wolfram TeXForm / sympy latex()) as rendered Typst math via
-  // the mitex package, importing it once at the top of the document.
-  // Includes a best-effort sanitiser that converts common SymPy str() output
-  // (e.g. raw print()) into passable LaTeX so #mitex() can render it.
-
-  /** Best-effort conversion of raw SymPy / Python math text into LaTeX. */
-  const sympyToLatex = (raw: string): string => {
-    let s = raw;
-
-    // --- Derivative(f, x) / Derivative(f, x, n) → \frac{d}{dx} f  ---
-    s = s.replace(/Derivative\(([^,]+),\s*([^,)]+)\)/g, (_m, f, v) =>
-      `\\frac{d}{d${v.trim()}} ${f.trim()}`);
-
-    // --- sqrt(expr) → \sqrt{expr} ---
-    // Handle nested parens via a simple depth-aware scan
-    s = s.replace(/sqrt\(/g, '\\sqrt{').replace(/\\sqrt\{([^}]*)\)/g, '\\sqrt{$1}');
-    // Fallback: balanced single-level
-    s = s.replace(/\\sqrt\{([^{}]*)\)/g, '\\sqrt{$1}');
-
-    // --- Python ** exponent → LaTeX ^{} ---
-    // e.g. r**2 → r^{2}, sin(theta)**2 → sin(theta)^{2}
-    s = s.replace(/\*\*(\d+)/g, '^{$1}');
-    s = s.replace(/\*\*\(([^)]+)\)/g, '^{$1}');
-
-    // --- Greek letters (must come before trig so "theta" inside sin() is caught) ---
-    const greekLetters = [
-      'alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta',
-      'theta', 'iota', 'kappa', 'lambda', 'mu', 'nu', 'xi',
-      'omicron', 'pi', 'rho', 'sigma', 'tau', 'upsilon', 'phi',
-      'chi', 'psi', 'omega',
-      'Gamma', 'Delta', 'Theta', 'Lambda', 'Xi', 'Pi', 'Sigma',
-      'Upsilon', 'Phi', 'Psi', 'Omega',
-    ];
-    // Sort longest-first so "theta" is matched before "eta", etc.
-    const sorted = [...greekLetters].sort((a, b) => b.length - a.length);
-    // Custom word boundary: _ is a word char in JS regex \b, but in LaTeX
-    // notation theta_ should still match "theta". Use lookaround on [A-Za-z]
-    // instead of \b so underscores/carets don't block matches.
-    for (const g of sorted) {
-      const re = new RegExp(`(?<!\\\\)(?<![A-Za-z])${g}(?![A-Za-z])`, 'g');
-      s = s.replace(re, `\\${g}`);
-    }
-
-    // --- Trig / log functions → \sin, \cos, etc. ---
-    const funcs = ['sin', 'cos', 'tan', 'cot', 'sec', 'csc',
-                   'asin', 'acos', 'atan', 'sinh', 'cosh', 'tanh',
-                   'log', 'ln', 'exp'];
-    for (const fn of funcs) {
-      const re = new RegExp(`(?<!\\\\)(?<![A-Za-z])${fn}(?![A-Za-z])`, 'g');
-      s = s.replace(re, `\\${fn}`);
-    }
-
-    // --- Subscript / superscript grouping ---
-    // ^word  →  ^{word}   (single word/letter after ^)
-    s = s.replace(/\^([A-Za-z\\][A-Za-z0-9]*)/g, '^{$1}');
-    // ^{...} already OK — don't double-wrap (the above won't match { )
-    // _(...)  →  _{...}   (parenthesised subscript like _(r r))
-    s = s.replace(/_\(([^)]*)\)/g, '_{$1}');
-    // _word  →  _{word}   (single word after _)
-    s = s.replace(/_([A-Za-z\\][A-Za-z0-9]*)/g, '_{$1}');
-
-    // --- Multiplication: remove explicit * between factors ---
-    // "a*b" → "a b"  (but not ** which is already handled)
-    s = s.replace(/(?<!\*)\*(?!\*)/g, ' ');
-
-    return s;
-  };
-
+  // Keep the printer's LaTeX intact, including multiline matrices and braces.
   const insertEquationFromLatex = (latex: string, codeBlock?: string) => {
+    if (!latex.trim()) return;
     ensureRule('@preview/mitex', '#import "@preview/mitex:0.2.7": mitex');
-    const lines = latex.split('\n').map(l => l.trim()).filter(Boolean);
-    if (lines.length === 0) return;
-    const body = lines.map(l => '#mitex(`' + sympyToLatex(l) + '`)').join('\n\n');
+    const body = '#mitex(' + JSON.stringify(latex.trim()) + ')';
     insertCode('\n' + (codeBlock ? codeBlock + '\n' : '') + body + '\n\n');
   };
 
@@ -6304,6 +6258,14 @@ export default function App() {
     }
   };
 
+  const editHistory = (action: 'undo' | 'redo') => {
+    if (activeTabPath.toLowerCase().endsWith('.excalidraw')) {
+      whiteboardCommandsRef.current?.[action]();
+    } else if (isProjectTextPath(activeTabPath)) {
+      editorRef.current?.trigger('command', action, null);
+    }
+  };
+
   // Everything reachable from the menus, exposed to the ⌘K palette. Built on
   // open (not memoised) so each command closes over current state.
   const paletteCommands = (): PaletteCommand[] => [
@@ -6316,8 +6278,8 @@ export default function App() {
     { category: 'File', title: 'Save', hint: keys('⌘S'), run: saveActiveFile },
     { category: 'File', title: 'Save As / Export...', run: () => setShowSaveAs(true) },
     { category: 'File', title: 'Sync / Share (Drive, WebDAV)...', run: () => setShowDriveSync(true) },
-    { category: 'Edit', title: 'Undo', run: () => editorRef.current?.trigger('palette', 'undo', null) },
-    { category: 'Edit', title: 'Redo', run: () => editorRef.current?.trigger('palette', 'redo', null) },
+    { category: 'Edit', title: 'Undo', run: () => editHistory('undo') },
+    { category: 'Edit', title: 'Redo', run: () => editHistory('redo') },
     { category: 'Edit', title: 'Find...', run: () => editorRef.current?.getAction('actions.find')?.run() },
     { category: 'Edit', title: 'Find & Replace...', run: () => editorRef.current?.getAction('editor.action.startFindReplaceAction')?.run() },
     { category: 'Code', title: 'Go to Definition', run: () => editorRef.current?.getAction('editor.action.revealDefinition')?.run() },
@@ -6529,8 +6491,8 @@ export default function App() {
                 <div className="dropdown">
                   <div className="dropdown-item" onClick={() => { setShowPalette(true); setActiveMenu(null); }}>Command Palette... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘K')}</span></div>
                   <div className="dropdown-divider"></div>
-                  <div className="dropdown-item" onClick={() => { editorRef.current?.trigger('menu', 'undo', null); setActiveMenu(null); }}>Undo</div>
-                  <div className="dropdown-item" onClick={() => { editorRef.current?.trigger('menu', 'redo', null); setActiveMenu(null); }}>Redo</div>
+                  <div className="dropdown-item" onClick={() => { editHistory('undo'); setActiveMenu(null); }}>Undo</div>
+                  <div className="dropdown-item" onClick={() => { editHistory('redo'); setActiveMenu(null); }}>Redo</div>
                   <div className="dropdown-divider"></div>
                   <div className="dropdown-item" onClick={() => { if (editorRef.current) void cutEditorSelection(editorRef.current); setActiveMenu(null); }}>Cut <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘X')}</span></div>
                   <div className="dropdown-item" onClick={() => { if (editorRef.current) void copyEditorSelection(editorRef.current); setActiveMenu(null); }}>Copy <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘C')}</span></div>
@@ -6915,8 +6877,8 @@ export default function App() {
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="9" y1="3" x2="9" y2="21"></line></svg>
           </button>}
           
-          {toolbarToolVisible('undo') && <button className="tool-btn" onClick={() => editorRef.current?.trigger('source', 'undo', null)} title="Undo"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="9 14 4 9 9 4"></polyline><path d="M20 20v-7a4 4 0 0 0-4-4H4"></path></svg></button>}
-          {toolbarToolVisible('redo') && <button className="tool-btn" onClick={() => editorRef.current?.trigger('source', 'redo', null)} title="Redo"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="15 14 20 9 15 4"></polyline><path d="M4 20v-7a4 4 0 0 1 4-4h12"></path></svg></button>}
+          {toolbarToolVisible('undo') && <button className="tool-btn" onClick={() => editHistory('undo')} title="Undo"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="9 14 4 9 9 4"></polyline><path d="M20 20v-7a4 4 0 0 0-4-4H4"></path></svg></button>}
+          {toolbarToolVisible('redo') && <button className="tool-btn" onClick={() => editHistory('redo')} title="Redo"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="15 14 20 9 15 4"></polyline><path d="M4 20v-7a4 4 0 0 1 4-4h12"></path></svg></button>}
           {toolbarDividerBefore('text') && <div className="toolbar-divider"></div>}
           {toolbarToolVisible('bold') && <button className="tool-btn" onClick={() => wrapSelection('*', '*')} title={`Bold  (${keys('⌘B')})`}><b>B</b></button>}
           {toolbarToolVisible('italic') && <button className="tool-btn" onClick={() => wrapSelection('_', '_')} title={`Italic  (${keys('⌘I')})`}><i>I</i></button>}
@@ -7233,7 +7195,7 @@ export default function App() {
             alone, a pane takes the whole area. */}
         <div className="editor-pane" onClick={() => setIsSearchVisible(false)} style={{
           ...(panels.editor && panels.preview
-            ? { width: editorWidth, minWidth: editorWidth, maxWidth: editorWidth, flex: 'none' }
+            ? { width: editorWidth, minWidth: 240, maxWidth: `calc(100% - ${sidebarVisible ? sidebarWidth : 0}px - 250px)`, flex: '0 1 auto' }
             : { flex: 1, minWidth: 0 }),
           display: panels.editor ? 'flex' : 'none',
           flexDirection: 'column',
@@ -7320,6 +7282,8 @@ export default function App() {
                     <Suspense fallback={<div className="empty-state">Loading whiteboard...</div>}><ExcalidrawEditor
                       key={`${activeTabPath}:${activeTab.binaryRevision ?? 0}`}
                       path={activeTabPath}
+                      commandsRef={whiteboardCommandsRef}
+                      theme={themeInfo(theme).dark ? 'dark' : 'light'}
                       initialContent={activeTab.content}
                       onSave={async (jsonContent, svgBlob) => {
                         // Save the .excalidraw file, and write down the hash it
@@ -7635,13 +7599,13 @@ export default function App() {
         {RIGHT_PANEL_KEYS.map(renderPanelToggle)}
       </div>
 
-      {showPackageInstaller && <PackageInstaller onClose={() => setShowPackageInstaller(false)} onInsert={(pkg) => {
+      {showPackageInstaller && <Boundary name="Typst Packages" onClose={() => setShowPackageInstaller(false)}><Suspense fallback={null}><PackageInstaller onClose={() => setShowPackageInstaller(false)} onInsert={(pkg) => {
         if (!editorRef.current) return;
         editorRef.current.executeEdits('packages', [{ range: new monaco!.Range(1, 1, 1, 1), text: `#import "@preview/${pkg.name}:${pkg.version}": *\n`, forceMoveMarkers: true }]);
         setShowPackageInstaller(false);
-      }} />}
-      {showTemplateInstaller && <TemplateInstaller onClose={() => setShowTemplateInstaller(false)} onInsert={handleInitTemplate} onUseBuiltin={handleUseBuiltin} />}
-      {showDiagramBuilder && <Suspense fallback={null}><DiagramBuilder onClose={() => setShowDiagramBuilder(false)} onInsert={(code) => { insertCode(code); setShowDiagramBuilder(false); }}
+      }} /></Suspense></Boundary>}
+      {showTemplateInstaller && <Boundary name="Templates" onClose={() => setShowTemplateInstaller(false)}><Suspense fallback={null}><TemplateInstaller onClose={() => setShowTemplateInstaller(false)} onInsert={handleInitTemplate} onUseBuiltin={handleUseBuiltin} /></Suspense></Boundary>}
+      {showDiagramBuilder && <Suspense fallback={null}><DiagramBuilder onClose={() => setShowDiagramBuilder(false)} onInsert={(code, imports) => { if (imports) ensureRule(imports, imports); insertCode(code); setShowDiagramBuilder(false); }}
         onSaveFile={async (filename, content) => {
           await fetch(`${API}/workspace/file?path=${encodeURIComponent(filename)}`, { method: 'POST', body: content, headers: { 'Content-Type': 'text/plain' } });
           await mirrorLocalPath(filename, content, true);
@@ -7665,7 +7629,7 @@ export default function App() {
           else if (key === 'flowchart') setShowFlowchart(true);
         }}
       /></Suspense></Boundary>}
-      {showFeynman && <Suspense fallback={null}><FeynmanBuilder onClose={() => setShowFeynman(false)} onInsert={(code) => { insertCode(code); setShowFeynman(false); }} /></Suspense>}
+      {showFeynman && <Suspense fallback={null}><FeynmanBuilder onClose={() => setShowFeynman(false)} onInsert={(code, imports) => { if (imports) ensureRule(imports, imports); insertCode(code); setShowFeynman(false); }} /></Suspense>}
       {showEqGallery && <Suspense fallback={null}><EquationGallery onClose={() => setShowEqGallery(false)} onInsert={insertEqTemplate} /></Suspense>}
       {showPhysics && <Suspense fallback={null}><PhysicsGallery onClose={() => setShowPhysics(false)} onInsert={insertPhysicsTemplate} /></Suspense>}
       {showHelp && <Suspense fallback={null}><HelpModal onClose={() => setShowHelp(false)} /></Suspense>}
@@ -7691,10 +7655,19 @@ export default function App() {
             <div className="about-version">An offline editor for Typst · Unofficial</div>
             <div className="about-version">Version {__APP_VERSION__}</div>
             <div className="about-author">Created by <a href="https://rousan.netlify.app/" target="_blank" rel="noreferrer" style={{ color: 'inherit', fontWeight: 600, textDecoration: 'underline', textDecorationColor: 'var(--accent)' }}>Kazi Abu Rousan</a></div>
-            <a className="about-donate" href="https://github.com/sponsors/aburousan" target="_blank" rel="noreferrer" title="Support Hilbert's development with a donation">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"></path></svg>
+            {/* Two routes, because one of them does not work from India: Indian
+                cards are routinely refused by international card processors, so
+                Sponsors fails for the people most likely to be reading this. */}
+            <div className="about-donate-row">
+              <a className="about-donate" href="https://github.com/sponsors/aburousan" target="_blank" rel="noreferrer" title="Support Hilbert's development through GitHub Sponsors">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"></path></svg>
               Donate
-            </a>
+              </a>
+              <a className="about-donate upi" href="https://rousan.netlify.app/hilbert/#support" target="_blank" rel="noreferrer" title="Donate over UPI — the QR code is on the Hilbert page">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"></rect><rect x="14" y="3" width="7" height="7" rx="1"></rect><rect x="3" y="14" width="7" height="7" rx="1"></rect><path d="M14 14h3v3h-3z"></path><path d="M20 14v3M17 20h4"></path></svg>
+                UPI · India
+              </a>
+            </div>
             <div className="about-links">
               <a href="https://github.com/aburousan/hilbert-editor" target="_blank" rel="noreferrer">GitHub</a>
               <span>·</span>
@@ -7766,7 +7739,7 @@ export default function App() {
       {showHtmlPreview && <Suspense fallback={null}><HtmlPreviewModal mainFile={currentMain} onClose={() => setShowHtmlPreview(false)} /></Suspense>}
       {showPlot3D && <Boundary name="3D Plot Studio" onClose={() => setShowPlot3D(false)}><Suspense fallback={null}><Plot3DStudio onClose={() => setShowPlot3D(false)} onInsert={(code) => { insertCode(code); setShowPlot3D(false); fetchTree(); }} onSaved={(path) => { void mirrorLocalPath(path); void fetchTree(); }} /></Suspense></Boundary>}
       {showPlotStudio && <Boundary name="Plot Studio" onClose={() => setShowPlotStudio(false)}><Suspense fallback={null}><PlotStudio onClose={() => setShowPlotStudio(false)} onInsert={(code) => insertCode(code)} onEnsureSetup={ensureSetup} onOpenInteractive={() => setShowPlot3D(true)} /></Suspense></Boundary>}
-      {showSymbolDraw && <Suspense fallback={null}><SymbolDraw onClose={() => setShowSymbolDraw(false)} onInsert={(name) => { insertCode(name + ' '); setShowSymbolDraw(false); }} /></Suspense>}
+      {showSymbolDraw && <Boundary name="Draw a Symbol" onClose={() => setShowSymbolDraw(false)}><Suspense fallback={null}><SymbolDraw onClose={() => setShowSymbolDraw(false)} onInsert={(name) => { insertMathSymbol(name); setShowSymbolDraw(false); }} /></Suspense></Boundary>}
       {showRefManager && activeTab && <Suspense fallback={null}><RefManager content={activeTab.content} onClose={() => setShowRefManager(false)} onJump={jumpToLine} onInsertRef={(name) => insertCode(`@${name}`)} /></Suspense>}
       {showBibManager && <Suspense fallback={null}><BibManager onClose={() => setShowBibManager(false)} onCite={(key) => { insertCode(`@${key}`); ensureBibliography(); }} onEnsureBib={ensureBibliography} onChanged={(paths) => { void fetchTree(); for (const path of paths || []) void mirrorLocalPath(path); }} /></Suspense>}
       

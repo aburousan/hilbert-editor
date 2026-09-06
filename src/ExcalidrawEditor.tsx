@@ -1,13 +1,22 @@
-import { useState, useEffect, useRef } from 'react';
-import { Excalidraw, exportToSvg, convertToExcalidrawElements } from '@excalidraw/excalidraw';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { Excalidraw, exportToSvg, convertToExcalidrawElements, newElementWith, CaptureUpdateAction } from '@excalidraw/excalidraw';
 import { WHITEBOARD_HISTORY_CHECKPOINT_CHANGES } from './performanceLimits';
 import '@excalidraw/excalidraw/index.css';
 import { notify } from './notify';
+import { keys } from './keys';
+
+export interface WhiteboardCommands {
+  undo: () => void;
+  redo: () => void;
+  save: () => Promise<void>;
+}
 
 interface ExcalidrawEditorProps {
   path: string;
   initialContent: string;
   onSave: (content: string, svgBlob: Blob) => Promise<void>;
+  theme?: 'light' | 'dark';
+  commandsRef?: { current: WhiteboardCommands | null };
 }
 
 type Skel = any; // Excalidraw element skeleton
@@ -218,10 +227,14 @@ const FILL_STYLES: { key: string; label: string }[] = [
 const FILL_COLORS = ['transparent', '#a5d8ff', '#b2f2bb', '#ffc9c9', '#ffec99', '#eebefa', '#ced4da', '#1e1e1e'];
 const STROKE_COLORS = ['#1e1e1e', '#e03131', '#1971c2', '#2f9e44', '#f08c00', '#9c36b5', '#ffffff'];
 
-export default function ExcalidrawEditor({ initialContent, onSave }: ExcalidrawEditorProps) {
+export default function ExcalidrawEditor({ initialContent, onSave, theme = 'dark', commandsRef }: ExcalidrawEditorProps) {
   const [initialData, setInitialData] = useState<any>(null);
   const [excalidrawAPI, setExcalidrawAPI] = useState<any>(null);
   const [paletteOpen, setPaletteOpen] = useState(true);
+  const [query, setQuery] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [dirty, setDirty] = useState(false);
+  const savingRef = useRef(false);
   const wrapperRef = useRef<HTMLDivElement>(null);
   const historyChangesRef = useRef(0);
   const sceneFingerprintRef = useRef('');
@@ -240,7 +253,8 @@ export default function ExcalidrawEditor({ initialContent, onSave }: ExcalidrawE
   const sceneCentre = () => {
     const st = excalidrawAPI.getAppState();
     const zoom = st.zoom?.value || 1;
-    return { cx: st.width / 2 / zoom - st.scrollX, cy: st.height / 2 / zoom - st.scrollY };
+    const usableWidth = paletteOpen ? Math.max(160, st.width - 264) : st.width;
+    return { cx: usableWidth / 2 / zoom - st.scrollX, cy: st.height / 2 / zoom - st.scrollY };
   };
 
   const insertShape = (make: (cx: number, cy: number, o: MakeOpts) => Skel[]) => {
@@ -259,7 +273,7 @@ export default function ExcalidrawEditor({ initialContent, onSave }: ExcalidrawE
     const scene = excalidrawAPI.getSceneElements();
     const selectedElementIds: Record<string, true> = {};
     for (const el of newEls) selectedElementIds[el.id] = true;
-    excalidrawAPI.updateScene({ elements: [...scene, ...newEls], appState: { selectedElementIds } });
+    excalidrawAPI.updateScene({ elements: [...scene, ...newEls], appState: { selectedElementIds }, captureUpdate: CaptureUpdateAction.IMMEDIATELY });
   };
 
   // Apply a fill style / colour: to the current selection if there is one,
@@ -271,8 +285,8 @@ export default function ExcalidrawEditor({ initialContent, onSave }: ExcalidrawE
     const ids = Object.keys(sel).filter(id => sel[id]);
     if (ids.length > 0) {
       const els = excalidrawAPI.getSceneElements().map((el: any) =>
-        sel[el.id] ? { ...el, ...patch, versionNonce: Math.floor(Math.random() * 1e9) } : el);
-      excalidrawAPI.updateScene({ elements: els });
+        sel[el.id] ? newElementWith(el, patch) : el);
+      excalidrawAPI.updateScene({ elements: els, captureUpdate: CaptureUpdateAction.IMMEDIATELY });
     } else {
       const appState: any = {};
       if (patch.backgroundColor !== undefined) appState.currentItemBackgroundColor = patch.backgroundColor;
@@ -282,13 +296,12 @@ export default function ExcalidrawEditor({ initialContent, onSave }: ExcalidrawE
     }
   };
 
-  useEffect(() => {
-    const handleKeyDown = async (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 's') {
-        if (!excalidrawAPI) return;
-        e.preventDefault();
-        e.stopPropagation();
-
+  const save = useCallback(async () => {
+    if (!excalidrawAPI || savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
+    const fingerprint = sceneFingerprintRef.current;
+    try {
         const elements = excalidrawAPI.getSceneElements();
         const appState = excalidrawAPI.getAppState();
         const files = excalidrawAPI.getFiles();
@@ -303,13 +316,40 @@ export default function ExcalidrawEditor({ initialContent, onSave }: ExcalidrawE
         });
         const svgBlob = new Blob([svgElement.outerHTML], { type: 'image/svg+xml' });
         await onSave(jsonContent, svgBlob);
+        setDirty(sceneFingerprintRef.current !== fingerprint);
         // The scene is now durable in both .excalidraw and SVG form. Excalidraw
         // exposes clear(), not a stack-length cap, so checkpoint only after a
         // successful save; an unsaved scene never loses its undo history.
-        if (historyChangesRef.current >= WHITEBOARD_HISTORY_CHECKPOINT_CHANGES) {
+        if (sceneFingerprintRef.current === fingerprint && historyChangesRef.current >= WHITEBOARD_HISTORY_CHECKPOINT_CHANGES) {
           excalidrawAPI.history?.clear?.();
           historyChangesRef.current = 0;
         }
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Could not save the whiteboard.');
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+  }, [excalidrawAPI, onSave]);
+
+  useEffect(() => {
+    if (!commandsRef || !excalidrawAPI) return;
+    // Excalidraw exposes history.clear(), but no public undo/redo methods.
+    // Delegate to its own controls so we use the scene's native history.
+    const history = (action: 'undo' | 'redo') => {
+      wrapperRef.current?.querySelector<HTMLButtonElement>(`button[data-testid="button-${action}"]`)?.click();
+    };
+    const commands = { undo: () => history('undo'), redo: () => history('redo'), save };
+    commandsRef.current = commands;
+    return () => { if (commandsRef.current === commands) commandsRef.current = null; };
+  }, [commandsRef, excalidrawAPI, save]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        e.stopPropagation();
+        void save();
       }
     };
     const el = wrapperRef.current;
@@ -317,13 +357,14 @@ export default function ExcalidrawEditor({ initialContent, onSave }: ExcalidrawE
       el.addEventListener('keydown', handleKeyDown, true);
       return () => el.removeEventListener('keydown', handleKeyDown, true);
     }
-  }, [excalidrawAPI, onSave]);
+  }, [save]);
 
   if (!initialData) return <div>Loading Whiteboard...</div>;
 
   return (
     <div ref={wrapperRef} style={{ flex: 1, position: 'relative', display: 'flex', flexDirection: 'column' }} tabIndex={-1}>
       <Excalidraw
+        aiEnabled={false}
         initialData={initialData}
         excalidrawAPI={(api) => setExcalidrawAPI(api)}
         onChange={(elements) => {
@@ -338,40 +379,48 @@ export default function ExcalidrawEditor({ initialContent, onSave }: ExcalidrawE
             nonces += Number(element.versionNonce) || 0;
           }
           const fingerprint = `${elements.length}:${versions}:${nonces}`;
-          if (sceneFingerprintRef.current && sceneFingerprintRef.current !== fingerprint) historyChangesRef.current++;
+          if (sceneFingerprintRef.current && sceneFingerprintRef.current !== fingerprint) {
+            historyChangesRef.current++;
+            setDirty(true);
+          }
           sceneFingerprintRef.current = fingerprint;
         }}
-        theme="dark"
+        theme={theme}
       />
 
       {/* Scientific shape + shading palette (right edge, collapsible) */}
-      <div className="sci-palette" style={{
-        position: 'absolute', top: '64px', right: paletteOpen ? '12px' : '-260px', bottom: '64px',
+      <div className="sci-palette" hidden={!paletteOpen} style={{
+        position: 'absolute', top: '64px', right: '12px', bottom: '64px',
         width: '240px', zIndex: 20, transition: 'right 0.18s ease',
-        display: 'flex', flexDirection: 'column',
+        display: paletteOpen ? 'flex' : 'none', flexDirection: 'column',
         background: 'var(--panel-bg, #23232a)', border: '1px solid rgba(255,255,255,0.12)',
-        borderRadius: '10px', boxShadow: '0 8px 30px rgba(0,0,0,0.45)', overflow: 'hidden',
+        borderRadius: '8px', boxShadow: '0 8px 30px rgba(0,0,0,0.45)', overflow: 'hidden',
+        visibility: paletteOpen ? 'visible' : 'hidden',
       }}>
         <div style={{ padding: '10px 12px', borderBottom: '1px solid rgba(255,255,255,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <span style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-color, #eee)' }}>Scientific shapes</span>
+          <span style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-main)' }}>Scientific shapes</span>
           <button onClick={() => setPaletteOpen(false)} title="Hide palette"
             style={{ background: 'none', border: 'none', color: 'var(--text-muted, #999)', cursor: 'pointer', fontSize: '16px', lineHeight: 1 }}>›</button>
         </div>
 
+        <input aria-label="Search scientific shapes" placeholder="Search shapes" value={query} onChange={e => setQuery(e.target.value)}
+          style={{ margin: '8px 10px', minWidth: 0, padding: '6px 8px' }} />
+
         <div style={{ overflowY: 'auto', padding: '8px 10px', flex: 1 }}>
-          {SHAPES.map(cat => (
+          {SHAPES.map(cat => ({ ...cat, items: cat.items.filter(item => `${cat.group} ${item.label}`.toLowerCase().includes(query.toLowerCase().trim())) }))
+            .filter(cat => cat.items.length > 0).map(cat => (
             <div key={cat.group} style={{ marginBottom: '12px' }}>
               <div style={{ fontSize: '10px', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted, #8a8a94)', margin: '2px 2px 6px' }}>{cat.group}</div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
                 {cat.items.map(it => (
                   <button key={it.label} title={`Insert ${it.label}`} onClick={() => insertShape(it.make)}
                     style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '7px 8px', fontSize: '11.5px',
-                      background: 'rgba(255,255,255,0.05)', color: 'var(--text-color, #e6e6e6)', border: '1px solid rgba(255,255,255,0.08)',
-                      borderRadius: '6px', cursor: 'pointer', textAlign: 'left', whiteSpace: 'nowrap', overflow: 'hidden' }}
+                      background: 'var(--panel-lighter)', color: 'var(--text-main)', border: '1px solid var(--border-color)',
+                      borderRadius: '6px', cursor: 'pointer', textAlign: 'left', minWidth: 0, minHeight: 38 }}
                     onMouseEnter={e => (e.currentTarget.style.background = 'rgba(139,92,246,0.25)')}
-                    onMouseLeave={e => (e.currentTarget.style.background = 'rgba(255,255,255,0.05)')}>
+                    onMouseLeave={e => (e.currentTarget.style.background = 'var(--panel-lighter)')}>
                     <span style={{ fontSize: '15px', width: '16px', textAlign: 'center' }}>{it.icon}</span>
-                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{it.label}</span>
+                    <span style={{ overflowWrap: 'anywhere', lineHeight: 1.25 }}>{it.label}</span>
                   </button>
                 ))}
               </div>
@@ -385,7 +434,7 @@ export default function ExcalidrawEditor({ initialContent, onSave }: ExcalidrawE
               {FILL_STYLES.map(f => (
                 <button key={f.key} title={`Fill: ${f.label}`}
                   onClick={() => applyShading(f.key === 'transparent' ? { backgroundColor: 'transparent' } : { fillStyle: f.key })}
-                  style={{ padding: '6px', fontSize: '11px', background: 'rgba(255,255,255,0.05)', color: 'var(--text-color,#e6e6e6)',
+                  style={{ padding: '6px', fontSize: '11px', background: 'var(--panel-lighter)', color: 'var(--text-main)',
                     border: '1px solid rgba(255,255,255,0.08)', borderRadius: '6px', cursor: 'pointer' }}>{f.label}</button>
               ))}
             </div>
@@ -409,7 +458,10 @@ export default function ExcalidrawEditor({ initialContent, onSave }: ExcalidrawE
         </div>
 
         <div style={{ padding: '8px 12px', borderTop: '1px solid rgba(255,255,255,0.1)', fontSize: '11px', color: 'var(--text-muted,#8a8a94)' }}>
-          Press <b style={{ color: 'var(--text-color,#ddd)' }}>Cmd/Ctrl+S</b> to save &amp; export SVG
+          <button className="btn-primary" onClick={() => void save()} disabled={saving || !excalidrawAPI} title={keys('Save whiteboard and SVG (⌘S)')}>
+            {saving ? 'Saving...' : 'Save drawing'}
+          </button>
+          <span role="status" style={{ marginLeft: 8 }}>{dirty ? 'Unsaved' : 'Saved'}</span>
         </div>
       </div>
 

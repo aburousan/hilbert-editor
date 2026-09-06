@@ -1,5 +1,6 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { keys } from '../keys';
+import { createHistory } from '../editHistory';
 
 // Visual Feynman-diagram builder: draw propagators (fermion / photon / gluon /
 // scalar / ghost), loops (plain, wavy or coiled circles), hatched or shaded
@@ -368,7 +369,7 @@ const TEMPLATES: { name: string, make: () => El[] }[] = [
 ];
 
 // ---- component ---------------------------------------------------------------
-export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => void, onInsert: (code: string) => void }) {
+export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => void, onInsert: (code: string, imports?: string) => void }) {
   const [els, setEls] = useState<El[]>([]);
   const [tool, setTool] = useState<'select' | 'edge' | 'loop' | 'vertex' | 'text'>('edge');
   const [edgeKind, setEdgeKind] = useState<EdgeKind>('fermion');
@@ -381,10 +382,30 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
 
   const svgRef = useRef<SVGSVGElement>(null);
   const idRef = useRef(1);
-  const undoRef = useRef<El[][]>([]);
+  const historyRef = useRef(createHistory<El[]>());
+  const draftRef = useRef<{ a: Pt, b: Pt } | null>(null);
+  const elsRef = useRef(els);
+  elsRef.current = els;
   const dragRef = useRef<null | { mode: 'draw' | 'move' | 'from' | 'to' | 'bend' | 'radius', start: Pt, snapshot: El[] }>(null);
 
-  const commit = (next: El[]) => { undoRef.current.push(els); setEls(next); };
+  const commit = (next: El[], key?: string) => {
+    historyRef.current.record(elsRef.current, key);
+    elsRef.current = next;
+    setEls(next);
+  };
+  const checkpoint = (previous: El[]) => historyRef.current.record(previous);
+  const undo = () => {
+    const previous = historyRef.current.undo(elsRef.current);
+    if (!previous) return;
+    elsRef.current = previous;
+    setEls(previous); setSelected(null);
+  };
+  const redo = () => {
+    const next = historyRef.current.redo(elsRef.current);
+    if (!next) return;
+    elsRef.current = next;
+    setEls(next); setSelected(null);
+  };
 
   const sel = els.find(e => e.id === selected) ?? null;
 
@@ -429,11 +450,15 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
     return null;
   };
 
-  const onDown = (ev: React.MouseEvent) => {
+  const onDown = (ev: React.PointerEvent) => {
+    if (!ev.isPrimary || ev.button !== 0) return;
+    ev.preventDefault();
+    ev.currentTarget.setPointerCapture(ev.pointerId);
     const p = mouse(ev);
     if (tool === 'edge' || tool === 'loop') {
       dragRef.current = { mode: 'draw', start: snap(p), snapshot: els };
-      setDraft({ a: snap(p), b: snap(p) });
+      draftRef.current = { a: snap(p), b: snap(p) };
+      setDraft(draftRef.current);
       return;
     }
     if (tool === 'vertex') { commit([...els, { id: idRef.current++, type: 'vertex', at: snap(p), size: 3 }]); return; }
@@ -448,14 +473,14 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
       const h = handlePoints(sel);
       for (const [mode, hp] of h) {
         if (Math.hypot(hp.x - p.x, hp.y - p.y) < 9) {
-          dragRef.current = { mode, start: p, snapshot: els.map(e => ({ ...e })) };
+          dragRef.current = { mode, start: p, snapshot: els };
           return;
         }
       }
     }
     const hit = hitTest(p);
     setSelected(hit);
-    if (hit != null) dragRef.current = { mode: 'move', start: p, snapshot: els.map(e => ({ ...e, ...(e as any) })) };
+    if (hit != null) dragRef.current = { mode: 'move', start: p, snapshot: els };
   };
 
   const handlePoints = (e: El): ['from' | 'to' | 'bend' | 'radius', Pt][] => {
@@ -471,9 +496,16 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
     const d = dragRef.current;
     if (!d) return;
     const p = mouse(ev);
-    if (d.mode === 'draw') { setDraft(prev => prev ? { a: prev.a, b: snap(p) } : null); return; }
+    if (d.mode === 'draw') {
+      const next = { a: d.start, b: snap(p) };
+      if (draftRef.current?.b.x !== next.b.x || draftRef.current?.b.y !== next.b.y) {
+        draftRef.current = next;
+        setDraft(next);
+      }
+      return;
+    }
     const dx = p.x - d.start.x, dy = p.y - d.start.y;
-    setEls(d.snapshot.map(e => {
+    const next = d.snapshot.map(e => {
       if (e.id !== selected) return e;
       if (d.mode === 'move') {
         if (e.type === 'edge') return { ...e, from: { x: e.from.x + dx, y: e.from.y + dy }, to: { x: e.to.x + dx, y: e.to.y + dy } };
@@ -491,34 +523,51 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
       if (e.type === 'loop' && d.mode === 'radius')
         return { ...e, radius: Math.max(12, Math.round(Math.hypot(p.x - e.center.x, p.y - e.center.y))) };
       return e;
-    }));
+    });
+    elsRef.current = next;
+    setEls(next);
   };
 
-  const onUp = () => {
+  const onUp = (ev: React.PointerEvent) => {
     const d = dragRef.current;
-    dragRef.current = null;
     if (!d) return;
-    if (d.mode === 'draw' && draft) {
-      const { a, b } = draft;
+    onMove(ev);
+    dragRef.current = null;
+    if (d.mode === 'draw' && draftRef.current) {
+      const { a, b } = draftRef.current;
+      draftRef.current = null;
       setDraft(null);
       if (Math.hypot(b.x - a.x, b.y - a.y) < 10) return; // too small: ignore click-without-drag
       const id = idRef.current++;
       if (tool === 'edge') {
         const th = edgeKind === 'photon' || edgeKind === 'gluon' ? 1 : 1.2;
         const amp = edgeKind === 'gluon' ? 7 : 5;
-        undoRef.current.push(d.snapshot);
+        checkpoint(d.snapshot);
         setEls([...d.snapshot, { id, type: 'edge', kind: edgeKind, from: a, to: b, bend: 0, thickness: th, amplitude: amp, endArrow: false, label: '', side: 1 }]);
       } else {
-        undoRef.current.push(d.snapshot);
+        checkpoint(d.snapshot);
         setEls([...d.snapshot, { id, type: 'loop', kind: 'plain', fill: 'none', center: a, radius: Math.max(15, Math.round(Math.hypot(b.x - a.x, b.y - a.y))), thickness: 1.2, amplitude: 5, label: '' }]);
       }
       setSelected(id);
     } else {
-      undoRef.current.push(d.snapshot); // moves/handle drags become one undo step
+      const p = mouse(ev);
+      if (Math.hypot(p.x - d.start.x, p.y - d.start.y) > 0.5) checkpoint(d.snapshot);
     }
   };
 
-  const update = (patch: Partial<El>) => setEls(els.map(e => e.id === selected ? { ...e, ...patch } as El : e));
+  const cancelDrag = () => {
+    const drag = dragRef.current;
+    dragRef.current = null;
+    draftRef.current = null;
+    setDraft(null);
+    if (drag) { elsRef.current = drag.snapshot; setEls(drag.snapshot); }
+  };
+
+  const update = (patch: Partial<El>) => {
+    const fields = Object.keys(patch);
+    const key = fields.length === 1 ? `${selected}:${fields[0]}` : undefined;
+    commit(els.map(e => e.id === selected ? { ...e, ...patch } as El : e), key);
+  };
   const removeSel = () => { if (selected != null) { commit(els.filter(e => e.id !== selected)); setSelected(null); } };
 
   useEffect(() => {
@@ -526,10 +575,10 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
       const tag = (ev.target as HTMLElement).tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
       if ((ev.key === 'Delete' || ev.key === 'Backspace') && selected != null) { ev.preventDefault(); removeSel(); }
-      if ((ev.metaKey || ev.ctrlKey) && ev.key === 'z') {
+      if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === 'z') {
         ev.preventDefault();
-        const prev = undoRef.current.pop();
-        if (prev) { setEls(prev); setSelected(null); }
+        ev.stopPropagation();
+        if (ev.shiftKey) redo(); else undo();
       }
     };
     window.addEventListener('keydown', onKey);
@@ -537,7 +586,7 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
   });
 
   // ---- code generation ----
-  const genCode = () => {
+  const genCode = useCallback(() => {
     const lines: string[] = [];
     for (const e of els) if (e.type === 'loop') lines.push(...loopCode(e));
     for (const e of els) if (e.type === 'edge') {
@@ -558,22 +607,25 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
     const imports = `#import "@preview/cetz:0.3.4": canvas, draw, decorations\n`;
     const canvas = `canvas({\n  import draw: *\n${lines.join('\n')}\n})`;
     return { imports, canvas };
-  };
+  }, [els]);
 
   const handleInsert = () => {
+    // The import is handed over separately so it can go to the top of the
+    // document once, rather than into the middle of the sentence the cursor
+    // happens to be in, again for every diagram after the first.
     const { imports, canvas } = genCode();
     let body;
     if (asFigure) {
       const tag = figLabel.trim() ? ` <fig:${figLabel.trim()}>` : '';
-      body = `${imports}#figure(\n  ${canvas},\n  caption: [${caption}],\n)${tag}`;
+      body = `#figure(\n  ${canvas},\n  caption: [${caption}],\n)${tag}`;
     } else {
-      body = `${imports}#align(center)[\n${canvas}\n]`;
+      body = `#align(center, ${canvas})`;
     }
-    onInsert('\n' + body + '\n\n');
+    onInsert('\n' + body + '\n\n', imports.trim());
   };
 
   // ---- SVG rendering ----
-  const renderEdge = (e: Edge) => {
+  const renderEdge = useCallback((e: Edge) => {
     const c = ctrlPt(e.from, e.to, e.bend);
     const col = previewCol(e.color, e.id === selected);
     const pathFor = (a: Pt, b: Pt, cc: Pt) => e.bend === 0
@@ -615,9 +667,9 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
       parts.push(<text key="l" x={m.x - d.y * off} y={m.y + d.x * off} fontSize="13" fontStyle="italic" fontFamily="Georgia, serif" textAnchor="middle" dominantBaseline="middle" fill={col}>{e.label}</text>);
     }
     return <g key={e.id}>{parts}</g>;
-  };
+  }, [selected]);
 
-  const renderLoop = (l: Loop) => {
+  const renderLoop = useCallback((l: Loop) => {
     const col = previewCol(l.color, l.id === selected);
     const parts: React.ReactNode[] = [];
     if (l.kind === 'plain') {
@@ -645,7 +697,7 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
     if (l.label.trim())
       parts.push(<text key="l" x={l.center.x} y={l.center.y - l.radius - 14} fontSize="13" fontStyle="italic" fontFamily="Georgia, serif" textAnchor="middle" dominantBaseline="middle" fill={col}>{l.label}</text>);
     return <g key={l.id}>{parts}</g>;
-  };
+  }, [selected]);
 
   const field = (label: string, el: React.ReactNode) => (
     <label className="form-field"><span>{label}</span>{el}</label>
@@ -663,7 +715,13 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
     </div>
   ));
 
-  const code = showCode ? genCode() : null;
+  const code = useMemo(() => showCode ? genCode() : null, [showCode, genCode]);
+  const diagram = useMemo(() => els.map(e =>
+    e.type === 'edge' ? renderEdge(e)
+    : e.type === 'loop' ? renderLoop(e)
+    : e.type === 'vertex' ? <circle key={e.id} cx={e.at.x} cy={e.at.y} r={e.size} fill={previewCol(e.color, e.id === selected)} />
+    : <text key={e.id} x={e.at.x} y={e.at.y} fontSize="14" fontStyle="italic" fontFamily="Georgia, serif" textAnchor="middle" dominantBaseline="middle" fill={previewCol(e.color, e.id === selected)}>{e.text || '…'}</text>
+  ), [els, selected, renderEdge, renderLoop]);
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -690,12 +748,13 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
                 <option value="" disabled>Insert template…</option>
                 {TEMPLATES.map(t => <option key={t.name} value={t.name}>{t.name}</option>)}
               </select>
-              <button className="btn-ghost" onClick={() => { const prev = undoRef.current.pop(); if (prev) { setEls(prev); setSelected(null); } }}>Undo</button>
-              <button className="btn-ghost" onClick={() => { commit([]); setSelected(null); }}>Clear</button>
+              <button className="btn-ghost" onClick={undo} disabled={!historyRef.current.canUndo()} title={keys('Undo (⌘Z)')} aria-label="Undo">↶</button>
+              <button className="btn-ghost" onClick={redo} disabled={!historyRef.current.canRedo()} title={keys('Redo (⌘⇧Z)')} aria-label="Redo">↷</button>
+              <button className="btn-ghost" disabled={!els.length} onClick={() => { commit([]); setSelected(null); }}>Clear</button>
             </div>
 
             <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', background: '#fff', border: '1px solid #cbd5e1', borderRadius: '6px', cursor: tool === 'select' ? 'default' : 'crosshair', touchAction: 'none', display: 'block' }}
-              onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}>
+              onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={cancelDrag} onLostPointerCapture={cancelDrag}>
               {/* Alignment grid: minor lines every GRID px, stronger lines every
                   UNIT px (= 1 cetz unit). Drawing aid only — never exported. */}
               <defs>
@@ -708,12 +767,7 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
                 </pattern>
               </defs>
               <rect width={W} height={H} fill="url(#fgrid)" />
-              {els.map(e =>
-                e.type === 'edge' ? renderEdge(e)
-                : e.type === 'loop' ? renderLoop(e)
-                : e.type === 'vertex' ? <circle key={e.id} cx={e.at.x} cy={e.at.y} r={e.size} fill={previewCol(e.color, e.id === selected)} />
-                : <text key={e.id} x={e.at.x} y={e.at.y} fontSize="14" fontStyle="italic" fontFamily="Georgia, serif" textAnchor="middle" dominantBaseline="middle" fill={previewCol(e.color, e.id === selected)}>{e.text || '…'}</text>
-              )}
+              {diagram}
               {draft && tool === 'edge' && <line x1={draft.a.x} y1={draft.a.y} x2={draft.b.x} y2={draft.b.y} stroke="#7c3aed" strokeWidth="1.5" strokeDasharray="4 4" />}
               {draft && tool === 'loop' && <circle cx={draft.a.x} cy={draft.a.y} r={Math.max(2, Math.hypot(draft.b.x - draft.a.x, draft.b.y - draft.a.y))} fill="none" stroke="#7c3aed" strokeWidth="1.5" strokeDasharray="4 4" />}
               {sel && tool === 'select' && handlePoints(sel).map(([mode, p], i) => (
@@ -827,7 +881,7 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
 
         {showCode && code && (
           <pre style={{ margin: '0 16px', maxHeight: '160px', overflow: 'auto', fontSize: '11px', background: '#0f172a', color: '#e2e8f0', padding: '8px 10px', borderRadius: '6px' }}>
-            {code.imports + code.canvas}
+            {code.imports + '#' + code.canvas}
           </pre>
         )}
 

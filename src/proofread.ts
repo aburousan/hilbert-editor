@@ -172,12 +172,19 @@ function ensureProvider(monaco: any) {
   monaco.languages.registerCodeActionProvider('plaintext', { provideCodeActions: provide });
 }
 
-async function requestLint(text: string, lang: string, region: string): Promise<{ issues: ProofIssue[]; reading: Reading }> {
+// Only one pass runs at a time, so one that waited its turn and was overtaken
+// is answered with a conflict. That is the queue doing its job — quite unlike a
+// build with no proofreading in it — so the answer is dropped and nothing else.
+class SupersededLint extends Error {}
+
+async function requestLint(text: string, lang: string, region: string, signal: AbortSignal): Promise<{ issues: ProofIssue[]; reading: Reading }> {
   const res = await fetch(`${API}/lint`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text, lang, region }),
+    signal,
   });
+  if (res.status === 409) throw new SupersededLint();
   if (!res.ok) throw new Error(`lint ${res.status}`);
   const data = await res.json();
   return {
@@ -194,7 +201,7 @@ async function requestLint(text: string, lang: string, region: string): Promise<
 const suggestCache = new Map<string, string[]>();
 const cacheKey = (lang: string, word: string) => `${lang}\u0000${word}`;
 
-async function fetchSuggestions(words: string[], lang: string, region: string): Promise<void> {
+async function fetchSuggestions(words: string[], lang: string, region: string, signal: AbortSignal): Promise<void> {
   const missing = Array.from(new Set(words)).filter((w) => !suggestCache.has(cacheKey(lang, w)));
   if (!missing.length) return;
   try {
@@ -202,6 +209,7 @@ async function fetchSuggestions(words: string[], lang: string, region: string): 
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ words: missing, lang, region }),
+      signal,
     });
     if (!res.ok) return;
     const data = await res.json();
@@ -268,6 +276,7 @@ export function useProofread(
   const [busy, setBusy] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const seq = useRef(0);
+  const controllerRef = useRef<AbortController | null>(null);
 
   const issues = useMemo(
     () => (dismissed.size ? raw.filter((i) => !dismissed.has(dismissKey(i))) : raw),
@@ -283,15 +292,16 @@ export function useProofread(
   // feature. Skipped while disabled so a held-back feature makes no backend calls.
   useEffect(() => {
     if (!enabled) return;
-    let cancel = false;
+    const controller = new AbortController();
     fetch(`${API}/lint`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text: '' }),
+      signal: controller.signal,
     })
-      .then((r) => { if (!cancel) setAvailable(r.ok); })
-      .catch(() => { if (!cancel) setAvailable(false); });
-    return () => { cancel = true; };
+      .then((r) => { if (!controller.signal.aborted) setAvailable(r.ok); })
+      .catch(() => { if (!controller.signal.aborted) setAvailable(false); });
+    return () => controller.abort();
   }, [enabled]);
 
   const clearMarkers = useCallback(() => {
@@ -305,14 +315,18 @@ export function useProofread(
     const model = editorRef.current.getModel?.();
     if (!model) return;
     const text = model.getValue();
+    const version = model.getVersionId();
+    controllerRef.current?.abort();
+    const controller = new AbortController();
+    controllerRef.current = controller;
     const mine = ++seq.current;
     setBusy(true);
 
     const { lang, region } = documentLanguage(text);
 
     try {
-      const answer = await requestLint(text, lang, region);
-      if (mine !== seq.current) return; // superseded by a newer run
+      const answer = await requestLint(text, lang, region, controller.signal);
+      if (mine !== seq.current || controller.signal.aborted || model !== editorRef.current?.getModel?.() || version !== model.getVersionId()) return;
       const placed = placeIssues(text, answer.issues);
       setReading(answer.reading);
       setRaw(withSuggestions(placed, lang)); // squiggles + any already-cached fixes now
@@ -322,16 +336,19 @@ export function useProofread(
       // Lazily enrich spelling fixes (off the hot path), then re-publish.
       const spellingWords = placed.filter((i) => i.kind === 'spelling').map((i) => i.text);
       if (spellingWords.some((w) => !suggestCache.has(cacheKey(lang, w)))) {
-        await fetchSuggestions(spellingWords, lang, region);
-        if (mine === seq.current) setRaw(withSuggestions(placed, lang));
+        await fetchSuggestions(spellingWords, lang, region, controller.signal);
+        if (mine === seq.current && !controller.signal.aborted && model === editorRef.current?.getModel?.() && version === model.getVersionId()) setRaw(withSuggestions(placed, lang));
       }
-    } catch {
-      if (mine === seq.current) {
+    } catch (error) {
+      if (error instanceof SupersededLint) return;
+      if (mine === seq.current && !controller.signal.aborted) {
         setAvailable(false); // no /lint route (Electron) — disable silently
         setRaw([]);
         clearMarkers();
         setBusy(false);
       }
+    } finally {
+      if (controllerRef.current === controller) { controllerRef.current = null; setBusy(false); }
     }
   }, [monaco, editorRef, clearMarkers]);
 
@@ -360,6 +377,9 @@ export function useProofread(
 
   // Debounced re-lint whenever the active content changes.
   useEffect(() => {
+    seq.current++;
+    controllerRef.current?.abort();
+    setBusy(false);
     if (!active) {
       setRaw([]);
       setChecked(false);
@@ -372,6 +392,8 @@ export function useProofread(
     timer.current = setTimeout(run, 700);
     return () => {
       if (timer.current) clearTimeout(timer.current);
+      seq.current++;
+      controllerRef.current?.abort();
     };
   }, [active, activeTabContent, activeTabPath, run, clearMarkers]);
 

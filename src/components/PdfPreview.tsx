@@ -4,6 +4,7 @@ import { TextLayer } from 'pdfjs-dist';
 import { bestMatch, tokenizeRenderedText, wordAtOffset, type SyncPayload } from '../syncMatch';
 import { MAX_PDF_PAGE_WORD_INDEXES } from '../performanceLimits';
 import { keys } from '../keys';
+import { createPdfTextCache } from '../pdfTextCache';
 
 export type PdfHandle = {
   revealSource(p: SyncPayload): Promise<boolean>;
@@ -17,7 +18,18 @@ export type PdfViewState = {
   dark: boolean;
 };
 
-type Slot = { div: HTMLDivElement; textDiv: HTMLDivElement; rendered: boolean; textRendered: boolean };
+type Slot = {
+  div: HTMLDivElement;
+  textDiv: HTMLDivElement;
+  rendered: boolean;
+  textRendered: boolean;
+  visible: boolean;
+  aspect: number;
+  renderRevision: number;
+  renderTask: pdfjsLib.RenderTask | null;
+  textTask: TextLayer | null;
+  textBuild: Promise<void> | null;
+};
 type WordIndex = { words: string[]; spans: HTMLElement[] };
 
 // Walk a text-layer subtree (a page, or the whole document) into a flat list of
@@ -141,7 +153,6 @@ function PdfPreview(
   const ioRef = useRef<IntersectionObserver | null>(null);
   const slotsRef = useRef<Slot[]>([]);
   const scaleRef = useRef({ dScale: 1, renderScale: DPR });
-  const aspectRef = useRef(1.414);
   const reportViewStateRef = useRef<() => void>(() => {});
   const setZoomRef = useRef<(zoom: number) => void>(() => {});
   const documentWordIndexRef = useRef<{ pass: number; root: ParentNode; index: WordIndex } | null>(null);
@@ -180,7 +191,7 @@ function PdfPreview(
     // lurches a second time when the re-raster settles — and on a long document
     // almost every page is a placeholder, so that second jump is the big one.
     for (const slot of slotsRef.current) {
-      if (!slot.rendered) slot.div.style.height = `${displayW * aspectRef.current}px`;
+      if (!slot.rendered) slot.div.style.height = `${displayW * slot.aspect}px`;
     }
   };
 
@@ -273,6 +284,18 @@ function PdfPreview(
     debounceRef.current = setTimeout(() => setRasterTick(t => t + 1), 160);
   };
 
+  const releaseBitmap = (slot: Slot) => {
+    slot.renderRevision++;
+    slot.renderTask?.cancel();
+    slot.renderTask = null;
+    slot.rendered = false;
+    slot.div.style.height = `${slot.div.clientWidth * slot.aspect}px`;
+    for (const canvas of slot.div.querySelectorAll('canvas')) {
+      canvas.remove();
+      canvas.width = canvas.height = 0;
+    }
+  };
+
   // Draw (or redraw) one page's bitmap. The new canvas is rendered off-screen and
   // only swapped in once it's ready, so a resize/zoom re-raster never blanks the
   // page — this is what removes the flicker. `force` re-rasterises a page that's
@@ -280,23 +303,36 @@ function PdfPreview(
   const drawPage = async (i: number, token: number, force = false) => {
     const slot = slotsRef.current[i - 1];
     const doc = docCache.current.doc;
-    if (!slot || !doc || token !== renderTokenRef.current) return;
+    if (!slot || !slot.visible || !doc || token !== renderTokenRef.current) return;
     if (slot.rendered && !force) return;
+    const revision = ++slot.renderRevision;
+    slot.renderTask?.cancel();
+    slot.renderTask = null;
     slot.rendered = true;
-    let page;
-    try { page = await doc.getPage(i); } catch { slot.rendered = false; return; }
-    if (token !== renderTokenRef.current) return;
-    const rvp = page.getViewport({ scale: scaleRef.current.renderScale });
-    const canvas = document.createElement('canvas');
-    canvas.width = rvp.width; canvas.height = rvp.height;
-    canvas.style.width = '100%'; canvas.style.height = 'auto';
-    try { await page.render({ canvasContext: canvas.getContext('2d')!, viewport: rvp }).promise; }
-    catch { slot.rendered = false; return; }
-    if (token !== renderTokenRef.current) return;
-    const old = slot.div.querySelector('canvas');
-    slot.div.insertBefore(canvas, slot.div.firstChild);   // add new first…
-    if (old) old.remove();                                 // …then drop the old one
-    slot.div.style.height = '';   // real bitmap now dictates the height
+    const current = () => token === renderTokenRef.current && revision === slot.renderRevision && slot.visible;
+    let canvas: HTMLCanvasElement | null = null;
+    try {
+      const page = await doc.getPage(i);
+      if (!current()) return;
+      const rvp = page.getViewport({ scale: scaleRef.current.renderScale });
+      canvas = document.createElement('canvas');
+      canvas.width = rvp.width; canvas.height = rvp.height;
+      canvas.style.width = '100%'; canvas.style.height = 'auto';
+      const task = page.render({ canvasContext: canvas.getContext('2d')!, viewport: rvp });
+      slot.renderTask = task;
+      await task.promise;
+      if (!current()) return;
+      const old = slot.div.querySelector('canvas');
+      slot.div.insertBefore(canvas, slot.div.firstChild);
+      if (old) { old.remove(); old.width = old.height = 0; }
+      slot.aspect = canvas.height / canvas.width;
+      slot.div.style.height = '';
+    } catch {
+      if (current()) slot.rendered = !!slot.div.querySelector('canvas');
+    } finally {
+      if (canvas && !canvas.isConnected) canvas.width = canvas.height = 0;
+      if (revision === slot.renderRevision) slot.renderTask = null;
+    }
   };
 
   // Each zoom step starts a fresh pass while the previous one may still be
@@ -304,6 +340,7 @@ function PdfPreview(
   // that, an older pass finishing last leaves layers built for the old scale, and
   // then double-click-to-source lands on the wrong word.
   const textPassRef = useRef(0);
+  const textCacheRef = useRef(createPdfTextCache());
 
   // Build one page's transparent text layer at the current scale. This is what
   // cursor↔PDF sync reads, and what lets a word be selected off the page.
@@ -315,31 +352,41 @@ function PdfPreview(
   // of its time rebuilding text for pages nobody was looking at. Now a page gets
   // its layer when it comes into view, alongside its bitmap, and the two places
   // that need text from a page that isn't on screen ask for it directly.
-  const buildTextLayer = async (i: number, token: number, pass: number) => {
+  const buildTextLayer = (i: number, token: number, pass: number): Promise<void> => {
     const doc = docCache.current.doc;
     const slot = slotsRef.current[i - 1];
-    if (!doc || !slot) return;
-    let page;
-    try { page = await doc.getPage(i); } catch { return; }
-    if (token !== renderTokenRef.current || pass !== textPassRef.current) return;
-    const td = slot.textDiv;
-    pageWordIndexesRef.current.delete(td);
-    documentWordIndexRef.current = null;
-    td.replaceChildren();
-    td.style.setProperty('--scale-factor', String(scaleRef.current.dScale));
-    const tl = new TextLayer({
-      textContentSource: page.streamTextContent(),
-      container: td,
-      viewport: page.getViewport({ scale: scaleRef.current.dScale }),
-    });
-    await tl.render();
-    if (token !== renderTokenRef.current || pass !== textPassRef.current) return;
-    // pdf.js writes a pixel width/height onto the container. Drop them so the
-    // stylesheet's inset:0 keeps the layer exactly on its page — an oversized
-    // one is invisible but still widens the scroll area.
-    td.style.width = '';
-    td.style.height = '';
-    slot.textRendered = true;
+    if (!doc || !slot || slot.textRendered) return Promise.resolve();
+    if (slot.textBuild) return slot.textBuild;
+    const build = async () => {
+      let page;
+      try { page = await doc.getPage(i); } catch { return; }
+      if (token !== renderTokenRef.current || pass !== textPassRef.current) return;
+      let content;
+      try { content = await textCacheRef.current.read(doc, i); } catch { return; }
+      if (token !== renderTokenRef.current || pass !== textPassRef.current) return;
+      const td = slot.textDiv;
+      pageWordIndexesRef.current.delete(td);
+      documentWordIndexRef.current = null;
+      td.replaceChildren();
+      td.style.setProperty('--scale-factor', String(scaleRef.current.dScale));
+      const tl = new TextLayer({
+        textContentSource: content,
+        container: td,
+        viewport: page.getViewport({ scale: scaleRef.current.dScale }),
+      });
+      slot.textTask = tl;
+      try { await tl.render(); }
+      catch { return; }
+      finally { if (slot.textTask === tl) slot.textTask = null; }
+      if (token !== renderTokenRef.current || pass !== textPassRef.current) return;
+      // Drop PDF.js's fixed dimensions so the layer follows its page.
+      td.style.width = '';
+      td.style.height = '';
+      slot.textRendered = true;
+    };
+    const pending = build().finally(() => { if (slot.textBuild === pending) slot.textBuild = null; });
+    slot.textBuild = pending;
+    return pending;
   };
 
   const ensureTextLayer = async (i: number, token: number) => {
@@ -369,6 +416,9 @@ function PdfPreview(
     documentWordIndexRef.current = null;
     pageWordIndexesRef.current.clear();
     for (const slot of slotsRef.current) {
+      slot.textTask?.cancel();
+      slot.textTask = null;
+      slot.textBuild = null;
       slot.textRendered = false;
       slot.textDiv.replaceChildren();
     }
@@ -492,11 +542,16 @@ function PdfPreview(
   const attachObserver = (tok: number, scrollEl: HTMLDivElement) => {
     ioRef.current?.disconnect();
     const io = new IntersectionObserver((entries) => {
+      if (tok !== renderTokenRef.current) return;
       for (const e of entries) {
+        const idx = slotsRef.current.findIndex(s => s.div === e.target);
+        if (idx < 0) continue;
+        const slot = slotsRef.current[idx];
+        slot.visible = e.isIntersecting;
         if (e.isIntersecting) {
-          const idx = slotsRef.current.findIndex(s => s.div === e.target);
-          if (idx >= 0) { drawPage(idx + 1, tok); ensureTextLayer(idx + 1, tok); }
-        }
+          void drawPage(idx + 1, tok);
+          void ensureTextLayer(idx + 1, tok);
+        } else releaseBitmap(slot);
       }
     }, { root: scrollEl, rootMargin: '800px 0px' });
     ioRef.current = io;
@@ -527,8 +582,11 @@ function PdfPreview(
         let loaded;
         try { loaded = await pdfjsLib.getDocument(url).promise; } catch { return; }
         if (token !== renderTokenRef.current) { try { loaded.destroy(); } catch {} return; }
+        let pg;
+        try { pg = await loaded.getPage(1); }
+        catch { await loaded.destroy().catch(() => {}); return; }
+        if (token !== renderTokenRef.current) { await loaded.destroy().catch(() => {}); return; }
         const prevDoc = docCache.current.doc;
-        const pg = await loaded.getPage(1);
         const vp1 = pg.getViewport({ scale: 1 });
         docCache.current = { url, doc: loaded, naturalW: vp1.width };
         pageInfoRef.current = { w: vp1.width, h: vp1.height };
@@ -550,7 +608,6 @@ function PdfPreview(
       const aspVp = (await doc.getPage(1)).getViewport({ scale: 1 });
       if (token !== renderTokenRef.current) return;
       const aspect = aspVp.height / aspVp.width;
-      aspectRef.current = aspect;
 
       // Refresh in place when the shape is unchanged (same page count and page
       // width) — the common case as you type. The old bitmaps stay on screen while
@@ -563,7 +620,7 @@ function PdfPreview(
       if (reusable) {
         for (const slot of prevSlots) {
           slot.div.style.width = `${displayW}px`;
-          if (!slot.rendered) slot.div.style.height = `${displayW * aspect}px`;
+          if (!slot.rendered) slot.div.style.height = `${displayW * slot.aspect}px`;
         }
         // The text on these pages belongs to the document we just replaced, so
         // it goes before the observer is attached; attaching one fires it for
@@ -593,8 +650,9 @@ function PdfPreview(
         textDiv.style.setProperty('--scale-factor', String(dScale));
         pageDiv.appendChild(textDiv);
         frag.appendChild(pageDiv);
-        slots.push({ div: pageDiv, textDiv, rendered: false, textRendered: false });
+        slots.push({ div: pageDiv, textDiv, rendered: false, textRendered: false, visible: false, aspect, renderRevision: 0, renderTask: null, textTask: null, textBuild: null });
       }
+      for (const slot of prevSlots) releaseBitmap(slot);
       pagesEl.replaceChildren(frag);
       slotsRef.current = slots;
       // A rebuild also happens when the page size changes, and then every page
@@ -607,7 +665,19 @@ function PdfPreview(
       attachObserver(token, scrollEl);
     })();
 
-    return () => { ioRef.current?.disconnect(); };
+    return () => {
+      renderTokenRef.current++;
+      ioRef.current?.disconnect();
+      for (const slot of slotsRef.current) {
+        slot.textTask?.cancel();
+        slot.textTask = null;
+        slot.textBuild = null;
+        slot.renderRevision++;
+        slot.renderTask?.cancel();
+        slot.renderTask = null;
+        slot.rendered = !!slot.div.querySelector('canvas');
+      }
+    };
   }, [url]);
 
   // Re-rasterise in place on resize-settle / zoom: no teardown. Update every
@@ -625,7 +695,7 @@ function PdfPreview(
     const anchor = captureAnchor();
     for (const slot of slots) {
       slot.div.style.width = `${displayW}px`;
-      if (!slot.rendered) slot.div.style.height = `${displayW * aspectRef.current}px`;
+      if (!slot.rendered) slot.div.style.height = `${displayW * slot.aspect}px`;
     }
     restoreAnchor(anchor);
     for (let i = 0; i < slots.length; i++) if (slots[i].rendered) drawPage(i + 1, token, true);
@@ -645,42 +715,49 @@ function PdfPreview(
   useEffect(() => {
     if (!url || !onWordCount) return;
     let cancelled = false;
+    let running = false;
+    let finished = false;
     let idle = 0;
-    const timer = setTimeout(() => {
-      const start = () => { if (!cancelled) void count(); };
-      const ric = (window as unknown as { requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => number }).requestIdleCallback;
-      if (ric) idle = ric(start, { timeout: 3000 });
-      else start();
-    }, 1200);
-    const count = async () => {
-      let doc: any = null, temp = false;
-      try {
-        if (docCache.current.url === url && docCache.current.doc) {
-          doc = docCache.current.doc;                       // reuse the shared doc
-        } else {
-          doc = await pdfjsLib.getDocument(url).promise;    // our own copy…
-          temp = true;                                      // …so we must destroy it
-        }
-        let text = '';
-        for (let i = 1; i <= doc.numPages; i++) {
-          if (cancelled) break;
-          const tc = await doc.getPage(i).then((p: any) => p.getTextContent());
-          for (const it of tc.items) {
-            if ('str' in it) text += it.str;
-            // pdf.js emits spacing as its own runs; add a break on end-of-line.
-            if (it.hasEOL) text += '\n';
-          }
-          text += '\n';
-        }
-        if (!cancelled) onWordCount((text.match(/[^\s]+/g) || []).length);
-      } catch { /* leave the last known count in place */ }
-      finally { if (temp && doc) { try { await doc.destroy(); } catch {} } }
+    let timer: ReturnType<typeof setTimeout>;
+    let page = 1;
+    let words = 0;
+    const ric = window.requestIdleCallback?.bind(window);
+    const schedule = (delay: number) => {
+      clearTimeout(timer);
+      if (idle) window.cancelIdleCallback?.(idle);
+      timer = setTimeout(() => {
+        if (cancelled || document.hidden || finished || running) return;
+        if (ric) idle = ric(() => { idle = 0; void countPage(); }, { timeout: 1500 });
+        else void countPage();
+      }, delay);
     };
+    const countPage = async () => {
+      if (cancelled || document.hidden || running || finished) return;
+      // Never parse a second PDF just to obtain the toolbar's word count.
+      const { doc, url: cachedUrl } = docCache.current;
+      if (!doc || cachedUrl !== url) { schedule(200); return; }
+      running = true;
+      try {
+        words += await textCacheRef.current.count(doc, page++);
+        if (cancelled || docCache.current.doc !== doc) return;
+        if (page > doc.numPages) {
+          finished = true;
+          onWordCount(words);
+        }
+      } catch { finished = true; /* retain the last complete count */ }
+      finally {
+        running = false;
+        if (!cancelled && !finished) schedule(30);
+      }
+    };
+    const visible = () => { if (!document.hidden) schedule(0); };
+    document.addEventListener('visibilitychange', visible);
+    schedule(1200);
     return () => {
       cancelled = true;
       clearTimeout(timer);
-      const cancelIdle = (window as unknown as { cancelIdleCallback?: (h: number) => void }).cancelIdleCallback;
-      if (idle && cancelIdle) cancelIdle(idle);
+      if (idle) window.cancelIdleCallback?.(idle);
+      document.removeEventListener('visibilitychange', visible);
     };
   }, [url, onWordCount]);
 
@@ -690,8 +767,8 @@ function PdfPreview(
   // instant into a four-second wait on this machine and nearly ten on a slower
   // one. So the pages nobody has looked at are filled in quietly instead: after
   // the typing stops, one page per idle slice, abandoned the moment the next
-  // compile arrives. Sync stays instant, and the work happens when the editor
-  // has nothing else to do.
+  // compile arrives. Bound speculative work: a long paper must not build every
+  // text layer in the background, especially on software-rendered WebKit.
   useEffect(() => {
     if (!url) return;
     let cancelled = false;
@@ -699,18 +776,20 @@ function PdfPreview(
     const ric = (window as unknown as { requestIdleCallback?: (cb: (d: { timeRemaining(): number }) => void, o?: { timeout: number }) => number }).requestIdleCallback;
     const cancelIdle = (window as unknown as { cancelIdleCallback?: (h: number) => void }).cancelIdleCallback;
     const fill = async () => {
-      if (cancelled) return;
+      if (cancelled || document.hidden) return;
       const token = renderTokenRef.current;
       const pass = textPassRef.current;
+      let warmed = 0;
       for (let i = 1; i <= slotsRef.current.length; i++) {
-        if (cancelled || token !== renderTokenRef.current || pass !== textPassRef.current) return;
+        if (cancelled || document.hidden || warmed >= 8 || token !== renderTokenRef.current || pass !== textPassRef.current) return;
         if (slotsRef.current[i - 1]?.textRendered) continue;
         await buildTextLayer(i, token, pass);
+        warmed++;
         // Back to the queue between pages: a keystroke, a scroll or the next
         // compile all get to go first.
         await new Promise<void>(resolve => {
           if (ric) ric(() => resolve(), { timeout: 500 });
-          else setTimeout(resolve, 0);
+          else setTimeout(resolve, 100);
         });
       }
     };
@@ -728,6 +807,8 @@ function PdfPreview(
   // Destroy the last-held PDF document when the preview unmounts (workspace
   // switch, app close) so it doesn't linger with its worker transport.
   useEffect(() => () => {
+    clearTimeout(flashTimer.current);
+    for (const slot of slotsRef.current) releaseBitmap(slot);
     const d = docCache.current.doc;
     docCache.current = { url: null, doc: null, naturalW: docCache.current.naturalW };
     documentWordIndexRef.current = null;

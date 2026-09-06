@@ -125,6 +125,12 @@ assert.equal(lineDirection('#set text(lang: "he")'), 'ltr');
 // Nothing strong at all falls back rather than guessing.
 assert.equal(lineDirection(''), 'ltr');
 assert.equal(lineDirection('   123 ...'), 'ltr');
+assert.equal(lineDirection('١٢٣ English text'), 'ltr');
+assert.equal(lineDirection('۱۲۳ English text'), 'ltr');
+assert.equal(lineDirection('\u05b0 English text'), 'ltr');
+assert.equal(lineDirection('\u064e English text'), 'ltr');
+assert.equal(lineDirection('١٢٣ שלום'), 'rtl');
+assert.equal(lineDirection('۱۲۳ مرحبا'), 'rtl');
 // A mark at the start is how you flip a line by hand.
 assert.equal(lineDirection('\u200f123 ILS'), 'rtl');
 assert.equal(lineDirection('\u200eשלום'), 'ltr');

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { embeddableInTypst, getInterpreter, setInterpreter } from '../prefs';
 
 import { API, useWorkspaceAsset } from '../api';
@@ -110,6 +110,11 @@ const EQ_TEMPLATES: Record<Lang, { label: string; code: string }[]> = {
     { label: 'Derivative', code: 'diff(sin(x**2), x)' },
     { label: 'Integral', code: 'integrate(1/(1 + x**2), x)' },
     { label: 'Simplify', code: 'simplify((x**2 - 1)/(x - 1))' },
+    { label: 'Solve a system', code: 'solve([Eq(x + y, 3), Eq(x - y, 1)], [x, y])' },
+    { label: 'Matrix inverse', code: 'A = Matrix([[2, 1], [1, 3]])\nA.inv()' },
+    { label: 'Series expansion', code: 'series(sin(x), x, 0, 7)' },
+    { label: 'Differential equation', code: 'f = Function("f")\ndsolve(Eq(diff(f(x), x, 2) + f(x), 0))' },
+    { label: 'Assumptions', code: 'x = symbols("x", positive=True)\nsimplify(sqrt(x**2))' },
   ],
   julia: [
     { label: 'Expression', code: '(x + y)^2' },
@@ -128,7 +133,7 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
   const [lang, setLang] = useState<Lang>(initialLang ?? 'python');
   const [bin, setBin] = useState<string>('');
   const [outputMode, setOutputMode] = useState<'text' | 'equation'>(initialMode ?? 'text');
-  const [code, setCode] = useState(initialCode ?? TEMPLATES[initialLang ?? 'python'][0].code);
+  const [code, setCode] = useState(initialCode ?? (initialMode === 'equation' ? EQ_TEMPLATES : TEMPLATES)[initialLang ?? 'python'][0].code);
   const [includeCode, setIncludeCode] = useState(true);
   // A stable name for this runner session so re-runs update one file instead of
   // spawning a new one each time.
@@ -136,17 +141,27 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
   const [savedPath, setSavedPath] = useState<string | null>(null);
   const templatesFor = (l: Lang, mode: 'text' | 'equation') => (mode === 'equation' ? EQ_TEMPLATES : TEMPLATES)[l];
   const [running, setRunning] = useState(false);
-  const [result, setResult] = useState<RunResult | null>(null);
+  const [completedResult, setResult] = useState<RunResult | null>(null);
+  const [resultInput, setResultInput] = useState('');
+  const [toolsError, setToolsError] = useState('');
+  const runController = useRef<AbortController | null>(null);
+  const inputKey = JSON.stringify([lang, code, bin, outputMode]);
+  const result = resultInput === inputKey ? completedResult : null;
 
   useEffect(() => {
-    fetch(`${API}/tools`).then(r => r.json()).then((t: Tools) => {
+    const controller = new AbortController();
+    fetch(`${API}/tools`, { signal: controller.signal }).then(r => {
+      if (!r.ok) throw new Error('Could not detect installed interpreters. Reopen this tool to retry.');
+      return r.json();
+    }).then((t: Tools) => {
       setTools(t);
       let l = initialLang ?? lang;
-      if (!t.available[l]) { l = (['python', 'julia', 'wolfram'] as Lang[]).find(x => t.available[x]) ?? l; setLang(l); if (!initialCode) setCode(TEMPLATES[l][0].code); }
+      if (!t.available[l]) { l = (['python', 'julia', 'wolfram'] as Lang[]).find(x => t.available[x]) ?? l; setLang(l); if (!initialCode) setCode(templatesFor(l, initialMode ?? 'text')[0].code); }
       const saved = getInterpreter(l);
       const opts = t.interpreters[l] || [];
       setBin(opts.find(o => o.path === saved)?.path || opts[0]?.path || '');
-    }).catch(() => {});
+    }).catch(error => { if (!controller.signal.aborted) setToolsError(error.message || 'Could not detect installed interpreters.'); });
+    return () => { controller.abort(); runController.current?.abort(); };
   }, []);
 
   const switchLang = (l: Lang) => {
@@ -164,16 +179,23 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
   };
 
   const run = async () => {
+    if (runController.current || !tools?.execEnabled || !code.trim()) return;
+    const controller = new AbortController();
+    runController.current = controller;
+    setResultInput(inputKey);
     setRunning(true); setResult(null);
+    setSavedPath(null);
     // Keep every run: persist the current snippet into codes/<lang>/ before it runs.
     const path = `codes/${lang}/${snippetName}.${LANG_EXT[lang]}`;
     try {
-      await fetch(`${API}/workspace/file?path=${encodeURIComponent(path)}`, { method: 'POST', body: code, headers: { 'Content-Type': 'text/plain' } });
-      setSavedPath(path);
-      await onChanged?.([path]);
+      const saved = await fetch(`${API}/workspace/file?path=${encodeURIComponent(path)}`, { method: 'POST', body: code, headers: { 'Content-Type': 'text/plain' }, signal: controller.signal });
+      if (saved.ok) {
+        setSavedPath(path);
+        await onChanged?.([path]);
+      }
     } catch { /* saving is best-effort; a run should still proceed offline */ }
     try {
-      const res = await fetch(`${API}/run`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lang, code, bin, outputMode }) });
+      const res = await fetch(`${API}/run`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lang, code, bin, outputMode }), signal: controller.signal });
       const data = await res.json();
       if (!res.ok) { setResult(limitRunResult({ ok: false, stdout: '', stderr: data.error || 'Failed.', images: [] })); }
       else {
@@ -181,8 +203,8 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
         setResult(limitRunResult(data));
       }
     } catch {
-      setResult({ ok: false, stdout: '', stderr: 'Could not reach the local server.', images: [] });
-    } finally { setRunning(false); }
+      if (!controller.signal.aborted) setResult({ ok: false, stdout: '', stderr: 'Could not reach the local server.', images: [] });
+    } finally { runController.current = null; setRunning(false); }
   };
 
   const codeBlock = () => '```' + LANG_FENCE[lang] + '\n' + code.trim() + '\n```\n';
@@ -217,6 +239,7 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
           <button className="close-btn" onClick={onClose}>×</button>
         </div>
         <div className="modal-body">
+          {toolsError && <div role="alert" className="form-hint">{toolsError}</div>}
           {tools && !tools.execEnabled && (
             <div className="form-hint" style={{ color: '#fca5a5' }}>
               {tools.execRefusal || 'Code execution is disabled on this server (ALLOW_CODE_EXECUTION=0).'}
@@ -231,7 +254,7 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
           <div className="form-row" style={{ alignItems: 'flex-end' }}>
             <label className="form-field" style={{ maxWidth: 150 }}>
               <span>Language</span>
-              <select value={lang} onChange={e => switchLang(e.target.value as Lang)}>
+              <select value={lang} disabled={running} onChange={e => switchLang(e.target.value as Lang)}>
                 {(['python', 'julia', 'wolfram'] as Lang[]).map(l => (
                   <option key={l} value={l} disabled={tools ? !tools.available[l] : false}>
                     {l === 'wolfram' ? 'Wolfram' : l[0].toUpperCase() + l.slice(1)}{tools && !tools.available[l] ? ' (n/a)' : ''}
@@ -241,21 +264,21 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
             </label>
             <label className="form-field">
               <span>Environment</span>
-              <select value={bin} onChange={e => { setBin(e.target.value); setInterpreter(lang, e.target.value); }}>
+              <select value={bin} disabled={running} onChange={e => { setBin(e.target.value); setInterpreter(lang, e.target.value); }}>
                 {interpOptions.map(o => <option key={o.path} value={o.path}>{o.label}</option>)}
                 {interpOptions.length === 0 && <option>None detected</option>}
               </select>
             </label>
             <label className="form-field" style={{ maxWidth: 140 }}>
               <span>Output</span>
-              <select value={outputMode} onChange={e => switchMode(e.target.value as any)}>
+              <select value={outputMode} disabled={running} onChange={e => switchMode(e.target.value as any)}>
                 <option value="text">Text</option>
                 <option value="equation" disabled={lang === 'julia'}>Equation (auto-LaTeX)</option>
               </select>
             </label>
             <label className="form-field" style={{ maxWidth: 150 }}>
               <span>Template</span>
-              <select onChange={e => { const t = templatesFor(lang, outputMode)[Number(e.target.value)]; if (t) setCode(t.code); }} value="">
+              <select disabled={running} onChange={e => { const t = templatesFor(lang, outputMode)[Number(e.target.value)]; if (t) setCode(t.code); }} value="">
                 <option value="" disabled>Examples…</option>
                 {templatesFor(lang, outputMode).map((t, i) => <option key={i} value={i}>{t.label}</option>)}
               </select>
@@ -266,7 +289,7 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
           )}
 
           <div style={{ display: 'flex', gap: 14, alignItems: 'center', margin: '2px 0' }}>
-            <button className="btn-primary" onClick={run} disabled={running || (tools ? !tools.execEnabled : false)}>{running ? 'Running…' : `▶ Run`}</button>
+            <button className="btn-primary" onClick={run} disabled={running || !tools?.execEnabled || !tools.available[lang] || !code.trim()}>{running ? 'Running…' : `▶ Run`}</button>
             <label className="form-check"><input type="checkbox" checked={includeCode} onChange={e => setIncludeCode(e.target.checked)} /> Include source code in document</label>
             {savedPath && <span className="form-hint" style={{ margin: 0, opacity: 0.7 }} title="Every run is kept in the project">💾 saved to <code>{savedPath}</code></span>}
           </div>
@@ -275,7 +298,7 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
           <div style={{ display: 'flex', gap: 14, alignItems: 'stretch' }}>
             <label className="form-field" style={{ flex: 1, minWidth: 0, marginBottom: 0 }}>
               <span>Code</span>
-              <textarea value={code} onChange={e => setCode(e.target.value)} style={{ minHeight: 260, height: '100%', fontSize: '0.85rem', resize: 'vertical' }} spellCheck={false} />
+              <textarea dir="ltr" value={code} onChange={e => setCode(e.target.value)} style={{ minHeight: 260, height: '100%', fontSize: '0.85rem', resize: 'vertical' }} spellCheck={false} />
             </label>
             <div className="form-field" style={{ flex: 1, minWidth: 0, marginBottom: 0, display: 'flex', flexDirection: 'column' }}>
               <span>Output {result?.interpreter ? `· ${result.interpreter}` : ''} {result?.timedOut ? '(timed out)' : ''}</span>
@@ -303,14 +326,14 @@ export default function CodeRunnerModal({ onClose, onInsert, onInsertEquation, o
               {result.outputTruncated && outputMode === 'equation' && (
                 <span className="form-hint">The generated equation is too large to insert safely; refine the output and run it again.</span>
               )}
-              {outputMode === 'equation' && onInsertEquation && result.stdout.trim() && !result.outputTruncated ? (
+              {outputMode === 'equation' && onInsertEquation && result.ok && result.stdout.trim() && !result.outputTruncated ? (
                 <button className="btn-primary" onClick={() => { onInsertEquation(result.stdout, includeCode ? codeBlock() : undefined); onClose(); }} title="Render the output as a typeset Typst equation (with the source code if checked)">
                   Insert {includeCode ? 'code + equation' : 'equation'}
                 </button>
               ) : (
                 <>
                   {(result.stdout.trim() || includeCode) && <button className="btn-ghost" onClick={insertText}>Insert {includeCode ? 'code + output' : 'output'}</button>}
-                  {onInsertEquation && result.stdout.trim() && !result.outputTruncated && (
+                  {onInsertEquation && result.ok && result.stdout.trim() && !result.outputTruncated && (
                     <button className="btn-primary" onClick={() => { onInsertEquation(result.stdout, includeCode ? codeBlock() : undefined); onClose(); }} title="Render the output (LaTeX) as a typeset equation via mitex">
                       Insert as equation
                     </button>

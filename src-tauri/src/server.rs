@@ -169,6 +169,7 @@ pub struct AppState {
     pub allow_exec: bool,
     pub exec_timeout_ms: u64,
     source_generation: AtomicU64,
+    lint_generation: AtomicU64,
     preview_watcher: tokio::sync::Mutex<Option<PreviewWatcher>>,
     pub compile_gate: tokio::sync::Semaphore,
     pub render_gate: tokio::sync::Semaphore,
@@ -410,6 +411,7 @@ impl AppState {
             allow_exec: std::env::var("ALLOW_CODE_EXECUTION").ok().as_deref() != Some("0"),
             exec_timeout_ms: std::env::var("EXEC_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(45000),
             source_generation: AtomicU64::new(0),
+            lint_generation: AtomicU64::new(0),
             preview_watcher: tokio::sync::Mutex::new(None),
             compile_gate: tokio::sync::Semaphore::new(1),
             render_gate: tokio::sync::Semaphore::new(2),
@@ -486,6 +488,12 @@ impl AppState {
 
     pub fn api_token(&self) -> &str {
         &self.api_token
+    }
+
+    fn preview_path(&self, ws: &Path, direct: bool) -> PathBuf {
+        let id = Sha256::digest(self.session_file.to_string_lossy().as_bytes());
+        let id: String = id[..12].iter().map(|byte| format!("{byte:02x}")).collect();
+        hilbert_dir(ws).join(format!("preview-{id}{}.pdf", if direct { "-direct" } else { "" }))
     }
 
     // Everything the user may run right now: what we found on the system, the
@@ -2197,7 +2205,7 @@ async fn ensure_preview_watcher(
     // Typst knows exactly which files the document is built from; ask it to
     // write them down. Which files belong to the project is what tells the
     // editor whether a chapter should be read on its own or as part of the whole.
-    cmd.arg("--deps").arg(deps_path(ws)).arg("--deps-format").arg("make");
+    cmd.arg("--deps").arg(main_deps_path(ws, main_path)).arg("--deps-format").arg("make");
     cmd.arg(main_path)
         .arg(output_path)
         .current_dir(ws)
@@ -2347,7 +2355,7 @@ async fn compile_once(ws: &Path, main_path: &Path, output_path: &Path) -> Respon
         compile_args.push("fonts".into());
     }
     compile_args.push("--deps".into());
-    compile_args.push(deps_path(ws).to_string_lossy().into_owned());
+    compile_args.push(main_deps_path(ws, main_path).to_string_lossy().into_owned());
     compile_args.push("--deps-format".into());
     compile_args.push("make".into());
     compile_args.push(main_path.to_string_lossy().into_owned());
@@ -2404,7 +2412,7 @@ async fn compile(State(st): St, Query(q): Q, body: Bytes) -> Response {
         return json_err(StatusCode::BAD_REQUEST, "Invalid main path");
     };
     ensure_hilbert(&ws);
-    let output_path = hilbert_dir(&ws).join("out.pdf");
+    let output_path = st.preview_path(&ws, false);
     let body_str = String::from_utf8_lossy(&body);
     if !body_str.trim().is_empty() && write_atomic(&main_path, body_str.as_bytes()).is_ok() {
         st.note_write();
@@ -2422,7 +2430,7 @@ async fn compile(State(st): St, Query(q): Q, body: Bytes) -> Response {
         }
         // A separate output file, so this never races the watcher writing its own.
         WatchCompileResult::Direct => {
-            compile_once(&ws, &main_path, &hilbert_dir(&ws).join("out-direct.pdf")).await
+            compile_once(&ws, &main_path, &st.preview_path(&ws, true)).await
         }
         WatchCompileResult::Fallback => {
             stop_preview_watcher(&st).await;
@@ -4085,6 +4093,10 @@ fn ext_for(lang: &str) -> Option<&'static str> {
 // Auto-convert a result to LaTeX so users write plain maths and still get a
 // typeset equation — without writing TeXForm / latex() themselves.
 fn wrap_for_equation(lang: &str, code: &str) -> String {
+    if lang == "python" {
+        return format!("{}\nprint(equation_output({}))\n",
+            include_str!("equation.py"), serde_json::to_string(code).unwrap());
+    }
     let lines: Vec<&str> = code
         .split('\n')
         .map(str::trim)
@@ -4095,11 +4107,6 @@ fn wrap_for_equation(lang: &str, code: &str) -> String {
     }
     match lang {
         "wolfram" => format!("Print[ToString[TeXForm[(\n{}\n)]]]", lines.join(";\n")),
-        "python" => {
-            let last = lines[lines.len() - 1];
-            let setup = lines[..lines.len() - 1].join("\n");
-            format!("from sympy import *\nx, y, z, t, n, k, a, b, c = symbols('x y z t n k a b c')\n{setup}\nprint(latex({last}))")
-        }
         "julia" => {
             let last = lines[lines.len() - 1];
             let setup = lines[..lines.len() - 1].join("\n");
@@ -4222,6 +4229,31 @@ fn image_stats(dir: &Path) -> HashMap<String, f64> {
 fn hilbert_dir(ws: &Path) -> PathBuf { ws.join(".hilbert") }
 // Where typst writes the list of files the document is built from.
 fn deps_path(ws: &Path) -> PathBuf { hilbert_dir(ws).join("deps.make") }
+
+fn main_deps_path(ws: &Path, main: &Path) -> PathBuf {
+    let main = main.strip_prefix(ws).unwrap_or(main);
+    // Frontend paths use '/', including on Windows; disk paths may use '\\'.
+    let key = main.components().map(|part| part.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
+    let id = Sha256::digest(key.as_bytes());
+    let id: String = id[..12].iter().map(|byte| format!("{byte:02x}")).collect();
+    hilbert_dir(ws).join(format!("deps-{id}.make"))
+}
+
+async fn last_preview(State(st): St) -> Response {
+    let ws = st.ws();
+    let paths = [st.preview_path(&ws, false), st.preview_path(&ws, true)];
+    let bytes = tokio::task::spawn_blocking(move || {
+        let path = paths.into_iter().filter_map(|path| {
+            let stamp = fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+            Some((stamp, path))
+        }).max_by_key(|(stamp, _)| *stamp);
+        path.and_then(|(_, path)| read_file_limited(&path, MAX_PDF_PREVIEW_BYTES).ok().flatten())
+    }).await.unwrap_or(None);
+    match bytes {
+        Some(bytes) => ([(header::CONTENT_TYPE, "application/pdf")], bytes).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
 fn hilbert_run(ws: &Path) -> PathBuf { hilbert_dir(ws).join("run") }
 
 // Python/Julia logos used to badge code blocks in the compiled PDF. Written into
@@ -5987,20 +6019,20 @@ fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
 /// inside a path is backslash-escaped and a `$` is doubled. Anything outside the
 /// workspace (a package from the cache) is left out; the question this answers
 /// is only ever about files the editor can open.
-fn project_files(ws: &Path) -> Arc<HashSet<String>> {
+fn project_files(ws: &Path, main: &str) -> Arc<HashSet<String>> {
     // Asked on every diagnostics request, which is every pause in typing, and
     // the answer only changes when typst recompiles. Keyed on the file's write
     // time so a recompile is picked up and nothing else costs a read.
     static CACHE: LazyLock<Mutex<HashMap<PathBuf, (Option<SystemTime>, Arc<HashSet<String>>)>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
-    let path = deps_path(ws);
+    let path = if main.is_empty() { deps_path(ws) } else { main_deps_path(ws, Path::new(main)) };
     let stamp = fs::metadata(&path).and_then(|m| m.modified()).ok();
     if let Some(hit) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&path)
         && hit.0 == stamp
     {
         return hit.1.clone();
     }
-    let files = Arc::new(read_project_files(ws));
+    let files = Arc::new(read_project_files(ws, &path));
     CACHE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -6008,9 +6040,9 @@ fn project_files(ws: &Path) -> Arc<HashSet<String>> {
     files
 }
 
-fn read_project_files(ws: &Path) -> HashSet<String> {
+fn read_project_files(ws: &Path, deps: &Path) -> HashSet<String> {
     let mut out = HashSet::new();
-    let Ok(text) = fs::read_to_string(deps_path(ws)) else { return out };
+    let Ok(text) = fs::read_to_string(deps) else { return out };
     for (index, token) in make_tokens(&text).into_iter().enumerate() {
         // The first token is the target — the PDF — and carries the colon.
         if index == 0 && token.ends_with(':') {
@@ -6178,6 +6210,70 @@ But @eq:real is.
 mod dependency_list_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn queued_proofreading_skips_superseded_text() {
+        let dir = unique_temp_dir("hilbert-lint-queue-test").unwrap();
+        let state = Arc::new(AppState::new(dir.clone(), None));
+        let reached = |want: u64| {
+            let state = state.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while state.lint_generation.load(Ordering::Acquire) < want { tokio::task::yield_now().await; }
+                }).await.unwrap();
+            }
+        };
+        // Held so both passes below are still queued when the assertions run.
+        let permit = LINT_GATE.clone().acquire_owned().await.unwrap();
+
+        let old_state = state.clone();
+        let old = tokio::spawn(async move {
+            lint_text(State(old_state), Bytes::from_static(br#"{"text":"Outdated text."}"#)).await
+        });
+        reached(1).await;
+
+        // Asking whether proofreading exists is not a newer piece of work. If it
+        // counted as one, toggling the feature while a long document was queued
+        // would answer that queued pass with a conflict, and the editor reads a
+        // failed lint as "this build has no proofreading" and switches it off.
+        let probe = lint_text(State(state.clone()), Bytes::from_static(br#"{"text":"   "}"#)).await;
+        assert_eq!(probe.status(), StatusCode::OK);
+        assert_eq!(state.lint_generation.load(Ordering::Acquire), 1, "a probe must not supersede queued work");
+
+        let new_state = state.clone();
+        let fresh = tokio::spawn(async move {
+            lint_text(State(new_state), Bytes::from_static(br#"{"text":"Fresh text."}"#)).await
+        });
+        reached(2).await;
+
+        drop(permit);
+        assert_eq!(old.await.unwrap().status(), StatusCode::CONFLICT);
+        assert_eq!(fresh.await.unwrap().status(), StatusCode::OK);
+        release_workspace_user(&dir);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn window_previews_and_entry_dependencies_are_isolated() {
+        let dir = unique_temp_dir("hilbert-window-preview-test").unwrap();
+        let mut first = AppState::new(dir.clone(), None);
+        first.session_file = dir.join("first-session.json");
+        let mut second = AppState::new(dir.clone(), None);
+        second.session_file = dir.join("second-session.json");
+        assert_ne!(first.preview_path(&dir, false), second.preview_path(&dir, false));
+        assert_ne!(first.preview_path(&dir, false), first.preview_path(&dir, true));
+        assert_eq!(main_deps_path(&dir, &dir.join("main.typ")), main_deps_path(&dir, Path::new("main.typ")));
+        assert_eq!(main_deps_path(&dir, &dir.join("chapters").join("one.typ")), main_deps_path(&dir, Path::new("chapters/one.typ")));
+        fs::create_dir_all(hilbert_dir(&dir)).unwrap();
+        fs::write(main_deps_path(&dir, Path::new("main.typ")), "preview.pdf: main.typ chapter.typ\n").unwrap();
+        fs::write(main_deps_path(&dir, Path::new("slides.typ")), "preview.pdf: slides.typ figures.typ\n").unwrap();
+        assert!(project_files(&dir, "main.typ").contains("chapter.typ"));
+        assert!(!project_files(&dir, "main.typ").contains("figures.typ"));
+        assert!(project_files(&dir, "slides.typ").contains("figures.typ"));
+        release_workspace_user(&dir);
+        release_workspace_user(&dir);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn reads_the_paths_out_of_a_make_dependency_line() {
         let dir = unique_temp_dir("hilbert-deps-test").unwrap();
@@ -6193,7 +6289,7 @@ mod dependency_list_tests {
         );
         fs::write(deps_path(&ws), line).unwrap();
 
-        let files = project_files(&ws);
+        let files = project_files(&ws, "");
         for expected in ["main.typ", "chapters/one two.typ", "refs.bib", "money$.typ", "assets/logo.svg"] {
             assert!(files.contains(expected), "missing {expected:?} in {files:?}");
         }
@@ -6215,7 +6311,7 @@ mod dependency_list_tests {
         )
         .unwrap();
 
-        let files = project_files(&ws);
+        let files = project_files(&ws, "");
         assert_eq!(*files, HashSet::from(["main.typ".to_string()]), "got {files:?}");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -6223,7 +6319,7 @@ mod dependency_list_tests {
     #[test]
     fn no_compile_yet_means_no_claims_about_the_project() {
         let dir = unique_temp_dir("hilbert-deps-empty").unwrap();
-        assert!(project_files(&dir.join("project")).is_empty());
+        assert!(project_files(&dir.join("project"), "").is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }
@@ -6657,7 +6753,7 @@ async fn lsp_diagnostics(State(st): St, body: Bytes) -> Response {
     // counts as part of its own project: unpinning to look at it would make
     // tinymist throw the analysis away and build it again on the way back.
     let main = jstr(&v, "main").unwrap_or("");
-    let pin = (!main.is_empty() && (main == file || project_files(&ws).contains(file)))
+    let pin = (!main.is_empty() && (main == file || project_files(&ws, main).contains(file)))
         .then(|| safe_workspace_path(&ws, main))
         .flatten()
         .filter(|path| path.is_file());
@@ -6792,7 +6888,7 @@ fn prose_only(line: &str) -> String {
 
 /// Everything the project's sources name and refer to.
 fn read_label_graph(ws: &Path, main: &str) -> Value {
-    let mut files: Vec<String> = project_files(ws)
+    let mut files: Vec<String> = project_files(ws, main)
         .iter()
         .filter(|f| f.ends_with(".typ"))
         .cloned()
@@ -7004,7 +7100,9 @@ async fn label_graph(State(st): St, Query(q): Q) -> Response {
 // Proofreading: spelling (spellbook / Nuspell-compatible) + grammar & style
 // (harper-core with a Typst-aware parser). Runs on a blocking thread so the
 // dictionary work never stalls the async runtime.
-async fn lint_text(body: Bytes) -> Response {
+static LINT_GATE: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+
+async fn lint_text(State(st): St, body: Bytes) -> Response {
     // The spell/grammar dictionaries cost ~150 MB resident, and proofreading is off
     // by default, so nothing is loaded until the feature is actually used. The client
     // probes this route the moment the user switches proofreading on, and that probe
@@ -7024,7 +7122,19 @@ async fn lint_text(body: Bytes) -> Response {
     if text.trim().is_empty() {
         return Json(json!({ "issues": [], "reading": reading })).into_response();
     }
-    let issues = tokio::task::spawn_blocking(move || crate::proofread::lint(&text, &how)).await.unwrap_or_default();
+    // Counted only once there is something to proofread. The client also calls
+    // this route with an empty body to ask whether proofreading exists at all,
+    // and that question must not cancel a pass someone is waiting on.
+    let generation = st.lint_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    let Ok(permit) = LINT_GATE.clone().acquire_owned().await else { return StatusCode::SERVICE_UNAVAILABLE.into_response() };
+    if generation != st.lint_generation.load(Ordering::Acquire) {
+        return json_err(StatusCode::CONFLICT, "A newer proofreading request superseded this one.");
+    }
+    let issues = tokio::task::spawn_blocking(move || {
+        // Keep the permit in the worker even if the requesting window disconnects.
+        let _permit = permit;
+        crate::proofread::lint(&text, &how)
+    }).await.unwrap_or_default();
     Json(json!({ "issues": issues, "reading": reading })).into_response()
 }
 
@@ -7075,7 +7185,11 @@ async fn lint_suggest(body: Bytes) -> Response {
         return Json(json!({ "suggestions": {} })).into_response();
     }
     let how = crate::proofread::Reading::of(jstr(&v, "lang").unwrap_or("en"), jstr(&v, "region").unwrap_or(""));
-    let pairs = tokio::task::spawn_blocking(move || crate::proofread::suggest_words(&words, &how)).await.unwrap_or_default();
+    let Ok(permit) = LINT_GATE.clone().acquire_owned().await else { return StatusCode::SERVICE_UNAVAILABLE.into_response() };
+    let pairs = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        crate::proofread::suggest_words(&words, &how)
+    }).await.unwrap_or_default();
     let map: serde_json::Map<String, Value> = pairs.into_iter().map(|(w, s)| (w, json!(s))).collect();
     Json(json!({ "suggestions": map })).into_response()
 }
@@ -7397,6 +7511,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/workspace/file", get(workspace_file_get).post(workspace_file_post).delete(workspace_file_delete).layer(DefaultBodyLimit::max(16 * 1024 * 1024)))
         .route("/workspace/file/state", get(workspace_file_state))
         .route("/workspace/files/state", post(workspace_files_state))
+        .route("/preview/last", get(last_preview))
         .route("/workspace/mkdir", post(workspace_mkdir))
         .route("/workspace/upload", post(workspace_upload).layer(DefaultBodyLimit::max(50 * 1024 * 1024)))
         .route("/workspace/save-image", post(workspace_save_image).layer(DefaultBodyLimit::max(50 * 1024 * 1024)))
