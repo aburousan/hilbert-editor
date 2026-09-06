@@ -4,6 +4,59 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.2.5
+
+Double-clicking an equation number in the preview lands on that equation now, not the nth block. Proofreading runs one pass at a time rather than one per keystroke. Every ready-made equation is checked against Typst. And the icon is visible again on dark Windows themes.
+
+### Preview and source stay in step
+
+Clicking an equation number used to count block equations and land on the nth
+one, which is only right in a document where every block is numbered. It now
+reads the number the equation actually carries. Words are matched by their share
+of a span rather than by the whole span, so clicking one word in a run no longer
+selects its neighbour.
+
+Two windows used to write their preview to the same file, and two different main
+files to the same dependency list. Both are keyed per window and per entry point
+now. The second was why following a link into another file could report a
+compile error that was not there.
+
+### Proofreading no longer piles up
+
+A long document was proofread once per keystroke, each pass loading the same
+150 MB of dictionaries and none of them cancelled. One pass runs at a time now,
+a pass overtaken by a newer edit is dropped rather than run, and a superseded
+request is cancelled rather than left to finish unread. Asking whether
+proofreading is available no longer counts as newer work, so the question can
+no longer cancel a pass you are waiting on.
+
+### The Insert menus produce code that compiles
+
+Every ready-made equation in the three menus is compiled against Typst as part
+of the test suite, once without the physica package and once with it. That
+caught a Wilson-loop entry using `expval` without asking for the import, which
+inserted an equation that could not compile.
+
+Where a preamble line goes is now decided by counting brackets rather than by
+reading one line at a time. A `#set page(...)` written across several lines has
+a first line that looks like preamble and a second that does not, so an import
+added by the pinit or page-setup items landed inside the function call. The
+Feynman and diagram builders hand their cetz import over to be placed at the top
+once, instead of pasting it at the cursor for every diagram.
+
+### Smaller things
+
+One drag of the Feynman builder's Bend slider is one undo, rather than forty.
+The icon carries its coloured badge at every size, so it is no longer an
+invisible black glyph on a dark Windows taskbar. Python equation mode reads the
+code with Python's own parser and prints through SymPy, so multi-line
+expressions, assignments and function bodies keep their meaning. Arabic-Indic
+digits and combining marks no longer decide a line's writing direction before
+its first letter. The About dialog offers UPI alongside GitHub Sponsors, because
+Indian cards are routinely refused by international card processors.
+
+---
+
 ## 0.2.4
 
 Spelling now follows the language you write in: say so with
