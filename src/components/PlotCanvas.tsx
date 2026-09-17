@@ -298,4 +298,3 @@ export default function PlotCanvas({ curves, view, rightView, onView, height = 4
     </div>
   );
 }
-

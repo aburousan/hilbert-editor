@@ -35,4 +35,3 @@ export const prettyLabel = (raw: string): string => {
   text = text.replace(/_(?:\{([^{}]*)\}|([A-Za-z0-9]+|[-+]))/g, scripted(SUBS, '_'));
   return text.replace(/\u0000(\d+)\u0000/g, (_, i) => quoted[Number(i)]);
 };
-

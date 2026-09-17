@@ -93,4 +93,3 @@ export function settle(nodes: Placed[], edges: Edge[], rounds = 320) {
     }
   }
 }
-
