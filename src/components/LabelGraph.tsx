@@ -11,100 +11,44 @@
 // having to lay them out.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { API } from '../api';
+import { HEIGHT, layout, settle, widthFor, type Placed } from '../labelLayout';
+import type { Graph, Node as Label } from './labelGraphTypes';
 
-type Node = {
-  id: string;
-  /// Section nodes carry a heading to show; labels are known by their id.
-  title?: string;
-  kind: string;
-  file: string;
-  line: number;
-  section: string;
-  referenced: number;
-  defined: number;
+// Two palettes: pale colours vanish on a white page, and dark ones vanish on a
+// black one. Which is in use is read from the page rather than from a setting,
+// so a theme Hilbert gains later is handled too.
+type Palette = { kinds: Record<string, string>; other: string; section: string };
+const DARK_PALETTE: Palette = {
+  kinds: { eq: '#60a5fa', fig: '#34d399', tab: '#fbbf24', sec: '#c084fc', thm: '#f87171', lst: '#fb923c' },
+  other: '#94a3b8',
+  section: '#8b93a7',
 };
-type Edge = { from: string; to: string; file: string; line: number; uses: number };
-type Missing = { id: string; uses: number; file: string; line: number };
-type Graph = { nodes: Node[]; edges: Edge[]; missing: Missing[]; files: string[] };
-
-type Placed = Node & { x: number; y: number; vy: number; home: number; pinned: boolean };
-
-const KIND_COLOR: Record<string, string> = {
-  eq: '#60a5fa',
-  fig: '#34d399',
-  tab: '#fbbf24',
-  sec: '#c084fc',
-  thm: '#f87171',
-  lst: '#fb923c',
+const LIGHT_PALETTE: Palette = {
+  kinds: { eq: '#1d4ed8', fig: '#047857', tab: '#b45309', sec: '#6d28d9', thm: '#b91c1c', lst: '#c2410c' },
+  other: '#475569',
+  section: '#334155',
 };
-const OTHER = '#94a3b8';
-const SECTION = '#8b93a7';
-const colorOf = (kind: string) => (kind === 'section' ? SECTION : KIND_COLOR[kind] || OTHER);
+const isDarkPage = () => {
+  if (typeof window === 'undefined') return true;
+  const background = getComputedStyle(document.documentElement).getPropertyValue('--bg-color').trim();
+  const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(background);
+  let rgb: [number, number, number] | null = null;
+  if (hex) {
+    const digits = hex[1].length === 3 ? [...hex[1]].map(c => c + c) : hex[1].match(/../g)!;
+    rgb = digits.map(d => parseInt(d, 16)) as [number, number, number];
+  } else {
+    const parts = background.match(/[\d.]+/g);
+    if (parts && parts.length >= 3) rgb = parts.slice(0, 3).map(Number) as [number, number, number];
+  }
+  if (!rgb) return true;
+  return (0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]) < 140;
+};
+const colourFor = (palette: Palette, kind: string) =>
+  (kind === 'section' ? palette.section : palette.kinds[kind] || palette.other);
 const nameOf = (node: { kind: string; title?: string; id: string }) =>
   node.kind === 'section' ? node.title || node.id : node.id;
 
-const WIDTH = 1600;
-const HEIGHT = 1150;
 
-function layout(graph: Graph): Placed[] {
-  const order = [...graph.nodes].sort((a, b) =>
-    a.file.localeCompare(b.file) || a.line - b.line);
-  const span = Math.max(1, order.length - 1);
-  return order.map((node, at) => {
-    const home = 90 + (at / span) * (WIDTH - 260);
-    return {
-      ...node,
-      home,
-      x: home,
-      // A repeatable starting spread: the same document always opens the same
-      // way, which matters more here than an interesting one.
-      y: HEIGHT / 2 + Math.sin(at * 2.399) * HEIGHT * 0.32,
-      vy: 0,
-      pinned: false,
-    };
-  });
-}
-
-// A few hundred rounds of push and pull. Small enough to run in one go for the
-// dozens of labels a paper has, and it settles the same way every time.
-function settle(nodes: Placed[], edges: Edge[], rounds = 320) {
-  const at = new Map(nodes.map((n, i) => [n.id, i]));
-  for (let round = 0; round < rounds; round++) {
-    const cooling = 1 - round / rounds;
-    for (let i = 0; i < nodes.length; i++) {
-      const a = nodes[i];
-      if (a.pinned) continue;
-      let push = 0;
-      for (let j = 0; j < nodes.length; j++) {
-        if (i === j) continue;
-        const b = nodes[j];
-        const dx = a.x - b.x;
-        const dy = a.y - b.y;
-        const d2 = dx * dx + dy * dy;
-        if (d2 > 90000 || d2 < 0.01) continue;
-        push += (dy / Math.sqrt(d2)) * (44000 / d2);
-      }
-      a.vy += push;
-    }
-    for (const edge of edges) {
-      const i = at.get(edge.from);
-      const j = at.get(edge.to);
-      if (i === undefined || j === undefined) continue;
-      const a = nodes[i];
-      const b = nodes[j];
-      const pull = (a.y - b.y) * 0.012;
-      if (!a.pinned) a.vy -= pull;
-      if (!b.pinned) b.vy += pull;
-    }
-    for (const node of nodes) {
-      if (node.pinned) continue;
-      node.vy += (HEIGHT / 2 - node.y) * 0.004;   // keep it on the page
-      node.x += (node.home - node.x) * 0.25;       // hold document order
-      node.vy *= 0.82 * cooling + 0.1;
-      node.y = Math.max(40, Math.min(HEIGHT - 40, node.y + node.vy));
-    }
-  }
-}
 
 export default function LabelGraph({ mainFile, onClose, onOpen }: {
   mainFile: string;
@@ -118,6 +62,9 @@ export default function LabelGraph({ mainFile, onClose, onOpen }: {
   const [held, setHeld] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const [view, setView] = useState({ x: 0, y: 0, k: 1 });
+  const [palette, setPalette] = useState<Palette>(() => (isDarkPage() ? DARK_PALETTE : LIGHT_PALETTE));
+  const width = useMemo(() => widthFor(nodes.length), [nodes.length]);
+  const colourOf = useCallback((kind: string) => colourFor(palette, kind), [palette]);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const drag = useRef<{ id: string | null; x: number; y: number } | null>(null);
 
@@ -135,6 +82,13 @@ export default function LabelGraph({ mainFile, onClose, onOpen }: {
       .catch(e => !cancelled && setError(String(e)));
     return () => { cancelled = true; };
   }, [mainFile]);
+
+  // The window can be open while the theme changes underneath it.
+  useEffect(() => {
+    const watch = new MutationObserver(() => setPalette(isDarkPage() ? DARK_PALETTE : LIGHT_PALETTE));
+    watch.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme', 'class', 'style'] });
+    return () => watch.disconnect();
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
@@ -169,11 +123,35 @@ export default function LabelGraph({ mainFile, onClose, onOpen }: {
     return near;
   }, [shown, graph]);
 
+  // Where every arrow runs. Only the labels' positions can change this, so
+  // moving the pointer over the drawing does not rebuild any of it.
+  const arcs = useMemo(() => {
+    if (!graph) return [];
+    const out: Array<{ key: string; d: string; width: number; from: string; to: string }> = [];
+    graph.edges.forEach((edge, i) => {
+      const a = at.get(edge.from);
+      const b = at.get(edge.to);
+      if (!a || !b) return;
+      // A gentle arc, so two labels that refer to each other both ways do not
+      // draw one line on top of the other.
+      const mx = (a.x + b.x) / 2;
+      const my = (a.y + b.y) / 2 - Math.abs(a.x - b.x) * 0.12;
+      out.push({
+        key: `${edge.from}->${edge.to}-${i}`,
+        d: `M ${a.x} ${a.y} Q ${mx} ${my} ${b.x} ${b.y}`,
+        width: Math.min(3, 0.8 + edge.uses * 0.5),
+        from: edge.from,
+        to: edge.to,
+      });
+    });
+    return out;
+  }, [graph, at]);
+
   const refersTo = graph && shown ? graph.edges.filter(e => e.from === shown).map(e => e.to) : [];
   const referredFrom = graph && shown ? graph.edges.filter(e => e.to === shown).map(e => e.from) : [];
 
   const query = search.trim().toLowerCase();
-  const matches = useCallback((n: Node) =>
+  const matches = useCallback((n: Label) =>
     !query || n.id.toLowerCase().includes(query) || n.section.toLowerCase().includes(query), [query]);
 
   // How far a pointer movement carries in the drawing's own units. Only the
@@ -183,7 +161,7 @@ export default function LabelGraph({ mainFile, onClose, onOpen }: {
   const perPixel = () => {
     const box = svgRef.current?.getBoundingClientRect();
     if (!box || !box.width || !box.height) return null;
-    return { x: WIDTH / box.width, y: HEIGHT / box.height };
+    return { x: width / box.width, y: HEIGHT / box.height };
   };
 
   const onPointerDown = (e: React.PointerEvent, id: string | null) => {
@@ -270,7 +248,7 @@ export default function LabelGraph({ mainFile, onClose, onOpen }: {
             {error && <div style={{ padding: 20, color: '#f87171', fontSize: '0.85rem' }}>{error}</div>}
             <svg
               ref={svgRef}
-              viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
+              viewBox={`0 0 ${width} ${HEIGHT}`}
               style={{ width: '100%', height: '100%', cursor: drag.current?.id ? 'grabbing' : 'default', touchAction: 'none' }}
               onPointerDown={e => onPointerDown(e, null)}
               onPointerMove={onPointerMove}
@@ -295,27 +273,17 @@ export default function LabelGraph({ mainFile, onClose, onOpen }: {
                     opacity={hoverSection === band.name ? 0.9 : 0.4}
                   />
                 ))}
-                {graph?.edges.map((edge, i) => {
-                  const a = at.get(edge.from);
-                  const b = at.get(edge.to);
-                  if (!a || !b) return null;
-                  const lit = !neighbours || (neighbours.has(edge.from) && neighbours.has(edge.to));
-                  // A gentle arc, so two labels that refer to each other both ways
-                  // do not draw one line on top of the other.
-                  const mx = (a.x + b.x) / 2;
-                  const my = (a.y + b.y) / 2 - Math.abs(a.x - b.x) * 0.12;
-                  return (
-                    <path
-                      key={i}
-                      d={`M ${a.x} ${a.y} Q ${mx} ${my} ${b.x} ${b.y}`}
-                      fill="none"
-                      stroke="var(--text-muted)"
-                      strokeWidth={Math.min(3, 0.8 + edge.uses * 0.5)}
-                      opacity={lit ? 0.45 : 0.07}
-                      markerEnd="url(#lg-arrow)"
-                    />
-                  );
-                })}
+                {arcs.map(arc => (
+                  <path
+                    key={arc.key}
+                    d={arc.d}
+                    fill="none"
+                    stroke="var(--text-muted)"
+                    strokeWidth={arc.width}
+                    opacity={!neighbours || (neighbours.has(arc.from) && neighbours.has(arc.to)) ? 0.45 : 0.07}
+                    markerEnd="url(#lg-arrow)"
+                  />
+                ))}
                 {nodes.map(node => {
                   const lit = (!neighbours || neighbours.has(node.id)) && matches(node);
                   const isSection = node.kind === 'section';
@@ -340,22 +308,22 @@ export default function LabelGraph({ mainFile, onClose, onOpen }: {
                       {isSection ? (
                         <rect
                           x={-4} y={-11} width={8} height={22} rx={2}
-                          fill={SECTION} fillOpacity={0.75} stroke={SECTION} strokeWidth={1}
+                          fill={palette.section} fillOpacity={0.75} stroke={palette.section} strokeWidth={1}
                         />
                       ) : (
                         <circle
                           r={r}
-                          fill={colorOf(node.kind)}
+                          fill={colourOf(node.kind)}
                           fillOpacity={node.referenced ? 0.9 : 0.25}
-                          stroke={colorOf(node.kind)}
+                          stroke={colourOf(node.kind)}
                           strokeWidth={node.defined > 1 ? 3 : 1.5}
                           strokeDasharray={node.referenced ? undefined : '3 2'}
                         />
                       )}
                       {(lit || !neighbours) && (
                       <text
-                        x={node.x > WIDTH - 260 ? -(r + 6) : r + 6}
-                        textAnchor={node.x > WIDTH - 260 ? 'end' : 'start'}
+                        x={node.x > width - 260 ? -(r + 6) : r + 6}
+                        textAnchor={node.x > width - 260 ? 'end' : 'start'}
                         y={5}
                         fontSize={16}
                         fontWeight={500}
@@ -378,7 +346,7 @@ export default function LabelGraph({ mainFile, onClose, onOpen }: {
           <div style={{ width: 250, flex: '0 0 250px', borderLeft: '1px solid var(--border-color)', overflowY: 'auto', padding: '12px 14px', fontSize: '0.8rem' }}>
             {detail && (
               <div style={{ marginBottom: 16, paddingBottom: 12, borderBottom: '1px solid var(--border-color)' }}>
-                <div style={{ fontWeight: 600, color: colorOf(detail.kind), marginBottom: 3 }}>{nameOf(detail)}</div>
+                <div style={{ fontWeight: 600, color: colourOf(detail.kind), marginBottom: 3 }}>{nameOf(detail)}</div>
                 {detail.kind !== 'section' && detail.section && (
                   <div style={{ color: 'var(--text-muted)', lineHeight: 1.45, marginBottom: 5 }}>{detail.section}</div>
                 )}
@@ -407,13 +375,13 @@ export default function LabelGraph({ mainFile, onClose, onOpen }: {
             )}
 
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 14 }}>
-              {Object.entries(KIND_COLOR).filter(([k]) => graph?.nodes.some(n => n.kind === k)).map(([kind, colour]) => (
+              {Object.entries(palette.kinds).filter(([k]) => graph?.nodes.some(n => n.kind === k)).map(([kind, colour]) => (
                 <span key={kind} style={{ display: 'flex', alignItems: 'center', gap: 5, color: 'var(--text-muted)' }}>
                   <span style={{ width: 9, height: 9, borderRadius: '50%', background: colour }} />{kind}
                 </span>
               ))}
               <span style={{ display: 'flex', alignItems: 'center', gap: 5, color: 'var(--text-muted)' }}>
-                <span style={{ width: 5, height: 12, borderRadius: 2, background: SECTION }} />section
+                <span style={{ width: 5, height: 12, borderRadius: 2, background: palette.section }} />section
               </span>
             </div>
 
