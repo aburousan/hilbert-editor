@@ -1,11 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Most distributions do not know Typst files yet. Without a type for *.typ,
-     the file manager has nothing to match the launcher's MimeType against and
-     never offers Hilbert under Open With. -->
+<!-- Recent shared-mime-info defines this type, but older distributions ship
+     without it, and there the file manager has no type for *.typ to match the
+     launcher's MimeType against, so Open With never offers Hilbert. Same name
+     and alias as upstream, so a newer database simply agrees with it. -->
 <mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
-  <mime-type type="text/x-typst">
+  <mime-type type="text/vnd.typst">
     <sub-class-of type="text/plain"/>
     <comment>Typst document</comment>
+    <alias type="text/x-typst"/>
     <glob pattern="*.typ"/>
   </mime-type>
 </mime-info>

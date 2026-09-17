@@ -29,7 +29,7 @@
         "name": "Typst document",
         "description": "Typst source document",
         "role": "Editor",
-        "mimeType": "text/x-typst"
+        "mimeType": "text/vnd.typst"
       }
     ],
     "linux": {

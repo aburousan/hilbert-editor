@@ -797,17 +797,20 @@ fn avoid_blank_webkit_window() {
     }
 }
 
-/// The identifier in tauri.conf.json. The Windows installer stamps it on
-/// Hilbert's shortcuts as their AppUserModelID.
+/// The identifier in tauri.conf.json. Both Windows installers put it on the
+/// Start menu shortcut as its AppUserModelID, and the NSIS one on its desktop
+/// shortcut too; the NSIS uninstaller deletes the jump list stored under it.
 #[cfg(windows)]
 const APP_ID: &str = "com.kaziaburousan.hilbert";
 
 fn main() {
     #[cfg(target_os = "linux")]
     avoid_blank_webkit_window();
-    // Before any window exists. The shortcuts carry this ID, and the taskbar
-    // button, pins and jump list belong together only if the process has it
-    // too; otherwise Windows makes one up from the executable's path.
+    // Before any window exists. Started from a shortcut that carries this ID,
+    // the process gets it from the shell; started any other way it would get
+    // one made up from the executable's path, and its taskbar button would
+    // not match the pinned shortcut or show the jump list. A pin made from a
+    // button with the made-up ID has to be pinned again once.
     #[cfg(windows)]
     jump_list::claim_app_id(APP_ID);
     augment_path();
@@ -840,11 +843,18 @@ fn main() {
         .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
             // The launcher's and the jump list's New Window start a second copy
             // with this flag; the copy hands it here and exits.
-            if args.iter().skip(1).any(|arg| arg == "--new-window") {
+            let args: Vec<String> = args.into_iter().skip(1).collect();
+            let files = files_in(args.iter().cloned(), Path::new(&cwd));
+            if args.iter().any(|arg| arg == "--new-window") {
+                // Files named with it are for the new window, which collects the
+                // queue as it starts, rather than for the one already open.
+                for file in &files {
+                    server::queue_open(file);
+                }
                 open_new_window(app);
                 return;
             }
-            deliver_files(app, files_in(args.into_iter().skip(1), Path::new(&cwd)));
+            deliver_files(app, files);
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())

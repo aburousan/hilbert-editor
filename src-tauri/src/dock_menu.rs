@@ -3,8 +3,8 @@
 //! AppKit asks the application delegate for that menu with
 //! `applicationDockMenu:`. The delegate is the windowing layer's own class and
 //! does not answer it, and Tauri offers no hook for one, so the method is added
-//! to that class once the delegate exists. Adding a method it lacks leaves
-//! every method it has alone.
+//! to that class once the delegate exists, and only if nothing in the class
+//! or its ancestors answers it already.
 
 use std::sync::OnceLock;
 
@@ -44,11 +44,14 @@ unsafe extern "C-unwind" fn dock_menu(_this: *mut AnyObject, _cmd: Sel, _app: *m
 /// Call on the main thread after the app has launched.
 pub fn install(open_window: impl Fn() + Send + Sync + 'static) {
     let Some(mtm) = MainThreadMarker::new() else { return };
-    if OPEN_WINDOW.set(Box::new(open_window)).is_err() {
-        return;
-    }
     let app = NSApplication::sharedApplication(mtm);
     let Some(delegate) = app.delegate() else { return };
+    let delegate: &AnyObject = objc2::runtime::ProtocolObject::as_ref(&*delegate);
+    let class: &AnyClass = delegate.class();
+    // An inherited implementation would be overridden by adding one here.
+    if class.responds_to(sel!(applicationDockMenu:)) || OPEN_WINDOW.set(Box::new(open_window)).is_err() {
+        return;
+    }
 
     let target: Retained<Target> = unsafe { msg_send![Target::alloc(mtm), init] };
     let item = unsafe {
@@ -66,18 +69,16 @@ pub fn install(open_window: impl Fn() + Send + Sync + 'static) {
     menu.addItem(&item);
     let _ = MENU.set(Retained::into_raw(menu) as usize);
 
-    let delegate: &AnyObject = objc2::runtime::ProtocolObject::as_ref(&*delegate);
-    let class: *const AnyClass = delegate.class();
     // Returns an object, takes self, _cmd and the application.
     let added = unsafe {
         objc2::ffi::class_addMethod(
-            class as *mut AnyClass,
+            class as *const AnyClass as *mut AnyClass,
             sel!(applicationDockMenu:),
             std::mem::transmute::<unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject) -> *mut NSMenu, Imp>(dock_menu),
             c"@@:@".as_ptr(),
         )
     };
     if !added.as_bool() {
-        eprintln!("dock menu: the app delegate already has a Dock menu; leaving it alone");
+        eprintln!("dock menu: could not add the Dock menu to the app delegate");
     }
 }
