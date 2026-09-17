@@ -32,6 +32,25 @@
         "mimeType": "text/x-typst"
       }
     ],
+    "linux": {
+      "deb": {
+        "desktopTemplate": "linux/hilbert.desktop",
+        "files": {
+          "/usr/share/mime/packages/hilbert.xml": "linux/typst-mime.xml"
+        }
+      },
+      "rpm": {
+        "desktopTemplate": "linux/hilbert.desktop",
+        "files": {
+          "/usr/share/mime/packages/hilbert.xml": "linux/typst-mime.xml"
+        }
+      },
+      "appimage": {
+        "files": {
+          "/usr/share/mime/packages/hilbert.xml": "linux/typst-mime.xml"
+        }
+      }
+    },
     "active": true,
     "targets": "all",
     "createUpdaterArtifacts": true,

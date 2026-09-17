@@ -8844,6 +8844,9 @@ dependencies = [
  "harper-typst",
  "libc",
  "mime_guess",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "open",
  "percent-encoding",
  "regex",
@@ -8865,6 +8868,7 @@ dependencies = [
  "typst-kit",
  "typst-layout",
  "unicode-normalization",
+ "windows 0.61.3",
  "zip 8.6.0",
 ]
 

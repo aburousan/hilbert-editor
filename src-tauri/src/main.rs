@@ -4,6 +4,10 @@
 
 mod dict_catalog;
 mod jump;
+#[cfg(target_os = "macos")]
+mod dock_menu;
+#[cfg(windows)]
+mod jump_list;
 mod proofread;
 mod sandbox;
 mod server;
@@ -704,6 +708,22 @@ fn open_instance_window(
 /// Flags and the values that belong to them are not files. A relative path is
 /// read from `cwd`: when a second launch hands its arguments over, that is the
 /// second launch's directory, not this one's.
+/// The UI folder windows are served from, fixed at startup, for windows opened
+/// later from outside the app: the Dock menu, the jump list, a launcher action.
+static WINDOW_DIST: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Opens another window in this process, from any thread.
+fn open_new_window(handle: &tauri::AppHandle) {
+    let h = handle.clone();
+    let _ = handle.run_on_main_thread(move || {
+        use tauri::Manager;
+        let n = NEXT_WINDOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ws = workspace_dir(h.path().document_dir().ok());
+        let dist = WINDOW_DIST.get().cloned().flatten();
+        let _ = open_instance_window(&h, format!("extra-{n}"), ws, server::new_window_session_path(), dist);
+    });
+}
+
 fn files_in(args: impl IntoIterator<Item = String>, cwd: &Path) -> Vec<PathBuf> {
     const TAKES_VALUE: [&str; 5] = ["--session-file", "--workspace", "--port", "--bind", "--root"];
     let mut files = Vec::new();
@@ -777,9 +797,19 @@ fn avoid_blank_webkit_window() {
     }
 }
 
+/// The identifier in tauri.conf.json. The Windows installer stamps it on
+/// Hilbert's shortcuts as their AppUserModelID.
+#[cfg(windows)]
+const APP_ID: &str = "com.kaziaburousan.hilbert";
+
 fn main() {
     #[cfg(target_os = "linux")]
     avoid_blank_webkit_window();
+    // Before any window exists. The shortcuts carry this ID, and the taskbar
+    // button, pins and jump list belong together only if the process has it
+    // too; otherwise Windows makes one up from the executable's path.
+    #[cfg(windows)]
+    jump_list::claim_app_id(APP_ID);
     augment_path();
     // A window opened from "New Window" is handed its own session file, so extra
     // windows restore and persist independently and never overwrite the primary
@@ -808,6 +838,12 @@ fn main() {
         // the copy already running and ends the new one, rather than letting a
         // second app come up and write over the first one's saved session.
         .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            // The launcher's and the jump list's New Window start a second copy
+            // with this flag; the copy hands it here and exits.
+            if args.iter().skip(1).any(|arg| arg == "--new-window") {
+                open_new_window(app);
+                return;
+            }
             deliver_files(app, files_in(args.into_iter().skip(1), Path::new(&cwd)));
         }))
         .plugin(tauri_plugin_dialog::init())
@@ -968,7 +1004,18 @@ fn main() {
                 .or_else(server::saved_workspace)
                 .unwrap_or_else(|| workspace_dir(app.path().document_dir().ok()));
             // Dictionaries load on the first /lint call; see the note in headless_main.
+            let _ = WINDOW_DIST.set(dist.clone());
             open_instance_window(app.handle(), "main".into(), ws, server::session_file_path(), dist)?;
+            // Right-clicking the app's icon offers New Window, as other editors
+            // do: the Dock menu on macOS, the jump list on Windows. On Linux it
+            // is an action in the launcher entry, which needs no code here.
+            #[cfg(target_os = "macos")]
+            {
+                let handle = app.handle().clone();
+                dock_menu::install(move || open_new_window(&handle));
+            }
+            #[cfg(windows)]
+            jump_list::install(APP_ID);
             #[cfg(unix)]
             {
                 // Service managers and terminal launches stop the app with

@@ -75,6 +75,27 @@ tauri-plugin-single-instance = "2.4.4"
 # Python/Julia code so a runaway cell can't fill the disk or peg a core.
 libc = "0.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# The Dock menu. Tauri has no hook for it, so it is added to the app delegate
+# directly; these are the versions the windowing layer already builds.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSThread"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSMenu", "NSMenuItem", "NSResponder"] }
+
+[target.'cfg(windows)'.dependencies]
+# The taskbar jump list, through the shell's COM interfaces. The version Tauri
+# already builds.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_EnhancedStorage",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
+
 [profile.release]
 codegen-units = 1
 lto = true
