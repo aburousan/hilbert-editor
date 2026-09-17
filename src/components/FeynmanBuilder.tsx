@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { prettyLabel } from '../feynmanLabels';
 import { keys } from '../keys';
 import { createHistory } from '../editHistory';
 
@@ -11,7 +12,7 @@ import { createHistory } from '../editHistory';
 
 type Pt = { x: number, y: number };
 type EdgeKind = 'fermion' | 'antifermion' | 'photon' | 'gluon' | 'scalar' | 'ghost' | 'plain' | 'double' | 'cscalar' | 'majorana' | 'wilson';
-type LoopKind = 'plain' | 'photon' | 'gluon';
+type LoopKind = 'plain' | 'scalar' | 'photon' | 'gluon';
 type LoopFill = 'none' | 'hatched' | 'shaded';
 
 type Edge = { id: number, type: 'edge', kind: EdgeKind, from: Pt, to: Pt, bend: number, thickness: number, amplitude: number, endArrow: boolean, label: string, side: 1 | -1, color?: string };
@@ -199,9 +200,11 @@ function edgeCode(e: Edge): string[] {
 
 function loopCode(l: Loop): string[] {
   const out: string[] = [];
-  if (l.kind === 'plain') {
+  if (l.kind === 'plain' || l.kind === 'scalar') {
     const fill = l.fill === 'shaded' ? `, fill: ${tint(l.color) ? `${tint(l.color)}.lighten(70%)` : 'gray.lighten(50%)'}` : '';
-    out.push(`  circle(${cx(l.center)}, radius: ${num(l.radius / UNIT)}, stroke: ${strokeOf(l.thickness, l.color)}${fill})`);
+    // A scalar runs dashed, loop or line.
+    const stroke = l.kind === 'scalar' ? dashStroke(l.thickness, 'dashed', l.color) : strokeOf(l.thickness, l.color);
+    out.push(`  circle(${cx(l.center)}, radius: ${num(l.radius / UNIT)}, stroke: ${stroke}${fill})`);
   } else {
     const fn = l.kind === 'photon' ? 'wave' : 'coil';
     const segs = Math.max(6, Math.round(2 * Math.PI * l.radius / (l.kind === 'photon' ? 13 : 12)));
@@ -239,39 +242,277 @@ const mathContent = (t: string, c?: string) => {
 // ---- templates --------------------------------------------------------------
 let tid = 1000;
 const T = (x: number, y: number): Pt => ({ x, y });
-const TEMPLATES: { name: string, make: () => El[] }[] = [
+// ---- SVG rendering ----
+// Pure, so the examples browser can draw a thumbnail with the very same lines
+// the canvas uses.
+function drawEdge(e: Edge, selected: number | null) {
+  const c = ctrlPt(e.from, e.to, e.bend);
+  const col = previewCol(e.color, e.id === selected);
+  const pathFor = (a: Pt, b: Pt, cc: Pt) => e.bend === 0
+    ? `M${a.x},${a.y} L${b.x},${b.y}`
+    : `M${a.x},${a.y} Q${cc.x},${cc.y} ${b.x},${b.y}`;
+  const basePath = pathFor(e.from, e.to, c);
+  const parts: React.ReactNode[] = [];
+  const midArrow = (t: number, back: boolean) => {
+    const m = bezPt(e.from, c, e.to, t), d = bezTan(e.from, c, e.to, t);
+    parts.push(<polygon key={`a${t}-${back}`} points={arrowPts(m, d, 5 + e.thickness * 1.5, back)} fill={col} />);
+  };
+  if (e.kind === 'photon' || e.kind === 'gluon') {
+    parts.push(<path key="p" d={decoPath(e.from, e.to, e.bend, e.kind, e.amplitude)} fill="none" stroke={col} strokeWidth={e.thickness} />);
+  } else if (e.kind === 'wilson') {
+    parts.push(<path key="p" d={zigzagPath(e.from, e.to, e.bend, e.amplitude)} fill="none" stroke={col} strokeWidth={e.thickness} />);
+    midArrow(0.5, false); // a gauge link runs one way; show which
+  } else if (e.kind === 'double') {
+    const l0 = Math.hypot(e.to.x - e.from.x, e.to.y - e.from.y) || 1;
+    const nx = -(e.to.y - e.from.y) / l0, ny = (e.to.x - e.from.x) / l0;
+    for (const s of [1, -1]) {
+      const o = (p: Pt): Pt => ({ x: p.x + nx * DBL * s, y: p.y + ny * DBL * s });
+      parts.push(<path key={`d${s}`} d={pathFor(o(e.from), o(e.to), o(c))} fill="none" stroke={col} strokeWidth={e.thickness} />);
+    }
+    if (e.endArrow) midArrow(0.94, false);
+  } else {
+    const dash = (e.kind === 'scalar' || e.kind === 'cscalar') ? '8 5' : e.kind === 'ghost' ? '2 5' : undefined;
+    parts.push(<path key="p" d={basePath} fill="none" stroke={col} strokeWidth={e.thickness} strokeDasharray={dash} />);
+    if (e.kind === 'fermion' || e.kind === 'cscalar' || e.kind === 'ghost') midArrow(0.5, false);
+    else if (e.kind === 'antifermion') midArrow(0.5, true);
+    else if (e.kind === 'majorana') { midArrow(0.4, false); midArrow(0.6, true); }
+  }
+  if (e.endArrow && e.kind !== 'photon' && e.kind !== 'gluon' && e.kind !== 'double' && e.kind !== 'wilson') {
+    const d = bezTan(e.from, c, e.to, 1);
+    parts.push(<polygon key="e" points={arrowPts(e.to, d, 5 + e.thickness * 1.5, false)} fill={col} />);
+  }
+  if (e.label.trim()) {
+    const m = bezPt(e.from, c, e.to, 0.5), d = bezTan(e.from, c, e.to, 0.5);
+    const off = (14 + e.amplitude) * e.side;
+    parts.push(<text key="l" x={m.x - d.y * off} y={m.y + d.x * off} fontSize="13" fontStyle="italic" fontFamily="Georgia, serif" textAnchor="middle" dominantBaseline="middle" fill={col}>{prettyLabel(e.label)}</text>);
+  }
+return <g key={e.id}>{parts}</g>;
+}
+
+function drawLoop(l: Loop, selected: number | null) {
+  const col = previewCol(l.color, l.id === selected);
+  const parts: React.ReactNode[] = [];
+  if (l.kind === 'plain' || l.kind === 'scalar') {
+    parts.push(<circle key="c" cx={l.center.x} cy={l.center.y} r={l.radius} fill={l.fill === 'shaded' ? (tint(l.color) ? `${l.color}44` : '#d4d4d4') : 'none'} stroke={col} strokeWidth={l.thickness} strokeDasharray={l.kind === 'scalar' ? '8 5' : undefined} />);
+  } else {
+    parts.push(<path key="c" d={decoCirclePath(l.center, l.radius, l.kind, l.amplitude)} fill="none" stroke={col} strokeWidth={l.thickness} />);
+  }
+  if (l.fill === 'hatched') {
+    const r = l.radius, spacing = Math.max(8, r / 3.2);
+    const hs: React.ReactNode[] = [];
+    for (let cD = -r + spacing, i = 0; cD < r - 1; cD += spacing, i++) {
+      const h = Math.sqrt(r * r - cD * cD);
+      hs.push(<line key={i}
+        x1={l.center.x + Math.SQRT1_2 * cD - Math.SQRT1_2 * h} y1={l.center.y + Math.SQRT1_2 * cD + Math.SQRT1_2 * h}
+        x2={l.center.x + Math.SQRT1_2 * cD + Math.SQRT1_2 * h} y2={l.center.y + Math.SQRT1_2 * cD - Math.SQRT1_2 * h}
+        stroke={col} strokeWidth={Math.max(0.4, l.thickness * 0.45)} />);
+    }
+    parts.push(<g key="h">{hs}</g>);
+  }
+  if (l.arrow) {
+    const size = 4 + l.thickness * 2;
+    parts.push(<polygon key="a1" points={arrowPts({ x: l.center.x, y: l.center.y - l.radius }, { x: l.arrow, y: 0 }, size, false)} fill={col} />);
+    parts.push(<polygon key="a2" points={arrowPts({ x: l.center.x, y: l.center.y + l.radius }, { x: -l.arrow, y: 0 }, size, false)} fill={col} />);
+  }
+  if (l.label.trim())
+    parts.push(<text key="l" x={l.center.x} y={l.center.y - l.radius - 14} fontSize="13" fontStyle="italic" fontFamily="Georgia, serif" textAnchor="middle" dominantBaseline="middle" fill={col}>{prettyLabel(l.label)}</text>);
+return <g key={l.id}>{parts}</g>;
+}
+
+type Example = { name: string; group: string; note?: string; make: () => El[] };
+
+// Shorthands for the examples below. A diagram is mostly the same four lines
+// with different particles on them, and spelling every field out each time
+// hides the physics in punctuation.
+const fer = (from: Pt, to: Pt, label = '', side: 1 | -1 = 1, bend = 0): El =>
+  ({ id: tid++, type: 'edge', kind: 'fermion', from, to, bend, thickness: 1.2, amplitude: 6, endArrow: false, label, side });
+const pho = (from: Pt, to: Pt, label = '', side: 1 | -1 = 1, bend = 0): El =>
+  ({ id: tid++, type: 'edge', kind: 'photon', from, to, bend, thickness: 1, amplitude: 5, endArrow: false, label, side });
+const glu = (from: Pt, to: Pt, label = '', side: 1 | -1 = 1, bend = 0): El =>
+  ({ id: tid++, type: 'edge', kind: 'gluon', from, to, bend, thickness: 1, amplitude: 5, endArrow: false, label, side });
+const sca = (from: Pt, to: Pt, label = '', side: 1 | -1 = 1, bend = 0): El =>
+  ({ id: tid++, type: 'edge', kind: 'scalar', from, to, bend, thickness: 1.1, amplitude: 5, endArrow: false, label, side });
+const dot = (at: Pt): El => ({ id: tid++, type: 'vertex', at, size: 3.2 });
+const note = (at: Pt, text: string): El => ({ id: tid++, type: 'text', at, text });
+const loop = (center: Pt, radius: number, extra: Partial<Loop> = {}): El =>
+  ({ id: tid++, type: 'loop', kind: 'plain', fill: 'none', center, radius, thickness: 1.2, amplitude: 5, label: '', ...extra } as Loop);
+
+// The diagrams a course actually draws, in the order a course draws them.
+// Each one is laid out by hand: legs at the same angle, vertices on the grid,
+// labels on the side the line leaves room for.
+const EXAMPLES: Example[] = [
   {
-    name: 'Tadpole (loop on a line)',
+    name: 'e⁻e⁺ → μ⁻μ⁺', group: 'QED', note: 'tree level, s-channel',
     make: () => [
-      { id: tid++, type: 'edge', kind: 'fermion', from: T(120, 300), to: T(420, 300), bend: 0, thickness: 1.2, amplitude: 6, endArrow: true, label: '', side: 1 },
-      { id: tid++, type: 'edge', kind: 'photon', from: T(270, 300), to: T(270, 220), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: '', side: 1 },
-      { id: tid++, type: 'loop', kind: 'plain', fill: 'none', center: T(270, 180), radius: 40, thickness: 1.2, amplitude: 5, label: '' },
-      { id: tid++, type: 'vertex', at: T(270, 300), size: 3 },
+      fer(T(120, 120), T(260, 200), 'e^-', 1),
+      fer(T(260, 200), T(120, 280), 'e^+', -1),
+      pho(T(260, 200), T(420, 200), 'gamma', 1),
+      fer(T(420, 200), T(560, 120), 'mu^-', -1),
+      fer(T(560, 280), T(420, 200), 'mu^+', 1),
+      dot(T(260, 200)), dot(T(420, 200)),
     ],
   },
   {
-    name: 'Self-energy (photon arch)',
+    name: 'e⁻μ⁻ → e⁻μ⁻', group: 'QED', note: 'tree level, t-channel',
     make: () => [
-      { id: tid++, type: 'edge', kind: 'fermion', from: T(120, 280), to: T(480, 280), bend: 0, thickness: 1.2, amplitude: 6, endArrow: true, label: '', side: 1 },
-      { id: tid++, type: 'edge', kind: 'photon', from: T(220, 280), to: T(380, 280), bend: -55, thickness: 1, amplitude: 5, endArrow: false, label: '', side: 1 },
-      { id: tid++, type: 'vertex', at: T(220, 280), size: 3 },
-      { id: tid++, type: 'vertex', at: T(380, 280), size: 3 },
-      { id: tid++, type: 'text', at: T(190, 305), text: 'x_1' },
-      { id: tid++, type: 'text', at: T(410, 305), text: 'x_2' },
+      fer(T(140, 120), T(320, 120), 'e^-', -1),
+      fer(T(320, 120), T(520, 120), 'e^-', -1),
+      fer(T(140, 300), T(320, 300), 'mu^-', 1),
+      fer(T(320, 300), T(520, 300), 'mu^-', 1),
+      pho(T(320, 120), T(320, 300), 'gamma', 1),
+      dot(T(320, 120)), dot(T(320, 300)),
     ],
   },
   {
-    name: 'Vacuum polarisation (photon–loop–photon)',
+    name: 'Compton — s-channel', group: 'QED', note: 'eγ → eγ, one of two orderings',
     make: () => [
-      { id: tid++, type: 'edge', kind: 'photon', from: T(100, 240), to: T(230, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'gamma', side: 1 },
-      { id: tid++, type: 'loop', kind: 'plain', fill: 'none', center: T(290, 240), radius: 60, thickness: 1.2, amplitude: 5, label: '', arrow: 1 },
-      { id: tid++, type: 'edge', kind: 'photon', from: T(350, 240), to: T(480, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'gamma', side: 1 },
-      { id: tid++, type: 'vertex', at: T(230, 240), size: 3 },
-      { id: tid++, type: 'vertex', at: T(350, 240), size: 3 },
+      fer(T(120, 300), T(260, 220), 'e^-', 1),
+      pho(T(120, 140), T(260, 220), 'gamma', -1),
+      fer(T(260, 220), T(420, 220), 'p + k', -1),
+      fer(T(420, 220), T(560, 300), 'e^-', -1),
+      pho(T(420, 220), T(560, 140), 'gamma', 1),
+      dot(T(260, 220)), dot(T(420, 220)),
     ],
   },
   {
-    name: 'QCD: three-gluon vertex',
+    name: 'Compton — u-channel', group: 'QED', note: 'the same process, photons the other way round',
+    make: () => [
+      fer(T(120, 330), T(260, 250), 'e^-', 1),
+      fer(T(260, 250), T(420, 250), "p - k'", 1),
+      fer(T(420, 250), T(560, 330), 'e^-', -1),
+      // The two photons cross: that is what makes it the u-channel. Their
+      // labels sit out near the ends so the crossing stays readable.
+      pho(T(120, 90), T(420, 250), 'gamma', -1),
+      pho(T(260, 250), T(560, 90), 'gamma', 1),
+      dot(T(260, 250)), dot(T(420, 250)),
+    ],
+  },
+  {
+    name: 'Electron self-energy', group: 'QED', note: 'one loop',
+    make: () => [
+      fer(T(110, 240), T(250, 240), 'p', 1),
+      fer(T(250, 240), T(430, 240), 'p - k', 1),
+      fer(T(430, 240), T(570, 240), 'p', 1),
+      pho(T(250, 240), T(430, 240), 'k', -1, -70),
+      dot(T(250, 240)), dot(T(430, 240)),
+    ],
+  },
+  {
+    name: 'Vacuum polarisation', group: 'QED', note: 'photon self-energy, fermion loop',
+    make: () => [
+      pho(T(110, 220), T(278, 220), 'q', 1),
+      loop(T(340, 220), 62, { arrow: 1, label: 'k' }),
+      pho(T(402, 220), T(570, 220), 'q', 1),
+      dot(T(278, 220)), dot(T(402, 220)),
+    ],
+  },
+  {
+    name: 'Vertex correction', group: 'QED', note: 'the loop behind g − 2',
+    make: () => [
+      fer(T(110, 320), T(260, 250), 'p', 1),
+      fer(T(260, 250), T(340, 180), '', 1),
+      fer(T(340, 180), T(420, 250), '', 1),
+      fer(T(420, 250), T(570, 320), "p'", -1),
+      pho(T(340, 180), T(340, 90), 'gamma', 1),
+      pho(T(260, 250), T(420, 250), 'k', -1),
+      dot(T(260, 250)), dot(T(340, 180)), dot(T(420, 250)),
+    ],
+  },
+  {
+    name: 'Muon decay', group: 'Electroweak', note: 'μ⁻ → ν_μ e⁻ ν̄_e through a W',
+    make: () => [
+      fer(T(110, 150), T(280, 150), 'mu^-', -1),
+      fer(T(280, 150), T(450, 90), 'nu_mu', -1),
+      pho(T(280, 150), T(360, 270), 'W^-', -1),
+      fer(T(360, 270), T(520, 230), 'e^-', -1),
+      fer(T(520, 330), T(360, 270), 'macron(nu)_e', 1),
+      dot(T(280, 150)), dot(T(360, 270)),
+    ],
+  },
+  {
+    name: 'Quark–gluon vertex', group: 'QCD', note: 'q q̄ g',
+    make: () => [
+      fer(T(130, 120), T(300, 220), 'q', 1),
+      fer(T(300, 220), T(130, 320), 'macron(q)', -1),
+      glu(T(300, 220), T(540, 220), 'g, a mu', 1),
+      dot(T(300, 220)),
+    ],
+  },
+  {
+    name: 'φ⁴ contact', group: 'Scalar', note: 'four legs, one vertex',
+    make: () => [
+      sca(T(150, 120), T(340, 220), 'phi', 1),
+      sca(T(150, 320), T(340, 220), 'phi', -1),
+      sca(T(340, 220), T(530, 120), 'phi', -1),
+      sca(T(340, 220), T(530, 320), 'phi', 1),
+      dot(T(340, 220)),
+    ],
+  },
+  {
+    name: 'φ⁴ tadpole', group: 'Scalar', note: 'the loop that renormalises the mass',
+    make: () => [
+      sca(T(140, 300), T(340, 300), 'phi', 1),
+      sca(T(340, 300), T(540, 300), 'phi', 1),
+      // The loop sits on the vertex, and it is the same scalar as the legs, so
+      // it is drawn the same way.
+      loop(T(340, 242), 58, { kind: 'scalar' }),
+      dot(T(340, 300)),
+    ],
+  },
+  {
+    name: 'Effective vertex', group: 'Scalar', note: 'a blob, not a particular graph',
+    make: () => [
+      fer(T(120, 130), T(280, 220), '', 1),
+      fer(T(120, 310), T(280, 220), '', -1),
+      loop(T(340, 220), 58, { fill: 'hatched' }),
+      fer(T(400, 220), T(560, 130), '', -1),
+      fer(T(400, 220), T(560, 310), '', 1),
+      note(T(340, 300), 'italic("effective")'),
+    ],
+  },
+];
+
+// The box a diagram actually occupies, so a thumbnail shows the drawing rather
+// than the empty canvas around it.
+const boundsOf = (els: El[]) => {
+  let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+  const see = (p: Pt, pad = 0) => {
+    x1 = Math.min(x1, p.x - pad); y1 = Math.min(y1, p.y - pad);
+    x2 = Math.max(x2, p.x + pad); y2 = Math.max(y2, p.y + pad);
+  };
+  for (const e of els) {
+    if (e.type === 'edge') { see(e.from, 14); see(e.to, 14); }
+    else if (e.type === 'loop') see(e.center, e.radius + 18);
+    else see(e.at, 16);
+  }
+  if (!Number.isFinite(x1)) return { x: 0, y: 0, w: W, h: H };
+  return { x: x1, y: y1, w: Math.max(40, x2 - x1), h: Math.max(40, y2 - y1) };
+};
+
+function ExampleThumb({ els, height = 96 }: { els: El[]; height?: number }) {
+  const b = boundsOf(els);
+  return (
+    <svg viewBox={`${b.x} ${b.y} ${b.w} ${b.h}`} style={{ width: '100%', height, display: 'block' }} aria-hidden>
+      {els.map(e => (e.type === 'edge' ? drawEdge(e, null)
+        : e.type === 'loop' ? drawLoop(e, null)
+        : e.type === 'vertex' ? <circle key={e.id} cx={e.at.x} cy={e.at.y} r={e.size} fill="#111" />
+        : <text key={e.id} x={e.at.x} y={e.at.y} fontSize="13" fontStyle="italic" fontFamily="Georgia, serif" textAnchor="middle" dominantBaseline="middle" fill="#111">{prettyLabel(e.text)}</text>))}
+    </svg>
+  );
+}
+
+const exampleGroups = () => {
+  const all = [...EXAMPLES, ...ADVANCED];
+  const order = ['QED', 'Electroweak', 'QCD', 'Scalar', 'Advanced QCD'];
+  return order
+    .map(group => ({ group, items: all.filter(e => e.group === group) }))
+    .filter(g => g.items.length);
+};
+
+// The older diagrams, kept: the loops and gauge links a research student needs.
+const ADVANCED: Example[] = [
+  {
+    name: 'three-gluon vertex', group: 'QCD',
     make: () => [
       { id: tid++, type: 'edge', kind: 'gluon', from: T(120, 140), to: T(300, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'a, mu', side: 1 },
       { id: tid++, type: 'edge', kind: 'gluon', from: T(120, 340), to: T(300, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'b, nu', side: -1 },
@@ -280,7 +521,7 @@ const TEMPLATES: { name: string, make: () => El[] }[] = [
     ],
   },
   {
-    name: 'QCD: four-gluon vertex',
+    name: 'four-gluon vertex', group: 'QCD',
     make: () => [
       { id: tid++, type: 'edge', kind: 'gluon', from: T(140, 120), to: T(300, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'a, mu', side: 1 },
       { id: tid++, type: 'edge', kind: 'gluon', from: T(460, 120), to: T(300, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'b, nu', side: -1 },
@@ -290,7 +531,7 @@ const TEMPLATES: { name: string, make: () => El[] }[] = [
     ],
   },
   {
-    name: 'QCD: quark self-energy (gluon arch)',
+    name: 'quark self-energy (gluon arch)', group: 'QCD',
     make: () => [
       { id: tid++, type: 'edge', kind: 'fermion', from: T(100, 280), to: T(500, 280), bend: 0, thickness: 1.2, amplitude: 6, endArrow: true, label: 'q', side: 1 },
       { id: tid++, type: 'edge', kind: 'gluon', from: T(210, 280), to: T(390, 280), bend: -60, thickness: 1, amplitude: 5, endArrow: false, label: 'g', side: 1 },
@@ -299,7 +540,7 @@ const TEMPLATES: { name: string, make: () => El[] }[] = [
     ],
   },
   {
-    name: 'QCD: gluon self-energy (quark loop)',
+    name: 'gluon self-energy (quark loop)', group: 'QCD',
     make: () => [
       { id: tid++, type: 'edge', kind: 'gluon', from: T(90, 240), to: T(230, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'g', side: 1 },
       { id: tid++, type: 'loop', kind: 'plain', fill: 'none', center: T(290, 240), radius: 60, thickness: 1.2, amplitude: 5, label: 'q', arrow: 1 },
@@ -309,7 +550,7 @@ const TEMPLATES: { name: string, make: () => El[] }[] = [
     ],
   },
   {
-    name: 'QCD: gluon self-energy (ghost loop)',
+    name: 'gluon self-energy (ghost loop)', group: 'QCD',
     make: () => [
       { id: tid++, type: 'edge', kind: 'gluon', from: T(90, 240), to: T(230, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'g', side: 1 },
       { id: tid++, type: 'edge', kind: 'ghost', from: T(230, 240), to: T(350, 240), bend: 60, thickness: 1.1, amplitude: 5, endArrow: false, label: 'c', side: 1 },
@@ -320,7 +561,7 @@ const TEMPLATES: { name: string, make: () => El[] }[] = [
     ],
   },
   {
-    name: 'QCD: gluon emission off a Wilson line (eikonal)',
+    name: 'gluon emission off a Wilson line (eikonal)', group: 'Advanced QCD',
     make: () => [
       { id: tid++, type: 'edge', kind: 'wilson', from: T(100, 300), to: T(520, 300), bend: 0, thickness: 1.3, amplitude: 5, endArrow: false, label: 'n dot A', side: 1 },
       { id: tid++, type: 'edge', kind: 'gluon', from: T(280, 300), to: T(400, 180), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'g', side: 1 },
@@ -328,7 +569,7 @@ const TEMPLATES: { name: string, make: () => El[] }[] = [
     ],
   },
   {
-    name: 'QCD: Wilson loop (rectangle)',
+    name: 'Wilson loop (rectangle)', group: 'Advanced QCD',
     make: () => [
       { id: tid++, type: 'edge', kind: 'wilson', from: T(160, 320), to: T(460, 320), bend: 0, thickness: 1.3, amplitude: 5, endArrow: false, label: 'R', side: 1 },
       { id: tid++, type: 'edge', kind: 'wilson', from: T(460, 320), to: T(460, 140), bend: 0, thickness: 1.3, amplitude: 5, endArrow: false, label: 'T', side: 1 },
@@ -337,7 +578,7 @@ const TEMPLATES: { name: string, make: () => El[] }[] = [
     ],
   },
   {
-    name: 'QCD: gauge-link staple (TMD)',
+    name: 'gauge-link staple (TMD)', group: 'Advanced QCD',
     make: () => [
       { id: tid++, type: 'edge', kind: 'fermion', from: T(120, 340), to: T(240, 340), bend: 0, thickness: 1.2, amplitude: 6, endArrow: true, label: 'q', side: 1 },
       { id: tid++, type: 'edge', kind: 'wilson', from: T(240, 340), to: T(240, 140), bend: 0, thickness: 1.3, amplitude: 5, endArrow: false, label: '', side: 1 },
@@ -346,24 +587,6 @@ const TEMPLATES: { name: string, make: () => El[] }[] = [
       { id: tid++, type: 'edge', kind: 'antifermion', from: T(440, 340), to: T(560, 340), bend: 0, thickness: 1.2, amplitude: 6, endArrow: false, label: 'macron(q)', side: 1 },
       { id: tid++, type: 'vertex', at: T(240, 340), size: 3 },
       { id: tid++, type: 'vertex', at: T(440, 340), size: 3 },
-    ],
-  },
-  {
-    name: 'QCD: quark–gluon vertex',
-    make: () => [
-      { id: tid++, type: 'edge', kind: 'fermion', from: T(120, 160), to: T(300, 280), bend: 0, thickness: 1.2, amplitude: 6, endArrow: false, label: 'q', side: 1 },
-      { id: tid++, type: 'edge', kind: 'fermion', from: T(300, 280), to: T(120, 400), bend: 0, thickness: 1.2, amplitude: 6, endArrow: true, label: 'macron(q)', side: -1 },
-      { id: tid++, type: 'edge', kind: 'gluon', from: T(300, 280), to: T(520, 280), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: 'a, mu', side: 1 },
-      { id: tid++, type: 'vertex', at: T(300, 280), size: 3.5 },
-    ],
-  },
-  {
-    name: 'Effective vertex (hatched blob)',
-    make: () => [
-      { id: tid++, type: 'edge', kind: 'fermion', from: T(100, 320), to: T(250, 240), bend: 0, thickness: 1.2, amplitude: 6, endArrow: false, label: '', side: 1 },
-      { id: tid++, type: 'edge', kind: 'fermion', from: T(250, 240), to: T(100, 160), bend: 0, thickness: 1.2, amplitude: 6, endArrow: false, label: '', side: 1 },
-      { id: tid++, type: 'loop', kind: 'plain', fill: 'hatched', center: T(300, 240), radius: 50, thickness: 1.2, amplitude: 5, label: '' },
-      { id: tid++, type: 'edge', kind: 'photon', from: T(350, 240), to: T(500, 240), bend: 0, thickness: 1, amplitude: 5, endArrow: false, label: '', side: 1 },
     ],
   },
 ];
@@ -624,80 +847,8 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
     onInsert('\n' + body + '\n\n', imports.trim());
   };
 
-  // ---- SVG rendering ----
-  const renderEdge = useCallback((e: Edge) => {
-    const c = ctrlPt(e.from, e.to, e.bend);
-    const col = previewCol(e.color, e.id === selected);
-    const pathFor = (a: Pt, b: Pt, cc: Pt) => e.bend === 0
-      ? `M${a.x},${a.y} L${b.x},${b.y}`
-      : `M${a.x},${a.y} Q${cc.x},${cc.y} ${b.x},${b.y}`;
-    const basePath = pathFor(e.from, e.to, c);
-    const parts: React.ReactNode[] = [];
-    const midArrow = (t: number, back: boolean) => {
-      const m = bezPt(e.from, c, e.to, t), d = bezTan(e.from, c, e.to, t);
-      parts.push(<polygon key={`a${t}-${back}`} points={arrowPts(m, d, 5 + e.thickness * 1.5, back)} fill={col} />);
-    };
-    if (e.kind === 'photon' || e.kind === 'gluon') {
-      parts.push(<path key="p" d={decoPath(e.from, e.to, e.bend, e.kind, e.amplitude)} fill="none" stroke={col} strokeWidth={e.thickness} />);
-    } else if (e.kind === 'wilson') {
-      parts.push(<path key="p" d={zigzagPath(e.from, e.to, e.bend, e.amplitude)} fill="none" stroke={col} strokeWidth={e.thickness} />);
-      midArrow(0.5, false); // a gauge link runs one way; show which
-    } else if (e.kind === 'double') {
-      const l0 = Math.hypot(e.to.x - e.from.x, e.to.y - e.from.y) || 1;
-      const nx = -(e.to.y - e.from.y) / l0, ny = (e.to.x - e.from.x) / l0;
-      for (const s of [1, -1]) {
-        const o = (p: Pt): Pt => ({ x: p.x + nx * DBL * s, y: p.y + ny * DBL * s });
-        parts.push(<path key={`d${s}`} d={pathFor(o(e.from), o(e.to), o(c))} fill="none" stroke={col} strokeWidth={e.thickness} />);
-      }
-      if (e.endArrow) midArrow(0.94, false);
-    } else {
-      const dash = (e.kind === 'scalar' || e.kind === 'cscalar') ? '8 5' : e.kind === 'ghost' ? '2 5' : undefined;
-      parts.push(<path key="p" d={basePath} fill="none" stroke={col} strokeWidth={e.thickness} strokeDasharray={dash} />);
-      if (e.kind === 'fermion' || e.kind === 'cscalar' || e.kind === 'ghost') midArrow(0.5, false);
-      else if (e.kind === 'antifermion') midArrow(0.5, true);
-      else if (e.kind === 'majorana') { midArrow(0.4, false); midArrow(0.6, true); }
-    }
-    if (e.endArrow && e.kind !== 'photon' && e.kind !== 'gluon' && e.kind !== 'double' && e.kind !== 'wilson') {
-      const d = bezTan(e.from, c, e.to, 1);
-      parts.push(<polygon key="e" points={arrowPts(e.to, d, 5 + e.thickness * 1.5, false)} fill={col} />);
-    }
-    if (e.label.trim()) {
-      const m = bezPt(e.from, c, e.to, 0.5), d = bezTan(e.from, c, e.to, 0.5);
-      const off = (14 + e.amplitude) * e.side;
-      parts.push(<text key="l" x={m.x - d.y * off} y={m.y + d.x * off} fontSize="13" fontStyle="italic" fontFamily="Georgia, serif" textAnchor="middle" dominantBaseline="middle" fill={col}>{e.label}</text>);
-    }
-    return <g key={e.id}>{parts}</g>;
-  }, [selected]);
-
-  const renderLoop = useCallback((l: Loop) => {
-    const col = previewCol(l.color, l.id === selected);
-    const parts: React.ReactNode[] = [];
-    if (l.kind === 'plain') {
-      parts.push(<circle key="c" cx={l.center.x} cy={l.center.y} r={l.radius} fill={l.fill === 'shaded' ? (tint(l.color) ? `${l.color}44` : '#d4d4d4') : 'none'} stroke={col} strokeWidth={l.thickness} />);
-    } else {
-      parts.push(<path key="c" d={decoCirclePath(l.center, l.radius, l.kind, l.amplitude)} fill="none" stroke={col} strokeWidth={l.thickness} />);
-    }
-    if (l.fill === 'hatched') {
-      const r = l.radius, spacing = Math.max(8, r / 3.2);
-      const hs: React.ReactNode[] = [];
-      for (let cD = -r + spacing, i = 0; cD < r - 1; cD += spacing, i++) {
-        const h = Math.sqrt(r * r - cD * cD);
-        hs.push(<line key={i}
-          x1={l.center.x + Math.SQRT1_2 * cD - Math.SQRT1_2 * h} y1={l.center.y + Math.SQRT1_2 * cD + Math.SQRT1_2 * h}
-          x2={l.center.x + Math.SQRT1_2 * cD + Math.SQRT1_2 * h} y2={l.center.y + Math.SQRT1_2 * cD - Math.SQRT1_2 * h}
-          stroke={col} strokeWidth={Math.max(0.4, l.thickness * 0.45)} />);
-      }
-      parts.push(<g key="h">{hs}</g>);
-    }
-    if (l.arrow) {
-      const size = 4 + l.thickness * 2;
-      parts.push(<polygon key="a1" points={arrowPts({ x: l.center.x, y: l.center.y - l.radius }, { x: l.arrow, y: 0 }, size, false)} fill={col} />);
-      parts.push(<polygon key="a2" points={arrowPts({ x: l.center.x, y: l.center.y + l.radius }, { x: -l.arrow, y: 0 }, size, false)} fill={col} />);
-    }
-    if (l.label.trim())
-      parts.push(<text key="l" x={l.center.x} y={l.center.y - l.radius - 14} fontSize="13" fontStyle="italic" fontFamily="Georgia, serif" textAnchor="middle" dominantBaseline="middle" fill={col}>{l.label}</text>);
-    return <g key={l.id}>{parts}</g>;
-  }, [selected]);
+  const renderEdge = useCallback((e: Edge) => drawEdge(e, selected), [selected]);
+  const renderLoop = useCallback((l: Loop) => drawLoop(l, selected), [selected]);
 
   const field = (label: string, el: React.ReactNode) => (
     <label className="form-field"><span>{label}</span>{el}</label>
@@ -715,21 +866,57 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
     </div>
   ));
 
+  const [showExamples, setShowExamples] = useState(false);
   const code = useMemo(() => showCode ? genCode() : null, [showCode, genCode]);
   const diagram = useMemo(() => els.map(e =>
     e.type === 'edge' ? renderEdge(e)
     : e.type === 'loop' ? renderLoop(e)
     : e.type === 'vertex' ? <circle key={e.id} cx={e.at.x} cy={e.at.y} r={e.size} fill={previewCol(e.color, e.id === selected)} />
-    : <text key={e.id} x={e.at.x} y={e.at.y} fontSize="14" fontStyle="italic" fontFamily="Georgia, serif" textAnchor="middle" dominantBaseline="middle" fill={previewCol(e.color, e.id === selected)}>{e.text || '…'}</text>
+    : <text key={e.id} x={e.at.x} y={e.at.y} fontSize="14" fontStyle="italic" fontFamily="Georgia, serif" textAnchor="middle" dominantBaseline="middle" fill={previewCol(e.color, e.id === selected)}>{prettyLabel(e.text) || '…'}</text>
   ), [els, selected, renderEdge, renderLoop]);
 
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-content" style={{ width: '960px', maxWidth: '96vw' }} onClick={e => e.stopPropagation()}>
+      <div className="modal-content" style={{ width: '1180px', maxWidth: '96vw' }} onClick={e => e.stopPropagation()}>
         <div className="modal-header">
           <h2>Feynman Diagram (visual)</h2>
           <button className="close-btn" onClick={onClose}>×</button>
         </div>
+
+        {showExamples && (
+          <div style={{ position: 'absolute', inset: 0, background: 'var(--bg-main, #111)', zIndex: 5, display: 'flex', flexDirection: 'column', borderRadius: 8 }}>
+            <div className="modal-header">
+              <h2>Start from a diagram</h2>
+              <button className="close-btn" onClick={() => setShowExamples(false)}>×</button>
+            </div>
+            <div className="modal-body" style={{ overflowY: 'auto' }}>
+              {exampleGroups().map(({ group, items }) => (
+                <div key={group} style={{ marginBottom: 20 }}>
+                  <div className="dropdown-header" style={{ padding: 0, marginBottom: 8 }}>{group}</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(190px, 1fr))', gap: 12 }}>
+                    {items.map(example => (
+                      <div key={example.name}
+                        style={{ border: '1px solid var(--border-color)', borderRadius: 8, overflow: 'hidden', cursor: 'pointer', background: 'var(--panel-lighter, rgba(127,127,127,0.06))' }}>
+                        <div style={{ background: '#fff', padding: 6 }}
+                          title={els.length ? 'Open this diagram (replaces what is on the canvas)' : 'Open this diagram'}
+                          onClick={() => { commit(example.make()); setSelected(null); setShowExamples(false); }}>
+                          <ExampleThumb els={example.make()} />
+                        </div>
+                        <div style={{ padding: '7px 9px 9px' }}>
+                          <div style={{ fontSize: '0.86rem', fontWeight: 600 }}>{example.name}</div>
+                          {example.note && <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)', marginTop: 2 }}>{example.note}</div>}
+                          <button className="btn-ghost" style={{ padding: '2px 8px', fontSize: '0.74rem', marginTop: 6 }}
+                            title="Add it beside what is already on the canvas"
+                            onClick={() => { commit([...els, ...example.make()]); setShowExamples(false); }}>Add to canvas</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         <div className="modal-body" style={{ display: 'flex', flexDirection: 'row', alignItems: 'flex-start', gap: '12px' }}>
           <div style={{ flex: '1 1 auto', minWidth: 0 }}>
@@ -744,10 +931,7 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
                   {EDGE_KINDS.map(k => <option key={k.k} value={k.k}>{k.name}</option>)}
                 </select>
               )}
-              <select value="" onChange={e => { const t = TEMPLATES.find(x => x.name === e.target.value); if (t) { commit([...els, ...t.make()]); } }}>
-                <option value="" disabled>Insert template…</option>
-                {TEMPLATES.map(t => <option key={t.name} value={t.name}>{t.name}</option>)}
-              </select>
+              <button className="btn-ghost" onClick={() => setShowExamples(true)}>Examples…</button>
               <button className="btn-ghost" onClick={undo} disabled={!historyRef.current.canUndo()} title={keys('Undo (⌘Z)')} aria-label="Undo">↶</button>
               <button className="btn-ghost" onClick={redo} disabled={!historyRef.current.canRedo()} title={keys('Redo (⌘⇧Z)')} aria-label="Redo">↷</button>
               <button className="btn-ghost" disabled={!els.length} onClick={() => { commit([]); setSelected(null); }}>Clear</button>
@@ -817,11 +1001,12 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
                 {field('Circle type', (
                   <select value={sel.kind} onChange={e => update({ kind: e.target.value as LoopKind })}>
                     <option value="plain">Plain circle</option>
+                    <option value="scalar">Dashed (scalar loop)</option>
                     <option value="photon">Wavy (photon loop)</option>
                     <option value="gluon">Coiled (gluon loop)</option>
                   </select>
                 ))}
-                {sel.kind === 'plain' && field('Fill', (
+                {(sel.kind === 'plain' || sel.kind === 'scalar') && field('Fill', (
                   <select value={sel.fill} onChange={e => update({ fill: e.target.value as LoopFill })}>
                     <option value="none">None (open loop)</option>
                     <option value="hatched">Hatched (blob)</option>

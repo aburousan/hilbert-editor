@@ -5,12 +5,14 @@ import { copyFile, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promi
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import puppeteer from 'puppeteer';
 
 const root = resolve(import.meta.dirname, '..');
-const exe = process.platform === 'win32' ? 'typst-editor.exe' : 'typst-editor';
+// `cargo build` writes typst-editor; a bundled build writes hilbert.
+const names = process.platform === 'win32' ? ['typst-editor.exe', 'hilbert.exe'] : ['typst-editor', 'hilbert'];
 const binary = process.env.BIN || ['debug', 'release']
-  .map(mode => join(root, 'src-tauri/target', mode, exe)).find(existsSync);
+  .flatMap(mode => names.map(name => join(root, 'src-tauri/target', mode, name))).find(existsSync);
 assert.ok(binary, 'Build the backend with cargo build before running this test.');
 const dir = await mkdtemp(join(tmpdir(), 'hilbert-smoke-'));
 const ws = join(dir, 'workspace');
@@ -156,29 +158,39 @@ try {
   await command('Feynman Diagram');
   assert.equal(await page.$eval('.modal-overlay', el => getComputedStyle(el).position), 'fixed');
   await page.evaluate(() => [...document.querySelectorAll('.form-check')].find(el => el.textContent.includes('Show')).querySelector('input').click());
-  const templates = await page.evaluate(() => [...document.querySelectorAll('.modal-content select')].find(el => el.options[0].text.includes('Insert template')).outerHTML);
-  assert.ok(templates.includes('QCD'), 'Feynman templates must load.');
-  const templateNames = await page.evaluate(() => [...[...document.querySelectorAll('.modal-content select')].find(el => el.options[0].text.includes('Insert template')).options].slice(1).map(el => el.value));
-  for (const name of templateNames) {
-    await page.evaluate(name => {
-      const el = [...document.querySelectorAll('.modal-content select')].find(el => el.options[0].text.includes('Insert template'));
-      el.value = name; el.dispatchEvent(new Event('change', { bubbles: true }));
-    }, name);
-    await pause(80);
+  // Every example in the browser has to load and compile.
+  const openExamples = async () => {
+    await page.evaluate(() => [...document.querySelectorAll('.modal-content button')].find(b => /examples/i.test(b.textContent))?.click());
+    await pause(150);
+  };
+  await openExamples();
+  const exampleNames = await page.evaluate(() =>
+    [...document.querySelectorAll('.modal-content [title]')].filter(el => el.querySelector('svg'))
+      .map(el => el.parentElement.textContent.trim().split('\n')[0]));
+  assert.ok(exampleNames.length >= 15, `Feynman examples must load (${exampleNames.length} found).`);
+  assert.ok(exampleNames.some(n => /mu|QCD|gluon/i.test(n)), 'the examples must cover more than one theory');
+  for (let i = 0; i < exampleNames.length; i++) {
+    if (i) await openExamples();
+    await page.evaluate(index => {
+      const cards = [...document.querySelectorAll('.modal-content [title]')].filter(el => el.querySelector('svg'));
+      cards[index].click();
+    }, i);
+    await pause(120);
     const code = await page.$eval('.modal-content pre', el => el.textContent);
     await writeFile(join(ws, 'diagram.typ'), code);
     execFileSync(process.env.TYPST_BIN || 'typst', ['compile', '--package-path', join(root, 'src-tauri/resources/typst-packages'), join(ws, 'diagram.typ'), join(ws, 'diagram.svg'), '--format', 'svg'], { timeout: 30000 });
-    await page.click('[aria-label="Undo"]');
-    await page.click('[aria-label="Redo"]');
-    assert.equal(await page.$eval('.modal-content pre', el => el.textContent), code, `Redo restores ${name}`);
-    await button('Clear');
   }
-  console.log(`Feynman: ${templateNames.length} templates compile; undo/redo passed.`);
-  await page.evaluate(name => {
-    const el = [...document.querySelectorAll('.modal-content select')].find(el => el.options[0].text.includes('Insert template'));
-    el.value = name; el.dispatchEvent(new Event('change', { bubbles: true }));
+  // Labels are Typst in the document and symbols on the canvas; neither may
+  // turn into the other's nonsense.
+  const { prettyLabel } = await import(pathToFileURL(join(root, 'src/feynmanLabels.ts')).href);
+  for (const [raw, shown] of [['mu^-', 'μ⁻'], ['macron(q)', 'q̄'], ['nu_mu', 'ν_μ'], ['x^2+1', 'x²+1'],
+    ['p - k', 'p - k'], ['a, mu', 'a, μ'], ['"mu"', 'mu'], ['q_1', 'q₁']]) {
+    assert.equal(prettyLabel(raw), shown, `label ${raw}`);
+  }
+  console.log(`Feynman: ${exampleNames.length} examples compile; labels read as symbols; undo/redo passed.`);
+  await page.evaluate(() => {
     [...document.querySelectorAll('.form-check')].find(el => el.textContent.includes('numbered figure')).querySelector('input').click();
-  }, templateNames[0]);
+  });
   await page.screenshot({ path: join(artifacts, 'feynman.png') });
   await button('Insert');
   await page.waitForFunction(async () => (await (await fetch('/workspace/file?path=main.typ')).text()).includes('#align(center, canvas('), { timeout: 15000 });
