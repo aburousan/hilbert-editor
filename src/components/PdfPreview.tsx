@@ -32,6 +32,12 @@ type Slot = {
 };
 type WordIndex = { words: string[]; spans: HTMLElement[] };
 
+// Numbers every double-click made in this window, so a slow answer cannot
+// overtake a newer click. Kept outside the component: the preview is remounted
+// when the project changes, and a counter that started again would make the
+// editor throw away the first clicks in the new one.
+let clicks = 0;
+
 // Walk a text-layer subtree (a page, or the whole document) into a flat list of
 // normalized words in reading order, each paired with the span that holds it.
 function collectSpanWords(root: ParentNode): { words: string[]; spans: HTMLElement[] } {
@@ -953,6 +959,40 @@ function PdfPreview(
           y: Math.max(0, Math.min(pageInfo.h, (event.clientY - pageRect.top) / pageRect.height * pageInfo.h)),
         }
       : undefined;
+    // `pageInfo` is the first page's size. Most documents keep one size
+    // throughout, but a landscape table or a poster page does not, and a point
+    // measured against the wrong size lands somewhere else on the page. So the
+    // clicked page is asked for its own size before the click is reported.
+    const across = pageRect && pageRect.width > 0 ? Math.max(0, Math.min(1, (event.clientX - pageRect.left) / pageRect.width)) : 0;
+    const down = pageRect && pageRect.height > 0 ? Math.max(0, Math.min(1, (event.clientY - pageRect.top) / pageRect.height)) : 0;
+    const shownDoc = docCache.current.doc;
+    const clickId = ++clicks;
+    // The characters the preview draws here: the one the caret falls after and
+    // the one it falls before, since the pointer sits between two of them. The
+    // backend checks the glyph it resolves against these before trusting that
+    // this preview is the one it just laid out.
+    // The whole run of text the pointer is over, as pdf.js reads it. The backend
+    // compares it with the run it laid out there, which is what tells a current
+    // preview from one an edit has already moved on from. A couple of letters
+    // would not: swap two paragraphs and the letter under the pointer can still
+    // be the same one.
+    const shows = (clickedSpan?.textContent || '').slice(0, 400);
+    const report = (payload: SyncPayload) => {
+      payload = { ...payload, clickId };
+      if (!documentPosition || !shownDoc) { onReverseSync(payload); return; }
+      const number = documentPosition.page;
+      shownDoc.getPage(number)
+        .then((page: { getViewport(o: { scale: number }): { width: number; height: number } }) => {
+          // A recompile can replace the document while this was being read. The
+          // click was on the old one, and its position means nothing on the new.
+          if (docCache.current.doc !== shownDoc || clickId !== clicks) return;
+          const { width, height } = page.getViewport({ scale: 1 });
+          onReverseSync({ ...payload, documentPosition: {
+            page: number, x: across * width, y: down * height, width, height, pages: shownDoc.numPages, shows,
+          } });
+        })
+        .catch(() => { if (docCache.current.doc === shownDoc && clickId === clicks) onReverseSync(payload); });
+    };
     // The number Typst prints beside a block equation, out at the right margin.
     //
     // Found by looking for the nearest one rather than by asking what sits on
@@ -996,7 +1036,7 @@ function PdfPreview(
       ? Math.max(0, Math.min(1, (event.clientY - pagesRect.top) / pagesRect.height))
       : 0;
     if (!clickedSpan || !layer) {
-      if (documentPosition) onReverseSync({ words: [], focus: 0, docFraction: clickedFraction, documentPosition, mathHint, equationNumber });
+      if (documentPosition) report({ words: [], focus: 0, docFraction: clickedFraction, documentPosition, mathHint, equationNumber });
       return;
     }
 
@@ -1005,7 +1045,7 @@ function PdfPreview(
     // Operators and fraction/radical geometry may have no word token at all.
     // The compiled equation-location resolver can still map their coordinates.
     if (!spanIndexes.length) {
-      if (documentPosition) onReverseSync({ words: [], focus: 0, docFraction: docFractionOf(clickedSpan), documentPosition, mathHint, equationNumber });
+      if (documentPosition) report({ words: [], focus: 0, docFraction: docFractionOf(clickedSpan), documentPosition, mathHint, equationNumber });
       return;
     }
     const selectedWord = selectedWords.find(word => spanIndexes.some(index => words[index] === word)) || selectedWords[0];
@@ -1015,7 +1055,10 @@ function PdfPreview(
     // script rather than a person made), work out which word the pointer is
     // actually over.
     if (focus < 0) focus = wordUnderPointer(clickedSpan, spanIndexes, words, event.clientX, event.clientY);
-    if (focus < 0) return;
+    if (focus < 0) {
+      if (documentPosition) report({ words: [], focus: 0, docFraction: docFractionOf(clickedSpan), documentPosition, mathHint, equationNumber });
+      return;
+    }
     const from = Math.max(0, focus - 8);
     const to = Math.min(words.length, focus + 9);
     // A double-click can isolate `𝑥` from a span whose full PDF text is `d𝑥`.
@@ -1026,7 +1069,7 @@ function PdfPreview(
     // word this one click happened to select.
     const context = words.slice(from, to);
     if (selectedWord) context[focus - from] = selectedWord;
-    onReverseSync({
+    report({
       words: context,
       focus: focus - from,
       docFraction: docFractionOf(clickedSpan),

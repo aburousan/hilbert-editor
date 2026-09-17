@@ -8,7 +8,8 @@ export type ThemeId =
   | 'typst-light'
   | 'typst-sepia'
   | 'typst-midnight'
-  | 'typst-contrast';
+  | 'typst-contrast'
+  | 'typst-cosmos';
 
 export interface ThemeInfo {
   id: ThemeId;
@@ -25,6 +26,7 @@ export const THEMES: ThemeInfo[] = [
   { id: 'typst-sepia', label: 'Sepia', note: 'Warm and low-blue, for long sessions', dark: false },
   { id: 'typst-midnight', label: 'Midnight', note: 'Near-black, for dark rooms and OLED', dark: true },
   { id: 'typst-contrast', label: 'High Contrast', note: 'Maximum legibility over subtlety', dark: true },
+  { id: 'typst-cosmos', label: 'Cosmos', note: 'The cosmic microwave background behind your work', dark: true },
 ];
 
 export const DEFAULT_THEME: ThemeId = 'typst-dark';

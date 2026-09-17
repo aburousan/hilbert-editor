@@ -21,10 +21,20 @@ export type SyncPayload = {
   // PDF page coordinates in Typst/PDF points, measured from the top-left.
   // Present for reverse sync; lets the backend resolve formulas whose rendered
   // glyph has no useful text token (fraction bars, =, delimiters, drawings).
-  documentPosition?: { page: number; x: number; y: number };
+  documentPosition?: {
+    page: number; x: number; y: number;
+    // The clicked page's own size, the document's page count, and the character
+    // pdf.js draws under the pointer with the one beside it, so the backend can
+    // tell whether the page it lays out is the page on screen or one an edit
+    // has already moved on from.
+    width?: number; height?: number; pages?: number; shows?: string;
+  };
   // True when the clicked PDF span contains a mathematical glyph/operator.
   // Repeated formulas need their compiled coordinate to break text-match ties.
   mathHint?: boolean;
+  // Counts up with every double-click, so an answer that arrives after a newer
+  // click can be dropped instead of moving the cursor somewhere unasked.
+  clickId?: number;
   // Which repeat of the focus word this is, counted through the source.
   repeat?: WordRepeat | null;
   // The number printed beside a block equation, when the click was on one.

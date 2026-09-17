@@ -3,6 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod dict_catalog;
+mod jump;
 mod proofread;
 mod sandbox;
 mod server;
@@ -698,6 +699,53 @@ fn open_instance_window(
     Ok(())
 }
 
+/// Paths given on the command line, which is how a desktop asks an application
+/// to open a file — "Open with" on Windows and Linux, and a terminal anywhere.
+/// Flags and the values that belong to them are not files. A relative path is
+/// read from `cwd`: when a second launch hands its arguments over, that is the
+/// second launch's directory, not this one's.
+fn files_in(args: impl IntoIterator<Item = String>, cwd: &Path) -> Vec<PathBuf> {
+    const TAKES_VALUE: [&str; 5] = ["--session-file", "--workspace", "--port", "--bind", "--root"];
+    let mut files = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg.starts_with('-') {
+            if TAKES_VALUE.contains(&arg.as_str()) {
+                args.next();
+            }
+            continue;
+        }
+        let path = PathBuf::from(&arg);
+        let path = if path.is_relative() { cwd.join(path) } else { path };
+        if path.is_file() {
+            files.push(path);
+        }
+    }
+    files
+}
+
+/// Gives files to the window and brings it forward. The files go into the
+/// backend's queue, which the window collects; it is also told to collect now,
+/// because a window that is already in front gets no focus event to prompt it.
+fn deliver_files(app: &tauri::AppHandle, files: Vec<PathBuf>) {
+    use tauri::Manager;
+    let any = !files.is_empty();
+    for file in files {
+        server::queue_open(file);
+    }
+    let window = app.get_webview_window("main").or_else(|| app.webview_windows().into_values().next());
+    if let Some(window) = window {
+        if any {
+            let _ = window.eval("window.__hilbertCollectFiles && window.__hilbertCollectFiles()");
+        }
+        // Even with nothing to open: starting Hilbert again from its shortcut
+        // ends the new copy, and the one already running should come forward
+        // rather than stay minimised as if nothing happened.
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
 fn arg_value(flag: &str) -> Option<String> {
     let mut it = std::env::args();
     while let Some(a) = it.next() {
@@ -755,6 +803,13 @@ fn main() {
     }
 
     tauri::Builder::default()
+        // Registered first, as the plugin asks: Windows and Linux open a file by
+        // starting the program again with its path, and this sends that path to
+        // the copy already running and ends the new one, rather than letting a
+        // second app come up and write over the first one's saved session.
+        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            deliver_files(app, files_in(args.into_iter().skip(1), Path::new(&cwd)));
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
@@ -899,9 +954,18 @@ fn main() {
                 })
                 .filter(|d| d.exists());
 
-            // Reopen the last project if its folder still exists (session restore),
-            // otherwise fall back to the default documents workspace.
-            let ws = server::saved_workspace()
+            // A file handed over by the system decides which project opens: its
+            // own folder. Otherwise reopen the last project if its folder still
+            // exists (session restore), and failing that the documents folder.
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let opened = files_in(std::env::args().skip(1), &cwd);
+            for file in &opened {
+                server::queue_open(file);
+            }
+            let ws = opened
+                .first()
+                .and_then(|file| file.parent().map(Path::to_path_buf))
+                .or_else(server::saved_workspace)
                 .unwrap_or_else(|| workspace_dir(app.path().document_dir().ok()));
             // Dictionaries load on the first /lint call; see the note in headless_main.
             open_instance_window(app.handle(), "main".into(), ws, server::session_file_path(), dist)?;
@@ -961,6 +1025,12 @@ fn main() {
                 if let Some(state) = state {
                     tauri::async_runtime::block_on(server::shutdown_window(&state));
                 }
+            }
+            // macOS does not start a second copy to open a file: it sends the
+            // running one this — only macOS has it, so it is gated to macOS.
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Opened { urls } => {
+                deliver_files(app, urls.into_iter().filter_map(|url| url.to_file_path().ok()).collect());
             }
             tauri::RunEvent::Exit => {
                 let states: Vec<_> = BACKENDS.lock().unwrap().iter().map(|(label, state)| (label.clone(), state.clone())).collect();

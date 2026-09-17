@@ -270,7 +270,7 @@ export default function AppSettingsModal({ onClose, initialTab, initialSearch, o
 
   const inputStyle: React.CSSProperties = { padding: '9px 11px', background: 'var(--bg-color)', color: 'var(--text-main)', border: '1px solid var(--border-color)', borderRadius: '6px', fontSize: '0.9rem', fontFamily: 'inherit' };
   const labelStyle: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: '6px', fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)', letterSpacing: '0.02em' };
-  const btn = (bg: string): React.CSSProperties => ({ background: bg, color: 'white', border: 'none', padding: '8px 14px', borderRadius: '4px', cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.6 : 1 });
+  const btn = (bg: string): React.CSSProperties => ({ background: bg, color: bg === 'var(--accent)' ? 'var(--on-accent)' : 'white', border: 'none', padding: '8px 14px', borderRadius: '4px', cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.6 : 1 });
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -279,7 +279,7 @@ export default function AppSettingsModal({ onClose, initialTab, initialSearch, o
           <div style={{ padding: '15px', fontWeight: 'bold', borderBottom: '1px solid var(--border-color)' }}>App Settings</div>
           {(['general', 'spelling', 'interpreters', 'git', 'cloud'] as const).map(t => (
             <div key={t}
-              style={{ padding: '10px 15px', cursor: 'pointer', background: activeTab === t ? 'var(--accent)' : 'transparent', color: activeTab === t ? 'white' : 'var(--text-main)' }}
+              style={{ padding: '10px 15px', cursor: 'pointer', background: activeTab === t ? 'var(--accent)' : 'transparent', color: activeTab === t ? 'var(--on-accent)' : 'var(--text-main)' }}
               onClick={() => setActiveTab(t)}
             >
               {t === 'general' ? 'General' : t === 'spelling' ? 'Spelling' : t === 'interpreters' ? 'Interpreters' : t === 'git' ? 'Git & GitHub' : 'Cloud Accounts'}

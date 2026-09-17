@@ -52,11 +52,12 @@ function parseExistingCode(code: string): { path?: string; width?: number; capti
 }
 
 export default function ImagePlacer({
-  onClose, onEnsureImport, onInsert, workspaceImages = [], selectedCode,
+  onClose, onEnsureImport, onInsert, onAddFile, workspaceImages = [], selectedCode,
 }: {
   onClose: () => void,
   onEnsureImport: (importLine: string) => void,  // add an import at the top if missing
   onInsert: (code: string) => void,               // insert the figure at the cursor
+  onAddFile?: (file: File) => Promise<string | null>,  // copy a picture into the project
   workspaceImages?: string[],                      // image paths available in the workspace
   selectedCode?: string,                           // existing code to re-wrap (from editor selection)
 }) {
@@ -68,6 +69,30 @@ export default function ImagePlacer({
   const bodyText = selectedCode && !looksLikeImage ? selectedCode.trim() : null;
 
   const [imgPath, setImgPath] = useState(parsed?.path || 'images/figure.png');
+  // Adding a picture used to mean copying the file into the project folder by
+  // hand, outside the app, and then typing its path here. A picture can be
+  // handed over directly instead — chosen, or dropped on this dialog — and it
+  // is copied into the project's `images` folder.
+  const [adding, setAdding] = useState<string | null>(null);
+  const [dropping, setDropping] = useState(false);
+  const takeFile = async (file: File | undefined | null, set: (path: string) => void) => {
+    if (!file || !onAddFile) return;
+    if (!/^image\//.test(file.type) && !/\.(svg|png|jpe?g|gif|webp|bmp|tiff?|pdf)$/i.test(file.name)) {
+      setAdding(`${file.name} is not a picture`);
+      return;
+    }
+    setAdding(`Copying ${file.name}…`);
+    const path = await onAddFile(file);
+    setAdding(path ? null : `Could not copy ${file.name} into the project`);
+    if (path) set(path);
+  };
+  const choose = (set: (path: string) => void) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/*,.svg,.pdf';
+    input.onchange = () => void takeFile(input.files?.[0], set);
+    input.click();
+  };
   const [caption, setCaption] = useState(parsed?.caption || 'My figure');
   const [width, setWidth] = useState(parsed?.width || 38);
   const [flow, setFlow] = useState<Flow>(parsed?.flow || 'wrap-right');
@@ -255,7 +280,11 @@ export default function ImagePlacer({
 
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-content" style={{ width: 720, maxWidth: '95vw' }} onClick={e => e.stopPropagation()}>
+      <div className="modal-content" style={{ width: 720, maxWidth: '95vw', outline: dropping ? '2px dashed var(--accent)' : undefined }}
+        onClick={e => e.stopPropagation()}
+        onDragOver={e => { if (onAddFile) { e.preventDefault(); setDropping(true); } }}
+        onDragLeave={() => setDropping(false)}
+        onDrop={e => { if (!onAddFile) return; e.preventDefault(); setDropping(false); void takeFile(e.dataTransfer.files?.[0], setImgPath); }}>
         <div className="modal-header">
           <h2>{looksLikeImage ? 'Re-place Image' : bodyText ? 'Wrap Text with an Image' : 'Place an Image'}</h2>
           <button className="close-btn" onClick={onClose}>×</button>
@@ -332,6 +361,12 @@ export default function ImagePlacer({
                   ) : (
                     <input type="text" value={imgPath} onChange={e => setImgPath(e.target.value)} placeholder="images/figure.png" />
                   )}
+                  {onAddFile && (
+                    <button type="button" className="btn-ghost" style={{ marginTop: 4, fontSize: '0.8rem' }}
+                      onClick={() => choose(setImgPath)}>
+                      Add a picture from this computer…
+                    </button>
+                  )}
                 </label>
                 <label className="form-field" style={{ maxWidth: 120 }}>
                   <span>Preview page</span>
@@ -340,6 +375,12 @@ export default function ImagePlacer({
                   </select>
                 </label>
               </div>
+              {adding && (
+                <div className="form-hint" style={{ marginTop: 4, color: /Could not|not a picture/.test(adding) ? '#dc2626' : undefined }}>{adding}</div>
+              )}
+              {!workspaceImages.length && onAddFile && !adding && (
+                <div className="form-hint" style={{ marginTop: 4 }}>No pictures in this project yet — choose one above, or drop one on this window.</div>
+              )}
               {/* Manual path entry when images exist (in case the user wants a different path) */}
               {workspaceImages.length > 0 && (
                 <label className="form-field" style={{ marginTop: 4 }}>
@@ -354,6 +395,12 @@ export default function ImagePlacer({
                 <>
                   <label className="form-field">
                     <span>Second image</span>
+                    {onAddFile && (
+                      <button type="button" className="btn-ghost" style={{ marginBottom: 4, fontSize: '0.8rem' }}
+                        onClick={() => choose(setImgPath2)}>
+                        Add a second picture…
+                      </button>
+                    )}
                     {workspaceImages.length > 0 ? (
                       <select value={imgPath2} onChange={e => setImgPath2(e.target.value)}>
                         {workspaceImages.map(p2 => <option key={p2} value={p2}>{p2}</option>)}

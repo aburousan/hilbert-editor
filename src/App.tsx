@@ -1458,7 +1458,10 @@ export default function App() {
           catch { await new Promise(r => setTimeout(r, 500)); }
         }
         selectRecoveryWorkspace(recoveryKey || window.location.origin);
-        await restoreSessionOrDefault();
+        try { await restoreSessionOrDefault(); } finally {
+          startupRestoredRef.current.settled = true;
+          startupRestoredRef.current.resolve();
+        }
         // Publish readiness after the session's pane positions are in state.
         // Otherwise the cached PDF can mount at page one in the render between
         // these two operations and consume an empty one-shot view restore.
@@ -2245,6 +2248,8 @@ export default function App() {
     treeHasPath('main.typ') ? 'main.typ' :
     (activeTabPath && activeTabPath.endsWith('.typ') ? activeTabPath : (lastTypPath || 'main.typ')),
     [mainOverride, detectedEntry, activeTabPath, lastTypPath, treeHasPath]);
+  const currentMainRef = useRef(currentMain);
+  currentMainRef.current = currentMain;
   // Declared after currentMain because tinymist has to be told which file the
   // document is compiled from: a chapter checked on its own reports every
   // reference that lives in another file as missing.
@@ -2586,7 +2591,18 @@ export default function App() {
 
   const openFileRef = useRef<(path: string) => Promise<void>>(async () => {});
   
+  // Opening a file reads it before showing it, and two files asked for in quick
+  // succession come back in whichever order the two reads happen to take. The
+  // file asked for last is the one wanted, however slow it is to read, or the
+  // editor lands on a file nobody asked for — usually the larger, older one.
+  // A read still on its way when the project is closed belongs to that project
+  // and has no business opening a tab in the next one.
+  const openTicketRef = useRef(0);
+  const projectGenerationRef = useRef(0);
+
   const openFile = async (path: string) => {
+    const ticket = ++openTicketRef.current;
+    const generation = projectGenerationRef.current;
     const ext = (path.split('.').pop() || '').toLowerCase();
     // Images and PDFs are binary: open them as a preview tab rather than reading
     // their bytes as text, which would fill the editor with garbage.
@@ -2598,13 +2614,15 @@ export default function App() {
       if (!tabs.find(t => t.path === path)) {
         try {
           const state = await readFileState(path);
+          if (projectGenerationRef.current !== generation) return;
           setTabs(prev => prev.some(t => t.path === path) ? prev : [...prev, {
             path, content: state.content, isDirty: false, diskHash: state.hash,
           }]);
         } catch (e) {}
       }
     }
-    
+
+    if (projectGenerationRef.current !== generation || ticket !== openTicketRef.current) return;
     setActiveTabPath(path);
   };
   openFileRef.current = openFile;
@@ -3211,6 +3229,9 @@ export default function App() {
   // After the workspace contents change (root switch or import), reload the tree,
   // reset the editor, name the project after the folder, and open a starter file.
   const loadWorkspace = async (projectDisplayName?: string) => {
+    // Whatever the last project was still reading, it is not wanted here.
+    projectGenerationRef.current++;
+    openTicketRef.current++;
     compileQueueRef.current?.cancelPending();
     compileAbortRef.current?.abort();
     setTabs([]);
@@ -3259,6 +3280,8 @@ export default function App() {
         if (r.ok) loaded.push({ path: p, content: await r.text(), isDirty: false });
       } catch {}
     }
+    // The reads take time, and a file opened from outside meanwhile wins.
+    if (startupRestoredRef.current.overtaken) return true;
     if (!loaded.length) return false;
     setTabs(loaded);
     const active = loaded.find(t => t.path === sess.activePath) ? sess.activePath : loaded[loaded.length - 1].path;
@@ -3278,24 +3301,36 @@ export default function App() {
   // with its disk hash) rather than seeding the starter template over it — a
   // dirty template would otherwise read as an external change against the file
   // already on disk. Only a workspace without a main.typ gets the template.
-  const openEntryOrSeed = async () => {
+  const openEntryOrSeed = async (stillWanted: () => boolean = () => true) => {
     try {
       const disk = await readFileState('main.typ');
+      if (!stillWanted()) return;
       if (disk.hash) {
         setTabs([{ path: 'main.typ', content: disk.content, isDirty: false, diskHash: disk.hash }]);
         setActiveTabPath('main.typ');
         return;
       }
     } catch {}
-    seedDefaultTab();
+    if (stillWanted()) seedDefaultTab();
   };
 
   // On launch, switch to the previous folder and reopen its tabs. The guarded
   // backend endpoint handles native paths in both the Tauri webview and browser
   // frontend, so this must not depend on an injected window.desktop helper.
   const restoreSessionOrDefault = async () => {
+    // How many handed-over files had opened when the restore began; the
+    // backend refuses its project switch once that has changed.
+    let handed: number | undefined;
+    try {
+      const peek = await (await fetch(`${API}/app/pending-open?peek=1`)).json();
+      if (Number.isFinite(peek?.handed)) handed = peek.handed;
+    } catch {}
     let sess: any = null;
     try { sess = await (await fetch(`${API}/session`)).json(); } catch {}
+    // Slow enough that a file handed over by the system opened first: that file
+    // is what the writer asked for, and the old project must not replace it.
+    const overtaken = () => startupRestoredRef.current.overtaken;
+    if (overtaken()) { setBooted(true); return; }
     // Before the tabs, and whether or not any of them can be reopened: the fold
     // state and the chosen main file belong to the project, not to the tabs.
     if (sess) {
@@ -3331,18 +3366,36 @@ export default function App() {
     if (sess && Array.isArray(sess.openPaths) && sess.openPaths.length) {
       try {
         if (sess.workspacePath) {
-          const res = await fetch(`${API}/workspace/root`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: sess.workspacePath }) });
+          if (overtaken()) { setBooted(true); return; }
+          const switchRoot = () => fetch(`${API}/workspace/root`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: sess.workspacePath, unlessOpenedSince: handed }) });
+          let res = await switchRoot();
+          // The count is shared by every window. Refused while this window has
+          // opened nothing, the file went to another window, and this one
+          // should still come back as it was.
+          for (let retry = 0; res.status === 409 && !overtaken() && retry < 5; retry++) {
+            try {
+              const peek = await (await fetch(`${API}/app/pending-open?peek=1`)).json();
+              if (peek?.waiting) break;
+              handed = Number.isFinite(peek?.handed) ? peek.handed : undefined;
+            } catch { break; }
+            if (overtaken()) break;
+            res = await switchRoot();
+          }
+          if (overtaken() || res.status === 409) { setBooted(true); return; }
           if (res.ok) {
             workspacePathRef.current = sess.workspacePath;
             selectRecoveryWorkspace(sess.workspacePath);
             setProjectName(sess.workspacePath.replace(/[/\\]+$/, '').split(/[/\\]/).pop() || 'Project');
           }
         }
-        setFileTree(await (await fetch(`${API}/workspace`)).json());
+        const tree = await (await fetch(`${API}/workspace`)).json();
+        if (overtaken()) { setBooted(true); return; }
+        setFileTree(tree);
         if (await restoreTabsFromSession(sess)) { setBooted(true); return; }
       } catch {}
     }
-    await openEntryOrSeed();
+    if (overtaken()) { setBooted(true); return; }
+    await openEntryOrSeed(() => !overtaken());
     setBooted(true);
     fetchTree();
   };
@@ -3373,6 +3426,7 @@ export default function App() {
   //   the real folder.
   // - Other browsers → folder picker that imports a working copy (no write-back).
   // Desktop: repoint the backend at an absolute path (also used by Open Recent).
+  const openFolderPathAsRootRef = useRef<(folder: string) => Promise<void>>(async () => {});
   const openFolderPathAsRoot = async (folder: string) => {
     try {
       if (collabRef.current) disposeProjectSession();
@@ -3386,6 +3440,15 @@ export default function App() {
       await loadWorkspace(name);
       addRecentFolder({ name, path: folder });
     } catch { notify('Could not reach the local server.'); }
+  };
+  openFolderPathAsRootRef.current = openFolderPathAsRoot;
+  // The backend is already on this project; the window only needs to know it.
+  const adoptProjectRef = useRef<(root: string) => Promise<void>>(async () => {});
+  adoptProjectRef.current = async (root: string) => {
+    workspacePathRef.current = root;
+    selectRecoveryWorkspace(root);
+    setProjectName(root.replace(/[/\\]+$/, '').split(/[/\\]/).pop() || 'Project');
+    await fetchTree();
   };
 
   // Chrome/Edge: writable directory handle → edits reflect on disk (also used by
@@ -3406,6 +3469,127 @@ export default function App() {
       const key = `dir:${dir.name}`;
       try { await idbPut(key, dir); addRecentFolder({ name: dir.name, idb: key }); } catch { /* recents are best-effort */ }
     } catch { notify('Could not open that folder.'); }
+  };
+
+  // Files the system asked Hilbert to open: "Open with" in Finder or Explorer,
+  // or a path given on the command line. The backend queues them, because at a
+  // cold start there is no window yet to open anything. They are collected once
+  // the last session has been put back — collecting sooner lets the restore
+  // land afterwards and put the old project back over the file just opened —
+  // and again when the backend says there are more, or the window comes to the
+  // front.
+  //
+  // One collection runs at a time and takes a file at a time. Running two at
+  // once let an older batch finish last and leave its file in front; taking a
+  // batch at once meant deciding for every file whether it was in the open
+  // project before the first of them had switched to another.
+  const startupRestoredRef = useRef((() => {
+    let resolve!: () => void;
+    const promise = new Promise<void>(done => { resolve = done; });
+    // `settled` once the restore is over; `overtaken` if a file opened before
+    // it was, so a restore that turns up late leaves that file alone.
+    // `waited` is whether one collection has already given up waiting on it.
+    return { promise, resolve, settled: false, overtaken: false, waited: false };
+  })());
+  const collectingRef = useRef<Promise<void> | null>(null);
+  const collectAgainRef = useRef(false);
+  const collectFilesToOpen = useCallback(async () => {
+    if (collectingRef.current) { collectAgainRef.current = true; return collectingRef.current; }
+    const run = (async () => {
+      // Restore normally takes a moment. If the backend never answers it, a
+      // file handed over must still open rather than wait for ever behind it.
+      const startup = startupRestoredRef.current;
+      if (!startup.settled) {
+        await Promise.race([startup.promise, new Promise(done => setTimeout(done, startup.waited ? 0 : 15000))]);
+        startup.waited = true;
+      }
+      do {
+        collectAgainRef.current = false;
+        if (!startup.settled) {
+          // Still restoring. Overtake it only for a file actually waiting: a
+          // slow restore with nothing to open instead should be left to finish.
+          let waiting = false;
+          try {
+            const res = await fetch(`${API}/app/pending-open?peek=1`);
+            waiting = res.ok && !!(await res.json()).waiting;
+          } catch {}
+          if (!waiting) continue;
+          if (!startup.settled) {
+            // The backend refuses the restore's project switch from here on,
+            // so it cannot land after the file whatever it is held up by.
+            // Everything that waits for startup — compiling, saving the
+            // session, draft recovery — would otherwise wait on it too.
+            startup.overtaken = true;
+            startup.settled = true;
+            startup.resolve();
+            setBooted(true);
+            setBackendReady(true);
+          }
+        }
+        // Until the queue is empty: the backend takes each file off as it hands
+        // it over, so this ends however many were queued.
+        for (;;) {
+          let answer: { file?: { path: string; folder?: string; inWorkspace: boolean } | null; more?: boolean; root?: string };
+          try {
+            const res = await fetch(`${API}/app/pending-open`);
+            if (!res.ok) break;
+            answer = await res.json();
+          } catch { break; }
+          const file = answer?.file;
+          if (!file?.path) break;
+          // One file that will not open should not keep the rest from opening.
+          try {
+            if (file.inWorkspace) {
+              // Opened ahead of the restore, or with no session to restore,
+              // the window has not been told which project the backend has,
+              // and the session would be saved without one.
+              if (answer.root && !workspacePathRef.current) await adoptProjectRef.current(answer.root);
+              await openFileRef.current(file.path);
+            } else if (file.folder) {
+              await openFolderPathAsRootRef.current(file.folder);
+              await openFileRef.current(file.path);
+            }
+          } catch {}
+          if (!answer.more) break;
+        }
+      } while (collectAgainRef.current);
+    })();
+    collectingRef.current = run;
+    try { await run; } finally { collectingRef.current = null; }
+  }, []);
+
+  useEffect(() => {
+    const w = window as typeof window & { __hilbertCollectFiles?: () => Promise<void> };
+    // The desktop shell calls this when it hands over a file, because a window
+    // already in front gets no focus event to prompt a collection.
+    w.__hilbertCollectFiles = collectFilesToOpen;
+    void collectFilesToOpen();
+    const onFocus = () => { void collectFilesToOpen(); };
+    window.addEventListener('focus', onFocus);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      if (w.__hilbertCollectFiles === collectFilesToOpen) delete w.__hilbertCollectFiles;
+    };
+  }, [collectFilesToOpen]);
+
+  // A picture chosen or dropped in a dialog is copied into the project's
+  // `images` folder and referred to from there, because a Typst document can
+  // only read what is inside its own root — a path to somewhere else on the
+  // computer compiles here and for nobody else. The backend picks the name, so
+  // that nothing already there is replaced: `Photo.png` and `photo.png` are one
+  // file on most Mac and Windows disks, and two pictures added at once could
+  // otherwise both find the same name free.
+  const addPictureToProject = async (file: File): Promise<string | null> => {
+    const clean = file.name.replace(/[\\/:*?"<>|]+/g, '-').replace(/^\.+/, '').trim() || 'picture';
+    try {
+      const res = await fetch(`${API}/workspace/upload?unique=1&path=${encodeURIComponent(`images/${clean}`)}`, {
+        method: 'POST', body: await file.arrayBuffer(), headers: { 'Content-Type': 'application/octet-stream' },
+      });
+      if (!res.ok) return null;
+      const { path } = await res.json();
+      await fetchTree();
+      return typeof path === 'string' ? path : null;
+    } catch { return null; }
   };
 
   const openRecentFolder = async (r: RecentFolder) => {
@@ -4015,17 +4199,44 @@ export default function App() {
       { key: 'email', label: 'Email', default: '', placeholder: 'you@example.com' },
       { key: 'institute', label: 'Institute / Affiliation', default: '', placeholder: 'Affiliation' },
     ],
-    onSubmit: (v) => insertAtTop(
+    onSubmit: async (v) => {
+      const email = v.email ? `#link("mailto:${v.email}")[${v.email.replace(/@/g, '\\@')}]` : '';
+      const byline = [v.author, v.institute && `#text(fill: gray)[${v.institute}]`, email].filter(Boolean).join(' \\\n  ');
+      // Typst carries the title itself: it goes into the PDF's metadata, which
+      // is what a reader's window title and its accessibility tools read, and
+      // `#title()` puts that same title on the page. Writing it out by hand as
+      // bold centred text leaves the document with no title at all as far as
+      // anything but a human eye is concerned.
+      if (atLeast(await typstVersion(), '0.15.0')) {
+        const meta = [`title: [${v.title}]`, v.author && `author: ("${v.author.replace(/"/g, '\\"')}",)`].filter(Boolean).join(', ');
+        insertAtTop(`#set document(${meta})\n\n#title()\n${byline ? `\n#align(center)[\n  ${byline}\n]\n` : ''}\n`);
+        return;
+      }
+      insertAtTop(
 `#align(center)[
   #text(17pt, weight: "bold")[${v.title}]
-
+${byline ? `
   #v(0.4em)
-  ${v.author} \\
-  #text(fill: gray)[${v.institute}]${v.email ? ` \\\n  #link("mailto:${v.email}")[${v.email.replace(/@/g, '\\@')}]` : ''}
-]
+  ${byline}
+` : ''}]
 
-`)
+`);
+    }
   });
+
+  // What the compiler on PATH will accept. `#set document(title:)` and the
+  // `#title()` element arrived in Typst 0.15, and a document using them does
+  // not compile for someone still on 0.14, so the older shape is kept for them.
+  const typstVersionRef = useRef<Promise<string> | null>(null);
+  const typstVersion = () => (typstVersionRef.current ??= fetch(`${API}/toolchain/status`)
+    .then(r => r.json())
+    .then(d => String(d?.typst?.version || ''))
+    .catch(() => ''));
+  const atLeast = (version: string, want: string) => {
+    const [a, b] = [version, want].map(v => v.split('.').map(n => Number(n) || 0));
+    for (let i = 0; i < 3; i++) if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) > (b[i] ?? 0);
+    return true;
+  };
 
   const insertAuthor = () => setInputModal({
     title: 'Insert Author',
@@ -5013,12 +5224,13 @@ export default function App() {
     setTimeout(() => { if (editorRef.current) syncDecorations.current = editorRef.current.deltaDecorations(syncDecorations.current, []); }, 1300);
   };
 
-  const flashWhenFileReady = (path: string, line: number) => {
+  const flashWhenFileReady = (path: string, line: number, column = 1, length = 0, wanted: () => boolean = () => true) => {
     let attempts = 0;
     const tryFlash = () => {
+      if (!wanted()) return;
       const modelPath = editorRef.current?.getModel()?.uri.path.replace(/^\//, '');
       if (activeTabRef.current?.path === path && modelPath === path) {
-        flashSourceRange(line, 1, 0);
+        flashSourceRange(line, column, length);
       } else if (attempts++ < 40) {
         setTimeout(tryFlash, 25);
       }
@@ -5090,7 +5302,104 @@ export default function App() {
   }, [currentMain, pdfUrl]);
 
   // Reverse: a PDF word (with its neighbours) → the exact source location.
+  // Typst records where every glyph on the page was written. The backend lays
+  // the document out again and reads that position off the glyph under the
+  // pointer, which is exact where matching words can only be likely. Answers
+  // false when it cannot say, and the matching in `reverseSync` takes over.
+  const jumpToWritten = async (p: SyncPayload, stillCurrent: () => boolean): Promise<boolean> => {
+    const point = p.documentPosition;
+    if (!point?.width || !point.height || !point.pages) return false;
+    let answer: any;
+    try {
+      const res = await fetch(`${API}/sync/jump`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ main: currentMainRef.current, page: point.page, x: point.x, y: point.y,
+          pages: point.pages, width: point.width, height: point.height, shows: point.shows }),
+      });
+      if (!res.ok) return false;
+      answer = await res.json();
+    } catch { return false; }
+    // Answered after a newer double-click: that one decides where to go, and
+    // this one must not fall back to matching against whatever is open now.
+    if (!stillCurrent()) return true;
+
+    if (answer?.found === 'package') {
+      setErrorLogs(`That text is written by the ${answer.package} package, not anywhere in this project.`);
+      return true;
+    }
+    if (answer?.found !== 'source' || typeof answer.path !== 'string') return false;
+    const { path, line, column } = answer as { path: string; line: number; column: number };
+    if (!stillCurrent()) return true;
+
+    const lineText = async () => {
+      const model = editorRef.current?.getModel();
+      if (activeTabRef.current?.path === path && model && line <= model.getLineCount()) return model.getLineContent(line);
+      try {
+        const res = await fetch(`${API}/workspace/file?path=${encodeURIComponent(path)}`);
+        return res.ok ? (await res.text()).split('\n')[line - 1] ?? '' : '';
+      } catch { return ''; }
+    };
+    const text = await lineText();
+    // The word around the column, to highlight. Chinese, Japanese and Thai put
+    // no spaces between words, so where the browser can split words properly it
+    // does; otherwise a run of letters, digits and combining marks. Never `_`,
+    // which in Typst is emphasis in prose and a subscript in math.
+    const at = column - 1;
+    let before = text.slice(0, at).match(/[\p{L}\p{N}\p{M}]*$/u)?.[0] ?? '';
+    let after = text.slice(at).match(/^[\p{L}\p{N}\p{M}]*/u)?.[0] ?? '';
+    const Segmenter = (Intl as { Segmenter?: new (locale?: string, options?: { granularity: string }) => { segment(t: string): Iterable<{ segment: string; index: number; isWordLike?: boolean }> } }).Segmenter;
+    if (Segmenter && (before || after)) {
+      const run = before + after;
+      const cut = before.length;
+      let last = null;
+      for (const piece of new Segmenter(undefined, { granularity: 'word' }).segment(run)) {
+        last = piece;
+        const end = piece.index + piece.segment.length;
+        if (piece.index <= cut && cut < end) { last = null; before = run.slice(piece.index, cut); after = run.slice(cut, end); break; }
+      }
+      // Nothing contains the cut when it sits at the very end of the run.
+      if (last) { before = run.slice(last.index); after = ''; }
+    }
+    const word = before + after;
+
+    // A `typst` on PATH of another version can break the lines of a page in
+    // other places without changing the page's size, so there the answer has
+    // to name the word that was clicked before it is believed. Prose only:
+    // a formula's glyphs are seldom spelled the way its source is.
+    if (!answer.sameTypst && !p.mathHint) {
+      const clicked = (p.words[usableFocus(p.words, p.focus)] || '').toLowerCase();
+      const found = word.toLowerCase();
+      if (clicked && /^\p{L}+$/u.test(clicked) && !(found.includes(clicked) || (found && clicked.includes(found)))) return false;
+    }
+
+    const start = column - before.length;
+    const length = Math.max(1, word.length);
+    // Reading the file may have taken a while; by now the reader may have
+    // double-clicked somewhere else, and that click decides where to go.
+    if (!stillCurrent()) return true;
+    if (activeTabRef.current?.path === path) {
+      flashSourceRange(line, start, length);
+    } else {
+      setSelectedPaths([path]);
+      setLastSelectedPath(path);
+      await openFileRef.current(path);
+      // Opening a file waits on a read; by then this click may be the older one.
+      if (!stillCurrent()) return true;
+      flashWhenFileReady(path, line, start, length, stillCurrent);
+    }
+    return true;
+  };
+
+  const reverseSyncClicks = useRef(0);
   const reverseSync = useCallback(async (p: SyncPayload) => {
+    // The preview numbers its double-clicks; anything else asking for a jump
+    // counts as the newest.
+    const click = p.clickId ?? reverseSyncClicks.current + 1;
+    reverseSyncClicks.current = Math.max(reverseSyncClicks.current, click);
+    const current = () => click === reverseSyncClicks.current;
+    if (await jumpToWritten(p, current)) return;
+    if (!current()) return;
     const editor = editorRef.current; const model = editor?.getModel();
     if (!editor || !model) return;
     // Not always the token under the pointer: a digit is no use as an anchor,
@@ -5110,6 +5419,7 @@ export default function App() {
     // each equation's number alongside which block equation it is.
     if (p.equationNumber) {
       const equations = await getCompiledMathMap();
+      if (!current()) return;
       const printed = equations.find(equation => equation.number === p.equationNumber);
       const counted = blockEquationStart(model.getLinesContent(), printed ? printed.blockOrdinal : p.equationNumber);
       if (counted) {
@@ -5153,6 +5463,7 @@ export default function App() {
     let compiledMathWords: string[] = [];
     if (p.documentPosition) {
       const equations = await getCompiledMathMap();
+      if (!current()) return;
       const point = p.documentPosition;
       const candidates = equations
           .filter(equation => equation.position.page === point.page)
@@ -5206,6 +5517,7 @@ export default function App() {
       const ctx = contextWords.filter(word => word !== focusWord);
       const resp = await fetch(`${API}/workspace/search?q=${encodeURIComponent(focusWord)}`);
       const hits = await resp.json();
+      if (!current()) return;
       if (Array.isArray(hits) && hits.length) {
         let bestHit = hits[0], bestLine = hits[0].matches[0].lineNum, bestScore = -1;
         for (const hit of hits) for (const m of hit.matches) {
@@ -5216,7 +5528,8 @@ export default function App() {
         setSelectedPaths([bestHit.path]);
         setLastSelectedPath(bestHit.path);
         await openFileRef.current(bestHit.path);
-        flashWhenFileReady(bestHit.path, bestLine);
+        if (!current()) return;
+        flashWhenFileReady(bestHit.path, bestLine, 1, 0, current);
         return;
       }
     } catch {}
@@ -6380,6 +6693,12 @@ export default function App() {
     { category: 'Text', title: 'Horizontal Line (full width)', hint: keys('⌘⇧H'), run: insertHRule },
     { category: 'Figures', title: 'Figure...', run: () => setShowFigureBuilder(true) },
     { category: 'Figures', title: 'Image...', run: insertImage },
+    { category: 'Figures', title: 'Place Image (wrap, float, side by side)...', run: () => {
+      const selection = editorRef.current?.getSelection();
+      const model = editorRef.current?.getModel();
+      const code = selection && model && !selection.isEmpty() ? model.getValueInRange(selection).trim() : '';
+      setShowImagePlacer(code ? code : true);
+    } },
     { category: 'Figures', title: 'Whiteboard / Sketch (Excalidraw)...', run: insertWhiteboard },
     { category: 'Figures', title: 'Table...', run: insertTable },
     { category: 'Figures', title: 'Import Data (CSV/Excel/JSON)...', run: insertDataFile },
@@ -7490,7 +7809,7 @@ export default function App() {
           document.body.classList.add('is-resizing');
         }} />
         )}
-        <div className="preview-pane" style={{ flex: 1, minWidth: 0, overflow: 'hidden', display: panels.preview ? 'flex' : 'none', flexDirection: 'column', position: 'relative', backgroundColor: '#ffffff', order: mirrored ? 1 : 0 }}>
+        <div className="preview-pane" style={{ flex: 1, minWidth: 0, overflow: 'hidden', display: panels.preview ? 'flex' : 'none', flexDirection: 'column', position: 'relative', order: mirrored ? 1 : 0 }}>
           <div style={{ flex: 1, minWidth: 0, position: 'relative', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
             {/* PDF stays mounted whenever it exists, so its scroll/zoom survive
                 switching to the Problems view and back. */}
@@ -7645,7 +7964,8 @@ export default function App() {
         onClose={() => setShowRecoveryDrafts(false)}
       /></Suspense>}
       {showMatrixStudio && <Suspense fallback={null}><MatrixStudio onClose={() => setShowMatrixStudio(false)} onInsert={insertMatrixBody} /></Suspense>}
-      {showImagePlacer && <Suspense fallback={null}><ImagePlacer onClose={() => setShowImagePlacer(false)} onEnsureImport={(imp) => { const m = editorRef.current?.getModel(); if (m && !m.getValue().includes(imp.trim())) insertAtTop(imp); }} onInsert={(code) => { if (typeof showImagePlacer === 'string') { const { editor, model, sel } = getSelectionCtx(''); if (sel && editor && model && !sel.isEmpty()) { editor.executeEdits('re-place', [{ range: sel, text: code, forceMoveMarkers: true }]); editor.focus(); } else insertCode(code); } else insertCode(code); fetchTree(); }} workspaceImages={workspaceImages} selectedCode={typeof showImagePlacer === 'string' ? showImagePlacer : undefined} /></Suspense>}
+      {showImagePlacer && <Suspense fallback={null}><ImagePlacer onClose={() => setShowImagePlacer(false)} onEnsureImport={(imp) => { const m = editorRef.current?.getModel(); if (m && !m.getValue().includes(imp.trim())) insertAtTop(imp); }}
+        onAddFile={addPictureToProject} onInsert={(code) => { if (typeof showImagePlacer === 'string') { const { editor, model, sel } = getSelectionCtx(''); if (sel && editor && model && !sel.isEmpty()) { editor.executeEdits('re-place', [{ range: sel, text: code, forceMoveMarkers: true }]); editor.focus(); } else insertCode(code); } else insertCode(code); fetchTree(); }} workspaceImages={workspaceImages} selectedCode={typeof showImagePlacer === 'string' ? showImagePlacer : undefined} /></Suspense>}
       {showFlowchart && <Suspense fallback={null}><FlowchartCoder onClose={() => setShowFlowchart(false)} onInsert={(code) => { if (code.includes('fc-result(')) ensureSetup('#let fc-result', '#let fc-result(v) = box(inset: (x: 9pt, y: 6pt), radius: 6pt, fill: rgb(238, 242, 255), stroke: 0.6pt + rgb(165, 180, 252))[*Result:* #v]'); insertCode(`\n${code}\n`); setShowFlowchart(false); }} onSaved={(path) => { void mirrorLocalPath(path); void fetchTree(); }} /></Suspense>}
       {showAbout && (
         <div className="modal-overlay" onClick={() => setShowAbout(false)}>

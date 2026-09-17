@@ -4,6 +4,70 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.2.6
+
+Double-clicking text in the preview now finds the exact place it was written, equations included, instead of guessing. Hilbert opens the file you asked for rather than the last one you had. `.typ` files are registered with the system, so Open With lists Hilbert and actually opens the file. And there is a new theme, Cosmos, with the cosmic microwave background behind your work.
+
+### Double-click finds what you clicked
+
+The jump from the preview to the source used to match words between the PDF and
+the file, which is a guess: a word that appears twice, a symbol in an equation,
+or a heading number could all send you to the wrong line. Hilbert now lays the
+document out the same way Typst does and asks which piece of the source produced
+the glyph under the pointer. Letters inside equations, sub- and superscripts and
+large brackets all land where they were written.
+
+When the preview on screen is older than the file, because you edited while it
+was recompiling, the answer is checked against what the page actually shows, and
+Hilbert falls back to the old matching rather than jumping to the wrong place.
+Arabic, Hebrew, Bengali, Chinese and Greek on the same page all land on the word
+you clicked.
+
+### The file you open is the one that opens
+
+Opening reads a file and then switches to its tab. Click a large file and then a
+small one, and the large one could finish reading last and take the editor back
+to it. The file clicked last now always wins, and a read still running from a
+project you have just left no longer opens a tab in the new one.
+
+Open With on macOS used to start Hilbert and drop the file, because it arrives as an event rather than a
+command-line argument. Opening a file while Hilbert is already running hands it
+to the open window instead of starting a second copy, several files at once all
+open, and a file from another folder brings its own project with it. If putting
+the last session back is slow at startup, the file you opened still comes first
+and the old project does not replace it afterwards.
+
+### Title and document details
+
+Insert → Title now writes `#set document(title: [...])` followed by `#title()`,
+the way Typst intends, so the PDF's metadata and the heading on the page come
+from one place. On a Typst older than 0.15 it falls back to the previous form.
+
+### Slides and pictures
+
+A picture can be added from anywhere on your computer without leaving the dialog,
+by choosing it or dropping it in. It is copied into the project's `images` folder
+under a name of its own, so it never replaces a picture already there, not even
+one whose name differs only in capitals. A half-finished copy is never left
+under the real name.
+
+In the slide builder, a layout waiting for pictures compiles and shows a box
+saying what is missing instead of an error about a path you never typed. A pair
+with only one picture chosen is sized by that picture's shape, as on the canvas,
+rather than as half the width, which let a tall picture run off the slide. A
+tall picture picked into a wide box shrinks to fit, and anything still off the
+bottom of the slide says so.
+
+### Cosmos
+
+A dark theme with a map of the cosmic microwave background behind the editor and
+around the preview, drawn from a simulated sky rather than a stock image. The
+page itself stays white and the text stays readable. Buttons on an accent
+colour now use the theme's own text colour, which also fixes white-on-orange
+and white-on-bright buttons in Midnight and High Contrast.
+
+---
+
 ## 0.2.5
 
 Double-clicking an equation number in the preview lands on that equation now, not the nth block. Proofreading runs one pass at a time rather than one per keystroke. Every ready-made equation is checked against Typst. And the icon is visible again on dark Windows themes.

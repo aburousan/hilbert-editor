@@ -1,13 +1,13 @@
 [package]
 name = "typst-editor"
-version = "0.2.5"
+version = "0.2.6"
 description = "Hilbert — an offline editor for Typst (Unofficial), aimed at maths/physics writing."
 authors = ["Kazi Abu Rousan"]
 license = "MIT"
 edition = "2024"
 # Let chains need 1.88, and the typst and burn crates harper pulls in need
 # 1.89 — declaring less holds those back at older versions.
-rust-version = "1.89"
+rust-version = "1.92"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -60,6 +60,13 @@ spellbook = "0.4"
 encoding_rs = "0.8"
 harper-core = "2.8"
 harper-typst = "2.8"
+typst = "=0.15.1"
+typst-layout = "=0.15.1"
+dunce = "1.0.5"
+ttf-parser = "0.25.1"
+unicode-normalization = "0.1.25"
+typst-kit = { version = "=0.15.1", default-features = false, features = ["datetime", "embedded-fonts", "scan-fonts", "system-packages"] }
+tauri-plugin-single-instance = "2.4.4"
 
 # Keep this LAST: a [target.…] header ends [dependencies], so anything written
 # below it would silently become unix-only.

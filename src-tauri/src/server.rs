@@ -1213,8 +1213,20 @@ async fn workspace_root_post(State(st): St, body: Bytes) -> Response {
         }
     }
     let old_ws = st.ws();
-    let stop_old_lsp = move_workspace_user(&old_ws, &resolved);
-    *st.workspace.write().unwrap_or_else(|e| e.into_inner()) = resolved.clone();
+    let stop_old_lsp = {
+        // Putting the last session back asks to switch "unless a file has been
+        // opened since": however late the request arrives, it must not move a
+        // file the system handed over back into the old project.
+        let _handing = PENDING_OPEN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(since) = v.get("unlessOpenedSince").and_then(Value::as_u64) {
+            if OPENS_HANDED_OUT.load(Ordering::SeqCst) != since {
+                return json_err(StatusCode::CONFLICT, "A file was opened meanwhile.");
+            }
+        }
+        let stop = move_workspace_user(&old_ws, &resolved);
+        *st.workspace.write().unwrap_or_else(|e| e.into_inner()) = resolved.clone();
+        stop
+    };
     stop_preview_watcher(&st).await;
     // Tinymist is shared per workspace. Moving one of two windows away must not
     // interrupt completion/diagnostics in the window that stayed behind.
@@ -1407,6 +1419,9 @@ async fn workspace_upload(State(st): St, Query(q): Q, body: Bytes) -> Response {
     let Some(full) = q.get("path").and_then(|p| safe_workspace_path(&st.ws(), p)) else {
         return text_err(StatusCode::BAD_REQUEST, "Invalid path");
     };
+    if q.get("unique").is_some() {
+        return upload_under_a_free_name(&st, q.get("path").map(String::as_str).unwrap_or(""), &body);
+    }
     if let Some(parent) = full.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -1417,6 +1432,91 @@ async fn workspace_upload(State(st): St, Query(q): Q, body: Bytes) -> Response {
         }
         Err(_) => text_err(StatusCode::INTERNAL_SERVER_ERROR, "Error"),
     }
+}
+
+// A picture added from outside the project must not replace one already there.
+// Checking a list of names first is not enough: `Photo.png` and `photo.png` are
+// one file on a Mac or Windows disk, and two pictures added at once can both
+// find the same name free. So a name is claimed by an operation the filesystem
+// refuses if anything by that name — in any case the disk treats as equal — is
+// already there: a hard link, or `create_new` where links are not supported.
+fn upload_under_a_free_name(st: &AppState, requested: &str, body: &[u8]) -> Response {
+    let ws = st.ws();
+    let (stem, ext) = match requested.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.contains('/') => (stem.to_string(), format!(".{ext}")),
+        _ => (requested.to_string(), String::new()),
+    };
+    let Some(first) = safe_workspace_path(&ws, &format!("{stem}{ext}")) else {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid path");
+    };
+    let Some(parent) = first.parent().map(Path::to_path_buf) else {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid path");
+    };
+    let _ = fs::create_dir_all(&parent);
+    // The whole picture goes into a hidden file first and is linked in under
+    // its name only once complete, so the name never shows an empty or half
+    // written picture — not even if Hilbert is killed part way. A hidden file
+    // left by that is not shown in the project. A disk without hard links
+    // (FAT, some network shares) takes the name with the plain claim instead.
+    static PART: AtomicU64 = AtomicU64::new(0);
+    let mut part = PathBuf::new();
+    let mut staged = false;
+    for _ in 0..16 {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+        part = parent.join(format!(".hilbert-upload-{}-{}-{nanos}.part", std::process::id(), PART.fetch_add(1, Ordering::Relaxed)));
+        // Its own new file, never one left behind: a leftover could still be a
+        // link to a picture published earlier, and writing into it would
+        // change that picture. The handle is the writable one it was created
+        // with, because Windows will not flush a file opened for reading.
+        match claim_and_write(&part, body) {
+            Ok(()) => { staged = true; break; }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => break,
+        }
+    }
+    let result = (|| {
+        for n in 1..1000 {
+            let candidate = if n == 1 { format!("{stem}{ext}") } else { format!("{stem}-{n}{ext}") };
+            let Some(full) = safe_workspace_path(&ws, &candidate) else {
+                return json_err(StatusCode::BAD_REQUEST, "Invalid path");
+            };
+            let claimed = if staged {
+                match fs::hard_link(&part, &full) {
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(_) => claim_and_write(&full, body),
+                    Ok(()) => Ok(()),
+                }
+            } else {
+                claim_and_write(&full, body)
+            };
+            match claimed {
+                Ok(()) => {
+                    st.note_write();
+                    return Json(json!({ "path": candidate })).into_response();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not write the picture: {e}")),
+            }
+        }
+        json_err(StatusCode::CONFLICT, "Too many pictures with that name already")
+    })();
+    if staged {
+        let _ = fs::remove_file(&part);
+    }
+    result
+}
+
+// Takes a name with `create_new` and writes into the handle that claimed it,
+// removing the file again if the write fails.
+fn claim_and_write(full: &Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(full)?;
+    let written = file.write_all(body).and_then(|_| file.sync_all());
+    drop(file);
+    if written.is_err() {
+        let _ = fs::remove_file(full);
+    }
+    written
 }
 
 // Convert an uploaded spreadsheet (xlsx/xls/xlsb/ods) into one CSV per sheet.
@@ -1883,6 +1983,79 @@ async fn app_new_window(State(st): St) -> Response {
     }
 }
 
+// Files the system has asked Hilbert to open: "Open with" on a desktop, or a
+// path given on the command line. They are queued rather than opened here
+// because only a window can open a file, and there may not be one yet — at a
+// cold start the queue is filled before the window exists, and the window
+// collects it as it comes up.
+static PENDING_OPEN: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+/// How many queued files have been handed to a window. Changed only while
+/// holding `PENDING_OPEN`, so a project switch that checks it under that lock
+/// cannot slip in between a file being handed over and it being opened.
+static OPENS_HANDED_OUT: AtomicU64 = AtomicU64::new(0);
+
+/// Asks for a file to be opened by whichever window collects it next.
+pub fn queue_open(path: impl Into<PathBuf>) {
+    let path = path.into();
+    // `dunce`, not the standard library: on Windows that returns a `\\?\C:\…`
+    // path, which the window would then be asked to open as a project folder.
+    let path = dunce::canonicalize(&path).unwrap_or(path);
+    if !path.is_file() {
+        return;
+    }
+    let mut queue = PENDING_OPEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !queue.contains(&path) {
+        queue.push(path);
+    }
+}
+
+async fn app_queue_open(body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let Some(path) = jstr(&v, "path") else {
+        return json_err(StatusCode::BAD_REQUEST, "A path is required");
+    };
+    queue_open(path);
+    Json(json!({ "ok": true })).into_response()
+}
+
+// One file per request. Whether a file lies inside the open project is only true
+// until the window opens a file from somewhere else and changes project, so each
+// is described against the project as it is when asked for, not as it was when
+// a batch was handed over. Taking it off the queue also means a second window
+// asking will not open it again.
+async fn app_pending_open(State(st): St, Query(q): Q) -> Response {
+    if q.contains_key("peek") {
+        let queue = PENDING_OPEN.lock().unwrap_or_else(|e| e.into_inner());
+        return Json(json!({ "waiting": !queue.is_empty(), "handed": OPENS_HANDED_OUT.load(Ordering::SeqCst) })).into_response();
+    }
+    // The project is read under the same lock as the hand-over, so no guarded
+    // switch lands between describing the file and the window opening it.
+    let (next, more, ws) = {
+        let mut queue = PENDING_OPEN.lock().unwrap_or_else(|e| e.into_inner());
+        let next = if queue.is_empty() { None } else { Some(queue.remove(0)) };
+        if next.is_some() {
+            OPENS_HANDED_OUT.fetch_add(1, Ordering::SeqCst);
+        }
+        (next, !queue.is_empty(), st.ws())
+    };
+    let Some(path) = next else {
+        return Json(json!({ "file": null, "more": false })).into_response();
+    };
+    let ws_real = dunce::canonicalize(&ws).unwrap_or(ws);
+    let file = match path.strip_prefix(&ws_real) {
+        Ok(inside) => json!({
+            "path": inside.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/"),
+            "inWorkspace": true,
+        }),
+        Err(_) => json!({
+            "path": path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            "folder": path.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+            "inWorkspace": false,
+        }),
+    };
+    Json(json!({ "file": file, "more": more, "root": ws_real.to_string_lossy() })).into_response()
+}
+
 // Full-text search across the workspace (skips dotfiles, binaries, build output).
 async fn workspace_search(State(st): St, Query(q): Q) -> Response {
     let query = q.get("q").map(|s| s.to_lowercase()).unwrap_or_default();
@@ -2072,7 +2245,7 @@ async fn workspace_compress(State(st): St, body: Bytes) -> Response {
 // Compile
 // ---------------------------------------------------------------------------
 
-fn font_signature(dir: &Path) -> u64 {
+pub(crate) fn font_signature(dir: &Path) -> u64 {
     use std::hash::{Hash, Hasher};
 
     fn walk(path: &Path, state: &mut std::collections::hash_map::DefaultHasher) {
@@ -2216,6 +2389,24 @@ async fn ensure_preview_watcher(
     strip_appimage_env(&mut cmd);
     let mut child = cmd.spawn()?;
     note!("watch: started typst watch on {} (pid {:?})", main_path.display(), child.id());
+    // A preview is running, so a double-click on it is likely. Scanning the
+    // system fonts for that takes a second or two; do it now, once, off to the
+    // side, rather than while someone waits on their click.
+    static WARM_FONTS: std::sync::Once = std::sync::Once::new();
+    let font_root = ws.to_path_buf();
+    WARM_FONTS.call_once(move || {
+        std::thread::spawn(move || crate::jump::warm_fonts(&font_root));
+        // And let the laid-out document go when the clicking stops, rather than
+        // holding a long document's layout for the rest of the session.
+        tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                if crate::jump::release_if_idle(Duration::from_secs(300)) {
+                    note!("jump: let go of the cached layout after five quiet minutes");
+                }
+            }
+        });
+    });
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let (line_tx, line_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -6886,6 +7077,61 @@ fn prose_only(line: &str) -> String {
     out
 }
 
+// Double-clicking the preview: where the point clicked was written, asked of
+// Typst rather than guessed from the words around it. See `jump.rs`. Every
+// answer short of a source position says why, so the editor can fall back to
+// matching words and still explain a miss.
+async fn sync_jump(State(st): St, body: Bytes) -> Response {
+    let v = parse_json(&body);
+    let ws = st.ws();
+    let Some(main) = jstr(&v, "main").and_then(|m| safe_workspace_path(&ws, m)).filter(|p| p.is_file()) else {
+        return json_err(StatusCode::BAD_REQUEST, "Invalid main path");
+    };
+    let number = |key: &str| v.get(key).and_then(Value::as_f64);
+    let (Some(page), Some(x), Some(y)) = (number("page"), number("x"), number("y")) else {
+        return json_err(StatusCode::BAD_REQUEST, "page, x and y are required");
+    };
+    let shown = match (number("pages"), number("width"), number("height")) {
+        (Some(pages), Some(width), Some(height)) => Some(crate::jump::Shown {
+            pages: pages as usize,
+            width,
+            height,
+            expect: jstr(&v, "shows").map(str::to_string),
+        }),
+        _ => None,
+    };
+    let started = Instant::now();
+    let answer = tokio::task::spawn_blocking(move || crate::jump::jump(&ws, &main, page as usize, x, y, shown)).await;
+    note!("jump: resolved in {} ms", started.elapsed().as_millis());
+    // The preview comes from the `typst` on PATH and the lookup from the Typst
+    // built into Hilbert. Of the same version they lay a page out identically;
+    // of different ones a page can match in size and still break its lines in
+    // other places, and the editor then checks the word before trusting it.
+    static SAME_TYPST: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+    let same_typst = *SAME_TYPST
+        .get_or_init(|| async {
+            let built_in = typst::utils::version();
+            let built_in = format!("{}.{}.{}", built_in.major(), built_in.minor(), built_in.patch());
+            let Some(path) = which("typst") else { return false };
+            let out = run_cmd(&path, &["--version"], None, Some(3000)).await.ok();
+            out.is_some_and(|o| o.stdout.split_whitespace().nth(1) == Some(built_in.as_str()))
+        })
+        .await;
+    use crate::jump::Jump;
+    Json(match answer {
+        Ok(Jump::Source { path, offset, line, column }) => json!({ "found": "source", "path": path, "offset": offset, "line": line, "column": column, "sameTypst": same_typst }),
+        Ok(Jump::Package { package, path }) => json!({ "found": "package", "package": package, "path": path }),
+        Ok(Jump::Nothing) => json!({ "found": "nothing" }),
+        Ok(Jump::LayoutDiffers(reason)) => {
+            note!("jump: not using the layout, {reason}");
+            json!({ "found": "layout-differs", "reason": reason })
+        }
+        Ok(Jump::Failed(message)) => json!({ "found": "failed", "message": message }),
+        Err(_) => json!({ "found": "failed", "message": "the lookup stopped unexpectedly" }),
+    })
+    .into_response()
+}
+
 /// Everything the project's sources name and refer to.
 fn read_label_graph(ws: &Path, main: &str) -> Value {
     let mut files: Vec<String> = project_files(ws, main)
@@ -7519,6 +7765,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/workspace/rename", post(workspace_rename))
         .route("/workspace/reveal", post(workspace_reveal))
         .route("/app/new-window", post(app_new_window))
+        .route("/app/pending-open", get(app_pending_open).post(app_queue_open))
         .route("/collab/info", get(collab_server_info))
         .route("/hosted/info", get(hosted_info))
         .route("/workspace/search", get(workspace_search))
@@ -7573,6 +7820,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/lsp/code-actions", post(lsp_code_actions))
         .route("/lsp/diagnostics", post(lsp_diagnostics))
         .route("/workspace/labels", get(label_graph))
+        .route("/sync/jump", post(sync_jump))
         .route("/lint", post(lint_text))
         .route("/lint/suggest", post(lint_suggest))
         .route("/lint/ignore", post(lint_ignore))
@@ -8194,5 +8442,42 @@ mod reveal_tests {
         let arg = explorer_argument(Path::new("C:/Users/think/Documents/a b/main .typ"), false);
         assert!(!arg.contains('/') || arg.starts_with("/select,"));
         assert!(arg.contains(r"C:\Users\think\Documents\a b\main .typ"));
+    }
+}
+
+#[cfg(test)]
+mod upload_name_tests {
+    use super::*;
+
+    #[test]
+    fn a_picture_never_replaces_one_already_there() {
+        let dir = unique_temp_dir("hilbert-upload-name").unwrap();
+        let state = AppState::new(dir.clone(), None);
+        fs::create_dir_all(dir.join("images")).unwrap();
+        fs::write(dir.join("images/photo.png"), b"the original").unwrap();
+
+        let read_path = |response: Response| -> String {
+            let body = tokio::runtime::Runtime::new().unwrap().block_on(axum::body::to_bytes(response.into_body(), 1 << 20)).unwrap();
+            serde_json::from_slice::<Value>(&body).unwrap()["path"].as_str().unwrap().to_string()
+        };
+        let first = read_path(upload_under_a_free_name(&state, "images/photo.png", b"new one"));
+        let second = read_path(upload_under_a_free_name(&state, "images/photo.png", b"another"));
+        assert_eq!(first, "images/photo-2.png");
+        assert_eq!(second, "images/photo-3.png");
+        assert_eq!(fs::read(dir.join("images/photo.png")).unwrap(), b"the original", "the original is untouched");
+        assert_eq!(fs::read(dir.join("images/photo-2.png")).unwrap(), b"new one");
+
+        // On a disk that ignores case, `Photo.png` is the same file as `photo.png`.
+        let case_blind = dir.join("images/PHOTO.png").exists();
+        let third = read_path(upload_under_a_free_name(&state, "images/Photo.png", b"capital"));
+        if case_blind {
+            assert_ne!(third, "images/Photo.png", "must not take a name the disk already has in another case");
+        }
+        assert_eq!(fs::read(dir.join("images/photo.png")).unwrap(), b"the original");
+        let leftovers: Vec<_> = fs::read_dir(dir.join("images")).unwrap().flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with('.')).collect();
+        assert!(leftovers.is_empty(), "the staging file is gone: {leftovers:?}");
+        release_workspace_user(&dir);
+        let _ = fs::remove_dir_all(dir);
     }
 }

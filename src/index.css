@@ -111,6 +111,57 @@
   color-scheme: dark;
 }
 
+/* The cosmic microwave background behind the page. The sky is not a picture of
+   the Planck map but a fresh Gaussian realisation of the lensed ΛCDM
+   temperature spectrum, drawn in Mollweide with Planck's colour scale over a
+   starfield — the statistics of the real sky, and no image anyone else owns.
+   Panels are tinted glass so it shows in the gaps and faintly behind the text;
+   menus and dialogs stay solid, because reading them matters more than seeing
+   past them. Tinted over the brightest hot spot, a panel still sits near
+   rgb(52, 45, 43), which keeps the text above twelve to one. */
+:root[data-theme="cosmos"] {
+  --bg-color: rgba(6, 9, 24, 0.74);
+  --panel-bg: rgba(8, 12, 30, 0.74);
+  --panel-lighter: rgba(17, 23, 50, 0.82);
+  --panel-elevated: #121936;
+  --text-main: #e8edff;
+  --text-muted: #93a0c8;
+  --text-faint: #636e96;
+  --accent: #ffab6b;
+  --accent-color: #ffab6b;
+  --accent-hover: #ffc494;
+  --accent-soft: rgba(255, 171, 107, 0.14);
+  --accent-line: rgba(255, 171, 107, 0.45);
+  --border-color: rgba(120, 140, 210, 0.22);
+  --border-soft: rgba(120, 140, 210, 0.12);
+  --hover-color: rgba(255, 255, 255, 0.06);
+  --header-top: rgba(12, 17, 40, 0.86);
+  --on-accent: #0b0f24;
+  --error-bg: #6d1c1c;
+  --error-text: #fecaca;
+  --shadow-lg: 0 20px 44px -14px rgba(0, 0, 0, 0.8), 0 6px 16px -8px rgba(0, 0, 0, 0.65);
+  color-scheme: dark;
+}
+
+/* Only fetched while the theme is on. The 4K sky is 33 MB once decoded, so a
+   screen that cannot show it gets the 1080p one. */
+:root[data-theme="cosmos"] body {
+  background-color: #050816;
+  background-image: url("/themes/cosmos-1080.webp");
+  background-image: -webkit-image-set(url("/themes/cosmos-1080.webp") 1x, url("/themes/cosmos.webp") 2x);
+  background-image: image-set(url("/themes/cosmos-1080.webp") 1x, url("/themes/cosmos.webp") 2x);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+}
+
+/* The preview is normally a PDF viewer's grey around a white pane. Here the sky
+   takes its place round the page; the page itself stays paper-white, since it
+   is the document. */
+:root[data-theme="cosmos"] .preview-pane { background-color: transparent; }
+:root[data-theme="cosmos"] .pdf-scroll { background: rgba(5, 8, 22, 0.32); }
+
 /* Everything here is decided by contrast rather than taste: pure black, white
    text, borders that are actually visible, and an accent bright enough to carry
    dark text on it. It is meant to be legible first and handsome second. */
@@ -1323,7 +1374,7 @@ body.is-resizing .editor-container {
 }
 .history-item:hover > div:nth-child(2) {
   background: var(--accent-color) !important;
-  color: white !important;
+  color: var(--on-accent) !important;
 }
 
 .outline-item:hover {

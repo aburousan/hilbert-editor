@@ -130,7 +130,19 @@ const unpackState = (tok: string): { slides: Slide[], imports: string[] } | null
 const textH = (e: TextEl) => Math.max(1, e.text.split('\n').length) * e.size * 1.35;
 const mathW = (e: MathEl) => mathDim.get(e.id)?.w ?? Math.max(60, e.tex.length * e.size * 0.52);
 const mathH = (e: MathEl) => mathDim.get(e.id)?.h ?? e.size * 1.7;
-const imgH = (e: ImgEl) => e.path2 ? pairWidths(e).h : e.w * aspectOf(e.path);
+// A pair is any image with a `path2`, chosen or not: an empty one is a pair
+// whose second picture has not been picked yet, and it keeps a pair's shape.
+const imgH = (e: ImgEl) => e.path2 != null ? pairWidths(e).h : e.w * aspectOf(e.path);
+// The width at which a picture (or pair) ends a margin above the bottom of the
+// slide. Height grows in step with the width left after the gap, so one ratio
+// gives it. Never wider than it already is.
+const overflows = (e: ImgEl) => e.y + imgH(e) > PH - 16 + 0.5;
+const widthToFit = (e: ImgEl) => {
+  const room = PH - 16 - e.y, h = imgH(e);
+  if (h <= room || room <= 0) return e.w;
+  const gap = e.path2 != null ? e.gap ?? IMG_GAP : 0;
+  return Math.max(40, Math.floor(gap + (e.w - gap) * room / h));
+};
 const typstH = (e: TypstEl) => Math.max(24, e.w * (typstAspect.get(e.id) ?? 0.4));
 
 const bounds = (e: El): { x: number, y: number, w: number, h: number } => {
@@ -294,7 +306,7 @@ const TEMPLATES: { name: string, make: () => Slide }[] = [
     name: 'Two images, same height', make: () => ({
       id: nid(), fill: '#ffffff', els: [
         { id: nid(), type: 'text', x: 52, y: 34, w: 740, size: 32, color: '#111827', align: 'left', text: '= Before and after' },
-        { id: nid(), type: 'image', x: 52, y: 110, w: 740, path: 'images/figure.png', path2: 'images/figure2.png', gap: 16 },
+        { id: nid(), type: 'image', x: 52, y: 110, w: 740, path: '', path2: '', gap: 16 },
         { id: nid(), type: 'text', x: 52, y: 410, w: 360, size: 17, color: '#64748b', align: 'center', text: 'Left: what we started with' },
         { id: nid(), type: 'text', x: 432, y: 410, w: 360, size: 17, color: '#64748b', align: 'center', text: 'Right: what came out' },
       ],
@@ -378,6 +390,26 @@ function elCode(e: El): string {
   }
   if (e.type === 'math') return `#absolute-place(dx: ${pt(e.x)}, dy: ${pt(e.y)}, box(text(${fontArg(e.font)}size: ${pt(e.size)}, fill: ${rgb(e.color)})[$ ${e.tex} $]))`;
   if (e.type === 'image') {
+    // Until a picture is chosen there is nothing to point at, and pointing at a
+    // file that is not there stops the whole document compiling — the deck goes
+    // in, and the first thing the writer sees is an error about a path they
+    // never typed. A box saying what is missing compiles and can be seen.
+    const waiting = (x: number, y: number, w: number, h: number) =>
+      `#absolute-place(dx: ${pt(x)}, dy: ${pt(y)}, box(width: ${pt(w)}, height: ${pt(h)}, radius: 4pt, `
+      + `stroke: (paint: rgb("#94a3b8"), thickness: 1pt, dash: "dashed"), fill: rgb("#f8fafc"), inset: 8pt)`
+      + `[#align(center + horizon)[#text(size: 11pt, fill: rgb("#64748b"))[Pick a picture for this box]]])`;
+    if (e.path2 != null && (!e.path || !e.path2)) {
+      // Half a pair chosen: the chosen picture goes in its place and only the
+      // missing one waits in a box. Both at the widths the canvas uses, which
+      // follow each picture's shape — halving the width instead let a portrait
+      // come out taller than it looked and run off the bottom of the slide.
+      const { gap, w1, w2, h } = pairWidths(e);
+      const side = (path: string, x: number, w: number) => path
+        ? `#absolute-place(dx: ${pt(x)}, dy: ${pt(e.y)}, image("${path}", width: ${pt(w)}))`
+        : waiting(x, e.y, w, h);
+      return `${side(e.path, e.x, w1)}\n${side(e.path2, e.x + w1 + gap, w2)}`;
+    }
+    if (!e.path) return waiting(e.x, e.y, e.w, imgH(e));
     if (e.path2) {
       // Widths are left to oasis-align, which solves them from the real
       // pictures at compile time — closer than the canvas can measure. Both
@@ -432,7 +464,7 @@ function deckCode(slides: Slide[], imports: string[]): string {
   lines.push('#import "@preview/pinit:0.2.2": absolute-place, simple-arrow, double-arrow');
   // Pull in oasis-align only if a paired image is actually on a slide, so a
   // deck without one needs nothing extra installed.
-  if (slides.some(s => s.els.some(e => e.type === 'image' && e.path2))) {
+  if (slides.some(s => s.els.some(e => e.type === 'image' && e.path && e.path2))) {
     lines.push('#import "@preview/oasis-align:0.4.0": oasis-align-images');
   }
   for (const imp of imports) if (!imp.includes('@preview/pinit')) lines.push(imp);
@@ -583,6 +615,35 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], w
     if (selected == null) return;
     snapshot(`${selected}:${Object.keys(patch).join(',')}`);
     updateEl(selected, patch);
+  };
+  // A tall picture chosen into a wide box runs off the slide, and nobody picks
+  // a picture wanting that. Once its shape is known the box shrinks to fit;
+  // a writer who then drags it bigger again is left alone.
+  const choosePicture = (patch: { path?: string, path2?: string }) => {
+    patchSel(patch);
+    // Snapshots from before this choice keep their sizes: an older one with
+    // the same picture may hold a size the writer set on purpose.
+    const earlier = new Set(undoRef.current);
+    const id = selected, path = patch.path ?? patch.path2;
+    if (id == null || !path) return;
+    const im = new Image();
+    im.onload = () => {
+      if (!im.naturalWidth || !im.naturalHeight) return;
+      imgAspect.set(path, im.naturalHeight / im.naturalWidth);
+      // By element id across the deck: the writer may have moved to another
+      // slide before the picture finished loading. Copies saved for undo and
+      // redo since the choice get the same width, so stepping back over an
+      // edit made meanwhile does not bring back a size the writer never saw.
+      const fit = (ss: Slide[]) => ss.map(sl => ({ ...sl, els: sl.els.map(e => {
+        if (e.id !== id || e.type !== 'image' || (e.path !== path && e.path2 !== path)) return e;
+        const w = widthToFit(e);
+        return w < e.w ? { ...e, w } : e;
+      }) }));
+      undoRef.current = undoRef.current.map(ss => earlier.has(ss) ? ss : fit(ss));
+      redoRef.current = redoRef.current.map(ss => earlier.has(ss) ? ss : fit(ss));
+      setSlides(fit);
+    };
+    im.src = `${API}/workspace/raw?path=${encodeURIComponent(path)}`;
   };
   const snapValue = (value: number) => snapEnabled ? snap(value) : Math.round(value * 10) / 10;
 
@@ -777,7 +838,7 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], w
     const p = toPt(ev);
     if (tool === 'text') return addEl({ id: nid(), type: 'text', x: snapValue(p.x), y: snapValue(p.y), w: 240, size: 22, color: '#111827', align: 'left', text: 'New text' }, true);
     if (tool === 'math') return addEl({ id: nid(), type: 'math', x: snapValue(p.x), y: snapValue(p.y), size: 26, color: '#111827', tex: 'e^(i pi) + 1 = 0' }, true);
-    if (tool === 'image') return addEl({ id: nid(), type: 'image', x: snapValue(p.x), y: snapValue(p.y), w: 220, path: workspaceImages[0] || 'images/figure.png' });
+    if (tool === 'image') return addEl({ id: nid(), type: 'image', x: snapValue(p.x), y: snapValue(p.y), w: 220, path: workspaceImages[0] || '' });
     if (tool === 'curve') { setCurvePts(prev => [...(prev || []), { x: snapValue(p.x), y: snapValue(p.y) }]); return; }
     if (tool !== 'select') { setDraft({ a: { x: snapValue(p.x), y: snapValue(p.y) }, b: { x: snapValue(p.x), y: snapValue(p.y) } }); return; }
 
@@ -1024,7 +1085,7 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], w
       );
     }
     if (e.type === 'image') {
-      const pair = e.path2 ? pairWidths(e) : null;
+      const pair = e.path2 != null ? pairWidths(e) : null;
       // The picture itself, not a hatched box with a filename in it: the point
       // of dragging things around a canvas is seeing what you are arranging.
       // A path that does not resolve keeps the old placeholder look.
@@ -1058,6 +1119,12 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], w
           {pair
             ? <>{shot(e.path, pair.w1)}{shot(e.path2!, pair.w2)}</>
             : shot(e.path, e.w)}
+          {live && (!e.path || (e.path2 != null && !e.path2)) && (
+            <div style={{
+              position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 12, color: '#64748b', textAlign: 'center', padding: 8, pointerEvents: 'none',
+            }}>Pick a picture on the right</div>
+          )}
         </div>
       );
     }
@@ -1310,21 +1377,29 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], w
         )}
         {sel.type === 'image' && (
           <>
-            {field(`${sel.path2 ? 'Total width' : 'Width'} — ${Math.round(sel.w)}pt`, <input type="range" min="40" max="800" step="4" value={sel.w} onChange={e => patchSel({ w: Number(e.target.value) })} />)}
+            {field(`${sel.path2 != null ? 'Total width' : 'Width'} — ${Math.round(sel.w)}pt`, <input type="range" min="40" max="800" step="4" value={sel.w} onChange={e => patchSel({ w: Number(e.target.value) })} />)}
+            {overflows(sel) && (
+              <div className="form-hint" style={{ color: '#b45309' }}>
+                This runs off the bottom of the slide.{' '}
+                {widthToFit(sel) < sel.w
+                  ? <button className="btn-ghost" onClick={() => patchSel({ w: widthToFit(sel) })}>Shrink to fit</button>
+                  : 'Move it up to make room.'}
+              </div>
+            )}
             {field('File', (
               <>
                 {workspaceImages.length > 0 && (
-                  <select value={workspaceImages.includes(sel.path) ? sel.path : ''} onChange={e => { if (e.target.value) patchSel({ path: e.target.value }); }} style={{ width: '100%', marginBottom: 4 }}>
+                  <select value={workspaceImages.includes(sel.path) ? sel.path : ''} onChange={e => { if (e.target.value) choosePicture({ path: e.target.value }); }} style={{ width: '100%', marginBottom: 4 }}>
                     <option value="" disabled>Pick from workspace…</option>
                     {workspaceImages.map(p => <option key={p} value={p}>{p}</option>)}
                   </select>
                 )}
-                <input type="text" value={sel.path} onChange={e => patchSel({ path: e.target.value })} style={{ width: '100%' }} />
+                <input type="text" value={sel.path} placeholder="No picture chosen yet" onChange={e => patchSel({ path: e.target.value })} style={{ width: '100%' }} />
               </>
             ))}
             {sel.path2 == null ? (
               <button className="btn-ghost" style={{ marginTop: 6 }}
-                onClick={() => patchSel({ path2: workspaceImages.find(p => p !== sel.path) || workspaceImages[0] || 'images/figure2.png', w: Math.min(760, Math.round(sel.w * 2)) })}>
+                onClick={() => patchSel({ path2: workspaceImages.find(p => p !== sel.path) || '', w: Math.min(760, Math.round(sel.w * 2)) })}>
                 Pair with a second image
               </button>
             ) : (
@@ -1332,7 +1407,7 @@ export default function SlideStudio({ onClose, onInsert, workspaceImages = [], w
                 {field('Second file', (
                   <>
                     {workspaceImages.length > 0 && (
-                      <select value={workspaceImages.includes(sel.path2) ? sel.path2 : ''} onChange={e => { if (e.target.value) patchSel({ path2: e.target.value }); }} style={{ width: '100%', marginBottom: 4 }}>
+                      <select value={workspaceImages.includes(sel.path2) ? sel.path2 : ''} onChange={e => { if (e.target.value) choosePicture({ path2: e.target.value }); }} style={{ width: '100%', marginBottom: 4 }}>
                         <option value="" disabled>Pick from workspace…</option>
                         {workspaceImages.map(p => <option key={p} value={p}>{p}</option>)}
                       </select>

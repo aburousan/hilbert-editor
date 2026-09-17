@@ -280,6 +280,25 @@ export function setupTypstLanguage(monacoInstance: any) {
       'editorHoverWidget.statusBarBackground': '#090d16',
     });
 
+    // Cosmos: the dark syntax colours on a translucent surface, so the sky
+    // behind the window shows faintly through the page.
+    variant('typst-cosmos', 'vs-dark', DARK_RULES, {
+      'editor.background': '#070b1cc7',
+      'editorGutter.background': '#070b1cc7',
+      'editor.foreground': '#e8edff',
+      'editorLineNumber.foreground': '#4a557d',
+      'editorLineNumber.activeForeground': '#93a0c8',
+      'editor.lineHighlightBackground': '#ffffff0d',
+      'editor.selectionBackground': '#ffab6b40',
+      'editorCursor.foreground': '#ffab6b',
+      'editorIndentGuide.background1': '#1a2244',
+      'editorBracketMatch.border': '#ffab6b',
+      'editorHoverWidget.background': '#121936',
+      'editorHoverWidget.border': '#2a3566',
+      'editorHoverWidget.foreground': '#e8edff',
+      'editorHoverWidget.statusBarBackground': '#0d1330',
+    });
+
     // Deliberately not the dark rules: several of them are mid-tone pastels that
     // are exactly what this theme exists to avoid.
     variant('typst-contrast', 'vs-dark', [

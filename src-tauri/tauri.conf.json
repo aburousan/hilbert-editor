@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Hilbert",
   "mainBinaryName": "hilbert",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "identifier": "com.kaziaburousan.hilbert",
   "build": {
     "beforeBuildCommand": "npm run build",
@@ -23,6 +23,15 @@
     }
   },
   "bundle": {
+    "fileAssociations": [
+      {
+        "ext": ["typ"],
+        "name": "Typst document",
+        "description": "Typst source document",
+        "role": "Editor",
+        "mimeType": "text/x-typst"
+      }
+    ],
     "active": true,
     "targets": "all",
     "createUpdaterArtifacts": true,
