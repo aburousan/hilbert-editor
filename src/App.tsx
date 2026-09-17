@@ -57,6 +57,7 @@ const ExcalidrawEditor = lazy(() => import('./ExcalidrawEditor'));
 const ImageEditor = lazy(() => import('./ImageEditor'));
 const DiagramBuilder = lazy(() => import('./components/DiagramBuilder'));
 const FigureBuilder = lazy(() => import('./components/FigureBuilder'));
+const CalloutBuilder = lazy(() => import('./components/CalloutBuilder'));
 const QuiverDiagram = lazy(() => import('./components/QuiverDiagram'));
 const LabelGraph = lazy(() => import('./components/LabelGraph'));
 const EditSettings = lazy(() => import('./components/EditSettings'));
@@ -178,6 +179,15 @@ const RIGHT_PANEL_KEYS: PanelKey[] = ['preview'];
 // block in the compiled PDF with its language logo (files under .hilbert/logos/,
 // created by the backend on compile).
 const NB_LOGO_MARKER = '#show raw.where(block: true, lang: "python")';
+// Symbolic results are typeset from the printer's own LaTeX. The import has to
+// bring in `mitex` itself: a document that imports only `mi`, renames it, or
+// names the package in a comment still needs one of its own.
+const importsMitex = (text: string) => text.split('\n').some(line => {
+  const m = /^\s*#import\s+"@preview\/mitex:[^"]*"\s*:\s*(.+)$/.exec(line);
+  if (!m) return false;
+  return m[1].split(',').some(part => part.trim().split(/\s+/)[0] === 'mitex' && !/\bas\b/.test(part));
+});
+const NB_MITEX_RULE = '#import "@preview/mitex:0.2.7": mitex\n';
 // The leading slash matters: Typst resolves an image path relative to the file
 // that names it, so ".hilbert/logos/…" only found the logos for a document
 // sitting in the project root. A rooted path works at any depth.
@@ -847,6 +857,7 @@ export default function App() {
   const [showFlowchart, setShowFlowchart] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
   const [showFigureBuilder, setShowFigureBuilder] = useState(false);
+  const [showCalloutBuilder, setShowCalloutBuilder] = useState(false);
   const [showQuiver, setShowQuiver] = useState(false);
   const [showLabelGraph, setShowLabelGraph] = useState(false);
   const [showEditSettings, setShowEditSettings] = useState(false);
@@ -3779,6 +3790,9 @@ export default function App() {
     const editor = editorRef.current;
     const model = editor?.getModel();
     if (!editor || !model || !activeTab) return;
+    // The run belongs to this file, whatever the editor is showing by the time
+    // it finishes.
+    const notebookPath = activeTab.path;
     const content = model.getValue();
 
     // Line-anchored so a fence printed *inside* a cell's output can't be mistaken
@@ -3845,11 +3859,42 @@ export default function App() {
 
       const esc = (s: string) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r/g, '').replace(/\n/g, '\\n').replace(/\t/g, '\\t');
       const stripExt = (p: string) => p.replace(/\.[^./\\]+$/, '');
+      // A printer's LaTeX comes wrapped in whatever delimiters it favours, and
+      // mitex wants the maths on its own.
+      const bareLatex = (tex: string) => tex.trim()
+        .replace(/^\$\$([\s\S]*)\$\$$/, '$1')
+        .replace(/^\\\[([\s\S]*)\\\]$/, '$1')
+        .replace(/^\\\(([\s\S]*)\\\)$/, '$1')
+        .replace(/^\$([\s\S]*)\$$/, '$1')
+        // Only the command itself, not a longer name that starts the same way.
+        .replace(/\\displaystyle(?![A-Za-z])\s*/g, '')
+        .trim();
+
+      // Whether mitex can actually typeset it. A printer can emit a command
+      // mitex does not know, and that would not fail here — it would fail when
+      // the document itself next compiles, with the writer left to work out
+      // why. Checked once per distinct result, before anything is inserted.
+      const typesets = async (tex: string) => {
+        try {
+          const probe = `#import "@preview/mitex:0.2.7": mitex\n#set page(width: auto, height: auto, margin: 2pt)\n#mitex("${esc(tex)}")\n`;
+          const res = await fetch(`${API}/template/render-preview`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ entry: 'p.typ', files: [{ path: 'p.typ', content: probe }] }),
+          });
+          return res.ok;
+        } catch { return false; }
+      };
       const outputBlock = (r: any) => {
         const parts: string[] = [];
         const so = (r?.stdout || '').replace(/\n+$/, '');
         const er = (r?.error || '').replace(/\n+$/, '');
         if (so) parts.push(`  #raw(block: true, "${esc(so)}")`);
+        // A symbolic result — SymPy, Symbolics.jl — comes back as LaTeX and is
+        // typeset instead of printed as a line of code, unless the typesetter
+        // cannot read it, in which case the plain result goes in as before.
+        const tex = r?.typeset ? bareLatex(r.latex) : '';
+        if (tex) parts.push(`  #align(center, mitex("${esc(tex)}"))`);
+        else if (r?.plain) parts.push(`  #raw(block: true, "${esc(String(r.plain).replace(/\n+$/, ''))}")`);
         if (er) parts.push(`  #text(fill: red, raw(block: true, "${esc(er)}"))`);
         // An EPS run also leaves a PDF of the same figure. Embed the PDF and
         // name the EPS instead of drawing it twice — and Typst cannot read EPS
@@ -3872,6 +3917,16 @@ export default function App() {
       // outputs pair with cells by position, so this only needs the cell layout
       // (count and languages) to still match. If it doesn't — a cell was added,
       // removed, or its language changed mid-run — keep the document untouched.
+      // Checked before the document is read: the check waits on the compiler,
+      // and anything typed meanwhile must still be there afterwards.
+      const checked = new Map<string, boolean>();
+      for (const cell of cells) {
+        const tex = bareLatex(typeof cell.result?.latex === 'string' ? cell.result.latex : '');
+        if (!tex) continue;
+        if (!checked.has(tex)) checked.set(tex, await typesets(tex));
+        cell.result.typeset = checked.get(tex);
+      }
+
       const live = model.getValue();
       const liveCells = scanCells(live);
       if (liveCells.map(c => c.lang).join() !== cells.map(c => c.lang).join()) {
@@ -3892,9 +3947,23 @@ export default function App() {
       // language logo in the compiled PDF (logos live in .hilbert/logos/).
       next = repairLogoPaths(next);
       if (!next.includes(NB_LOGO_MARKER)) next = NB_LOGO_SHOW_RULE + next;
+      // Typeset results need mitex imported, once, at the top.
+      if (liveCells.some(c => c.result?.typeset) && !importsMitex(next)) {
+        next = NB_MITEX_RULE + next;
+      }
 
-      editor.executeEdits('notebook', [{ range: model.getFullModelRange(), text: next, forceMoveMarkers: true }]);
-      editor.pushUndoStop();
+      if (editor.getModel() === model) {
+        editor.executeEdits('notebook', [{ range: model.getFullModelRange(), text: next, forceMoveMarkers: true }]);
+        editor.pushUndoStop();
+      } else {
+        // Another file is on screen now. The output belongs to the notebook's
+        // own text, and since the editor is not showing it, nothing else will
+        // notice the change — so its tab is told directly.
+        model.pushEditOperations([], [{ range: model.getFullModelRange(), text: next }], () => null);
+        const version = ++editorVersionRef.current;
+        setTabs(prev => prev.map(t => (t.path === notebookPath
+          ? { ...t, content: next, isDirty: true, editorVersion: version } : t)));
+      }
     } catch (e: any) {
       notify('Notebook run error: ' + (e?.message || e));
     } finally {
@@ -6688,6 +6757,7 @@ ${byline ? `
     { category: 'Lists', title: 'Term / Definition List', run: insertTermList },
     { category: 'Text', title: 'Callout / Admonition box...', run: insertCallout },
     { category: 'Text', title: 'Block Quote...', run: insertBlockQuote },
+    { category: 'Text', title: 'Boxed Aside (coloured callout)...', run: () => setShowCalloutBuilder(true) },
     { category: 'Text', title: 'Footnote', run: insertFootnote },
     { category: 'Text', title: 'Margin / Side Note...', run: insertSideNote },
     { category: 'Text', title: 'Horizontal Line (full width)', hint: keys('⌘⇧H'), run: insertHRule },
@@ -6945,6 +7015,7 @@ ${byline ? `
                     <div className="submenu">
                       <div className="dropdown-item" onClick={() => { insertCallout(); setActiveMenu(null); }}>Callout / Admonition box...</div>
                       <div className="dropdown-item" onClick={() => { insertBlockQuote(); setActiveMenu(null); }}>Block Quote...</div>
+                      <div className="dropdown-item" onClick={() => { setShowCalloutBuilder(true); setActiveMenu(null); }}>Boxed Aside...</div>
                       <div className="dropdown-item" onClick={() => { insertFootnote(); setActiveMenu(null); }}>Footnote</div>
                       <div className="dropdown-item" onClick={() => { insertSideNote(); setActiveMenu(null); }}>Margin / Side Note...</div>
                       <div className="dropdown-item" onClick={() => { insertHRule(); setActiveMenu(null); }}>Horizontal Line (full width) <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘⇧H')}</span></div>
@@ -8059,6 +8130,7 @@ ${byline ? `
       {showHtmlPreview && <Suspense fallback={null}><HtmlPreviewModal mainFile={currentMain} onClose={() => setShowHtmlPreview(false)} /></Suspense>}
       {showPlot3D && <Boundary name="3D Plot Studio" onClose={() => setShowPlot3D(false)}><Suspense fallback={null}><Plot3DStudio onClose={() => setShowPlot3D(false)} onInsert={(code) => { insertCode(code); setShowPlot3D(false); fetchTree(); }} onSaved={(path) => { void mirrorLocalPath(path); void fetchTree(); }} /></Suspense></Boundary>}
       {showPlotStudio && <Boundary name="Plot Studio" onClose={() => setShowPlotStudio(false)}><Suspense fallback={null}><PlotStudio onClose={() => setShowPlotStudio(false)} onInsert={(code) => insertCode(code)} onEnsureSetup={ensureSetup} onOpenInteractive={() => setShowPlot3D(true)} /></Suspense></Boundary>}
+      {showCalloutBuilder && <Boundary name="Boxed Aside" onClose={() => setShowCalloutBuilder(false)}><Suspense fallback={null}><CalloutBuilder onClose={() => setShowCalloutBuilder(false)} onInsert={(code) => { insertCode(code); setShowCalloutBuilder(false); }} /></Suspense></Boundary>}
       {showSymbolDraw && <Boundary name="Draw a Symbol" onClose={() => setShowSymbolDraw(false)}><Suspense fallback={null}><SymbolDraw onClose={() => setShowSymbolDraw(false)} onInsert={(name) => { insertMathSymbol(name); setShowSymbolDraw(false); }} /></Suspense></Boundary>}
       {showRefManager && activeTab && <Suspense fallback={null}><RefManager content={activeTab.content} onClose={() => setShowRefManager(false)} onJump={jumpToLine} onInsertRef={(name) => insertCode(`@${name}`)} /></Suspense>}
       {showBibManager && <Suspense fallback={null}><BibManager onClose={() => setShowBibManager(false)} onCite={(key) => { insertCode(`@${key}`); ensureBibliography(); }} onEnsureBib={ensureBibliography} onChanged={(paths) => { void fetchTree(); for (const path of paths || []) void mirrorLocalPath(path); }} /></Suspense>}

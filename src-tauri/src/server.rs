@@ -4619,7 +4619,7 @@ async fn run_code(State(st): St, body: Bytes) -> Response {
 // runs — the process lives only for the length of one run.
 // ---------------------------------------------------------------------------
 
-const NB_PY: &str = r#"import sys, io, os, base64, traceback, ast
+const NB_PY: &str = r#"import sys, io, os, base64, traceback, ast, json
 os.environ.setdefault("MPLBACKEND", "Agg")
 SEP = "__SEP__"; SENT = "__SENT__"; FMT = "__FMT__"
 EXTS = (".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp", ".pdf", ".eps")
@@ -4629,15 +4629,47 @@ g = {"__name__": "__main__"}
 real = sys.__stdout__
 def _pngs(): return {f: os.path.getmtime(f) for f in os.listdir(".") if f.lower().endswith(EXTS)}
 def _b(s): return base64.b64encode(s.encode("utf-8")).decode("ascii")
+def _symbolic(v, sym, depth=0):
+    # Symbolic itself, or a container of symbolic things and numbers — a list of
+    # roots, a dictionary of substitutions. A container holding anything else is
+    # left alone: half a typeset answer is worse than the printed one.
+    if isinstance(v, (sym.Basic, sym.MatrixBase)): return True
+    if depth >= 3: return False
+    if isinstance(v, dict):
+        items = list(v.keys())[:64] + list(v.values())[:64]
+    elif isinstance(v, (list, tuple, set, frozenset)):
+        items = list(v)[:64]
+    else:
+        return False
+    if not items or len(v) > 64: return False
+    seen = any(isinstance(x, (sym.Basic, sym.MatrixBase)) for x in items)
+    return seen and all(isinstance(x, (sym.Basic, sym.MatrixBase, int, float, complex)) or _symbolic(x, sym, depth + 1) for x in items)
+def _tex(v):
+    # Only for a result that is symbolic maths, and only through a library the
+    # cell has already imported: importing sympy here to ask would cost a second
+    # of startup on every run that never mentions it.
+    sym = sys.modules.get("sympy")
+    if sym is None: return ""
+    try:
+        if _symbolic(v, sym): return sym.latex(v)
+    except Exception:
+        pass
+    return ""
 for i, code in enumerate(cells):
-    before = _pngs(); buf = io.StringIO(); old = sys.stdout; sys.stdout = buf; err = ""
+    before = _pngs(); buf = io.StringIO(); old = sys.stdout; sys.stdout = buf; err = ""; tex = ""; plain = ""
     try:
         tree = ast.parse(code)
         if tree.body and isinstance(tree.body[-1], ast.Expr):
             last = tree.body.pop()
             exec(compile(tree, "<cell>", "exec"), g)
             val = eval(compile(ast.Expression(last.value), "<cell>", "eval"), g)
-            if val is not None: print(repr(val))
+            if val is not None:
+                tex = _tex(val)
+                # The typeset form replaces the printed one; printing both would
+                # show the same result twice. The plain form travels beside it
+                # so the app can fall back to it if the maths will not typeset.
+                if tex: plain = repr(val)
+                else: print(repr(val))
         else:
             exec(compile(code, "<cell>", "exec"), g)
     except SystemExit:
@@ -4663,7 +4695,8 @@ for i, code in enumerate(cells):
     after = _pngs()
     for f in sorted(after):
         if f not in imgs and (f not in before or after[f] != before[f]): imgs.append(f)
-    real.write("%s\t%d\t%s\t%s\t%s\n" % (SENT, i, _b(buf.getvalue()), _b(err), ",".join(imgs))); real.flush()
+    rich = json.dumps({"latex": tex, "text": plain}) if tex else ""
+    real.write("%s\t%d\t%s\t%s\t%s\t%s\n" % (SENT, i, _b(buf.getvalue()), _b(err), ",".join(imgs), _b(rich))); real.flush()
 "#;
 
 const NB_JL: &str = r#"using Base64
@@ -4674,6 +4707,25 @@ src = read("nb_cells.txt", String)
 cells = isempty(src) ? String[] : split(src, "\n" * SEP * "\n")
 real = stdout
 pngs() = Dict(f => mtime(f) for f in filter(x->any(e->endswith(lowercase(x), e), EXTS), readdir(".")))
+
+# A JSON string: the five escapes JSON demands, and \u for the rest of the
+# control characters.
+function jsonstr(s)
+    out = IOBuffer()
+    write(out, '"')
+    for c in s
+        if c == '"' write(out, "\\\"")
+        elseif c == '\\' write(out, "\\\\")
+        elseif c == '\n' write(out, "\\n")
+        elseif c == '\r' write(out, "\\r")
+        elseif c == '\t' write(out, "\\t")
+        elseif c < ' ' write(out, string("\\u", lpad(string(UInt32(c), base=16), 4, '0')))
+        else write(out, c)
+        end
+    end
+    write(out, '"')
+    String(take!(out))
+end
 
 # Write a displayable value — a plot — to `file` in the format `ext` names.
 # Backends disagree about which MIME types they answer to, so ask for the MIME
@@ -4718,6 +4770,8 @@ for (idx, code) in enumerate(cells)
     before = pngs()
     outfile = "nb_out_$i.txt"
     err = ""
+    tex = ""
+    plain = ""
     open(outfile, "w") do io
         redirect_stdout(io) do
             try
@@ -4745,6 +4799,18 @@ for (idx, code) in enumerate(cells)
                         end
                         # Whatever the backend can manage beats no figure at all.
                         wrote || write_figure(val, "nb_plot_$i.png", "png")
+                    elseif Base.invokelatest(showable, MIME("text/latex"), val)
+                        # Symbolics.jl, SymPy.jl and anything else that answers
+                        # to text/latex: typeset rather than printed. A printer
+                        # that throws is not an error in the cell — the plain
+                        # form is printed instead.
+                        try
+                            tex = Base.invokelatest(repr, MIME("text/latex"), val)
+                            plain = sprint(io -> Base.invokelatest(show, io, "text/plain", val))
+                        catch
+                            tex = ""
+                            Base.invokelatest(show, stdout, "text/plain", val); println(stdout)
+                        end
                     else
                         Base.invokelatest(show, stdout, "text/plain", val); println(stdout)
                     end
@@ -4758,7 +4824,12 @@ for (idx, code) in enumerate(cells)
     rm(outfile, force=true)
     after = pngs()
     imgs = sort([f for f in keys(after) if !haskey(before, f) || after[f] != before[f]])
-    println(real, join([SENT, string(i), base64encode(out), base64encode(err), join(imgs, ",")], "\t"))
+    # The typeset result and the plain one travel together, as JSON, so the app
+    # can fall back if the maths will not typeset. Julia's own `repr` escapes
+    # for Julia, not for JSON — it writes `\$` for a dollar, which no JSON
+    # reader accepts — so the strings are escaped here.
+    rich = isempty(tex) ? "" : string("{\"latex\":", jsonstr(tex), ",\"text\":", jsonstr(plain), "}")
+    println(real, join([SENT, string(i), base64encode(out), base64encode(err), join(imgs, ","), base64encode(rich)], "\t"))
     flush(real)
 end
 "#;
@@ -4841,13 +4912,25 @@ async fn notebook_run(State(st): St, body: Bytes) -> Response {
     let prefix = format!("{sent}\t");
     for line in out.stdout.lines() {
         let Some(rest) = line.strip_prefix(&prefix) else { continue };
-        let parts: Vec<&str> = rest.splitn(4, '\t').collect();
+        let parts: Vec<&str> = rest.splitn(5, '\t').collect();
         if parts.len() < 4 { continue; }
         let Ok(idx) = parts[0].parse::<usize>() else { continue };
         if idx >= results.len() { continue; }
         let names: Vec<String> = parts[3].split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
         let imgs = promote_images(&ws, &sandbox, &names);
-        results[idx] = json!({ "stdout": dec(parts[1]), "error": dec(parts[2]), "images": imgs });
+        // A symbolic result travels as JSON: the LaTeX, and the plain text to
+        // fall back on. Anything else in that field is taken as bare LaTeX.
+        let rich = parts.get(4).map(|t| dec(t)).unwrap_or_default();
+        let (latex, plain) = match serde_json::from_str::<Value>(&rich) {
+            Ok(Value::Object(o)) if o.contains_key("latex") => (
+                o.get("latex").and_then(Value::as_str).unwrap_or_default().to_string(),
+                o.get("text").and_then(Value::as_str).unwrap_or_default().to_string(),
+            ),
+            // Anything else in that field is taken as the LaTeX itself, which
+            // is what an older harness would have put there.
+            _ => (rich, String::new()),
+        };
+        results[idx] = json!({ "stdout": dec(parts[1]), "error": dec(parts[2]), "images": imgs, "latex": latex, "plain": plain });
     }
 
     let any_sentinel = out.stdout.contains(&sent);

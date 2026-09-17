@@ -35,6 +35,23 @@ const retained = notebook.reduce((sum, item) => sum + item.stdout.length + item.
 assert.ok(retained <= mod.MAX_RETAINED_NOTEBOOK_TEXT);
 assert.ok(notebook.some(item => item.outputTruncated));
 
+// A typeset result and the plain form that backs it up are both output, and
+// both have to be charged for. LaTeX cut in half would not compile, so it is
+// kept whole or dropped; the plain text may be trimmed like any other text.
+const bigMaths = mod.limitRunResult({ latex: 'x'.repeat(50_000), plain: 'p'.repeat(2_000_000), stdout: '' }, 4096);
+assert.equal(bigMaths.latex, '', 'maths too large for the budget is dropped, not truncated');
+assert.ok(bigMaths.plain.length <= 4096, `the plain fallback is charged too (${bigMaths.plain.length})`);
+assert.equal(bigMaths.outputTruncated, true);
+
+const smallMaths = mod.limitRunResult({ latex: 'e^{x}', plain: 'exp(x)', stdout: '' }, 4096);
+assert.equal(smallMaths.latex, 'e^{x}', 'maths within the budget is kept exactly');
+
+const mathNotebook = mod.limitNotebookResults(Array.from({ length: 20 }, () => ({
+  stdout: '', error: '', latex: 'y'.repeat(30_000), plain: 'q'.repeat(30_000), images: [],
+})));
+const mathRetained = mathNotebook.reduce((sum, item) => sum + (item.latex || '').length + (item.plain || '').length, 0);
+assert.ok(mathRetained <= mod.MAX_RETAINED_NOTEBOOK_TEXT, `maths counts against the notebook budget (${mathRetained})`);
+
 const pdf = await readFile('src/components/PdfPreview.tsx', 'utf8');
 assert.match(pdf, /const context = words\.slice\(from, to\)/);
 assert.doesNotMatch(pdf, /if \(selectedWord\) words\[focus\] = selectedWord/);

@@ -48,9 +48,16 @@ export type RetainableRunResult = {
   stdout?: string;
   stderr?: string;
   error?: string;
+  latex?: string;
+  plain?: string;
   outputTruncated?: boolean;
   [key: string]: unknown;
 };
+
+// A typeset result is all or nothing: LaTeX cut in the middle is not LaTeX, and
+// what arrives truncated would fail to compile. Past this size the plain text
+// of the result is kept instead.
+export const MAX_RETAINED_MATH = 48 * 1024;
 
 export function limitRunResult<T extends RetainableRunResult>(
   result: T,
@@ -59,7 +66,16 @@ export function limitRunResult<T extends RetainableRunResult>(
   let remaining = Math.max(0, totalLimit);
   let truncated = !!result.outputTruncated;
   const next = { ...result } as T;
-  for (const key of ['stdout', 'stderr', 'error'] as const) {
+  // Charged against the same budget as the text, but never cut short.
+  if (typeof result.latex === 'string' && result.latex) {
+    if (result.latex.length > Math.min(MAX_RETAINED_MATH, remaining)) {
+      (next as RetainableRunResult).latex = '';
+      truncated = true;
+    } else {
+      remaining = Math.max(0, remaining - result.latex.length);
+    }
+  }
+  for (const key of ['stdout', 'stderr', 'error', 'plain'] as const) {
     const value = typeof result[key] === 'string' ? result[key] as string : '';
     const limited = limitRetainedText(value, remaining, key);
     if (key in result || value) (next as RetainableRunResult)[key] = limited.text;
@@ -77,7 +93,9 @@ export function limitNotebookResults<T extends RetainableRunResult>(results: T[]
     remaining = Math.max(0, remaining
       - (typeof limited.stdout === 'string' ? limited.stdout.length : 0)
       - (typeof limited.stderr === 'string' ? limited.stderr.length : 0)
-      - (typeof limited.error === 'string' ? limited.error.length : 0));
+      - (typeof limited.error === 'string' ? limited.error.length : 0)
+      - (typeof limited.latex === 'string' ? limited.latex.length : 0)
+      - (typeof limited.plain === 'string' ? limited.plain.length : 0));
     return limited;
   });
 }
