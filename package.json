@@ -56,6 +56,10 @@
     "test:open": "node scripts/test-open-file.mjs",
     "test:slides": "node scripts/test-slide-studio.mjs",
     "test:image": "node scripts/test-image-placer.mjs",
+    "test:plot": "node scripts/test-plot-studio.mjs",
+    "test:plotexpr": "node scripts/test-plot-expressions.mjs",
+    "test:notebook": "node scripts/test-notebook-math.mjs",
+    "test:labels": "node scripts/test-label-layout.mjs",
     "test:symbolic": "python3 scripts/test-symbolic.py",
     "test:webkit": "python3 scripts/test-linux-webkit.py dist"
   },

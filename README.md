@@ -27,6 +27,11 @@ Hilbert updates itself. Install it once and every future version arrives on its 
 asking before it installs. On Linux the AppImage auto-updates; the `.deb` gets its
 updates from the apt repository below.
 
+Updates come once a month. A month is long enough to finish something and test it
+properly, and short enough that a fix is never far away. The exception is a real
+problem: anything broken is fixed and released as soon as it is ready, without
+waiting for the date.
+
 ---
 
 ## What it's like to use
@@ -274,6 +279,11 @@ broken, missing, or annoying, open an
 [Issue](https://github.com/aburousan/hilbert-editor/issues) or a
 [Discussion](https://github.com/aburousan/hilbert-editor/discussions). Feature requests
 from people actually writing papers are what I'll act on first.
+
+New versions go out once a month, gathered into one release rather than dribbled
+out a piece at a time. Issues are different: I read them as they arrive and close
+them as quickly as I can, and a fix for something broken ships on its own rather
+than waiting for the month to be up.
 
 ## License
 

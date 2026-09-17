@@ -2,13 +2,16 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import puppeteer from 'puppeteer';
 
 const root = resolve(import.meta.dirname, '..');
 const dir = await mkdtemp(join(tmpdir(), 'hilbert-windows-'));
-const binary = process.env.BIN || join(root, 'src-tauri/target/debug', process.platform === 'win32' ? 'typst-editor.exe' : 'typst-editor');
+// `cargo build` writes typst-editor; a bundled build writes hilbert.
+const binary = process.env.BIN || (process.platform === 'win32' ? ['typst-editor.exe', 'hilbert.exe'] : ['typst-editor', 'hilbert'])
+  .map(name => join(root, 'src-tauri/target/debug', name)).find(existsSync);
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 const instances = [];
 let browser;

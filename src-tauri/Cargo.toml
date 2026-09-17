@@ -99,6 +99,12 @@ windows = { version = "0.61", features = [
 [profile.release]
 codegen-units = 1
 lto = true
+# Size, measured rather than assumed. Against `opt-level = 3` on this codebase:
+# the binary is 50.1 MB rather than 53.1 MB, and the only thing that runs slower
+# is building the proofreading dictionaries once per session, 450 ms against
+# 330 ms. Everything a writer waits on — a lint after an edit (3 ms), the
+# double-click jump (3 ms), the file tree, search — measures the same either
+# way, so the three megabytes of download are worth more than the 120 ms.
 opt-level = "s"
 strip = true
 # Panics unwind rather than abort. The backend runs the proofreader, the

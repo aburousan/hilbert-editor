@@ -18,8 +18,10 @@ import { join, resolve } from 'node:path';
 import puppeteer from 'puppeteer';
 
 const root = resolve(import.meta.dirname, '..');
-const exe = process.platform === 'win32' ? 'typst-editor.exe' : 'typst-editor';
-const binary = process.env.BIN || ['debug', 'release'].map(m => join(root, 'src-tauri/target', m, exe)).find(existsSync);
+// `cargo build` writes typst-editor; a bundled build writes hilbert.
+const names = process.platform === 'win32' ? ['typst-editor.exe', 'hilbert.exe'] : ['typst-editor', 'hilbert'];
+const binary = process.env.BIN || ['debug', 'release']
+  .flatMap(m => names.map(name => join(root, 'src-tauri/target', m, name))).find(existsSync);
 assert.ok(binary, 'Build the backend with cargo build before running this test.');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 

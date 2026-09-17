@@ -397,7 +397,7 @@ fn opens_no_sentence(before: &[char]) -> bool {
     true
 }
 
-/// Answers for pieces seen before, by hash./// Answers for pieces seen before, by hash. Bounded, so a long session editing
+/// Answers for pieces seen before, by hash. Bounded, so a long session editing
 /// its way through a book does not keep every version of every paragraph.
 static PIECE_CACHE: LazyLock<Mutex<HashMap<u64, Vec<Issue>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 const PIECE_CACHE_MAX: usize = 4096;
