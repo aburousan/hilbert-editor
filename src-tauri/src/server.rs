@@ -1318,25 +1318,53 @@ async fn workspace_file_post(State(st): St, Query(q): Q, headers: HeaderMap, bod
     } else {
         body.to_vec()
     };
-    if let Some(expected) = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()) {
-        let current = fs::read_to_string(&full).unwrap_or_default();
-        let current_hash = format!("{:016x}", content_hash(&current));
-        if expected != current_hash {
+    // The check that the file is still what this window last saw, and the write,
+    // happen together under one lock. Apart, two windows saving the same file at
+    // once could both pass the check and the second would overwrite the first.
+    // Every window's backend lives in this process, so one lock covers them all.
+    let expected = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()).map(str::to_string);
+    enum Saved {
+        Written,
+        Conflict { current: String, hash: String },
+    }
+    let written = {
+        let (target, bytes) = (full.clone(), content.clone());
+        // Off the request threads: the write waits for the disk to confirm it,
+        // which on a network share can take long enough to hold up everything
+        // else the page is asking for meanwhile.
+        tokio::task::spawn_blocking(move || -> std::io::Result<Saved> {
+            let _guard = FILE_SAVE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(expected) = expected {
+                let current = fs::read_to_string(&target).unwrap_or_default();
+                let hash = format!("{:016x}", content_hash(&current));
+                if expected != hash {
+                    return Ok(Saved::Conflict { current, hash });
+                }
+            }
+            if let Some(parent) = target.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            write_atomic(&target, &bytes).map(|_| Saved::Written)
+        })
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+    };
+    let written = match written {
+        Ok(Saved::Conflict { current, hash }) => {
             return (
                 StatusCode::CONFLICT,
                 Json(json!({
                     "error": "The file changed outside Hilbert.",
                     "content": current,
-                    "hash": current_hash,
+                    "hash": hash,
                 })),
             )
                 .into_response();
         }
-    }
-    if let Some(parent) = full.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    match write_atomic(&full, &content) {
+        Ok(Saved::Written) => Ok(()),
+        Err(e) => Err(e),
+    };
+    match written {
         Ok(_) => {
             st.note_write();
             // The hash of what we wrote, not of a read-back. Reading the file
@@ -1372,11 +1400,29 @@ fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = parent.join(format!(".{name}.{seq}.hilbert-tmp"));
-    match fs::write(&tmp, contents).and_then(|_| fs::rename(&tmp, path)) {
-        Ok(()) => Ok(()),
+    // The bytes reach the disk before the new name points at them. Renaming a
+    // file whose contents are still only in memory is the classic way to lose
+    // work: the machine goes down — a forced update, a flat battery — and the
+    // name comes back pointing at an empty file, or at nothing that was saved.
+    let durable = |file: &Path| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut handle = fs::File::create(file)?;
+        handle.write_all(contents)?;
+        handle.sync_all()
+    };
+    match durable(&tmp).and_then(|_| fs::rename(&tmp, path)) {
+        Ok(()) => {
+            // And the rename itself, which lives in the folder. Only Unix lets a
+            // folder be synced; Windows commits the rename with the metadata.
+            #[cfg(unix)]
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+            Ok(())
+        }
         Err(error) => {
             let _ = fs::remove_file(&tmp);
-            fs::write(path, contents).map_err(|_| error)
+            durable(path).map_err(|_| error)
         }
     }
 }
@@ -2345,6 +2391,52 @@ async fn stop_preview_watcher(st: &Arc<AppState>) {
     }
 }
 
+// If Hilbert is killed outright — a crash, a forced restart of the app — its
+// `typst watch` outlives it and goes on compiling the project. Opening the
+// project again then starts a second one beside it, both writing the same
+// preview file. Each watcher's process id is noted in the project, and the next
+// start stops a leftover one before starting its own.
+fn watch_pid_file(ws: &Path) -> PathBuf {
+    ws.join(".hilbert").join("watch.pid")
+}
+
+#[cfg(unix)]
+fn stop_orphaned_watcher(ws: &Path) {
+    let Ok(text) = fs::read_to_string(watch_pid_file(ws)) else { return };
+    let Ok(pid) = text.trim().parse::<i32>() else { return };
+    if pid <= 1 || pid as u32 == std::process::id() {
+        return;
+    }
+    let ps = |pid: &str, field: &str| {
+        std::process::Command::new("ps")
+            .args(["-p", pid, "-o", field])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    };
+    // Only a `typst watch` of this very project, and only one nobody owns any
+    // more. A number the system has since handed to some other program is left
+    // alone, and so is the live watcher of another window on the same project.
+    let args = ps(&pid.to_string(), "args=");
+    if !(args.contains("typst") && args.contains("watch") && args.contains(&*ws.to_string_lossy())) {
+        return;
+    }
+    let parent = ps(&pid.to_string(), "ppid=");
+    if parent == std::process::id().to_string() {
+        return;
+    }
+    let parent_args = ps(&parent, "args=");
+    if parent_args.contains("hilbert") || parent_args.contains("typst-editor") {
+        return;
+    }
+    // SAFETY: a plain signal to a process checked just above.
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    note!("watch: stopped a typst watch (pid {pid}) left running by an earlier start");
+}
+
+#[cfg(not(unix))]
+fn stop_orphaned_watcher(_ws: &Path) {}
+
 async fn ensure_preview_watcher(
     st: &Arc<AppState>,
     ws: &Path,
@@ -2368,6 +2460,7 @@ async fn ensure_preview_watcher(
     }
 
     ensure_hilbert(ws);
+    stop_orphaned_watcher(ws);
     let mut cmd = Command::new("typst");
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
@@ -2389,6 +2482,9 @@ async fn ensure_preview_watcher(
     strip_appimage_env(&mut cmd);
     let mut child = cmd.spawn()?;
     note!("watch: started typst watch on {} (pid {:?})", main_path.display(), child.id());
+    if let Some(pid) = child.id() {
+        let _ = fs::write(watch_pid_file(ws), pid.to_string());
+    }
     // A preview is running, so a double-click on it is likely. Scanning the
     // system fonts for that takes a second or two; do it now, once, off to the
     // side, rather than while someone waits on their click.
@@ -2407,6 +2503,16 @@ async fn ensure_preview_watcher(
             }
         });
     });
+    // The document too, once the preview has had a head start on the processor.
+    {
+        let (root, main) = (ws.to_path_buf(), main_path.to_path_buf());
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(2));
+            let started = Instant::now();
+            crate::jump::prepare(&root, &main);
+            note!("jump: laid out ahead of the first click in {} ms", started.elapsed().as_millis());
+        });
+    }
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let (line_tx, line_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2613,6 +2719,12 @@ async fn compile(State(st): St, Query(q): Q, body: Bytes) -> Response {
     let response = match outcome {
         WatchCompileResult::Pdf(bytes) => {
             note!("compile: served the watcher's PDF ({} bytes) in {} ms", bytes.len(), queued.elapsed().as_millis());
+            // The layout for double-clicks was let go after a quiet spell; now
+            // that the writing has started again, have it ready again.
+            if crate::jump::wants_layout() {
+                let (root, main) = (ws.to_path_buf(), main_path.clone());
+                std::thread::spawn(move || crate::jump::prepare(&root, &main));
+            }
             ([(header::CONTENT_TYPE, "application/pdf")], bytes).into_response()
         }
         WatchCompileResult::CompileError(message) => {
@@ -3288,7 +3400,7 @@ const UNIVERSE_INDEX_URL: &str = "https://packages.typst.org/preview/index.json"
 const UNIVERSE_TTL: Duration = Duration::from_secs(24 * 3600);
 
 fn universe_cache_file() -> PathBuf {
-    std::env::temp_dir().join("typst-editor-universe-index.json")
+    std::env::temp_dir().join("hilbert-universe-index.json")
 }
 
 fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
@@ -3469,7 +3581,7 @@ async fn git_status(State(st): St) -> Response {
 
 async fn git_init_defaults(ws: &Path) {
     let _ = git(ws, &["config", "user.name", "Typst Editor"]).await;
-    let _ = git(ws, &["config", "user.email", "typst-editor@localhost"]).await;
+    let _ = git(ws, &["config", "user.email", "hilbert@localhost"]).await;
 }
 
 async fn git_init(State(st): St) -> Response {
@@ -5047,14 +5159,14 @@ async fn builtin_preview(body: Bytes) -> Response {
     entry_content.hash(&mut hasher);
     let key = format!("{:x}", hasher.finish());
 
-    let cache_dir = std::env::temp_dir().join("typst-editor-builtin-previews");
+    let cache_dir = std::env::temp_dir().join("hilbert-builtin-previews");
     let _ = fs::create_dir_all(&cache_dir);
     let cached = cache_dir.join(format!("{key}.png"));
     if let Ok(bytes) = fs::read(&cached) {
         return ([(header::CONTENT_TYPE, "image/png")], bytes).into_response();
     }
 
-    let Ok(dir) = unique_temp_dir(&format!("typst-editor-bp-{key}")) else {
+    let Ok(dir) = unique_temp_dir(&format!("hilbert-bp-{key}")) else {
         return json_err(StatusCode::INTERNAL_SERVER_ERROR, "Could not create a scratch directory.");
     };
     for f in files {
@@ -7727,6 +7839,337 @@ async fn session_post(State(st): St, body: Bytes) -> Response {
     Json(json!({ "ok": true })).into_response()
 }
 
+// ---------------------------------------------------------------------------
+// Recovery copies of unsaved text
+// ---------------------------------------------------------------------------
+//
+// Every open file with unsaved changes has a copy here, rewritten a moment after
+// each edit, so work outlives the app being killed: a forced update, a crash, a
+// flat battery. They used to live in the webview's own storage, which is keyed
+// to the address the page came from — and that address carries a port that
+// changes when 3001 is taken and differs for every extra window. After a
+// restart the copies were there and could not be found. On disk they are found
+// whatever port the next start happens to get.
+//
+// One file per open document, named by a hash of its project and its path, so
+// nothing a document is called can reach outside this folder.
+
+const RECOVERY_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+fn recovery_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("HILBERT_RECOVERY_DIR") {
+        return PathBuf::from(p);
+    }
+    hilbert_config_dir().join("recovery")
+}
+
+fn recovery_hash(text: &str) -> String {
+    Sha256::digest(text.as_bytes()).iter().take(12).map(|b| format!("{b:02x}")).collect()
+}
+
+fn recovery_file(workspace: &str, path: &str) -> PathBuf {
+    recovery_dir().join(recovery_hash(workspace)).join(format!("{}.json", recovery_hash(path)))
+}
+
+// A shared hosted server is one folder for everyone who signs in, and one
+// person's unsaved text is not for anyone else to be offered. The browser's own
+// storage stays in use there.
+fn recovery_refused(st: &AppState) -> Option<Response> {
+    st.remote_mode().then(|| json_err(StatusCode::NOT_FOUND, "Recovery copies are kept in the browser here."))
+}
+
+async fn recovery_list(State(st): St, Query(q): Q) -> Response {
+    if let Some(refused) = recovery_refused(&st) {
+        return refused;
+    }
+    let Some(workspace) = q.get("workspace").filter(|w| !w.is_empty()) else {
+        return json_err(StatusCode::BAD_REQUEST, "A workspace is required.");
+    };
+    let folder = recovery_dir().join(recovery_hash(workspace));
+    let mut drafts = Vec::new();
+    if let Ok(entries) = fs::read_dir(&folder) {
+        for entry in entries.flatten() {
+            let file = entry.path();
+            if file.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            // A copy damaged by the very crash it was meant to survive is
+            // skipped, not allowed to hide the others.
+            let Ok(text) = fs::read_to_string(&file) else { continue };
+            let Ok(draft) = serde_json::from_str::<Value>(&text) else { continue };
+            if draft.get("workspace").and_then(Value::as_str) == Some(workspace.as_str())
+                && draft.get("path").and_then(Value::as_str).is_some()
+                && draft.get("content").and_then(Value::as_str).is_some()
+            {
+                drafts.push(draft);
+            }
+        }
+    }
+    Json(drafts).into_response()
+}
+
+async fn recovery_put(State(st): St, body: Bytes) -> Response {
+    if let Some(refused) = recovery_refused(&st) {
+        return refused;
+    }
+    if body.len() > RECOVERY_MAX_BYTES {
+        return json_err(StatusCode::PAYLOAD_TOO_LARGE, "That document is too large for a recovery copy.");
+    }
+    let v = parse_json(&body);
+    let (Some(workspace), Some(path), Some(content)) = (jstr(&v, "workspace"), jstr(&v, "path"), jstr(&v, "content")) else {
+        return json_err(StatusCode::BAD_REQUEST, "A recovery copy needs a workspace, a path and the text.");
+    };
+    let draft = json!({
+        "key": jstr(&v, "key").unwrap_or_default(),
+        "workspace": workspace,
+        "path": path,
+        "content": content,
+        "diskHash": jstr(&v, "diskHash"),
+        "savedAt": v.get("savedAt").and_then(Value::as_u64).filter(|t| *t > 0).unwrap_or_else(|| epoch_ms(SystemTime::now()) as u64),
+    });
+    let file = recovery_file(workspace, path);
+    // Written a moment after every edit, and each write waits for the disk, so
+    // two can be out at once and land in either order. The older one arriving
+    // second must not replace the newer: after a crash that newer text would be
+    // gone. One lock for these writes and for removals, and older loses.
+    let written = tokio::task::spawn_blocking(move || {
+        let _guard = RECOVERY_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+        let held = fs::read_to_string(&file)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .and_then(|v| v.get("savedAt").and_then(Value::as_u64));
+        let incoming = draft.get("savedAt").and_then(Value::as_u64).unwrap_or(0);
+        // A held copy dated in the future says the clock was set back since it
+        // was written, not that it is newer; it does not get to block anything.
+        let now = epoch_ms(SystemTime::now()) as u64;
+        if held.is_some_and(|held| held > incoming && held <= now + 60_000) {
+            return Ok(());
+        }
+        if let Some(parent) = file.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        write_atomic(&file, draft.to_string().as_bytes())
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+    match written {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not keep a recovery copy: {e}")),
+    }
+}
+
+async fn recovery_remove(State(st): St, body: Bytes) -> Response {
+    if let Some(refused) = recovery_refused(&st) {
+        return refused;
+    }
+    let v = parse_json(&body);
+    let (Some(workspace), Some(path)) = (jstr(&v, "workspace"), jstr(&v, "path")) else {
+        return json_err(StatusCode::BAD_REQUEST, "A workspace and a path are required.");
+    };
+    let file = recovery_file(workspace, path);
+    let expected = jstr(&v, "onlyIfContent").map(str::to_string);
+    // Only the copy that was asked about: if a newer one has been written since,
+    // it is still unsaved work and stays. Checked and removed under the same
+    // lock as the writes, so a write cannot slip in between the two.
+    let kept = tokio::task::spawn_blocking(move || {
+        let _guard = RECOVERY_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(expected) = expected {
+            let current = fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
+            if let Some(current) = current
+                && current.get("content").and_then(Value::as_str) != Some(expected.as_str())
+            {
+                return true;
+            }
+        }
+        let _ = fs::remove_file(&file);
+        if let Some(folder) = file.parent() {
+            let _ = fs::remove_dir(folder); // only when it is now empty
+        }
+        false
+    })
+    .await
+    .unwrap_or(true);
+    Json(json!({ "ok": true, "kept": kept })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Version history
+// ---------------------------------------------------------------------------
+//
+// The versions kept by Ctrl+S (and, if asked for, on a timer). They lived only
+// in the page's memory, so closing Hilbert — or a machine going down — took
+// every one of them with it, which is exactly when they are wanted. One file
+// per document here, holding its newest versions.
+
+const HISTORY_MAX_BYTES: usize = 64 * 1024 * 1024;
+// The same number the app keeps in memory.
+const HISTORY_PER_FILE: usize = 40;
+// One read-merge-write at a time, so two windows cannot interleave theirs.
+static HISTORY_WRITE: Mutex<()> = Mutex::new(());
+// Recovery copies: writes and conditional removals, one at a time.
+static RECOVERY_WRITE: Mutex<()> = Mutex::new(());
+// Held across a save's If-Match check and its write; see workspace_file_post.
+static FILE_SAVE: Mutex<()> = Mutex::new(());
+
+fn history_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("HILBERT_HISTORY_DIR") {
+        return PathBuf::from(p);
+    }
+    hilbert_config_dir().join("history")
+}
+
+async fn history_list(State(st): St, Query(q): Q) -> Response {
+    if let Some(refused) = recovery_refused(&st) {
+        return refused;
+    }
+    let Some(workspace) = q.get("workspace").filter(|w| !w.is_empty()) else {
+        return json_err(StatusCode::BAD_REQUEST, "A workspace is required.");
+    };
+    let mut entries = Vec::new();
+    if let Ok(files) = fs::read_dir(history_dir().join(recovery_hash(workspace))) {
+        for file in files.flatten() {
+            let Ok(text) = fs::read_to_string(file.path()) else { continue };
+            let Ok(saved) = serde_json::from_str::<Value>(&text) else { continue };
+            if saved.get("workspace").and_then(Value::as_str) != Some(workspace.as_str()) {
+                continue;
+            }
+            if let Some(list) = saved.get("entries").and_then(Value::as_array) {
+                entries.extend(list.iter().cloned());
+            }
+        }
+    }
+    Json(entries).into_response()
+}
+
+async fn history_put(State(st): St, body: Bytes) -> Response {
+    if let Some(refused) = recovery_refused(&st) {
+        return refused;
+    }
+    if body.len() > HISTORY_MAX_BYTES {
+        return json_err(StatusCode::PAYLOAD_TOO_LARGE, "That history is too large to keep.");
+    }
+    let v = parse_json(&body);
+    let (Some(workspace), Some(path)) = (jstr(&v, "workspace"), jstr(&v, "path")) else {
+        return json_err(StatusCode::BAD_REQUEST, "A workspace and a path are required.");
+    };
+    let incoming = v.get("entries").and_then(Value::as_array).cloned().unwrap_or_default();
+    let file = history_dir().join(recovery_hash(workspace)).join(format!("{}.json", recovery_hash(path)));
+    let (workspace, path) = (workspace.to_string(), path.to_string());
+    let written = tokio::task::spawn_blocking(move || merge_history(&file, &workspace, &path, incoming))
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+    match written {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not keep the history: {e}")),
+    }
+}
+
+// Merged with what is there, not written over it: each window sends only the
+// versions it has kept since, and two windows on one project each keep their
+// own. The newest per file survive.
+fn merge_history(file: &Path, workspace: &str, path: &str, incoming: Vec<Value>) -> std::io::Result<()> {
+    let _guard = HISTORY_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut entries: Vec<Value> = fs::read_to_string(file)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|saved| saved.get("entries").and_then(Value::as_array).cloned())
+        .unwrap_or_default();
+    for entry in incoming {
+        let id = entry.get("id").and_then(Value::as_str).map(str::to_string);
+        if id.is_none() || !entries.iter().any(|e| e.get("id").and_then(Value::as_str) == id.as_deref()) {
+            entries.push(entry);
+        }
+    }
+    entries.sort_by_key(|e| e.get("timestamp").and_then(Value::as_f64).unwrap_or(0.0) as i64);
+    let excess = entries.len().saturating_sub(HISTORY_PER_FILE);
+    entries.drain(..excess);
+    // Forty versions of a very long document is a lot to rewrite on every save
+    // and to read back when the project opens; past the cap the oldest go.
+    let size = |e: &Value| e.get("content").and_then(Value::as_str).map_or(0, str::len);
+    let mut total: usize = entries.iter().map(size).sum();
+    while total > HISTORY_MAX_BYTES && entries.len() > 1 {
+        total -= size(&entries.remove(0));
+    }
+    if entries.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = file.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let saved = json!({ "workspace": workspace, "path": path, "entries": entries });
+    write_atomic(file, saved.to_string().as_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// Leftovers from projects that are gone
+// ---------------------------------------------------------------------------
+//
+// Recovery copies and versions are kept per project, and a project deleted from
+// disk would otherwise leave its folder here for good. One goes only when all of
+// this holds: the project folder is gone, the folder it sat in is still there —
+// so an unplugged drive or an unmounted share, where the parent is missing too,
+// does not count as deleted — and nothing in it has been touched for 90 days.
+
+fn is_mount_container(dir: &Path) -> bool {
+    let d = dir.to_string_lossy();
+    let d = d.trim_end_matches('/');
+    ["/Volumes", "/mnt", "/media", "/run/media"].contains(&d)
+        || dir.parent().is_some_and(|p| {
+            let p = p.to_string_lossy();
+            let p = p.trim_end_matches('/');
+            p == "/media" || p == "/run/media"
+        })
+}
+
+const LEFTOVER_AGE: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+
+fn prune_leftovers(dir: &Path, older_than: Duration, now: SystemTime) -> usize {
+    let mut removed = 0;
+    let Ok(projects) = fs::read_dir(dir) else { return 0 };
+    for project in projects.flatten() {
+        let folder = project.path();
+        if !folder.is_dir() {
+            continue;
+        }
+        let mut workspace: Option<String> = None;
+        let mut recent = false;
+        for file in fs::read_dir(&folder).into_iter().flatten().flatten() {
+            let modified = file.metadata().and_then(|m| m.modified()).unwrap_or(now);
+            if now.duration_since(modified).unwrap_or_default() < older_than {
+                recent = true;
+                break;
+            }
+            if workspace.is_none() {
+                workspace = fs::read_to_string(file.path())
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                    .and_then(|v| v.get("workspace").and_then(Value::as_str).map(str::to_string));
+            }
+        }
+        // A folder whose project cannot be read from it is not guessed about.
+        let Some(workspace) = workspace.filter(|_| !recent) else { continue };
+        let path = Path::new(&workspace);
+        // Gone for certain, not merely out of reach: the lookup says "not found"
+        // (any other error is no answer), and the folder it sat in is there and
+        // holds something. An unmounted share usually leaves its mount point
+        // behind as an empty folder, and that is not evidence of deletion.
+        let missing = matches!(fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+        let parent_in_use = path
+            .parent()
+            .and_then(|parent| fs::read_dir(parent).ok())
+            .is_some_and(|mut entries| entries.next().is_some());
+        // A project that is a whole drive sits straight in the folder drives are
+        // mounted in, and that folder holds other drives whether or not this
+        // one is plugged in.
+        let in_mount_container = path.parent().is_some_and(is_mount_container);
+        let gone = path.is_absolute() && missing && parent_in_use && !in_mount_container;
+        if gone && fs::remove_dir_all(&folder).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 // Settings, as opposed to the session. The session is what one window was in the
 // middle of; these are the choices someone made about the app and expects to
 // find again — font size, theme, how the panels are arranged.
@@ -7824,6 +8267,18 @@ async fn clipboard_post(State(st): St, body: Bytes) -> Response {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
+    static PRUNED: std::sync::Once = std::sync::Once::new();
+    // Not from the test build: its routers would sweep the real folders of
+    // whoever runs `cargo test`.
+    PRUNED.call_once(|| if !cfg!(test) {
+        std::thread::spawn(|| {
+            let removed = prune_leftovers(&recovery_dir(), LEFTOVER_AGE, SystemTime::now())
+                + prune_leftovers(&history_dir(), LEFTOVER_AGE, SystemTime::now());
+            if removed > 0 {
+                note!("cleanup: removed what was kept for {removed} project folder(s) deleted over 90 days ago");
+            }
+        });
+    });
     use tower_http::cors::{AllowOrigin, Any, CorsLayer};
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(|origin, _| {
@@ -7912,6 +8367,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/dictionaries/remove", post(dictionaries_remove))
         .route("/session", get(session_get).post(session_post))
         .route("/settings", get(settings_get).post(settings_post))
+        .route("/recovery/drafts", get(recovery_list).post(recovery_put).layer(DefaultBodyLimit::max(RECOVERY_MAX_BYTES)))
+        .route("/recovery/remove", post(recovery_remove))
+        .route("/history/versions", get(history_list).post(history_put).layer(DefaultBodyLimit::max(HISTORY_MAX_BYTES)))
         .route("/clipboard", get(clipboard_get).post(clipboard_post).layer(DefaultBodyLimit::max(16 * 1024 * 1024)))
         .route("/auth/revoke-sessions", post(remote_revoke_sessions))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_guard));
@@ -7998,7 +8456,7 @@ pub async fn serve(listener: std::net::TcpListener, state: Arc<AppState>) {
         .with_graceful_shutdown(wait_for_shutdown)
         .await
     {
-        eprintln!("[typst-editor] server error: {e}");
+        eprintln!("[hilbert] server error: {e}");
     }
 }
 
@@ -8014,6 +8472,53 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn drives_are_mounted_in_these_folders_and_nowhere_else() {
+        for dir in ["/Volumes", "/mnt", "/media", "/media/kazi", "/run/media/kazi", "/Volumes/"] {
+            assert!(is_mount_container(Path::new(dir)), "{dir} holds drives");
+        }
+        for dir in ["/Users/kazi", "/home/kazi/Documents", "/media/kazi/Drive", "/mnt/share", "/"] {
+            assert!(!is_mount_container(Path::new(dir)), "{dir} is not where drives are mounted");
+        }
+    }
+
+    #[test]
+    fn leftovers_go_only_for_a_project_deleted_long_ago() {
+        let root = temp_workspace("prune");
+        let store = root.join("history");
+        let keep = |name: &str, workspace: &Path| {
+            let folder = store.join(name);
+            fs::create_dir_all(&folder).unwrap();
+            let file = folder.join("a.json");
+            fs::write(&file, json!({ "workspace": workspace.to_string_lossy(), "entries": [] }).to_string()).unwrap();
+            folder
+        };
+        let alive = root.join("alive");
+        fs::create_dir_all(&alive).unwrap();
+        let deleted = keep("deleted", &root.join("deleted-project"));
+        let recent = keep("recent", &root.join("deleted-just-now"));
+        let living = keep("living", &alive);
+        // Its parent is missing too: a drive that is not plugged in right now.
+        let unplugged = keep("unplugged", &root.join("no-such-drive").join("thesis"));
+        // An unmounted share: the mount point stays behind, empty.
+        let mountpoint = root.join("share");
+        fs::create_dir_all(&mountpoint).unwrap();
+        let unmounted = keep("unmounted", &mountpoint.join("thesis"));
+
+        let long_ago = SystemTime::now() - Duration::from_secs(200 * 24 * 60 * 60);
+        for folder in [&deleted, &living, &unplugged, &unmounted] {
+            fs::File::options().write(true).open(folder.join("a.json")).unwrap().set_modified(long_ago).unwrap();
+        }
+        let removed = prune_leftovers(&store, LEFTOVER_AGE, SystemTime::now());
+        assert_eq!(removed, 1);
+        assert!(!deleted.exists(), "a project deleted long ago is cleaned up");
+        assert!(recent.exists(), "one deleted recently is kept a while");
+        assert!(living.exists(), "one that still exists is kept");
+        assert!(unplugged.exists(), "one on a drive that is not attached is kept");
+        assert!(unmounted.exists(), "one under an empty mount point is kept");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

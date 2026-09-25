@@ -155,7 +155,7 @@ like `node server.js` did:
 
 ```bash
 export HILBERT_API_TOKEN="$(openssl rand -hex 32)"
-./target/release/typst-editor --headless
+./target/release/hilbert --headless
 curl -H "Authorization: Bearer $HILBERT_API_TOKEN" http://127.0.0.1:3001/workspace
 ```
 

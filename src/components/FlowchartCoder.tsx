@@ -265,6 +265,16 @@ export default function FlowchartCoder({ onClose, onInsert, onSaved }: {
   const [mouse, setMouse] = useState<{ x: number, y: number } | null>(null);
   // Pan / zoom: the SVG viewBox. Zooming out shows more room for big diagrams.
   const [view, setView] = useState({ x: 0, y: 0, w: W, h: H });
+  // Lines every GRID units across the visible area. Zoomed far out they would
+  // be a solid wash and thousands of segments, so past that they are left out.
+  const gridPath = useMemo(() => {
+    if (view.w / GRID > 300 || view.h / GRID > 300) return '';
+    let d = '';
+    const x0 = Math.floor(view.x / GRID) * GRID, y0 = Math.floor(view.y / GRID) * GRID;
+    for (let x = x0; x <= view.x + view.w; x += GRID) d += `M ${x} ${view.y} V ${view.y + view.h} `;
+    for (let y = y0; y <= view.y + view.h; y += GRID) d += `M ${view.x} ${y} H ${view.x + view.w} `;
+    return d;
+  }, [view.x, view.y, view.w, view.h]);
   const viewRef = useRef(view); viewRef.current = view;
   const svgRef = useRef<SVGSVGElement>(null);
   const idRef = useRef(SAVED?.nextId ?? 3);
@@ -457,7 +467,7 @@ export default function FlowchartCoder({ onClose, onInsert, onSaved }: {
     setBusy(true);
     const clone = svg.cloneNode(true) as SVGSVGElement;
     clone.setAttribute('width', String(W)); clone.setAttribute('height', String(H)); clone.removeAttribute('style');
-    clone.querySelectorAll('rect').forEach(r => { if (r.getAttribute('fill') === 'url(#fcgrid)') r.remove(); });
+    clone.querySelectorAll('[data-grid]').forEach(g => g.remove());
     clone.querySelectorAll('circle').forEach(c => c.remove());   // drag/select handles
     const svgStr = new XMLSerializer().serializeToString(clone);
     // Export resolution from App Settings (DPI). Base SVG is 96 dpi.
@@ -556,12 +566,14 @@ export default function FlowchartCoder({ onClose, onInsert, onSaved }: {
             <svg ref={svgRef} viewBox={`${view.x} ${view.y} ${view.w} ${view.h}`} onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}
               style={{ width: '100%', background: '#fff', border: '1px solid #cbd5e1', borderRadius: 6, cursor: tool === 'connect' ? 'crosshair' : 'default', display: 'block', userSelect: 'none', WebkitUserSelect: 'none' }}>
               <defs>
-                <pattern id="fcgrid" width={GRID} height={GRID} patternUnits="userSpaceOnUse"><path d={`M ${GRID} 0 L 0 0 0 ${GRID}`} fill="none" stroke="#eef1f6" strokeWidth="1" /></pattern>
                 <marker id="fc-arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#475569" /></marker>
                 <marker id="fc-arrow-sel" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7c3aed" /></marker>
                 <filter id="fc-shadow" x="-20%" y="-40%" width="140%" height="180%"><feDropShadow dx="0" dy="1.4" stdDeviation="1.6" floodColor="#0f172a" floodOpacity="0.18" /></filter>
               </defs>
-              <rect x={view.x} y={view.y} width={view.w} height={view.h} fill="url(#fcgrid)" />
+              {/* The grid as plain lines over what is in view, not an SVG
+                  pattern: WebKitGTK drawing without a GPU crashed the whole page
+                  on a pattern fill. */}
+              <path data-grid d={gridPath} fill="none" stroke="#eef1f6" strokeWidth="1" />
               {edges.map(ed => {
                 const a = nodes.find(n => n.id === ed.from), b = nodes.find(n => n.id === ed.to);
                 if (!a || !b) return null;

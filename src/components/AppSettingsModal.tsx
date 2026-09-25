@@ -59,9 +59,11 @@ type SettingsProps = {
   fontSize: number, onFontSize: (n: number) => void,
   textDirection: TextDirection, onTextDirection: (d: TextDirection) => void,
   compileDelay: number, onCompileDelay: (n: number) => void,
+  historyInterval: number, onHistoryInterval: (n: number) => void,
 };
 
-export default function AppSettingsModal({ onClose, initialTab, initialSearch, onDictionaryChange, theme, onTheme, fontSize, onFontSize, textDirection, onTextDirection, compileDelay, onCompileDelay }: SettingsProps) {
+export default function AppSettingsModal({ onClose, initialTab, initialSearch, onDictionaryChange, theme, onTheme, fontSize, onFontSize, textDirection, onTextDirection, compileDelay, onCompileDelay, historyInterval, onHistoryInterval }: SettingsProps) {
+  const saveKeys = keys('⌘S');
   const [activeTab, setActiveTab] = useState<'general' | 'spelling' | 'interpreters' | 'git' | 'cloud'>(initialTab || 'general');
   const [tools, setTools] = useState<Tools | null>(null);
   const [tinymist, setTinymist] = useState<TinymistStatus | null>(null);
@@ -319,7 +321,7 @@ export default function AppSettingsModal({ onClose, initialTab, initialSearch, o
                   </span>
                 </label>
                 <label style={labelStyle}>
-                  Auto-compile after typing stops
+                  Auto-save and compile after typing stops
                   <select style={inputStyle} value={compileDelay} onChange={e => onCompileDelay(Number(e.target.value))}>
                     <option value={100}>0.1 s — near-instant</option>
                     <option value={250}>0.25 s — fast</option>
@@ -328,6 +330,25 @@ export default function AppSettingsModal({ onClose, initialTab, initialSearch, o
                     <option value={2000}>2 s — big documents</option>
                     <option value={4000}>4 s — huge documents / slow machines</option>
                   </select>
+                  <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                    Your work is written to disk each time you pause, because the preview shows what is on disk.
+                    A copy of anything not yet written is also kept, so a crash or a forced restart loses at most a moment.
+                  </span>
+                </label>
+                <label style={labelStyle}>
+                  Keep a version in History
+                  <select style={inputStyle} value={historyInterval} onChange={e => onHistoryInterval(Number(e.target.value))}>
+                    <option value={0}>only when I press {saveKeys}</option>
+                    <option value={1}>every minute while I work</option>
+                    <option value={5}>every 5 minutes while I work</option>
+                    <option value={10}>every 10 minutes while I work</option>
+                    <option value={30}>every 30 minutes while I work</option>
+                  </select>
+                  <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                    {saveKeys} always keeps a version you can go back to from the clock button at the top right (Version history).
+                    The timed choices also keep one on that schedule, for any file that changed since the last.
+                    The newest 40 versions of each file are kept, and they survive closing Hilbert.
+                  </span>
                 </label>
                 <label style={labelStyle}>
                   Inserted diagram quality — <b style={{ color: 'var(--text-main)' }}>{exportDpi} DPI</b>

@@ -22,6 +22,13 @@ type TextEl = { id: number, type: 'text', at: Pt, text: string, color?: string }
 type El = Edge | Loop | Vertex | TextEl;
 
 const W = 680, H = 400, GRID = 20, UNIT = 40; // 40 px = 1 cetz unit
+const gridLines = (step: number) => {
+  let d = '';
+  for (let x = 0; x <= W; x += step) d += `M ${x} 0 V ${H} `;
+  for (let y = 0; y <= H; y += step) d += `M 0 ${y} H ${W} `;
+  return d;
+};
+const GRID_MINOR = gridLines(GRID), GRID_MAJOR = gridLines(UNIT);
 const DBL = 2.4; // px half-gap between the two rails of a double line
 
 const EDGE_KINDS: { k: EdgeKind, name: string }[] = [
@@ -940,17 +947,12 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
             <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', background: '#fff', border: '1px solid #cbd5e1', borderRadius: '6px', cursor: tool === 'select' ? 'default' : 'crosshair', touchAction: 'none', display: 'block' }}
               onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={cancelDrag} onLostPointerCapture={cancelDrag}>
               {/* Alignment grid: minor lines every GRID px, stronger lines every
-                  UNIT px (= 1 cetz unit). Drawing aid only — never exported. */}
-              <defs>
-                <pattern id="fgrid-minor" width={GRID} height={GRID} patternUnits="userSpaceOnUse">
-                  <path d={`M ${GRID} 0 L 0 0 0 ${GRID}`} fill="none" stroke="#e7ebf2" strokeWidth="1" />
-                </pattern>
-                <pattern id="fgrid" width={UNIT} height={UNIT} patternUnits="userSpaceOnUse">
-                  <rect width={UNIT} height={UNIT} fill="url(#fgrid-minor)" />
-                  <path d={`M ${UNIT} 0 L 0 0 0 ${UNIT}`} fill="none" stroke="#cfd8e6" strokeWidth="1" />
-                </pattern>
-              </defs>
-              <rect width={W} height={H} fill="url(#fgrid)" />
+                  UNIT px (= 1 cetz unit). Drawing aid only — never exported.
+                  Plain lines, not an SVG pattern: a pattern filled with another
+                  pattern crashed the whole page in WebKitGTK when it drew
+                  without a GPU (a virtual machine, a remote desktop). */}
+              <path d={GRID_MINOR} fill="none" stroke="#e7ebf2" strokeWidth="1" />
+              <path d={GRID_MAJOR} fill="none" stroke="#cfd8e6" strokeWidth="1" />
               {diagram}
               {draft && tool === 'edge' && <line x1={draft.a.x} y1={draft.a.y} x2={draft.b.x} y2={draft.b.y} stroke="#7c3aed" strokeWidth="1.5" strokeDasharray="4 4" />}
               {draft && tool === 'loop' && <circle cx={draft.a.x} cy={draft.a.y} r={Math.max(2, Math.hypot(draft.b.x - draft.a.x, draft.b.y - draft.a.y))} fill="none" stroke="#7c3aed" strokeWidth="1.5" strokeDasharray="4 4" />}

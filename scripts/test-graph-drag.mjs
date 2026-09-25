@@ -17,7 +17,7 @@ import { once } from 'node:events';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import puppeteer from 'puppeteer';
 
 const root = resolve(import.meta.dirname, '..');
@@ -26,7 +26,7 @@ const PORT = Number(process.env.PORT || 3097);
 const WIDTH = 1600; // the graph's own coordinate width, from LabelGraph.tsx
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-const binary = ['target/release/typst-editor', 'target/debug/typst-editor']
+const binary = ['target/release/hilbert', 'target/debug/hilbert']
   .map(p => join(root, 'src-tauri', p)).find(existsSync);
 if (!binary) {
   console.error('No backend binary. Run: cd src-tauri && cargo build');
@@ -60,7 +60,8 @@ await writeFile(join(home, '.config/hilbert/session.json'), session);
 
 const server = spawn(binary, ['--headless'], {
   env: { ...process.env, HOME: home, TYPST_WORKSPACE: ws, TYPST_DIST: process.env.TYPST_DIST || join(root, 'dist'),
-         HILBERT_SESSION_FILE: sessionFile, HILBERT_API_TOKEN: TOKEN, PORT: String(PORT) },
+         HILBERT_SESSION_FILE: sessionFile, HILBERT_SETTINGS_FILE: join(dirname(sessionFile), 'settings.json'),
+         HILBERT_RECOVERY_DIR: join(dirname(sessionFile), 'recovery'), HILBERT_HISTORY_DIR: join(dirname(sessionFile), 'history'), HILBERT_API_TOKEN: TOKEN, PORT: String(PORT) },
   stdio: 'ignore',
 });
 

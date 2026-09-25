@@ -44,7 +44,7 @@ of load plus the idle cooldown, release build, macOS Apple Silicon.
 Re-run with:
 
 ```
-python3 stress.py --binary <path>/target/release/typst-editor \
+python3 stress.py --binary <path>/target/release/hilbert \
     --duration 300 --concurrency 12 --cooldown 30
 ```
 

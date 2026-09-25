@@ -36,6 +36,8 @@ import {
   createEmergencyDraft,
   listEmergencyDrafts,
   putEmergencyDraft,
+  putEmergencyDraftOnExit,
+  enableDiskRecovery,
   removeEmergencyDraft,
   type EmergencyDraft,
 } from './emergencyDrafts';
@@ -64,6 +66,7 @@ const EditSettings = lazy(() => import('./components/EditSettings'));
 const SymbolPicker = lazy(() => import('./components/SymbolPicker'));
 const DriveSyncModal = lazy(() => import('./components/DriveSyncModal'));
 const AppSettingsModal = lazy(() => import('./components/AppSettingsModal'));
+const HistoryPanel = lazy(() => import('./components/HistoryPanel'));
 const CodeRunnerModal = lazy(() => import('./components/CodeRunnerModal'));
 const SaveAsModal = lazy(() => import('./components/SaveAsModal'));
 const HtmlPreviewModal = lazy(() => import('./components/HtmlPreviewModal'));
@@ -227,12 +230,27 @@ const NOOP_REVERSE_SYNC = () => {};
 const PROOFREAD_FEATURE_ENABLED = true;
 const IS_NATIVE_APP = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
+// Recovery copies go to the backend's folder on disk, not the page's storage.
+enableDiskRecovery(API);
+
 interface HistoryEntry {
   id: string;
   timestamp: number;
   path: string;
   content: string;
+  // Kept by Ctrl+S, or on the timer the writer chose.
+  kind?: 'save' | 'auto' | 'before-restore';
 }
+
+// How often a version is also kept while someone works, in minutes. 0 is only
+// on Ctrl+S, which always keeps one.
+const HISTORY_INTERVALS = [0, 1, 5, 10, 30];
+
+// The file tree shows each file's time in its tooltip and is drawn on every
+// keystroke. Building a date formatter per file per keystroke is what
+// toLocaleTimeString does; one made once is the same text for a fraction.
+const DAY_FORMAT = new Intl.DateTimeFormat();
+const TIME_FORMAT = new Intl.DateTimeFormat([], { hour: '2-digit', minute: '2-digit' });
 
 // Best-effort LaTeX math → Typst math, for labels coming out of quiver (which
 // are written for KaTeX). Covers the symbols that show up in commutative
@@ -625,6 +643,7 @@ export default function App() {
     const saved = localStorage.getItem('editor_text_dir');
     return isTextDirection(saved) ? saved : 'auto';
   });
+  const [historyInterval, setHistoryInterval] = useState<number>(0);
   const [compileDelay, setCompileDelay] = useState<number>(() => {
     const saved = Number(localStorage.getItem('compile_delay'));
     // Move former defaults to the faster value once. After migration, every
@@ -807,7 +826,16 @@ export default function App() {
   const stats = useMemo(() => {
     if (!activeTab) return { words: 0, chars: 0 };
     const text = activeTab.content;
-    return { words: text.trim().split(/\s+/).filter(w => w.length > 0).length, chars: text.length };
+    // Counted, not split: splitting built an array of every word in the file on
+    // every keystroke only to read its length.
+    let words = 0, inWord = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text.charCodeAt(i);
+      const space = c === 32 || (c >= 9 && c <= 13) || (c > 127 && /\s/.test(text[i]));
+      if (!space && !inWord) words++;
+      inWord = !space;
+    }
+    return { words, chars: text.length };
   }, [activeTab?.content]);
   const [showPackageInstaller, setShowPackageInstaller] = useState(false);
   const [showTemplateInstaller, setShowTemplateInstaller] = useState(false);
@@ -1589,6 +1617,7 @@ export default function App() {
         if (isThemeId(saved.theme)) setTheme(saved.theme);
         const delay = clamp(saved.compileDelay, 0, 10000);
         if (delay !== null) setCompileDelay(delay);
+        if (HISTORY_INTERVALS.includes(saved.historyInterval)) setHistoryInterval(saved.historyInterval);
         if (saved.panels && typeof saved.panels === 'object') setPanels(p => ({ ...p, ...saved.panels }));
         // Sizes are clamped on the way back in as well as while dragging: a file
         // written by a bigger screen shouldn't be able to push the preview off
@@ -1635,6 +1664,7 @@ export default function App() {
           textDirection: editorTextDir,
           theme,
           compileDelay,
+          historyInterval,
           panels,
           layout: { sidebar: sidebarWidth, editor: editorWidth, tree: treeHeight, problems: problemsHeight },
           interpreters: allInterpreters(),
@@ -1643,7 +1673,7 @@ export default function App() {
         }),
       }).catch(() => {});
     }, 400);
-  }, [settingsLoaded, prefsRevision, editorFontSize, editorTextDir, theme, compileDelay, panels, sidebarWidth, editorWidth, treeHeight, problemsHeight, hiddenToolbarTools]);
+  }, [settingsLoaded, prefsRevision, editorFontSize, editorTextDir, theme, compileDelay, historyInterval, panels, sidebarWidth, editorWidth, treeHeight, problemsHeight, hiddenToolbarTools]);
 
   // Interpreter choices are made in two different dialogs and land in
   // localStorage rather than in this component's state, so nothing above would
@@ -2025,6 +2055,22 @@ export default function App() {
     } catch(e) {}
   };
 
+  // A compile is also how files written by something else — a script, a
+  // plotting run — reach the tree. But with a short compile delay that is every
+  // few keystrokes, and each reload redraws the whole tree. Once within a second
+  // and a half is soon enough to notice a new file.
+  const treeRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const refreshTreeSoon = () => {
+    if (treeRefreshTimer.current) return;
+    treeRefreshTimer.current = setTimeout(() => {
+      treeRefreshTimer.current = null;
+      void fetchTreeRef.current();
+    }, 1500);
+  };
+  const fetchTreeRef = useRef(fetchTree);
+  fetchTreeRef.current = fetchTree;
+  useEffect(() => () => { if (treeRefreshTimer.current) clearTimeout(treeRefreshTimer.current); }, []);
+
   const filePathsUnder = (path: string): string[] => {
     const out: string[] = [];
     const walk = (nodes: FileNode[]) => {
@@ -2174,7 +2220,7 @@ export default function App() {
         if (!written) return t;
         return { ...t, isDirty: t.content !== written.content, diskHash: written.hash };
       }));
-      fetchTree();
+      refreshTreeSoon();
     } catch (error) {
       if (gaveUp) {
         const msg = `The Typst engine hasn't answered in ${COMPILE_CEILING_MS / 1000} seconds, so this compile was abandoned. `
@@ -2209,15 +2255,19 @@ export default function App() {
     compileAbortRef.current?.abort();
   }, []);
 
-  const restoreHistory = async (h: HistoryEntry) => {
-    if (await confirmDialog(`Restore version from ${new Date(h.timestamp).toLocaleTimeString()}?`, { confirmLabel: 'Restore' })) {
-      setTabs(prev => {
-        if (!prev.find(t => t.path === h.path)) {
-          return [...prev, { path: h.path, content: h.content, isDirty: true }];
-        }
-        return prev.map(t => t.path === h.path ? { ...t, content: h.content, isDirty: true } : t);
-      });
-    }
+  // The panel has already shown what the version holds, so there is nothing
+  // left to ask. What the file held a moment ago is kept as a version first,
+  // which makes a restore something that can itself be undone.
+  const restoreHistory = (h: HistoryEntry) => {
+    const open = tabsRef.current.find(t => t.path === h.path);
+    const now = liveText(h.path) ?? open?.content;
+    if (now !== undefined && now !== h.content) snapshotHistory(h.path, now, 'before-restore');
+    setTabs(prev => {
+      if (!prev.find(t => t.path === h.path)) {
+        return [...prev, { path: h.path, content: h.content, isDirty: true }];
+      }
+      return prev.map(t => t.path === h.path ? { ...t, content: h.content, isDirty: true } : t);
+    });
   };
 
   // Remember the last .typ file the user had open. When they switch to a
@@ -2296,11 +2346,11 @@ export default function App() {
   // since the last snapshot) and keeps only the newest few per file, since each
   // entry holds a full copy of the document.
   const HISTORY_PER_FILE = 40;
-  const snapshotHistory = useCallback((path: string, content: string) => {
+  const snapshotHistory = useCallback((path: string, content: string, kind: HistoryEntry['kind'] = 'save') => {
     setHistory(prev => {
       const last = prev.filter(h => h.path === path).pop();
       if (last && last.content === content) return prev;
-      const next = [...prev, { id: Math.random().toString(), timestamp: Date.now(), path, content }];
+      const next = [...prev, { id: Math.random().toString(), timestamp: Date.now(), path, content, kind }];
       const seen: Record<string, number> = {};
       const kept: typeof next = [];
       for (let i = next.length - 1; i >= 0; i--) {
@@ -2311,6 +2361,98 @@ export default function App() {
       return kept.reverse();
     });
   }, []);
+
+  // Versions outlive the app: read back when a project opens, and each new one
+  // written as it is kept. Only the new ones are sent — the backend merges them
+  // into what it has — so a save costs one copy of the document, not forty. The
+  // hosted server declines, and there they last as long as the page, as they
+  // always did.
+  const historyWritten = useRef(new Set<string>());
+  const historyRef = useRef(history);
+  historyRef.current = history;
+  const historyWorkspaceRef = useRef('');
+  historyWorkspaceRef.current = workspaceRecoveryKey;
+  // The project whose saved versions have been read. Until then nothing is
+  // written, so nothing kept in the first moment after opening is taken for
+  // the whole list.
+  const [historyReadyFor, setHistoryReadyFor] = useState('');
+  const historyReadyRef = useRef('');
+  historyReadyRef.current = historyReadyFor;
+  // Bumped when a project is (re)opened, so the same folder opened again reads
+  // its versions back in rather than showing an empty list.
+  const [historyEpoch, setHistoryEpoch] = useState(0);
+  const writeNewHistory = useCallback((workspace: string, entries: HistoryEntry[]) => {
+    const byPath = new Map<string, HistoryEntry[]>();
+    for (const entry of entries) {
+      if (historyWritten.current.has(entry.id)) continue;
+      historyWritten.current.add(entry.id);
+      byPath.set(entry.path, [...(byPath.get(entry.path) || []), entry]);
+    }
+    for (const [path, fresh] of byPath) {
+      fetch(`${API}/history/versions`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspace, path, entries: fresh }),
+      }).then(r => { if (!r.ok && r.status !== 404) throw new Error(); })
+        // Not kept: tried again with the next version of the file.
+        .catch(() => { for (const entry of fresh) historyWritten.current.delete(entry.id); });
+    }
+  }, []);
+  const flushHistory = () => {
+    const workspace = historyWorkspaceRef.current;
+    if (workspace && historyReadyRef.current === workspace) writeNewHistory(workspace, historyRef.current);
+  };
+  useEffect(() => {
+    if (!workspaceRecoveryKey) return;
+    setHistoryReadyFor('');
+    let cancelled = false;
+    fetch(`${API}/history/versions?workspace=${encodeURIComponent(workspaceRecoveryKey)}`)
+      .then(r => (r.ok ? r.json() : []))
+      .then((saved: HistoryEntry[]) => {
+        if (cancelled || !Array.isArray(saved)) return;
+        const valid = saved.filter(h => typeof h?.id === 'string' && typeof h?.path === 'string'
+          && typeof h?.content === 'string' && Number.isFinite(h?.timestamp));
+        for (const entry of valid) historyWritten.current.add(entry.id);
+        const known = new Set(valid.map(v => v.id));
+        // Whatever was kept this session before the list arrived stays too.
+        setHistory(prev => [...valid, ...prev.filter(p => !known.has(p.id))]
+          .sort((a, b) => a.timestamp - b.timestamp));
+      })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setHistoryReadyFor(workspaceRecoveryKey); });
+    return () => { cancelled = true; };
+  }, [workspaceRecoveryKey, historyEpoch]);
+  useEffect(() => {
+    if (workspaceRecoveryKey && historyReadyFor === workspaceRecoveryKey) writeNewHistory(workspaceRecoveryKey, history);
+  }, [history, workspaceRecoveryKey, historyReadyFor, writeNewHistory]);
+
+  // A version on the timer the writer chose, for every open file that has
+  // changed since the last tick — nothing is kept for a file left alone. Each
+  // file is measured against its text when it was opened, and then against the
+  // text at the last tick, so ten untouched tabs do not become ten versions.
+  const tabsForHistory = useRef(tabs);
+  tabsForHistory.current = tabs;
+  const textAtLastTick = useRef(new Map<string, string>());
+  useEffect(() => {
+    const seen = textAtLastTick.current;
+    const open = new Set<string>();
+    for (const tab of tabs) {
+      open.add(tab.path);
+      if (!seen.has(tab.path)) seen.set(tab.path, tab.content);
+    }
+    for (const path of seen.keys()) if (!open.has(path)) seen.delete(path);
+  }, [tabs]);
+  useEffect(() => {
+    if (!historyInterval) return;
+    const timer = window.setInterval(() => {
+      for (const tab of tabsForHistory.current) {
+        if (!isProjectTextPath(tab.path) || tab.path.toLowerCase().endsWith('.excalidraw')) continue;
+        if (textAtLastTick.current.get(tab.path) === tab.content) continue;
+        textAtLastTick.current.set(tab.path, tab.content);
+        snapshotHistory(tab.path, tab.content, 'auto');
+      }
+    }, historyInterval * 60_000);
+    return () => window.clearInterval(timer);
+  }, [historyInterval, snapshotHistory]);
 
   // If the user enabled WebDAV auto-sync, push the project on every save.
   const webdavAutoSync = useCallback(() => {
@@ -2326,6 +2468,14 @@ export default function App() {
   // Points at the latest runNotebook (defined further down). Held in a ref so an
   // intentional save can trigger it without pulling it into save's dependencies.
 
+  // The text of `path` as the editor holds it this instant, if it is the file
+  // on screen.
+  const liveText = useCallback((path: string): string | undefined => {
+    const model = editorRef.current?.getModel?.();
+    if (!model || model.uri?.path?.replace(/^\//, '') !== path.replace(/^\//, '')) return undefined;
+    return model.getValue();
+  }, []);
+
   const saveActiveFile = useCallback(async () => {
     if (!activeTab) return;
     // A whiteboard saves itself. Its editor holds the drawing; this tab's
@@ -2340,10 +2490,21 @@ export default function App() {
       await whiteboardCommandsRef.current?.save();
       return;
     }
+    const generation = projectGenerationRef.current;
     try {
-      const hash = await writeTab(activeTab);
-      snapshotHistory(activeTab.path, activeTab.content);   // keep a version, this save only
-      setTabs(prev => prev.map(t => t.path === activeTab.path ? { ...t, isDirty: t.content !== activeTab.content, diskHash: hash } : t));
+      // What the editor holds right now. State hears of a keystroke a render
+      // later, and Ctrl+S pressed straight after typing arrived before it did:
+      // the save, and the version kept, were missing the last few characters.
+      const tab = { ...activeTab, content: liveText(activeTab.path) ?? activeTab.content };
+      const hash = await writeTab(tab);
+      // Another project was opened while the write was out. The file is saved;
+      // but a version kept now would be filed under the new project.
+      if (projectGenerationRef.current !== generation) return;
+      snapshotHistory(tab.path, tab.content);   // keep a version, this save only
+      // The text itself is left alone. The write took a moment, and anything
+      // typed during it is already in the editor and on its way into state;
+      // putting the text from before the write back here would delete it.
+      setTabs(prev => prev.map(t => t.path === tab.path ? { ...t, isDirty: t.content !== tab.content, diskHash: hash } : t));
       fetchTree();
       compileTypst(currentMain);
       webdavAutoSync();
@@ -2351,7 +2512,7 @@ export default function App() {
       if (e instanceof Error && e.message === 'external-conflict') return;
       notify(e instanceof Error ? e.message : 'Could not save the file.');
     }
-  }, [activeTab, currentMain, compileTypst, snapshotHistory, webdavAutoSync]);
+  }, [activeTab, currentMain, compileTypst, snapshotHistory, webdavAutoSync, liveText]);
 
   // Move through the open files without reaching for the tab strip. Both read
   // the live refs rather than the rendered values, because the key handler is
@@ -2472,6 +2633,59 @@ export default function App() {
     const timer = window.setTimeout(() => compileTypst(currentMain), 5000);
     return () => window.clearTimeout(timer);
   }, [backendReady, draftRecoveryReady, tabs, compileError, isCompiling, externalConflict, compileTypst, currentMain]);
+
+  // Leaving the window, or closing it. Switching to another app writes the files
+  // there and then rather than after the usual pause, so what is on disk is what
+  // was last seen. Closing cannot wait for a save to be confirmed, so a copy of
+  // anything still unsaved is sent on its way as the page goes, and the next
+  // start puts it back.
+  const leavingRef = useRef({ tabs, key: workspaceRecoveryKey, ready: draftRecoveryReady, main: currentMain, active: activeTabPath, canSave: false });
+  leavingRef.current = { tabs, key: workspaceRecoveryKey, ready: draftRecoveryReady, main: currentMain, active: activeTabPath,
+    // The same holds as for the save after a pause: not before the backend has
+    // answered, and not while a question about a changed file waits on a reply.
+    canSave: backendReady && !externalConflict };
+  useEffect(() => {
+    const saveNow = () => {
+      const { ready, canSave, tabs: open, active, main } = leavingRef.current;
+      if (!ready || !canSave) return;
+      // Straight through each file's own save queue, not by way of a compile: a
+      // compile already running would hold the save until it finished. The
+      // text is the editor's own for the file on screen — state may not have
+      // heard of the last keystrokes yet — and state is left to catch up by
+      // itself, since writing an older copy into it is what reorders typing.
+      const writes: Promise<unknown>[] = [];
+      for (const tab of open) {
+        if (!isProjectTextPath(tab.path)) continue;
+        const text = (tab.path === active ? liveText(tab.path) : undefined) ?? tab.content;
+        if (!tab.isDirty && text === tab.content) continue;
+        writes.push(writeTab({ ...tab, content: text }).then(hash => {
+          setTabs(prev => prev.map(t => t.path === tab.path ? { ...t, isDirty: t.content !== text, diskHash: hash } : t));
+        }).catch(() => { /* the save after the next pause tries again */ }));
+      }
+      if (writes.length) void Promise.all(writes).then(() => compileTypst(main));
+    };
+    const onHidden = () => { if (document.visibilityState === 'hidden') saveNow(); };
+    const onExit = () => {
+      const { key, ready, tabs: open, active } = leavingRef.current;
+      if (!key || !ready) return;
+      for (const tab of open) {
+        if (!isProjectTextPath(tab.path)) continue;
+        const text = (tab.path === active ? liveText(tab.path) : undefined) ?? tab.content;
+        if (!tab.isDirty && text === tab.content) continue;
+        putEmergencyDraftOnExit(createEmergencyDraft(key, tab.path, text, tab.diskHash));
+      }
+    };
+    window.addEventListener('blur', saveNow);
+    document.addEventListener('visibilitychange', onHidden);
+    window.addEventListener('pagehide', onExit);
+    window.addEventListener('beforeunload', onExit);
+    return () => {
+      window.removeEventListener('blur', saveNow);
+      document.removeEventListener('visibilitychange', onHidden);
+      window.removeEventListener('pagehide', onExit);
+      window.removeEventListener('beforeunload', onExit);
+    };
+  }, [compileTypst, liveText]);
 
   // Recompile after a collaborator's change lands (see remoteApplyRev). Reads
   // the current main file fresh, so a late image or an edit to an included file
@@ -3257,7 +3471,11 @@ export default function App() {
     delete sessionRef.current.pdfView;
     sessionRef.current.treeScrollTop = 0;
     loadedDirsRef.current.clear();
+    // Versions kept in the old project but not yet written go out now, under
+    // the old project's name, before its list is cleared.
+    flushHistory();
     setHistory([]);
+    setHistoryEpoch(n => n + 1);
     setErrorLogs(null);
     setPdfUrl(prev => { if (prev) releaseLater(prev); return null; });
     if (projectDisplayName) setProjectName(projectDisplayName);
@@ -5682,7 +5900,7 @@ ${byline ? `
     if (!ms) return '';
     const date = new Date(ms);
     const isToday = new Date().toDateString() === date.toDateString();
-    return (isToday ? 'Today ' : date.toLocaleDateString() + ' ') + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return (isToday ? 'Today ' : DAY_FORMAT.format(date) + ' ') + TIME_FORMAT.format(date);
   };
 
   const getGitStatusForPath = (path: string, isDir: boolean) => {
@@ -8092,7 +8310,8 @@ ${byline ? `
         theme={theme} onTheme={setTheme}
         fontSize={editorFontSize} onFontSize={setEditorFontSize}
         textDirection={editorTextDir} onTextDirection={setEditorTextDir}
-        compileDelay={compileDelay} onCompileDelay={setCompileDelay} /></Suspense>}
+        compileDelay={compileDelay} onCompileDelay={setCompileDelay}
+        historyInterval={historyInterval} onHistoryInterval={setHistoryInterval} /></Suspense>}
       {showLabelGraph && <Suspense fallback={null}><LabelGraph
         mainFile={currentMain}
         onClose={() => setShowLabelGraph(false)}
@@ -8135,30 +8354,14 @@ ${byline ? `
       {showRefManager && activeTab && <Suspense fallback={null}><RefManager content={activeTab.content} onClose={() => setShowRefManager(false)} onJump={jumpToLine} onInsertRef={(name) => insertCode(`@${name}`)} /></Suspense>}
       {showBibManager && <Suspense fallback={null}><BibManager onClose={() => setShowBibManager(false)} onCite={(key) => { insertCode(`@${key}`); ensureBibliography(); }} onEnsureBib={ensureBibliography} onChanged={(paths) => { void fetchTree(); for (const path of paths || []) void mirrorLocalPath(path); }} /></Suspense>}
       
-      {showHistoryModal && (
-        <div className="modal-overlay" onClick={() => setShowHistoryModal(false)}>
-          <div className="modal-content" style={{ width: '400px' }} onClick={e => e.stopPropagation()}>
-            <div className="modal-header">
-              <h2>File History</h2>
-              <button className="tab-close" style={{ fontSize: '24px', cursor: 'pointer' }} onClick={() => setShowHistoryModal(false)}>×</button>
-            </div>
-            <div style={{ padding: '10px' }}>
-              <div style={{ color: 'var(--text-muted)', marginBottom: '15px' }}>History for {activeTabPath}</div>
-              <div className="history-list" style={{ maxHeight: '400px', overflowY: 'auto' }}>
-                {history.filter(h => h.path === activeTabPath).length === 0 && (
-                  <div style={{ color: 'var(--text-muted)', fontSize: '13px', textAlign: 'center', marginTop: '20px' }}>No history for this file yet.<br/>Save the file ({keys('⌘S')}) to keep a version.</div>
-                )}
-                {history.filter(h => h.path === activeTabPath).reverse().map((h, i) => (
-                  <div key={h.id} className="history-item" onClick={() => { restoreHistory(h); setShowHistoryModal(false); }} style={{ padding: '12px', borderBottom: '1px solid var(--border-color)', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <div style={{ fontSize: '14px', fontWeight: i === 0 ? 'bold' : 'normal' }}>{new Date(h.timestamp).toLocaleString()}</div>
-                    <div style={{ fontSize: '12px', color: 'var(--text-muted)', background: 'var(--hover-color)', padding: '4px 8px', borderRadius: '4px' }}>Restore</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
+      {showHistoryModal && <Suspense fallback={null}><HistoryPanel
+        path={activeTabPath}
+        versions={history.filter(h => h.path === activeTabPath)}
+        current={liveText(activeTabPath) ?? activeTab?.content ?? ''}
+        theme={theme}
+        saveKeys={keys('⌘S')}
+        onRestore={version => { restoreHistory(version); setShowHistoryModal(false); }}
+        onClose={() => setShowHistoryModal(false)} /></Suspense>}
 
       {showSymbolPicker && <Suspense fallback={null}><SymbolPicker onClose={() => setShowSymbolPicker(false)} onInsert={(code) => { insertCode(code + ' '); setShowSymbolPicker(false); }} /></Suspense>}
 

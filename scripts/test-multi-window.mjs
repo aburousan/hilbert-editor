@@ -9,9 +9,9 @@ import puppeteer from 'puppeteer';
 
 const root = resolve(import.meta.dirname, '..');
 const dir = await mkdtemp(join(tmpdir(), 'hilbert-windows-'));
-// `cargo build` writes typst-editor; a bundled build writes hilbert.
-const binary = process.env.BIN || (process.platform === 'win32' ? ['typst-editor.exe', 'hilbert.exe'] : ['typst-editor', 'hilbert'])
-  .map(name => join(root, 'src-tauri/target/debug', name)).find(existsSync);
+const binary = process.env.BIN || ['debug', 'release']
+  .flatMap(m => (process.platform === 'win32' ? ['hilbert.exe'] : ['hilbert'])
+    .map(name => join(root, 'src-tauri/target', m, name))).find(existsSync);
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 const instances = [];
 let browser;
@@ -55,7 +55,8 @@ try {
     const token = `hilbert-window-${i}-0123456789abcdef0123456789`;
     const child = spawn(binary, ['--headless'], { env: { ...process.env, PORT: String(port), HILBERT_API_TOKEN: token,
       TYPST_DIST: join(root, 'dist'), TYPST_WORKSPACE: ws, HILBERT_SESSION_FILE: session,
-      HILBERT_SETTINGS_FILE: settings, HILBERT_INTERPRETERS_FILE: join(dir, 'interpreters.json') }, stdio: ['ignore', 'pipe', 'pipe'] });
+      HILBERT_SETTINGS_FILE: settings,
+      HILBERT_RECOVERY_DIR: join(dir, 'recovery'), HILBERT_HISTORY_DIR: join(dir, 'history'), HILBERT_INTERPRETERS_FILE: join(dir, 'interpreters.json') }, stdio: ['ignore', 'pipe', 'pipe'] });
     const instance = { ws, session, child, token, origin: `http://127.0.0.1:${port}`, logs: '' };
     instances.push(instance);
     for (const stream of [child.stdout, child.stderr]) stream.on('data', data => { instance.logs = (instance.logs + data).slice(-10000); });

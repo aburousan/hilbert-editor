@@ -19,12 +19,11 @@ import { spawn, execFileSync } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import puppeteer from 'puppeteer';
 
 const root = resolve(import.meta.dirname, '..');
-// `cargo build` writes typst-editor; a bundled build writes hilbert.
-const names = process.platform === 'win32' ? ['typst-editor.exe', 'hilbert.exe'] : ['typst-editor', 'hilbert'];
+const names = process.platform === 'win32' ? ['hilbert.exe'] : ['hilbert'];
 const binary = process.env.BIN || ['debug', 'release']
   .flatMap(mode => names.map(name => join(root, 'src-tauri/target', mode, name))).find(existsSync);
 assert.ok(binary, 'Build the backend with cargo build before running this test.');
@@ -51,7 +50,8 @@ const port = Number(process.env.PORT || 3098);
 const origin = `http://127.0.0.1:${port}`;
 const server = spawn(binary, ['--headless'], {
   env: { ...process.env, PORT: String(port), TYPST_WORKSPACE: ws, TYPST_DIST: join(root, 'dist'),
-    HILBERT_SESSION_FILE: session, HILBERT_SETTINGS_FILE: settings, HILBERT_API_TOKEN: token },
+    HILBERT_SESSION_FILE: session, HILBERT_SETTINGS_FILE: settings,
+    HILBERT_RECOVERY_DIR: join(dirname(settings), 'recovery'), HILBERT_HISTORY_DIR: join(dirname(settings), 'history'), HILBERT_API_TOKEN: token },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 let logs = '';

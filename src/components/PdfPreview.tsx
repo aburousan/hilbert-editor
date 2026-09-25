@@ -24,6 +24,8 @@ type Slot = {
   rendered: boolean;
   textRendered: boolean;
   visible: boolean;
+  /** In the viewport itself, not just within the margin drawn ahead. */
+  onScreen: boolean;
   aspect: number;
   renderRevision: number;
   renderTask: pdfjsLib.RenderTask | null;
@@ -153,10 +155,28 @@ function PdfPreview(
   const pagesRef = useRef<HTMLDivElement | null>(null);
   const flashTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const renderTokenRef = useRef(0);
+  // How long drawing a fresh document onto the visible pages takes on this
+  // machine, and when a key was last pressed anywhere in the window. A new
+  // document waits for a gap in the typing at least as long as it takes to draw,
+  // so on a slow machine the preview catches up in the pauses rather than
+  // landing on top of the keystrokes. On a fast one the gap between two keys is
+  // already long enough, and nothing waits.
+  const drawCostRef = useRef(0);
+  const lastKeyRef = useRef(0);
+  // When the oldest document still waiting to be drawn arrived. A newer one
+  // replacing it keeps the time, so a steady stream of compiles cannot push
+  // the ceiling back for ever while someone types.
+  const waitingSinceRef = useRef(0);
+  useEffect(() => {
+    const pressed = () => { lastKeyRef.current = performance.now(); };
+    window.addEventListener('keydown', pressed, true);
+    return () => window.removeEventListener('keydown', pressed, true);
+  }, []);
   const docCache = useRef<{ url: string | null; doc: any; naturalW: number }>({ url: null, doc: null, naturalW: 595 });
   const liveWRef = useRef(0);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const ioRef = useRef<IntersectionObserver | null>(null);
+  const viewIoRef = useRef<IntersectionObserver | null>(null);
   const slotsRef = useRef<Slot[]>([]);
   const scaleRef = useRef({ dScale: 1, renderScale: DPR });
   const reportViewStateRef = useRef<() => void>(() => {});
@@ -295,11 +315,37 @@ function PdfPreview(
     slot.renderTask?.cancel();
     slot.renderTask = null;
     slot.rendered = false;
-    slot.div.style.height = `${slot.div.clientWidth * slot.aspect}px`;
-    for (const canvas of slot.div.querySelectorAll('canvas')) {
+    // A page that was never drawn already has its placeholder height. Asking
+    // the layout for its width anyway, page after page, made every new document
+    // a run of forced layouts.
+    const drawn = slot.div.querySelectorAll('canvas');
+    if (!drawn.length) return;
+    slot.div.style.height = `${(parseFloat(slot.div.style.width) || slot.div.clientWidth) * slot.aspect}px`;
+    for (const canvas of drawn) {
       canvas.remove();
       canvas.width = canvas.height = 0;
     }
+  };
+
+  // While the document is being edited, each compile redoes only what is on
+  // screen. The pages just beyond it (drawn ahead so scrolling finds them ready)
+  // and the transparent text used for selecting and double-clicking wait until
+  // the preview has been quiet for a moment, or until the pointer comes over
+  // it. With a short compile delay that was most of the preview's work while
+  // typing — on a slow machine enough to hold the keystrokes up.
+  const settleTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const settleRef = useRef<{ token: number; pages: Set<number>; texts: Set<number> } | null>(null);
+  const settleNow = () => {
+    clearTimeout(settleTimerRef.current);
+    const pending = settleRef.current;
+    settleRef.current = null;
+    if (!pending || pending.token !== renderTokenRef.current) return;
+    for (const i of pending.pages) void drawPage(i, pending.token, true);
+    for (const i of pending.texts) void ensureTextLayer(i, pending.token);
+  };
+  const dropSettle = () => {
+    clearTimeout(settleTimerRef.current);
+    settleRef.current = null;
   };
 
   // Draw (or redraw) one page's bitmap. The new canvas is rendered off-screen and
@@ -556,12 +602,23 @@ function PdfPreview(
         slot.visible = e.isIntersecting;
         if (e.isIntersecting) {
           void drawPage(idx + 1, tok);
-          void ensureTextLayer(idx + 1, tok);
+          const pending = settleRef.current;
+          if (pending && pending.token === tok) pending.texts.add(idx + 1);
+          else void ensureTextLayer(idx + 1, tok);
         } else releaseBitmap(slot);
       }
     }, { root: scrollEl, rootMargin: '800px 0px' });
     ioRef.current = io;
     for (const s of slotsRef.current) io.observe(s.div);
+    viewIoRef.current?.disconnect();
+    const view = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        const slot = slotsRef.current.find(s => s.div === e.target);
+        if (slot) slot.onScreen = e.isIntersecting;
+      }
+    }, { root: scrollEl });
+    viewIoRef.current = view;
+    for (const s of slotsRef.current) view.observe(s.div);
   };
 
   // Load a compiled document into the preview. While you type, each recompile
@@ -576,10 +633,24 @@ function PdfPreview(
     const pagesEl = pagesRef.current, scrollEl = scrollRef.current;
     if (!url || !pagesEl || !scrollEl) return;
     const token = ++renderTokenRef.current;
-    const prevScroll = scrollEl.scrollTop;
-    const prevAnchor = captureAnchor();
+    let prevScroll = scrollEl.scrollTop;
+    let prevAnchor = captureAnchor();
 
     (async () => {
+      // Never longer than three seconds, so a long stretch of typing still
+      // sees the preview move; and not at all before the first draw has been
+      // measured, or for the first document.
+      if (!waitingSinceRef.current) waitingSinceRef.current = performance.now();
+      const quiet = Math.min(600, drawCostRef.current);
+      while (quiet && slotsRef.current.length) {
+        const since = performance.now() - lastKeyRef.current;
+        if (since >= quiet || performance.now() - waitingSinceRef.current > 3000) break;
+        await new Promise(resolve => setTimeout(resolve, Math.max(16, quiet - since)));
+        if (token !== renderTokenRef.current) return;
+      }
+      waitingSinceRef.current = 0;
+      if (quiet) { prevScroll = scrollEl.scrollTop; prevAnchor = captureAnchor(); }
+      const drawStarted = performance.now();
       const prevSlots = slotsRef.current;
       const prevNaturalW = docCache.current.naturalW;
 
@@ -633,12 +704,34 @@ function PdfPreview(
         // everything already on screen, which puts the visible layers straight
         // back.
         invalidateTextLayers();
+        // Pages left waiting by the compile before this one are still waiting.
+        const pending = { token, pages: new Set(settleRef.current?.pages ?? []), texts: new Set<number>() };
+        settleRef.current = pending;
         attachObserver(token, scrollEl);
-        // Redraw the pages that already hold a bitmap; the rest refresh lazily
+        // Redraw the pages that already hold a bitmap: the ones on screen now,
+        // the rest once the preview settles. Pages without one refresh lazily
         // through the observer as they scroll into view.
+        // Which pages are on screen comes from an observer rather than from
+        // measuring them here: measuring straight after the widths above were
+        // set made the browser lay the page out on the spot, inside this task,
+        // and on a slow machine that was a stall on every compile.
+        const drawing: Promise<void>[] = [];
         for (let i = 0; i < prevSlots.length; i++) {
-          if (prevSlots[i].rendered) drawPage(i + 1, token, true);
+          if (!prevSlots[i].rendered) continue;
+          if (prevSlots[i].onScreen) {
+            pending.pages.delete(i + 1);
+            drawing.push(drawPage(i + 1, token, true));
+          } else pending.pages.add(i + 1);
         }
+        // Measured from the document arriving to the visible pages being on
+        // screen, and smoothed, so one slow draw does not set the pace.
+        void Promise.all(drawing).then(() => {
+          if (token !== renderTokenRef.current || !drawing.length) return;
+          const took = performance.now() - drawStarted;
+          drawCostRef.current = drawCostRef.current ? drawCostRef.current * 0.7 + took * 0.3 : took;
+        });
+        clearTimeout(settleTimerRef.current);
+        settleTimerRef.current = setTimeout(settleNow, 700);
         if (restoreInitialView()) requestAnimationFrame(() => reportViewStateRef.current());
         return;
       }
@@ -656,8 +749,9 @@ function PdfPreview(
         textDiv.style.setProperty('--scale-factor', String(dScale));
         pageDiv.appendChild(textDiv);
         frag.appendChild(pageDiv);
-        slots.push({ div: pageDiv, textDiv, rendered: false, textRendered: false, visible: false, aspect, renderRevision: 0, renderTask: null, textTask: null, textBuild: null });
+        slots.push({ div: pageDiv, textDiv, rendered: false, textRendered: false, visible: false, onScreen: false, aspect, renderRevision: 0, renderTask: null, textTask: null, textBuild: null });
       }
+      dropSettle();
       for (const slot of prevSlots) releaseBitmap(slot);
       pagesEl.replaceChildren(frag);
       slotsRef.current = slots;
@@ -674,6 +768,7 @@ function PdfPreview(
     return () => {
       renderTokenRef.current++;
       ioRef.current?.disconnect();
+      viewIoRef.current?.disconnect();
       for (const slot of slotsRef.current) {
         slot.textTask?.cancel();
         slot.textTask = null;
@@ -691,6 +786,10 @@ function PdfPreview(
   // crisply — each new canvas swaps in only when ready, so nothing blanks.
   useEffect(() => {
     const slots = slotsRef.current, w = liveWRef.current;
+    // Everything drawn is redrawn at the new size below, waiting pages included.
+    // Text still waiting to be laid is laid at the new size instead.
+    const waitingText = [...(settleRef.current?.texts ?? [])];
+    dropSettle();
     if (!slots.length || !docCache.current.doc || !w) return;
     const token = renderTokenRef.current;
     const dScale = displayScale(w, zoomFactorRef.current);
@@ -705,7 +804,7 @@ function PdfPreview(
     }
     restoreAnchor(anchor);
     for (let i = 0; i < slots.length; i++) if (slots[i].rendered) drawPage(i + 1, token, true);
-    refreshTextLayers(token);
+    void refreshTextLayers(token).then(() => { for (const i of waitingText) void ensureTextLayer(i, token); });
   }, [rasterTick, zoomFactor]);
 
   // Word count from the RENDERED document (the PDF's text), not the Typst source —
@@ -814,6 +913,7 @@ function PdfPreview(
   // switch, app close) so it doesn't linger with its worker transport.
   useEffect(() => () => {
     clearTimeout(flashTimer.current);
+    dropSettle();
     for (const slot of slotsRef.current) releaseBitmap(slot);
     const d = docCache.current.doc;
     docCache.current = { url: null, doc: null, naturalW: docCache.current.naturalW };
@@ -1138,7 +1238,8 @@ function PdfPreview(
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
         </button>
       </div>
-      <div className="pdf-scroll" ref={scrollRef} onDoubleClick={handleDblClick} title={`Double-click a word to jump to it in the source · Ctrl/${keys('⌘')} + scroll to zoom`}>
+      <div className="pdf-scroll" ref={scrollRef} onDoubleClick={handleDblClick}
+        onPointerMove={() => { if (settleRef.current) settleNow(); }} onPointerDown={settleNow} title={`Double-click a word to jump to it in the source · Ctrl/${keys('⌘')} + scroll to zoom`}>
         <div className="pdf-pages" ref={pagesRef} />
       </div>
     </div>

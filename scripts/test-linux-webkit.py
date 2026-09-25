@@ -131,21 +131,28 @@ try:
           entry.click();
           await wait(()=>document.querySelector('.modal-content svg'),'Feynman');
           if(getComputedStyle(document.querySelector('.modal-overlay')).position!=='fixed') throw Error('Missing dialog CSS');
-          const selector=[...document.querySelectorAll('.modal-content select')].find(el=>el.options[0].text.includes('Insert template'));
-          selector.value=selector.options[1].value; selector.dispatchEvent(new Event('change',{bubbles:true}));
-          await wait(()=>!document.querySelector('[aria-label="Undo"]').disabled,'template insertion');
+          // Diagrams start from the examples browser now, not a template list.
+          const examples=[...document.querySelectorAll('.modal-content button')].find(el=>el.textContent.trim()==='Examples…');
+          if(!examples) throw Error('Feynman examples button missing');
+          examples.click();
+          await wait(()=>[...document.querySelectorAll('.modal-content h2')].some(el=>el.textContent.includes('Start from a diagram')),'examples browser');
+          document.querySelector('.modal-content [title^="Open this diagram"]').click();
+          await wait(()=>!document.querySelector('[aria-label="Undo"]').disabled,'example insertion');
           document.querySelector('[aria-label="Undo"]').click();
           await wait(()=>!document.querySelector('[aria-label="Redo"]').disabled,'undo');
           document.querySelector('[aria-label="Redo"]').click();
           document.querySelector('.modal-content .close-btn').click();
           [...document.querySelectorAll('.tree-file')].find(el=>el.textContent.includes('drawing.excalidraw')).click();
           await wait(()=>document.querySelector('.sci-palette button[title="Insert Circle"]'),'whiteboard');
+          // The palette is Hilbert's own and shows before Excalidraw has started;
+          // a shape asked for before then is dropped, so wait for its canvas.
+          await wait(()=>document.querySelector('.excalidraw canvas'),'Excalidraw ready');
           document.querySelector('.sci-palette button[title="Insert Circle"]').click();
           await wait(()=>document.querySelector('.sci-palette [role="status"]').textContent==='Unsaved','shape insertion');
           document.querySelector('.sci-palette .btn-primary').click();
           await wait(()=>document.querySelector('.sci-palette [role="status"]').textContent==='Saved','save drawing');
           if(smokeErrors.length) throw Error(smokeErrors.join('; '));
-          window.smokeResult={ok:true,ink,checks:['PDF pixels','RTL decoration','Feynman template/undo/redo','whiteboard save']};
+          window.smokeResult={ok:true,ink,checks:['PDF pixels','RTL decoration','Feynman example/undo/redo','whiteboard save']};
         })().catch(error=>{window.smokeResult={ok:false,error:String(error),errors:window.smokeErrors}})
           .then(()=>window.webkit.messageHandlers.smoke.postMessage(JSON.stringify(window.smokeResult)));
         'scheduled';

@@ -70,6 +70,7 @@ pub enum Jump {
 /// Finds what was written at `(x, y)`, in points from the top-left corner of
 /// `page` (counted from one), in the document `main` compiled from `root`.
 pub fn jump(root: &Path, main: &Path, page: usize, x: f64, y: f64, shown: Option<Shown>) -> Jump {
+    CLICKED.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut session = SESSION.lock().unwrap_or_else(|e| e.into_inner());
     let (mut document, _) = match layout(&mut session, root, main, false) {
         Ok(found) => found,
@@ -207,10 +208,46 @@ pub fn release_if_idle(after: std::time::Duration) -> bool {
     idle
 }
 
+static CLICKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PREPARING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the layout should be made again ahead of the next click: it was let
+/// go after a quiet spell, and this is someone who does double-click the
+/// preview. Someone who never has is not made to hold a long document's layout
+/// in memory for nothing.
+pub fn wants_layout() -> bool {
+    if !CLICKED.load(std::sync::atomic::Ordering::Relaxed) || PREPARING.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    // Held means a click is being answered right now, which lays it out anyway.
+    // A layout that failed is left alone: the next click will say why, and trying
+    // again after every compile would only repeat the failure.
+    SESSION.try_lock().is_ok_and(|session| session.is_none())
+}
+
 /// Scans the fonts ahead of the first double-click, which would otherwise wait
 /// a second or two on it. Call it from a background thread.
 pub fn warm_fonts(root: &Path) {
     let _ = font_store(&FontConfig::for_root(root, true));
+}
+
+/// Lays the document out before anyone double-clicks, so the first click after
+/// opening a project answers as quickly as the ones after it. That first layout
+/// is the slow part of a jump, a second or more on a long document. A click
+/// already under way has the session, and this steps aside for it.
+pub fn prepare(root: &Path, main: &Path) {
+    if PREPARING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            PREPARING.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _done = Done;
+    let Ok(mut session) = SESSION.try_lock() else { return };
+    let _ = layout(&mut session, root, main, false);
 }
 
 /// Characters left out of the comparison.

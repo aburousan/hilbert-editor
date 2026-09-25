@@ -53,14 +53,14 @@ jobs:
           # to the HTTP API, so a placeholder is enough and saves an npm build.
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Set-Content dist\index.html "<!doctype html><title>probe</title>"
-          cargo build --manifest-path src-tauri\Cargo.toml --bin typst-editor
+          cargo build --manifest-path src-tauri\Cargo.toml --bin hilbert
           if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
       - name: Can Hilbert find a winget-installed tinymist?
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $exe   = "$PWD\src-tauri\target\debug\typst-editor.exe"
+          $exe   = "$PWD\src-tauri\target\debug\hilbert.exe"
           $token = 'probe-token-long-enough-to-be-accepted-0123456789'
           $pkg   = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Myriad-Dreamin.Tinymist_Microsoft.Winget.Source_8wekyb3d8bbwe"
           $links = "$env:LOCALAPPDATA\Microsoft\WinGet\Links"
@@ -273,7 +273,7 @@ jobs:
 
           env = dict(os.environ, HILBERT_API_TOKEN=token, TYPST_WORKSPACE=str(ws),
                      TYPST_DIST=str(root / "dist"), PORT="3151")
-          exe = root / "src-tauri" / "target" / "debug" / "typst-editor.exe"
+          exe = root / "src-tauri" / "target" / "debug" / "hilbert.exe"
           with open(log, "w") as sink:
               backend = subprocess.Popen(
                   [str(exe), "--headless", "--session-file", str(root / "latency.session.json")],
@@ -330,4 +330,4 @@ jobs:
         run: |
           $env:PATH = "$PWD\tools;$env:PATH"
           python .github\probes\abort-churn.py `
-            "$PWD\churn" "$PWD\src-tauri\target\debug\typst-editor.exe" 3161
+            "$PWD\churn" "$PWD\src-tauri\target\debug\hilbert.exe" 3161

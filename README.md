@@ -130,6 +130,7 @@ Prebuilt installers are on the
 | macOS, Apple Silicon | `…-macOS-arm64.dmg` |
 | macOS, Intel | `…-macOS-x64.dmg` |
 | Linux | `.AppImage` (auto-updates) / `.deb` / `.rpm` |
+| Anywhere with Rust | `cargo install hilbert-editor` |
 
 On a Mac, pick Apple Silicon for M-series chips and Intel for older Macs (*About This
 Mac* tells you which).
@@ -177,6 +178,19 @@ echo "deb [arch=amd64 signed-by=/usr/share/keyrings/hilbert-archive-keyring.gpg]
   | sudo tee /etc/apt/sources.list.d/hilbert.list
 sudo apt update && sudo apt install hilbert
 ```
+
+**Any platform, Cargo.** With a [Rust toolchain](https://rustup.rs) installed, this
+builds Hilbert from crates.io and puts it on your `PATH` as `hilbert`:
+
+```bash
+cargo install hilbert-editor
+```
+
+The interface ships inside the binary, so nothing else needs downloading. On Linux the
+build needs the WebKitGTK development files first (on Debian or Ubuntu:
+`sudo apt install libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev
+librsvg2-dev`). A Cargo install doesn't update itself; run the same command again for
+a new version. You still need Typst (`cargo install typst-cli`).
 
 ---
 
@@ -227,7 +241,10 @@ the port on a network, read the hosted-workspace section of
 
 ## A few tips
 
-- Compile: edits recompile after a short pause; ⌘S saves and recompiles now.
+- Saving: edits are written to disk and recompiled after a short pause, and leaving the
+  window saves at once. ⌘S also keeps a version you can compare and restore from the
+  clock button (Version history); Settings can keep one on a timer as well. Text not
+  yet written is kept aside, so after a crash or a forced restart Hilbert offers it back.
 - Find anything: ⌘K opens the command palette; every menu action is in it.
 - Numbering: put the cursor on a heading or block equation and press ⌘⇧N.
 - Cross-references: add a label (`= Intro <sec:intro>`), then type `@` and pick it.
@@ -253,6 +270,9 @@ the port on a network, read the hosted-workspace section of
 - **It sits on "Compiling…" and won't finish.** Past a few seconds the status bar says
   *still waiting on Typst*; saving still works meanwhile. Recompile to start over, and
   **Help → Copy Diagnostics** records every line `typst watch` emitted.
+- **Typing feels slow on Linux.** Usually WebKit has no GPU to draw with, as in a
+  virtual machine, over `ssh -X`, or without graphics drivers. Hilbert switches to plain
+  drawing when it can tell; if it can't, start it with `HILBERT_SOFTWARE_RENDERING=1`.
 - **A template fails with an error inside `@preview/…`.** A package compatibility
   problem, not the editor: some Typst Universe templates pull in helper packages
   written for an older Typst. Your own document is fine.

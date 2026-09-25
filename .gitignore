@@ -48,3 +48,4 @@ bin/tinymist
 
 # Working notes for this machine. Records server addresses, so it stays local.
 LIVE_SYNC_HANDOFF.txt
+src-tauri/ui-dist/

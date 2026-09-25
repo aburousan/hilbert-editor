@@ -1208,9 +1208,9 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "chacha20"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
@@ -4024,6 +4024,51 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
+name = "hilbert-editor"
+version = "0.2.7"
+dependencies = [
+ "arboard",
+ "axum",
+ "base64 0.23.1",
+ "calamine",
+ "dirs",
+ "dunce",
+ "encoding_rs",
+ "getrandom 0.4.3",
+ "harper-core",
+ "harper-typst",
+ "include_dir",
+ "libc",
+ "mime_guess",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "open",
+ "percent-encoding",
+ "regex",
+ "reqwest 0.13.4",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "spellbook",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-single-instance",
+ "tauri-plugin-updater",
+ "tokio",
+ "tower-http 0.7.0",
+ "ttf-parser",
+ "typst",
+ "typst-kit",
+ "typst-layout",
+ "unicode-normalization",
+ "windows 0.61.3",
+ "zip 8.6.0",
+]
+
+[[package]]
 name = "html5ever"
 version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4454,6 +4499,25 @@ name = "imagesize"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09e54e57b4c48b40f7aec75635392b12b3421fa26fe8b4332e63138ed278459c"
+
+[[package]]
+name = "include_dir"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "923d117408f1e49d914f1a379a309cffe4f18c05cf4e3d12e613a15fc81bd0dd"
+dependencies = [
+ "include_dir_macros",
+]
+
+[[package]]
+name = "include_dir_macros"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cab85a7ed0bd5f0e76d93846e0147172bed2e2d3f859bcc33a8d9699cad1a75"
+dependencies = [
+ "proc-macro2",
+ "quote",
+]
 
 [[package]]
 name = "indexmap"
@@ -8826,50 +8890,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bcee505dac6702dd1c5e65aa2e94a6179d19ee09e2e5637d7313db91765dc4e0"
 dependencies = [
  "bitflags 2.13.1",
-]
-
-[[package]]
-name = "typst-editor"
-version = "0.2.6"
-dependencies = [
- "arboard",
- "axum",
- "base64 0.23.1",
- "calamine",
- "dirs",
- "dunce",
- "encoding_rs",
- "getrandom 0.4.3",
- "harper-core",
- "harper-typst",
- "libc",
- "mime_guess",
- "objc2",
- "objc2-app-kit",
- "objc2-foundation",
- "open",
- "percent-encoding",
- "regex",
- "reqwest 0.13.4",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "spellbook",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-single-instance",
- "tauri-plugin-updater",
- "tokio",
- "tower-http 0.7.0",
- "ttf-parser",
- "typst",
- "typst-kit",
- "typst-layout",
- "unicode-normalization",
- "windows 0.61.3",
- "zip 8.6.0",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 // Reproducible backend benchmark for Hilbert.
 //
 //   node scripts/bench.mjs                 # uses the release binary
-//   BIN=/path/to/typst-editor node scripts/bench.mjs
+//   BIN=/path/to/hilbert node scripts/bench.mjs
 //
 // Generates four workspaces of increasing size, runs the backend against each on
 // its own port with its own workspace, and reports index/search/file-op latency,
@@ -14,7 +14,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 
 const BIN = process.env.BIN
-  || join(process.cwd(), 'src-tauri/target/release/typst-editor');
+  || join(process.cwd(), 'src-tauri/target/release/hilbert');
 const ROOT = join(tmpdir(), 'hilbert-bench');
 const PORT = 3222;
 const API_TOKEN = randomBytes(32).toString('base64url');

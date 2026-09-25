@@ -1,7 +1,7 @@
 {
   "name": "hilbert-editor",
   "private": true,
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "Hilbert: an offline editor for Typst (Unofficial), aimed at maths/physics writing.",
   "author": "Kazi Abu Rousan",
   "license": "MIT",
@@ -60,6 +60,8 @@
     "test:plotexpr": "node scripts/test-plot-expressions.mjs",
     "test:notebook": "node scripts/test-notebook-math.mjs",
     "test:labels": "node scripts/test-label-layout.mjs",
+    "test:autosave": "node scripts/test-autosave.mjs",
+    "test:oldissues": "node scripts/test-old-issues.mjs",
     "test:symbolic": "python3 scripts/test-symbolic.py",
     "test:webkit": "python3 scripts/test-linux-webkit.py dist"
   },

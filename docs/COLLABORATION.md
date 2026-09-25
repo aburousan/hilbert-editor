@@ -195,7 +195,7 @@ cd src-tauri
 cargo build --release
 HILBERT_SERVER_TOKEN="replace-with-a-random-secret-of-at-least-32-characters" \
   TYPST_DIST=../dist \
-  ./target/release/typst-editor --serve \
+  ./target/release/hilbert --serve \
   --bind 127.0.0.1 --port 3001 --workspace /srv/hilbert/project
 ```
 
@@ -482,7 +482,7 @@ cargo run --release -- --sync-server --port 3020
 Once it is built you can also call the binary directly:
 
 ```sh
-./target/release/typst-editor --sync-server --port 3020
+./target/release/hilbert --sync-server --port 3020
 ```
 
 ## Troubleshooting

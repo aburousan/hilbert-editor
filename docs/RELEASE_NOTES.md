@@ -4,6 +4,80 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.2.7
+
+Your work now survives a crash or a forced restart, and versions you keep with ⌘S survive closing Hilbert. You can compare a version with the file before restoring it, and a restore can be undone. Typing stays smooth while the preview catches up, most of all on slower machines. The first double-click after opening a project answers straight away. And Hilbert can now be installed with Cargo.
+
+### Nothing typed is lost to a crash or a forced restart
+
+A Windows update restarted someone's laptop and hours of work could not be brought back (issue #37). Three things were behind it. A save was not pushed all the way to the disk before Hilbert moved on, so a machine going down at the wrong moment could leave the file empty or old. The copy Hilbert kept of text not yet saved lived in the page's own storage, which is tied to the port the app happened to get; after a restart on a different port the copy was there and could not be found. And versions kept with ⌘S lived only in memory.
+
+Saves now wait until the disk confirms them. The copy of unsaved text is kept in Hilbert's own folder, where the next start finds it whatever port it runs on, and is offered back when you open the project again. Switching to another app saves at once instead of after the usual pause, and closing the window keeps a last copy on its way out.
+
+### Version history you can see before you restore
+
+⌘S keeps a version, and the newest forty of each file now stay across restarts. Settings has a new choice, Keep a version in History, which can also keep one every 1, 5, 10 or 30 minutes while you work, for files you have actually changed. The History panel (the clock button at the top right) shows the chosen version beside the file as it is now, with the unchanged parts folded away. Restoring keeps what was there first as a version of its own, so a restore can be undone.
+
+### Typing stays smooth while the preview catches up
+
+With a short compile delay the preview recompiled every few keystrokes and redrew itself on top of the typing, which on a slower machine meant keys arriving late. The preview now measures how long it takes to redraw on your machine and, while you are typing, waits for a pause at least that long, never more than three seconds. On a fast machine that changes nothing; on a laptop without a working GPU it removed about four fifths of the stalls while typing. Pages off screen and the text used for selecting and double-clicking are brought up to date once you pause or move the pointer over the preview. On Linux, where WebKit has no GPU to draw with (a virtual machine, `ssh -X`, missing drivers), Hilbert now switches to plain drawing, which cut the stalls a further 40% there; `HILBERT_SOFTWARE_RENDERING=1` asks for it anywhere.
+
+### The first double-click after opening
+
+Jumping from the preview to the source lays the document out inside Hilbert, and the first time that took a second or more. It now happens in the background as soon as a project opens, so the first double-click is as quick as the rest.
+
+### Two windows, one file
+
+Two windows saving the same file at the same moment could both pass the check that the file had not changed and the second would silently overwrite the first. The check and the write now happen together, so one wins and the other is told the file moved on.
+
+### Linux: two builders no longer crash the window
+
+On Linux machines where WebKit draws without a GPU (a virtual machine, a remote desktop, missing drivers) opening the Feynman or the Flowchart builder crashed the page a moment later, and the window went blank. Both drew their background grid with an SVG pattern, which WebKit cannot draw there; they now draw plain lines, which look the same. The whiteboard could also lose a shape added from the palette in its first moments on such a machine, while it still reported the drawing as saved; palette edits now always count as changes.
+
+### A crash no longer leaves a compiler running
+
+If Hilbert was killed outright, its `typst watch` went on compiling the project in the background, and reopening the project started a second one writing the same preview. The next start now stops the one left behind (macOS and Linux).
+
+### Install with Cargo
+
+Anywhere with a Rust toolchain:
+
+```bash
+cargo install hilbert-editor
+```
+
+It installs as `hilbert`, with the interface inside the binary. On Linux the build needs the WebKitGTK development files first: `sudo apt install libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev`. A Cargo install does not update itself; run the command again for a new version.
+
+### Other ways to install or update
+
+Windows, with winget:
+
+```powershell
+winget install --exact --id Aburousan.Hilbert
+winget upgrade --exact --id Aburousan.Hilbert
+```
+
+macOS, with Homebrew:
+
+```bash
+brew install --cask aburousan/hilbert/hilbert
+brew upgrade --cask hilbert
+```
+
+Debian and Ubuntu, from the apt repository:
+
+```bash
+curl -fsSL https://aburousan.github.io/hilbert-apt/hilbert-archive-keyring.asc \
+  | sudo gpg --dearmor -o /usr/share/keyrings/hilbert-archive-keyring.gpg
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/hilbert-archive-keyring.gpg] https://aburousan.github.io/hilbert-apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/hilbert.list
+sudo apt update && sudo apt install hilbert
+```
+
+If you already have Hilbert from a download, it offers this update on its own; the AppImage, the Windows installers and the macOS app all update in place.
+
+---
+
 ## 0.2.6
 
 Double-clicking text in the preview now finds the exact place it was written, equations included, instead of guessing. Hilbert opens the file you asked for rather than the last one you had. `.typ` files are registered with the system, so Open With lists Hilbert and actually opens the file. And there is a new theme, Cosmos, with the cosmic microwave background behind your work.

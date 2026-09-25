@@ -15,8 +15,7 @@ import { join, resolve } from 'node:path';
 import puppeteer from 'puppeteer';
 
 const root = resolve(import.meta.dirname, '..');
-// `cargo build` writes typst-editor; a bundled build writes hilbert.
-const names = process.platform === 'win32' ? ['typst-editor.exe', 'hilbert.exe'] : ['typst-editor', 'hilbert'];
+const names = process.platform === 'win32' ? ['hilbert.exe'] : ['hilbert'];
 const binary = process.env.BIN || ['debug', 'release']
   .flatMap(m => names.map(name => join(root, 'src-tauri/target', m, name))).find(existsSync);
 assert.ok(binary, 'Build the backend with cargo build before running this test.');
@@ -44,10 +43,15 @@ const other = '= Another file\n\nNothing to do with the notebook.\n';
 await writeFile(join(ws, 'other.typ'), other);
 await writeFile(join(dir, 'session.json'), JSON.stringify({ workspacePath: ws, openPaths: ['main.typ'], activePath: 'main.typ', mainFile: 'main.typ' }));
 await writeFile(join(dir, 'interpreters.json'), JSON.stringify({ python: python ? [{ label: 'Test Python', path: python }] : [] }));
+// The notebook runs with the interpreter chosen in settings. This test has
+// settings of its own, so it makes that choice itself rather than borrowing
+// whatever the person running it happens to have picked.
+await writeFile(join(dir, 'settings.json'), JSON.stringify(python ? { interpreters: { python } } : {}));
 const token = 'hilbert-nbmath-token-0123456789abcd';
 const server = spawn(binary, ['--headless'], {
   env: { ...process.env, PORT: String(Number(process.env.PORT || 3087)), TYPST_WORKSPACE: ws, TYPST_DIST: join(root, 'dist'),
-    HILBERT_SESSION_FILE: join(dir, 'session.json'), HILBERT_INTERPRETERS_FILE: join(dir, 'interpreters.json'), HILBERT_API_TOKEN: token },
+    HILBERT_SESSION_FILE: join(dir, 'session.json'), HILBERT_SETTINGS_FILE: join(dir, 'settings.json'),
+    HILBERT_RECOVERY_DIR: join(dir, 'recovery'), HILBERT_HISTORY_DIR: join(dir, 'history'), HILBERT_INTERPRETERS_FILE: join(dir, 'interpreters.json'), HILBERT_API_TOKEN: token },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 let bound = null;

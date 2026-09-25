@@ -14,8 +14,7 @@ import { join, resolve } from 'node:path';
 import puppeteer from 'puppeteer';
 
 const root = resolve(import.meta.dirname, '..');
-// `cargo build` writes typst-editor; a bundled build writes hilbert.
-const names = process.platform === 'win32' ? ['typst-editor.exe', 'hilbert.exe'] : ['typst-editor', 'hilbert'];
+const names = process.platform === 'win32' ? ['hilbert.exe'] : ['hilbert'];
 const binary = process.env.BIN || ['debug', 'release']
   .flatMap(m => names.map(name => join(root, 'src-tauri/target', m, name))).find(existsSync);
 assert.ok(binary, 'Build the backend with cargo build before running this test.');
@@ -29,7 +28,8 @@ await writeFile(join(dir, 'session.json'), JSON.stringify({ workspacePath: ws, o
 const token = 'hilbert-plot-token-0123456789abcdefgh';
 const server = spawn(binary, ['--headless'], {
   env: { ...process.env, PORT: String(Number(process.env.PORT || 3085)), TYPST_WORKSPACE: ws, TYPST_DIST: join(root, 'dist'),
-    HILBERT_SESSION_FILE: join(dir, 'session.json'), HILBERT_API_TOKEN: token },
+    HILBERT_SESSION_FILE: join(dir, 'session.json'), HILBERT_SETTINGS_FILE: join(dir, 'settings.json'),
+    HILBERT_RECOVERY_DIR: join(dir, 'recovery'), HILBERT_HISTORY_DIR: join(dir, 'history'), HILBERT_API_TOKEN: token },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 let bound = null;

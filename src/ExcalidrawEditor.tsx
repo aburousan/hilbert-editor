@@ -257,6 +257,11 @@ export default function ExcalidrawEditor({ initialContent, onSave, theme = 'dark
     return { cx: usableWidth / 2 / zoom - st.scrollX, cy: st.height / 2 / zoom - st.scrollY };
   };
 
+  const markEdited = () => {
+    historyChangesRef.current++;
+    setDirty(true);
+  };
+
   const insertShape = (make: (cx: number, cy: number, o: MakeOpts) => Skel[]) => {
     if (!excalidrawAPI) return;
     const st = excalidrawAPI.getAppState();
@@ -274,6 +279,11 @@ export default function ExcalidrawEditor({ initialContent, onSave, theme = 'dark
     const selectedElementIds: Record<string, true> = {};
     for (const el of newEls) selectedElementIds[el.id] = true;
     excalidrawAPI.updateScene({ elements: [...scene, ...newEls], appState: { selectedElementIds }, captureUpdate: CaptureUpdateAction.IMMEDIATELY });
+    // An edit, said so directly. Unsaved is otherwise judged against the first
+    // scene Excalidraw reports, and on a slow machine a shape added before that
+    // first report became part of it: the drawing claimed to be saved and the
+    // shape was never written.
+    markEdited();
   };
 
   // Apply a fill style / colour: to the current selection if there is one,
@@ -287,6 +297,7 @@ export default function ExcalidrawEditor({ initialContent, onSave, theme = 'dark
       const els = excalidrawAPI.getSceneElements().map((el: any) =>
         sel[el.id] ? newElementWith(el, patch) : el);
       excalidrawAPI.updateScene({ elements: els, captureUpdate: CaptureUpdateAction.IMMEDIATELY });
+      markEdited();
     } else {
       const appState: any = {};
       if (patch.backgroundColor !== undefined) appState.currentItemBackgroundColor = patch.backgroundColor;

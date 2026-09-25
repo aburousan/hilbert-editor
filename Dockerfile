@@ -92,7 +92,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-sympy \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/src-tauri/target/release/typst-editor /usr/local/bin/hilbert
+COPY --from=builder /app/src-tauri/target/release/hilbert /usr/local/bin/hilbert
 COPY --from=builder /app/dist /usr/local/share/hilbert/dist
 COPY --from=builder /usr/local/bin/typst /usr/local/bin/typst
 COPY --from=builder /usr/local/bin/tinymist /usr/local/bin/tinymist

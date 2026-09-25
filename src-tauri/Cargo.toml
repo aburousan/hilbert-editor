@@ -1,18 +1,46 @@
 [package]
-name = "typst-editor"
-version = "0.2.6"
+name = "hilbert-editor"
+version = "0.2.7"
 description = "Hilbert — an offline editor for Typst (Unofficial), aimed at maths/physics writing."
+repository = "https://github.com/aburousan/hilbert-editor"
+homepage = "https://github.com/aburousan/hilbert-editor"
+readme = "../README.md"
+keywords = ["typst", "editor", "latex", "physics", "math"]
+categories = ["text-editors", "science"]
 authors = ["Kazi Abu Rousan"]
 license = "MIT"
 edition = "2024"
 # Let chains need 1.88, and the typst and burn crates harper pulls in need
 # 1.89 — declaring less holds those back at older versions.
 rust-version = "1.92"
+default-run = "hilbert"
+# What `cargo publish` sends. ui-dist is the built interface, copied in by
+# scripts/publish-crate.mjs before publishing and never committed.
+include = [
+    "src/**/*",
+    "build.rs",
+    "tauri.conf.json",
+    "icons/**/*",
+    "gen/**/*",
+    "linux/**/*",
+    "ui-dummy/**/*",
+    "ui-dist/**/*",
+]
+
+[[bin]]
+name = "hilbert"
+path = "src/main.rs"
+
+[features]
+# For `cargo install --git`: build the interface with npm and carry it inside
+# the binary. The published crate already carries it and needs no feature.
+embed-ui = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+include_dir = "0.7"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-updater = "2"
