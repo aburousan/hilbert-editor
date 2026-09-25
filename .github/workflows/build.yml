@@ -85,7 +85,9 @@ jobs:
           # `print` quietly substituted for the em dash.
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as out:
               out.write('text<<HILBERT_EOF\n' + summary + '\nHILBERT_EOF\n')
-          print('Update dialog will say:', summary)
+          # The log is not UTF-8 on the Windows runner either, and a ⌘ in the
+          # notes made this very line fail the build.
+          print('Update dialog will say:', summary.encode('ascii', 'backslashreplace').decode('ascii'))
           PY
 
       # Pinned to a commit SHA (not the mutable @v0 tag) so a compromise of the

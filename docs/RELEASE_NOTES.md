@@ -6,7 +6,7 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ## 0.2.7
 
-Your work now survives a crash or a forced restart, and versions you keep with ⌘S survive closing Hilbert. You can compare a version with the file before restoring it, and a restore can be undone. Typing stays smooth while the preview catches up, most of all on slower machines. The first double-click after opening a project answers straight away. And Hilbert can now be installed with Cargo.
+Your work now survives a crash or a forced restart, and versions you keep with Ctrl+S (⌘S on a Mac) survive closing Hilbert. You can compare a version with the file before restoring it, and a restore can be undone. Typing stays smooth while the preview catches up, most of all on slower machines. The first double-click after opening a project answers straight away. And Hilbert can now be installed with Cargo.
 
 ### Nothing typed is lost to a crash or a forced restart
 
