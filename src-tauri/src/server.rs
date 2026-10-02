@@ -6327,9 +6327,10 @@ impl LspProxy {
     /// every `@label` and `@citation` living in another file of the same
     /// document is reported as missing. The chapter is fine; it is the question
     /// that was wrong.
-    async fn pin_main(&mut self, main: Option<&Path>) {
+    /// True when this changed which document the file is read as part of.
+    async fn pin_main(&mut self, main: Option<&Path>) -> bool {
         if self.pinned.as_deref() == main {
-            return;
+            return false;
         }
         let argument = match main {
             Some(path) => json!(path.to_string_lossy()),
@@ -6347,6 +6348,7 @@ impl LspProxy {
             .await,
         );
         self.pinned = main.map(Path::to_path_buf);
+        true
     }
 }
 
@@ -7144,16 +7146,19 @@ async fn lsp_diagnostics(State(st): St, body: Bytes) -> Response {
         .flatten()
         .filter(|path| path.is_file());
     let uri = file_uri(&full_path);
-    let (target_version, changed, state, baseline) = {
+    let (target_version, changed, state, baseline, repinned) = {
         let mut guard = LSPS.lock().await;
         let Some(proxy) = guard.get_mut(&ws) else {
             return Json(json!({ "available": false, "diagnostics": [] })).into_response();
         };
-        proxy.pin_main(pin.as_deref()).await;
+        // Taken before the pin moves: a new main makes tinymist read the same
+        // text in another context, and only what it publishes after that
+        // describes the file as it is now read.
         let state = proxy.diagnostics.clone();
         let baseline = state.lock().unwrap().revision;
+        let repinned = proxy.pin_main(pin.as_deref()).await;
         let (version, changed) = proxy.sync_file(&uri, &content).await;
-        (version, changed, state, baseline)
+        (version, changed, state, baseline, repinned)
     };
 
     let latest = || {
@@ -7164,15 +7169,57 @@ async fn lsp_diagnostics(State(st): St, body: Bytes) -> Response {
                 .map(|(_, value)| value.clone())
         })
     };
+    // Whether a publication belongs to the text just synced, rather than to an
+    // older version of it.
+    let fresh = |published: &PublishedDiagnostics| {
+        if repinned {
+            // After the new pin, and for this text: tinymist can publish for
+            // the old text between the pin and the change that follows it.
+            return published.revision > baseline
+                && published.version.is_none_or(|version| version >= target_version);
+        }
+        published.version.map(|version| version >= target_version).unwrap_or(false)
+            || (published.version.is_none() && published.revision > baseline)
+    };
+    // Same text, same context as last time: what is held already answers it.
+    let unchanged = !changed && !repinned;
+    // A follow-up from the editor: the answer it had was older than its text,
+    // and it is waiting for whatever tinymist publishes next for this file.
+    let after = v.get("after").and_then(Value::as_u64);
+    if let Some(after) = after {
+        let wait = async {
+            loop {
+                // Newer than what the editor has, and not a late publication
+                // for an older version of the text arriving out of order.
+                if let Some(published) = latest()
+                    && published.revision > after
+                    && published.version.is_none_or(|version| version >= target_version)
+                {
+                    return Some(published);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let newer = tokio::time::timeout(Duration::from_millis(1500), wait).await.ok().flatten();
+        let found = newer.is_some();
+        let published = newer.or_else(latest);
+        return Json(json!({
+            "available": true,
+            "diagnostics": published.as_ref().map(|item| item.items.clone()).unwrap_or_else(|| json!([])),
+            "version": published.as_ref().and_then(|item| item.version),
+            "revision": published.as_ref().map(|item| item.revision).unwrap_or(after),
+            "pending": published.is_none(),
+            "fresh": found,
+        }))
+        .into_response();
+    }
     let wait = async {
         loop {
             let published = latest();
-            if let Some(published) = published {
-                let current_version = published.version.map(|version| version >= target_version).unwrap_or(false);
-                let fresh_unversioned = published.version.is_none() && published.revision > baseline;
-                if current_version || fresh_unversioned || !changed {
-                    return Some(published);
-                }
+            if let Some(published) = published
+                && (fresh(&published) || unchanged)
+            {
+                return Some(published);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -7187,13 +7234,20 @@ async fn lsp_diagnostics(State(st): St, body: Bytes) -> Response {
     let published = tokio::time::timeout(Duration::from_millis(400), wait).await.ok().flatten();
     // Silence means the previous set still stands, so report that rather than
     // reporting nothing and making the editor drop every marker it was showing.
+    // That set may describe the text as it was before this edit — tinymist was
+    // still working on it — and the editor is told so, so it can wait for the
+    // next one instead of showing old errors until someone types again.
     let published = published.or_else(latest);
     let pending = published.is_none();
     let version = published.as_ref().and_then(|item| item.version);
+    let is_fresh = published.as_ref().is_some_and(|item| fresh(item) || unchanged);
+    let revision = published.as_ref().map(|item| item.revision).unwrap_or(baseline);
     Json(json!({
         "available": true,
         "diagnostics": published.as_ref().map(|item| item.items.clone()).unwrap_or_else(|| json!([])),
         "version": version,
+        "revision": revision,
+        "fresh": is_fresh,
         "pending": pending,
     }))
     .into_response()

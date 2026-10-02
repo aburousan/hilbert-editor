@@ -62,6 +62,7 @@
     "test:labels": "node scripts/test-label-layout.mjs",
     "test:autosave": "node scripts/test-autosave.mjs",
     "test:oldissues": "node scripts/test-old-issues.mjs",
+    "test:problems": "node scripts/test-problems-clear.mjs",
     "test:symbolic": "python3 scripts/test-symbolic.py",
     "test:webkit": "python3 scripts/test-linux-webkit.py dist"
   },

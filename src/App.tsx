@@ -644,6 +644,7 @@ export default function App() {
     return isTextDirection(saved) ? saved : 'auto';
   });
   const [historyInterval, setHistoryInterval] = useState<number>(0);
+  const [errorsCompiledFrom, setErrorsCompiledFrom] = useState<Record<string, string>>({});
   const [compileDelay, setCompileDelay] = useState<number>(() => {
     const saved = Number(localStorage.getItem('compile_delay'));
     // Move former defaults to the faster value once. After migration, every
@@ -2185,11 +2186,16 @@ export default function App() {
         if (ac.signal.aborted) return;
       }
 
+      // What each open file held for this compile, so its errors can later be
+      // recognised as belonging to an older version of the text.
+      const compiledFrom: Record<string, string> = {};
+      for (const tab of tabs) compiledFrom[tab.path] = saved.get(tab.path)?.content ?? tab.content;
       const res = await fetch(`${API}/compile?main=${encodeURIComponent(mainFile)}`, { method: 'POST', signal: ac.signal });
       if (ac.signal.aborted) return;
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         const msg = errData.error || 'Compilation failed.';
+        setErrorsCompiledFrom(compiledFrom);
         setErrorLogs(msg);
         setCompileError(msg);
         return;
@@ -5459,8 +5465,11 @@ ${byline ? `
       let fromPackage = false;
       for (let j = i + 1; j < Math.min(i + 4, lines.length); j++) {
         if (lines[j].includes('@preview/')) fromPackage = true; // location points inside a package
-        const loc = lines[j].match(/([\w./\-]+):(\d+):(\d+)/);
-        if (loc) { prob.file = loc[1]; prob.line = Number(loc[2]); prob.col = Number(loc[3]); break; }
+        // The whole path after the box-drawing arrow, spaces, backslashes and
+        // drive letters included; a bare name would match a file of the same
+        // name in another folder.
+        const loc = lines[j].match(/─\s+(.+):(\d+):(\d+)\s*$/) || lines[j].match(/([\w./\\-]+):(\d+):(\d+)/);
+        if (loc) { prob.file = loc[1].trim().replace(/\\/g, '/'); prob.line = Number(loc[2]); prob.col = Number(loc[3]); break; }
       }
       // Skip warnings that originate inside an imported package (e.g. mitex's own
       // deprecation notices) — the user can't act on them and they only add noise.
@@ -5471,11 +5480,31 @@ ${byline ? `
   };
   const compileProblems = useMemo(() => parseProblems(errorLogs), [errorLogs]);
   const problems = useMemo(() => {
-    if (!compileProblems.length) return tinymist.problems;
+    // A compile error in the open file stops being true the moment the text it
+    // came from is edited. Once tinymist has checked the text as it is now and
+    // found no errors, the old ones go, instead of waiting out the compile
+    // delay and the next compile. An error from compiling the current text, or
+    // in another file, always stays.
+    const tab = activeTab;
+    // Only an exact match: the path as the project names it, or an absolute
+    // path that ends in it. Anything looser keeps the error.
+    // Only an exact match: the path as the project names it, or the absolute
+    // path of that file in this project. A package in the cache can have a
+    // file of the same name, and its errors are not the open file's.
+    const root = (workspacePathRef.current || '').replace(/\\/g, '/').replace(/\/+$/, '');
+    const isOpenFile = (file?: string) => {
+      if (!tab || !file) return false;
+      const f = file.replace(/\\/g, '/').replace(/^\.\//, ''), t = tab.path.replace(/\\/g, '/');
+      return f === t || (!!root && f.toLowerCase() === `${root}/${t}`.toLowerCase());
+    };
+    const fixedSince = !!tab && tinymist.checked?.path === tab.path && tinymist.checked.content === tab.content
+      && tinymist.checked.errors === 0 && errorsCompiledFrom[tab.path] !== undefined && errorsCompiledFrom[tab.path] !== tab.content;
+    const fromCompile = fixedSince ? compileProblems.filter(problem => !isOpenFile(problem.file)) : compileProblems;
+    if (!fromCompile.length) return tinymist.problems;
     // Compiler errors describe the actual PDF build. Keep Tinymist's warnings,
     // information and hints without duplicating speculative LSP errors.
-    return [...compileProblems, ...tinymist.problems.filter(problem => problem.severity !== 'error')];
-  }, [compileProblems, tinymist.problems]);
+    return [...fromCompile, ...tinymist.problems.filter(problem => problem.severity !== 'error')];
+  }, [compileProblems, tinymist.problems, tinymist.checked, activeTab, errorsCompiledFrom]);
 
   // The last non-empty error list. Diagnostics are cleared and re-published on
   // every recompile, so mid-cycle the list is briefly empty — showing the held
@@ -5486,8 +5515,17 @@ ${byline ? `
   const jumpToProblem = async (p: EditorProblem) => {
     if (!p.line) return;
     if (p.file && p.file !== activeTabPath && !p.file.includes('@preview')) {
-      const base = p.file.split('/').pop() || p.file;
-      if (tabs.find(t => t.path === base) || fileTree.some(n => n.name === base)) await openFile(base);
+      // The path as the compiler gave it, made relative to the project when it
+      // is absolute; the bare name only when nothing in the project has the
+      // whole path, so a chapter is not confused with a same-named file.
+      const root = (workspacePathRef.current || '').replace(/\\/g, '/').replace(/\/+$/, '');
+      const full = p.file.replace(/\\/g, '/').replace(/^\.\//, '');
+      const relative = root && full.toLowerCase().startsWith(root.toLowerCase() + '/') ? full.slice(root.length + 1) : full;
+      const base = relative.split('/').pop() || relative;
+      const known = (path: string) => tabs.some(t => t.path === path) || !!findNode(fileTree, path);
+      const target = known(relative) ? relative : known(base) ? base : null;
+      if (target && target !== activeTabPath) await openFile(target);
+      else if (!target) return;
     }
     const ed = editorRef.current;
     if (!ed) return;
