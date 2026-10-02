@@ -299,6 +299,24 @@ export function setupTypstLanguage(monacoInstance: any) {
       'editorHoverWidget.statusBarBackground': '#0d1330',
     });
 
+    // Puja: the dark syntax colours on warm glass, the kash field faint behind.
+    variant('typst-puja', 'vs-dark', DARK_RULES, {
+      'editor.background': '#1a160fc4',
+      'editorGutter.background': '#1a160fc4',
+      'editor.foreground': '#f6eedb',
+      'editorLineNumber.foreground': '#6e624a',
+      'editorLineNumber.activeForeground': '#c4b493',
+      'editor.lineHighlightBackground': '#fff5dc0d',
+      'editor.selectionBackground': '#f2a33a40',
+      'editorCursor.foreground': '#f2a33a',
+      'editorIndentGuide.background1': '#3a3122',
+      'editorBracketMatch.border': '#f2a33a',
+      'editorHoverWidget.background': '#2b2417',
+      'editorHoverWidget.border': '#4d4129',
+      'editorHoverWidget.foreground': '#f6eedb',
+      'editorHoverWidget.statusBarBackground': '#221c11',
+    });
+
     // Deliberately not the dark rules: several of them are mid-tone pastels that
     // are exactly what this theme exists to avoid.
     variant('typst-contrast', 'vs-dark', [

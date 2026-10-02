@@ -162,6 +162,47 @@
 :root[data-theme="cosmos"] .preview-pane { background-color: transparent; }
 :root[data-theme="cosmos"] .pdf-scroll { background: rgba(5, 8, 22, 0.32); }
 
+/* Durga Puja: a field of kash flowers at dusk, the sight that says the Pujas
+   are coming in Bengal. Painted by scripts/make-puja-theme.py, not taken from a
+   photograph. Warm dark glass over it, cream text, and marigold for the accent,
+   the colour of the garlands. */
+:root[data-theme="puja"] {
+  --bg-color: rgba(24, 20, 14, 0.74);
+  --panel-bg: rgba(26, 22, 15, 0.76);
+  --panel-lighter: rgba(42, 35, 22, 0.84);
+  --panel-elevated: #2b2417;
+  --text-main: #f6eedb;
+  --text-muted: #c4b493;
+  --text-faint: #8d7f63;
+  --accent: #f2a33a;
+  --accent-color: #f2a33a;
+  --accent-hover: #f7bb63;
+  --accent-soft: rgba(242, 163, 58, 0.15);
+  --accent-line: rgba(242, 163, 58, 0.46);
+  --border-color: rgba(230, 200, 140, 0.22);
+  --border-soft: rgba(230, 200, 140, 0.12);
+  --hover-color: rgba(255, 245, 220, 0.07);
+  --header-top: rgba(30, 25, 16, 0.86);
+  --on-accent: #1c1508;
+  --error-bg: #6d1c1c;
+  --error-text: #fecaca;
+  --shadow-lg: 0 20px 44px -14px rgba(0, 0, 0, 0.8), 0 6px 16px -8px rgba(0, 0, 0, 0.65);
+  color-scheme: dark;
+}
+
+:root[data-theme="puja"] body {
+  background-color: #2a2418;
+  background-image: url("/themes/puja-1080.webp");
+  background-image: -webkit-image-set(url("/themes/puja-1080.webp") 1x, url("/themes/puja.webp") 2x);
+  background-image: image-set(url("/themes/puja-1080.webp") 1x, url("/themes/puja.webp") 2x);
+  background-size: cover;
+  background-position: center 62%;
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+}
+:root[data-theme="puja"] .preview-pane { background-color: transparent; }
+:root[data-theme="puja"] .pdf-scroll { background: rgba(22, 18, 10, 0.28); }
+
 /* Everything here is decided by contrast rather than taste: pure black, white
    text, borders that are actually visible, and an accent bright enough to carry
    dark text on it. It is meant to be legible first and handsome second. */
