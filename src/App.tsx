@@ -67,6 +67,7 @@ const SymbolPicker = lazy(() => import('./components/SymbolPicker'));
 const DriveSyncModal = lazy(() => import('./components/DriveSyncModal'));
 const AppSettingsModal = lazy(() => import('./components/AppSettingsModal'));
 const HistoryPanel = lazy(() => import('./components/HistoryPanel'));
+const BrowserServeModal = lazy(() => import('./components/BrowserServeModal'));
 const CodeRunnerModal = lazy(() => import('./components/CodeRunnerModal'));
 const SaveAsModal = lazy(() => import('./components/SaveAsModal'));
 const HtmlPreviewModal = lazy(() => import('./components/HtmlPreviewModal'));
@@ -245,6 +246,24 @@ interface HistoryEntry {
 // How often a version is also kept while someone works, in minutes. 0 is only
 // on Ctrl+S, which always keeps one.
 const HISTORY_INTERVALS = [0, 1, 5, 10, 30];
+
+// The shortest pause after typing before the preview compiles. With the fastest
+// setting (0.1 s or less), and while saving, compiling and redrawing have all
+// been quick lately, the pause shrinks to 50 ms: on a machine where the whole
+// round trip is cheap, the extra 50 ms is most of what the wait costs. A slow
+// machine, a long document or a longer setting keeps the setting as chosen.
+function effectiveCompileDelay(setting: number): number {
+  if (setting > 100) return setting;
+  const median = (values: number[]) => {
+    if (values.length < 3) return Infinity;
+    const sorted = [...values].sort((a, b) => a - b);
+    return sorted[sorted.length >> 1];
+  };
+  const compiles: { save: number; compile: number }[] = ((window as any).__hilbertCompileTimings || []).slice(-5);
+  const previews: { load: number; draw: number }[] = ((window as any).__hilbertPreviewTimings || []).slice(-5);
+  const cheap = median(compiles.map(c => c.save + c.compile)) < 150 && median(previews.map(p => p.load + p.draw)) < 120;
+  return cheap ? Math.min(setting, 50) : setting;
+}
 
 // The file tree shows each file's time in its tooltip and is drawn on every
 // keystroke. Building a date formatter per file per keystroke is what
@@ -885,6 +904,7 @@ export default function App() {
   }, [fileTree]);
   const [showFlowchart, setShowFlowchart] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
+  const [showBrowserServe, setShowBrowserServe] = useState(false);
   const [showFigureBuilder, setShowFigureBuilder] = useState(false);
   const [showCalloutBuilder, setShowCalloutBuilder] = useState(false);
   const [showQuiver, setShowQuiver] = useState(false);
@@ -2172,6 +2192,8 @@ export default function App() {
       if (compileAbortRef.current === ac) setCompileStalled(true);
     }, COMPILE_SLOW_MS);
     const ceilingTimer = window.setTimeout(() => { gaveUp = true; ac.abort(); }, COMPILE_CEILING_MS);
+    const compileStarted = performance.now();
+    let saveEnded = compileStarted;
     try {
       const saved = new Map<string, { hash: string; content: string }>();
       for (const tab of tabs) {
@@ -2190,8 +2212,14 @@ export default function App() {
       // recognised as belonging to an older version of the text.
       const compiledFrom: Record<string, string> = {};
       for (const tab of tabs) compiledFrom[tab.path] = saved.get(tab.path)?.content ?? tab.content;
+      saveEnded = performance.now();
       const res = await fetch(`${API}/compile?main=${encodeURIComponent(mainFile)}`, { method: 'POST', signal: ac.signal });
       if (ac.signal.aborted) return;
+      // Save and compile timings, beside the preview's own (see PdfPreview).
+      const timings: { save: number; compile: number; at: number }[] = ((window as any).__hilbertCompileTimings ||= []);
+      timings.push({ save: saveEnded - compileStarted, compile: performance.now() - saveEnded, at: performance.now() });
+      if (timings.length > 50) timings.shift();
+      noteServedCycle(res.headers.get('x-hilbert-preview-cycle'));
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         const msg = errData.error || 'Compilation failed.';
@@ -2256,6 +2284,23 @@ export default function App() {
   const compileQueueRef = useRef<ReturnType<typeof createLatestTask<string>> | null>(null);
   if (!compileQueueRef.current) compileQueueRef.current = createLatestTask(main => performCompileRef.current(main));
   const compileTypst = useCallback((main = 'main.typ') => compileQueueRef.current!.request(main), []);
+  // The last watcher compile this window has shown. See the wait on
+  // /preview/changes below.
+  const previewCycleSeenRef = useRef(0);
+  const previewEpochRef = useRef('');
+  // "epoch:cycle" from a compile reply. A new epoch is a restarted backend whose
+  // count began again, so the count is taken as it is rather than compared.
+  const noteServedCycle = (value: string | null) => {
+    const [epoch, raw] = (value || '').split(':');
+    const cycle = Number(raw);
+    if (!epoch || !Number.isFinite(cycle)) return;
+    if (epoch !== previewEpochRef.current) {
+      previewEpochRef.current = epoch;
+      previewCycleSeenRef.current = cycle;
+    } else if (cycle > previewCycleSeenRef.current) {
+      previewCycleSeenRef.current = cycle;
+    }
+  };
   useEffect(() => () => {
     compileQueueRef.current?.cancelPending();
     compileAbortRef.current?.abort();
@@ -2317,6 +2362,67 @@ export default function App() {
     [mainOverride, detectedEntry, activeTabPath, lastTypPath, treeHasPath]);
   const currentMainRef = useRef(currentMain);
   currentMainRef.current = currentMain;
+
+  // A file the document reads can change outside Hilbert: a .txt behind #read,
+  // a figure redrawn by a script, a .bib from a reference manager. `typst watch`
+  // notices and recompiles by itself, but the preview only ever fetched a PDF
+  // after asking for a compile, so it went on showing the old one until the
+  // next keystroke (issue #39). One request stays open here and comes back when
+  // the watcher has finished a compile; a compile this window did not ask for
+  // is then fetched and shown.
+  const previewWatchRef = useRef({ ready: false, compiling: false, dirty: false, conflict: false });
+  previewWatchRef.current = { ready: backendReady, compiling: isCompiling, dirty: tabs.some(t => t.isDirty), conflict: !!externalConflict };
+  useEffect(() => {
+    if (!backendReady) return;
+    const controller = new AbortController();
+    const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+    (async () => {
+      let observed: number | null = null;
+      while (!controller.signal.aborted) {
+        try {
+          const query = observed === null ? '' : `?after=${observed}&epoch=${encodeURIComponent(previewEpochRef.current)}`;
+          const response = await fetch(`${API}/preview/changes${query}`, { signal: controller.signal });
+          if (!response.ok) { await pause(5000); continue; }
+          const { cycle, epoch } = await response.json();
+          if (typeof cycle !== 'number') { await pause(5000); continue; }
+          // A restarted backend counts from the start again.
+          if (typeof epoch === 'string' && epoch !== previewEpochRef.current) {
+            const restarted = previewEpochRef.current !== '';
+            previewEpochRef.current = epoch;
+            previewCycleSeenRef.current = cycle;
+            observed = cycle;
+            // A backend that has just started is not watching anything until
+            // asked to compile once; without that, a file changed from now on
+            // would go unnoticed, and what is on screen may already be old.
+            const state = previewWatchRef.current;
+            if (restarted && state.ready && !state.compiling && !state.conflict) compileTypst(currentMainRef.current);
+            continue;
+          }
+          if (observed !== null && cycle < observed) { observed = cycle; continue; }
+          if (observed === null) {
+            // Whatever has happened up to now is already on screen.
+            observed = cycle;
+            previewCycleSeenRef.current = Math.max(previewCycleSeenRef.current, cycle);
+            continue;
+          }
+          if (cycle <= observed) continue;
+          observed = cycle;
+          // A compile of this window's own lands here too; its reply carries
+          // the cycle, so give that reply a moment to arrive first.
+          await pause(300);
+          const state = previewWatchRef.current;
+          if (cycle > previewCycleSeenRef.current && state.ready && !state.compiling && !state.dirty && !state.conflict) {
+            previewCycleSeenRef.current = cycle;
+            compileTypst(currentMainRef.current);
+          }
+        } catch {
+          if (controller.signal.aborted) return;
+          await pause(3000);
+        }
+      }
+    })();
+    return () => controller.abort();
+  }, [backendReady, compileTypst]);
   // Declared after currentMain because tinymist has to be told which file the
   // document is compiled from: a chapter checked on its own reports every
   // reference that lives in another file as missing.
@@ -2622,7 +2728,7 @@ export default function App() {
       const timeoutId = setTimeout(() => {
         compileTypst(currentMain);
         setLastCompiledPath(currentMain);
-      }, hasDirty ? compileDelay : 50);
+      }, hasDirty ? effectiveCompileDelay(compileDelay) : 50);
       return () => clearTimeout(timeoutId);
     }
   }, [backendReady, draftRecoveryReady, externalConflict, tabs, compileTypst, currentMain, lastCompiledPath, compileDelay]);
@@ -7065,6 +7171,7 @@ ${byline ? `
     { category: 'Format', title: 'Letter Spacing...', run: insertTracking },
     { category: 'Packages', title: 'Install Typst Package...', run: () => setShowPackageInstaller(true) },
     { category: 'Help', title: 'Features & Help...', run: () => setShowHelp(true) },
+    ...(IS_NATIVE_APP ? [{ category: 'Help', title: 'Use in a Browser...', run: () => setShowBrowserServe(true) }] : []),
     { category: 'Help', title: 'Copy Diagnostics', run: () => copyDiagnostics() },
   ];
 
@@ -7406,6 +7513,7 @@ ${byline ? `
                 <div className="dropdown">
                   <div className="dropdown-item" onClick={() => { setShowHelp(true); setActiveMenu(null); }}>Features &amp; Help...</div>
                   <div className="dropdown-item" onClick={() => { setShowPalette(true); setActiveMenu(null); }}>Command Palette... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘K')}</span></div>
+                  {IS_NATIVE_APP && <div className="dropdown-item" onClick={() => { setShowBrowserServe(true); setActiveMenu(null); }}>Use in a Browser...</div>}
                   <div className="dropdown-item" onClick={() => { copyDiagnostics(); setActiveMenu(null); }}>Copy Diagnostics</div>
                 </div>
               )}
@@ -8294,6 +8402,7 @@ ${byline ? `
       {showImagePlacer && <Suspense fallback={null}><ImagePlacer onClose={() => setShowImagePlacer(false)} onEnsureImport={(imp) => { const m = editorRef.current?.getModel(); if (m && !m.getValue().includes(imp.trim())) insertAtTop(imp); }}
         onAddFile={addPictureToProject} onInsert={(code) => { if (typeof showImagePlacer === 'string') { const { editor, model, sel } = getSelectionCtx(''); if (sel && editor && model && !sel.isEmpty()) { editor.executeEdits('re-place', [{ range: sel, text: code, forceMoveMarkers: true }]); editor.focus(); } else insertCode(code); } else insertCode(code); fetchTree(); }} workspaceImages={workspaceImages} selectedCode={typeof showImagePlacer === 'string' ? showImagePlacer : undefined} /></Suspense>}
       {showFlowchart && <Suspense fallback={null}><FlowchartCoder onClose={() => setShowFlowchart(false)} onInsert={(code) => { if (code.includes('fc-result(')) ensureSetup('#let fc-result', '#let fc-result(v) = box(inset: (x: 9pt, y: 6pt), radius: 6pt, fill: rgb(238, 242, 255), stroke: 0.6pt + rgb(165, 180, 252))[*Result:* #v]'); insertCode(`\n${code}\n`); setShowFlowchart(false); }} onSaved={(path) => { void mirrorLocalPath(path); void fetchTree(); }} /></Suspense>}
+      {showBrowserServe && <Suspense fallback={null}><BrowserServeModal onClose={() => setShowBrowserServe(false)} /></Suspense>}
       {showAbout && (
         <div className="modal-overlay" onClick={() => setShowAbout(false)}>
           <div className="modal-content about-modal" onClick={e => e.stopPropagation()}>

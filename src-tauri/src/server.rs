@@ -169,6 +169,14 @@ pub struct AppState {
     pub allow_exec: bool,
     pub exec_timeout_ms: u64,
     source_generation: AtomicU64,
+    // Every compile `typst watch` finishes, counted. It also recompiles by
+    // itself when a file the document reads changes outside Hilbert (a `.txt`
+    // behind #read, an image, a `.bib`), and the editor waits on this count to
+    // hear about those.
+    preview_cycle: tokio::sync::watch::Sender<u64>,
+    // Names this run of the backend, so a page that outlives a restart can tell
+    // the count started again rather than went backwards.
+    preview_epoch: String,
     lint_generation: AtomicU64,
     preview_watcher: tokio::sync::Mutex<Option<PreviewWatcher>>,
     pub compile_gate: tokio::sync::Semaphore,
@@ -411,6 +419,8 @@ impl AppState {
             allow_exec: std::env::var("ALLOW_CODE_EXECUTION").ok().as_deref() != Some("0"),
             exec_timeout_ms: std::env::var("EXEC_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(45000),
             source_generation: AtomicU64::new(0),
+            preview_cycle: tokio::sync::watch::channel(0).0,
+            preview_epoch: format!("{:x}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0) ^ u128::from(std::process::id())),
             lint_generation: AtomicU64::new(0),
             preview_watcher: tokio::sync::Mutex::new(None),
             compile_gate: tokio::sync::Semaphore::new(1),
@@ -2339,6 +2349,7 @@ async fn collect_preview_events(
                 Err(_) => {
                     let message = if diagnostics.is_empty() { "Compilation failed.".into() } else { diagnostics.join("\n") };
                     let _ = events.send(PreviewEvent::new(cycle_generation, PreviewOutcome::Error(message)));
+                    st.preview_cycle.send_modify(|cycle| *cycle += 1);
                     pending_error = false;
                     diagnostics.clear();
                     continue;
@@ -2371,6 +2382,7 @@ async fn collect_preview_events(
             let _ = events.send(PreviewEvent::new(cycle_generation, PreviewOutcome::Waiting));
         } else if line.contains("compiled successfully") || line.contains("compiled with warnings") {
             let _ = events.send(PreviewEvent::new(cycle_generation, PreviewOutcome::Success));
+            st.preview_cycle.send_modify(|cycle| *cycle += 1);
             pending_error = false;
             diagnostics.clear();
         } else if line.contains("compiled with errors") {
@@ -2693,6 +2705,35 @@ async fn compile_once(ws: &Path, main_path: &Path, output_path: &Path) -> Respon
     }
 }
 
+const PREVIEW_CYCLE_HEADER: header::HeaderName = header::HeaderName::from_static("x-hilbert-preview-cycle");
+
+// GET /preview/changes?after=N answers once `typst watch` has finished a compile
+// past N, or after 25 s with nothing new. The editor keeps one of these open:
+// when a file the document reads changes on disk, the watcher recompiles on its
+// own, and this is how the preview hears that there is a new PDF to show.
+async fn preview_changes(State(st): St, Query(q): Q) -> Response {
+    let after = q.get("after").and_then(|v| v.parse::<u64>().ok());
+    // A page that knew another run of this backend has a count from that run;
+    // it hears about the restart now, not after the wait.
+    let same_run = q.get("epoch").is_none_or(|epoch| *epoch == st.preview_epoch);
+    let mut changes = st.preview_cycle.subscribe();
+    let current = *changes.borrow_and_update();
+    if let Some(after) = after
+        && same_run
+        && current <= after
+    {
+        let wait = async {
+            while changes.changed().await.is_ok() {
+                if *changes.borrow_and_update() > after {
+                    break;
+                }
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(25), wait).await;
+    }
+    Json(json!({ "cycle": *st.preview_cycle.borrow(), "epoch": st.preview_epoch })).into_response()
+}
+
 async fn compile(State(st): St, Query(q): Q, body: Bytes) -> Response {
     let queued = Instant::now();
     let Ok(_permit) = st.compile_gate.acquire().await else {
@@ -2719,17 +2760,25 @@ async fn compile(State(st): St, Query(q): Q, body: Bytes) -> Response {
     let response = match outcome {
         WatchCompileResult::Pdf(bytes) => {
             note!("compile: served the watcher's PDF ({} bytes) in {} ms", bytes.len(), queued.elapsed().as_millis());
+            let cycle = *st.preview_cycle.borrow();
             // The layout for double-clicks was let go after a quiet spell; now
             // that the writing has started again, have it ready again.
             if crate::jump::wants_layout() {
                 let (root, main) = (ws.to_path_buf(), main_path.clone());
                 std::thread::spawn(move || crate::jump::prepare(&root, &main));
             }
-            ([(header::CONTENT_TYPE, "application/pdf")], bytes).into_response()
+            // Which watcher compile this is, so the editor does not fetch it a
+            // second time when its wait on /preview/changes wakes for it.
+            ([(header::CONTENT_TYPE, "application/pdf".to_string()), (PREVIEW_CYCLE_HEADER, format!("{}:{cycle}", st.preview_epoch))], bytes).into_response()
         }
         WatchCompileResult::CompileError(message) => {
             note!("compile: typst reported errors after {} ms", queued.elapsed().as_millis());
-            json_err(StatusCode::BAD_REQUEST, message)
+            let cycle = *st.preview_cycle.borrow();
+            let mut response = json_err(StatusCode::BAD_REQUEST, message);
+            if let Ok(value) = header::HeaderValue::from_str(&format!("{}:{cycle}", st.preview_epoch)) {
+                response.headers_mut().insert(PREVIEW_CYCLE_HEADER, value);
+            }
+            response
         }
         // A separate output file, so this never races the watcher writing its own.
         WatchCompileResult::Direct => {
@@ -7033,6 +7082,28 @@ fn tinymist_version(output: &str) -> String {
 
 // Everything someone would otherwise have to be talked through gathering over
 // several messages, in one block they can paste into a bug report.
+// What the "Use in a browser" dialog needs to write the command that serves this
+// project to a browser: this program's own path and the open project. A hosted
+// server cannot start another one, so it says so instead.
+async fn app_serve_command(State(st): St) -> Response {
+    if st.remote_mode() {
+        return json_err(StatusCode::NOT_FOUND, "This is already a browser workspace.");
+    }
+    // An AppImage runs from a mount that is gone once the app closes; the
+    // AppImage file itself takes the same arguments and stays put.
+    let exe = std::env::var("APPIMAGE")
+        .ok()
+        .filter(|path| Path::new(path).is_file())
+        .or_else(|| std::env::current_exe().ok().map(|p| p.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "hilbert".into());
+    Json(json!({
+        "exe": exe,
+        "workspace": st.ws().to_string_lossy(),
+        "os": std::env::consts::OS,
+    }))
+    .into_response()
+}
+
 async fn diagnostics(State(st): St) -> Response {
     let mut lines = vec![
         format!("Hilbert {} on {}", env!("CARGO_PKG_VERSION"), std::env::consts::OS),
@@ -8339,7 +8410,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             cfg!(debug_assertions) && origin.to_str().map(|o| DEV_ORIGIN_RE.is_match(o)).unwrap_or(false)
         }))
         .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_headers(Any)
+        .expose_headers([PREVIEW_CYCLE_HEADER]);
 
     let api = Router::new()
         .route("/workspace", get(workspace_tree))
@@ -8357,6 +8429,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/workspace/rename", post(workspace_rename))
         .route("/workspace/reveal", post(workspace_reveal))
         .route("/app/new-window", post(app_new_window))
+        .route("/app/serve-command", get(app_serve_command))
         .route("/app/pending-open", get(app_pending_open).post(app_queue_open))
         .route("/collab/info", get(collab_server_info))
         .route("/hosted/info", get(hosted_info))
@@ -8365,6 +8438,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/workspace/raw", get(workspace_raw))
         .route("/workspace/compress", post(workspace_compress))
         .route("/data/xlsx", post(data_xlsx).layer(DefaultBodyLimit::max(50 * 1024 * 1024)))
+        .route("/preview/changes", get(preview_changes))
         .route("/compile", post(compile).layer(DefaultBodyLimit::max(16 * 1024 * 1024)))
         .route("/compile/html", get(compile_html))
         .route("/render/snippet", post(render_snippet))

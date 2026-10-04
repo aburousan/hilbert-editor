@@ -179,6 +179,12 @@ echo "deb [arch=amd64 signed-by=/usr/share/keyrings/hilbert-archive-keyring.gpg]
 sudo apt update && sudo apt install hilbert
 ```
 
+**In a web browser.** The app can serve a project to browsers, for people who
+haven't installed it or who work from another machine. In the app, choose
+**Help → Use in a Browser…**: it writes the command for the open project, with a fresh
+sign-in token. The details, and how to let other computers in safely, are in the
+[collaboration guide](docs/COLLABORATION.md#a-complete-browser-hosted-workspace).
+
 **Any platform, Cargo.** With a [Rust toolchain](https://rustup.rs) installed, this
 builds Hilbert from crates.io and puts it on your `PATH` as `hilbert`:
 

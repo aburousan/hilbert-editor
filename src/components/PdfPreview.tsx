@@ -18,6 +18,22 @@ export type PdfViewState = {
   dark: boolean;
 };
 
+// Where the time went for each new preview: waiting for a pause in the typing,
+// pdf.js reading the PDF, and drawing the pages on screen. Kept in the page's
+// performance timeline and in a short list the tests read, so a change to the
+// preview is judged by numbers rather than by feel.
+type PreviewTiming = { wait: number; load: number; draw: number; at: number };
+function notePreviewTiming(timing: PreviewTiming) {
+  const list: PreviewTiming[] = ((window as any).__hilbertPreviewTimings ||= []);
+  list.push(timing);
+  if (list.length > 50) list.shift();
+  try {
+    performance.measure('hilbert:preview-wait', { start: timing.at - timing.draw - timing.load - timing.wait, duration: timing.wait });
+    performance.measure('hilbert:preview-load', { start: timing.at - timing.draw - timing.load, duration: timing.load });
+    performance.measure('hilbert:preview-draw', { start: timing.at - timing.draw, duration: timing.draw });
+  } catch { /* an older engine without measure options */ }
+}
+
 type Slot = {
   div: HTMLDivElement;
   textDiv: HTMLDivElement;
@@ -637,6 +653,7 @@ function PdfPreview(
     let prevAnchor = captureAnchor();
 
     (async () => {
+      const arrived = performance.now();
       // Never longer than three seconds, so a long stretch of typing still
       // sees the preview move; and not at all before the first draw has been
       // measured, or for the first document.
@@ -651,6 +668,7 @@ function PdfPreview(
       waitingSinceRef.current = 0;
       if (quiet) { prevScroll = scrollEl.scrollTop; prevAnchor = captureAnchor(); }
       const drawStarted = performance.now();
+      let loadedAt = drawStarted;
       const prevSlots = slotsRef.current;
       const prevNaturalW = docCache.current.naturalW;
 
@@ -658,6 +676,7 @@ function PdfPreview(
       if (cache.url !== url || !cache.doc) {
         let loaded;
         try { loaded = await pdfjsLib.getDocument(url).promise; } catch { return; }
+        loadedAt = performance.now();
         if (token !== renderTokenRef.current) { try { loaded.destroy(); } catch {} return; }
         let pg;
         try { pg = await loaded.getPage(1); }
@@ -727,8 +746,10 @@ function PdfPreview(
         // screen, and smoothed, so one slow draw does not set the pace.
         void Promise.all(drawing).then(() => {
           if (token !== renderTokenRef.current || !drawing.length) return;
-          const took = performance.now() - drawStarted;
+          const now = performance.now();
+          const took = now - drawStarted;
           drawCostRef.current = drawCostRef.current ? drawCostRef.current * 0.7 + took * 0.3 : took;
+          notePreviewTiming({ wait: drawStarted - arrived, load: loadedAt - drawStarted, draw: now - loadedAt, at: now });
         });
         clearTimeout(settleTimerRef.current);
         settleTimerRef.current = setTimeout(settleNow, 700);

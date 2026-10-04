@@ -2,6 +2,7 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import './monacoLocal'
 import App from './App.tsx'
+import OutsideApp from './OutsideApp'
 import './index.css'
 
 class ErrorBoundary extends React.Component<any, any> {
@@ -31,11 +32,27 @@ window.addEventListener('unhandledrejection', event => {
   if (isCancellation(event.reason)) event.preventDefault();
 });
 
-(window as any).logTiming('React mounted');
-ReactDOM.createRoot(document.getElementById('root')!).render(
-  <React.StrictMode>
-    <ErrorBoundary>
-      <App />
-    </ErrorBoundary>
-  </React.StrictMode>,
-)
+// The app's window always has its token before any of this runs. Without one,
+// and not in development, this is either a browser signed in to a hosted
+// workspace or a browser pointed at the desktop app's private address; only the
+// second is refused, and it is shown what to do instead of an editor that can
+// neither load nor save.
+const root = ReactDOM.createRoot(document.getElementById('root')!);
+const outsideTheApp = !(window as any).__HILBERT_API_TOKEN__ && window.location.port !== '5173';
+const refused = outsideTheApp
+  ? fetch('/workspace/root').then(response => response.status === 401).catch(() => false)
+  : Promise.resolve(false);
+void refused.then(isRefused => {
+  if (isRefused) {
+    root.render(<OutsideApp />);
+    return;
+  }
+  (window as any).logTiming('React mounted');
+  root.render(
+    <React.StrictMode>
+      <ErrorBoundary>
+        <App />
+      </ErrorBoundary>
+    </React.StrictMode>,
+  );
+});
