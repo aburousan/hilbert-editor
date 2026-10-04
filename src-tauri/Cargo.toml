@@ -1,6 +1,6 @@
 [package]
 name = "hilbert-editor"
-version = "0.2.7"
+version = "0.2.8"
 description = "Hilbert — an offline editor for Typst (Unofficial), aimed at maths/physics writing."
 repository = "https://github.com/aburousan/hilbert-editor"
 homepage = "https://github.com/aburousan/hilbert-editor"

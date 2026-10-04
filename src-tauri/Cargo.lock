@@ -4025,7 +4025,7 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "hilbert-editor"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "arboard",
  "axum",

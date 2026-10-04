@@ -4,6 +4,44 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.2.8
+
+The Problems list now clears the moment you fix a mistake. A file your document reads, changed outside Hilbert, now shows in the preview by itself. Opening Hilbert's own address in a browser explains what to do instead of showing an editor that cannot save, and Help has a new way to use Hilbert in a browser. The preview is a little quicker on small and medium documents. And there is a new theme for the Pujas.
+
+### Fixed mistakes leave the Problems list straight away
+
+After fixing a mistake, the red Problems list could stay for a few seconds, or until you typed again (issue #38). Two things were behind it. When tinymist took longer than Hilbert waited for it, Hilbert showed its previous answer as if it were current and did not ask again. And compile errors stayed until the next compile, a full compile delay later. Hilbert now waits for tinymist's answer for the text you have now, and once tinymist has checked that text and found nothing wrong, compile errors in the open file from an older version of it go too. Errors from compiling the text as it is, or in other files, always stay.
+
+### Files changed outside Hilbert reach the preview
+
+If your document reads a file with `#read`, shows an image or cites a `.bib`, and that file changed outside Hilbert, the preview stayed as it was until the next keystroke (issue #39). Typst had already recompiled; Hilbert just never fetched the result. It now does, within about a second, and once per change.
+
+### Using Hilbert in a browser
+
+The address the desktop app uses for its own window is private to it, so a browser opened on it showed an editor that could neither open nor save anything (issue #40). It now shows a page explaining that. To work in a browser, or to let people who have not installed Hilbert join you, choose Help → Use in a Browser. It writes the command that serves the project you have open to browsers, with a fresh sign-in token: run it in a terminal, open the address it gives and sign in. There is an option to let other computers on your network connect, with running code from the document turned off for them. The collaboration guide has the details, including HTTPS for live co-editing between browsers.
+
+### A slightly quicker preview
+
+With the fastest compile-delay setting, Hilbert now waits 50 ms after you stop typing instead of 100 whenever saving, compiling and redrawing have all been quick, which takes about 50 ms off each update on small and medium documents. Slower machines and longer settings keep the delay you chose.
+
+### The Puja theme
+
+A field of kash flowers under a golden evening sky, for Durga Puja. Choose it with the theme button at the top or in Settings → Theme. The picture is painted by Hilbert's own code, not taken from a photograph.
+
+### Install or update
+
+If you already have Hilbert from a download, it offers this update on its own. Package managers:
+
+```bash
+winget upgrade --exact --id Aburousan.Hilbert      # Windows
+brew upgrade --cask hilbert                        # macOS
+sudo apt update && sudo apt install hilbert        # Debian and Ubuntu
+```
+
+With Rust installed, `cargo install --git https://github.com/aburousan/hilbert-editor --features embed-ui` builds it from source and installs it as `hilbert`.
+
+---
+
 ## 0.2.7
 
 Your work now survives a crash or a forced restart, and versions you keep with Ctrl+S (⌘S on a Mac) survive closing Hilbert. You can compare a version with the file before restoring it, and a restore can be undone. Typing stays smooth while the preview catches up, most of all on slower machines. The first double-click after opening a project answers straight away. And Hilbert can now be installed with Cargo.
