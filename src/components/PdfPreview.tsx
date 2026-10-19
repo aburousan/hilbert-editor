@@ -73,6 +73,18 @@ function collectSpanWords(root: ParentNode): { words: string[]; spans: HTMLEleme
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).href;
 
+// One pdf.js worker for every revision. Left to itself pdf.js starts a fresh
+// worker for each document and stops it again on destroy, and the preview loads
+// a new document on every compile, so each edit paid for a worker starting up.
+// Destroying a document still frees its data in the worker; the worker stays.
+let sharedWorker: pdfjsLib.PDFWorker | null = null;
+const previewWorker = () => {
+  if (!sharedWorker || sharedWorker.destroyed) sharedWorker = new pdfjsLib.PDFWorker();
+  return sharedWorker;
+};
+// While developing, a hot reload of this file would otherwise leave the old one running.
+import.meta.hot?.dispose(() => { sharedWorker?.destroy(); sharedWorker = null; });
+
 const DPR = Math.min(typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1, 2);
 const PRESETS = [50, 75, 90, 100, 110, 125, 150, 200, 300];
 const MAX_CACHED_SYNC_WORDS = 120_000;
@@ -675,7 +687,7 @@ function PdfPreview(
       let cache = docCache.current;
       if (cache.url !== url || !cache.doc) {
         let loaded;
-        try { loaded = await pdfjsLib.getDocument(url).promise; } catch { return; }
+        try { loaded = await pdfjsLib.getDocument({ url, worker: previewWorker() }).promise; } catch { return; }
         loadedAt = performance.now();
         if (token !== renderTokenRef.current) { try { loaded.destroy(); } catch {} return; }
         let pg;

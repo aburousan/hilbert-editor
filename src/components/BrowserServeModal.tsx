@@ -90,13 +90,14 @@ export default function BrowserServeModal({ onClose }: { onClose: () => void }) 
                 <input type="checkbox" checked={network} onChange={e => setNetwork(e.target.checked)} style={{ marginTop: 3 }} />
                 <span>
                   Let other computers on this network connect. They open <b>http://&lt;this computer's address&gt;:{PORT}</b>.
-                  Running code from the document is turned off for them. Live co-editing between browsers also needs
-                  HTTPS or an SSH tunnel; see the collaboration guide.
+                  Running code from the document is turned off for them. Plain http is not encrypted, so others on
+                  the same network could read the token: do this only on a network you trust, or use HTTPS or an SSH
+                  tunnel as the collaboration guide shows. Live co-editing between browsers needs one of those too.
                 </span>
               </label>
               <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: 12.5 }}>
-                The browser and this window work on the same files. Edit a file in one place at a time; if both change it,
-                Hilbert asks which version to keep.{' '}
+                The browser and this window work on the same files. Edit a file in one place at a time; if both change
+                it, Hilbert asks which version to keep.{' '}
                 <a href="https://github.com/aburousan/hilbert-editor/blob/main/docs/COLLABORATION.md#a-complete-browser-hosted-workspace" target="_blank" rel="noreferrer">Collaboration guide</a>
               </p>
             </>

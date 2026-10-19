@@ -12,7 +12,7 @@
 // is run with sh).
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -106,6 +106,56 @@ try {
   let pdf = false;
   for (let i = 0; i < 200 && !pdf; i++) { pdf = await page.evaluate(() => [...document.querySelectorAll('.textLayer span')].some(s => s.textContent.includes('Written in a browser'))); if (!pdf) await sleep(100); }
   check('and the project compiles in the browser', pdf);
+
+  // 4. A signed-in browser can neither read nor write a `.git` folder: its
+  //    config and hooks name programs git runs, so a file there is code that
+  //    runs on this computer, code execution switch or not.
+  const gitAnswers = await page.evaluate(async () => {
+    const out = {};
+    for (const path of ['.git/config', '.GIT/config', '.git./hooks/pre-commit', 'chapters/.git/config']) {
+      out[`write ${path}`] = (await fetch(`/workspace/file?path=${encodeURIComponent(path)}`, { method: 'POST', body: '[core]\n\tfsmonitor = touch /tmp/hilbert-pwned\n' })).status;
+    }
+    out['read .git/config'] = (await fetch('/workspace/file?path=.git/config')).status;
+    out['make .git/hooks'] = (await fetch('/workspace/mkdir?path=.git/hooks', { method: 'POST' })).status;
+    out['write notes.typ'] = (await fetch('/workspace/file?path=notes.typ', { method: 'POST', body: 'fine' })).status;
+    return out;
+  });
+  const refused = Object.entries(gitAnswers).filter(([k]) => k !== 'write notes.typ').every(([, status]) => status >= 400);
+  check('a browser cannot read or write .git', refused && gitAnswers['write notes.typ'] === 200 && !existsSync(join(ws, '.git')), JSON.stringify(gitAnswers));
+
+  // Copying the project to a folder named in the request would let a browser
+  // write anywhere on this computer, so a hosted server refuses it.
+  const outside = join(dir, 'outside-copy');
+  const syncStatus = await page.evaluate(async folder => (await fetch('/drive/sync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ folder }) })).status, outside);
+  check('a browser cannot copy the project to a folder of its choosing', syncStatus === 403 && !existsSync(outside), String(syncStatus));
+
+  // The server knows which versions on disk it wrote itself. A file written by
+  // the session (here an upload, the way unopened shared files arrive) is its
+  // own; one written by another copy of Hilbert is not.
+  const ownership = await page.evaluate(async () => {
+    await fetch('/workspace/upload?path=shared.typ', { method: 'POST', body: 'from the session' });
+    return (await (await fetch('/workspace/file/state?path=shared.typ')).json()).ours;
+  });
+  await fetch(`${origin}/workspace/file?path=shared.typ`, { method: 'POST', body: 'from the desktop', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'text/plain' } });
+  const afterDesktop = await page.evaluate(async () => (await (await fetch('/workspace/file/state?path=shared.typ')).json()).ours);
+  check("the server tells its own writes from another program's", ownership === true && afterDesktop === false, `session upload: ${ownership}, desktop save: ${afterDesktop}`);
+
+  // 5. The desktop window changes the open file while the browser has it open.
+  //    The browser's next save must ask which version to keep, not write over
+  //    the desktop's text without a word.
+  await page.click('.view-lines');
+  const mod = process.platform === 'darwin' ? 'Meta' : 'Control';
+  await page.keyboard.down(mod); await page.keyboard.press('End'); await page.keyboard.up(mod);
+  await page.keyboard.type(' browserword', { delay: 15 });
+  await sleep(2500);
+  const desktopSave = await fetch(`${origin}/workspace/file?path=main.typ`, { method: 'POST', body: '= Served\n\nWritten in the desktop window.\n', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'text/plain' } });
+  check('the desktop window saves its own change', desktopSave.ok, String(desktopSave.status));
+  await page.keyboard.type(' secondword', { delay: 15 });
+  let asked = false;
+  for (let i = 0; i < 60 && !asked; i++) { await sleep(100); asked = await page.evaluate(() => /File changed outside Hilbert/.test(document.body.innerText)); }
+  const onDisk = await readFile(join(ws, 'main.typ'), 'utf8');
+  check('the browser asks before saving over it', asked);
+  check("and the desktop's text is still on disk", onDisk.includes('Written in the desktop window') && !onDisk.includes('secondword'), JSON.stringify(onDisk));
 } catch (error) {
   failures++;
   console.error(error);

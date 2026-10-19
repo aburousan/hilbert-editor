@@ -211,14 +211,17 @@ across an ordinary process restart as long as the same `HILBERT_SERVER_TOKEN` an
 workspace path are used. Changing either intentionally rotates those derived secrets
 and asks browsers to sign in to the new hosted workspace identity.
 
-Use `--bind 0.0.0.0` only when other machines need to reach it. Encrypted browser
+Use `--bind 0.0.0.0` only when other machines need to reach it. Over plain
+`http://` the sign-in token and the session cookie cross the network unencrypted, so
+anyone else on that network can read them and sign in. Use that only on a network you
+trust, and prefer HTTPS or an SSH tunnel. Encrypted browser
 collaboration requires a secure browser context: use an HTTPS reverse proxy even on a
 LAN, or reach the loopback listener through an SSH tunnel. Browsers deliberately do not
 expose Web Crypto to a page opened as plain `http://<LAN address>`, so that address can
 still edit and compile but cannot start the encrypted live channel. With HTTPS the app
 uses secure `https://` and `wss://` connections. `/healthz` is an unauthenticated health
 endpoint suitable for a process monitor. The workspace path is fixed at startup and
-signed-in browsers cannot change it.
+signed-in browsers cannot change it, nor read or write any `.git` folder inside it.
 
 For example, if the server is reachable by SSH through a campus network but is not on
 the same Wi-Fi, leave Hilbert bound to loopback and run this on each client:

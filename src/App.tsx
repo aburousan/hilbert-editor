@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo, lazy, Suspense } from 'react';
 import { API, useWorkspaceAsset } from './api';
+import { exportStem } from './exportName';
 import { createLatestTask } from './latestTask';
 import { preambleInsertLine } from './preamble';
 import type { WhiteboardCommands } from './ExcalidrawEditor';
@@ -630,6 +631,9 @@ export default function App() {
   }, [treeSearch]);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
+  // The main file the shown PDF was compiled from, so a download is named after
+  // the document it holds and not after a main file that has not compiled yet.
+  const [pdfMain, setPdfMain] = useState<string | null>(null);
   const compiledMathCacheRef = useRef<{ revision: string; promise: Promise<CompiledEquation[]> } | null>(null);
   const [restoredPdfView, setRestoredPdfView] = useState<PdfViewState | undefined>();
   // Word count of the RENDERED document (reported by PdfPreview from the PDF's
@@ -1729,11 +1733,12 @@ export default function App() {
     }
   };
 
-  const readFileState = async (path: string): Promise<{ content: string; hash?: string }> => {
+  // `ours` is false when the server did not write what is on disk itself.
+  const readFileState = async (path: string): Promise<{ content: string; hash?: string; ours?: boolean }> => {
     const response = await fetch(`${API}/workspace/file/state?path=${encodeURIComponent(path)}`);
     if (!response.ok) throw new Error(`Could not inspect ${path} (${response.status}).`);
     const state = await response.json();
-    return { content: state.content || '', hash: state.hash || undefined };
+    return { content: state.content || '', hash: state.hash || undefined, ours: state.ours };
   };
 
   const showExternalConflict = (tab: Tab, disk: { content: string; hash?: string }) => {
@@ -1871,7 +1876,7 @@ export default function App() {
   // no two sides to choose between, and the prompt only ever offered to throw
   // the collaborators' work away. Outside a session it is a real outside edit
   // and the user decides.
-  const resolveDiskChange = (tab: Tab, disk: { content: string; hash?: string }) => {
+  const resolveDiskChange = (tab: Tab, disk: { content: string; hash?: string; ours?: boolean }) => {
     // The file already holds what this tab holds. However the two got there,
     // they agree, so record the hash and say nothing.
     if (disk.hash && disk.content === tab.content) {
@@ -1883,8 +1888,10 @@ export default function App() {
     // also share one physical server workspace, so another participant's
     // autosave can reach the disk watcher before the workspace metadata event.
     // Treat the binding itself as sufficient proof instead of opening a false
-    // "changed outside" conflict during that startup-sized race.
-    if (disk.hash && (isBoundToSession(tab.path) || shared?.metaOf(tab.path)?.kind === 'text')) {
+    // "changed outside" conflict during that startup-sized race. Unless the
+    // server says it did not write this version: then it came from outside the
+    // session (the desktop app on the same folder, say), and the person decides.
+    if (disk.hash && disk.ours !== false && (isBoundToSession(tab.path) || shared?.metaOf(tab.path)?.kind === 'text')) {
       adoptDiskVersion(tab.path, disk.content, disk.hash);
       return;
     }
@@ -1893,7 +1900,12 @@ export default function App() {
 
   // Pull a changed file back into a tab that has no unsaved edits. The bound
   // file is deliberately left alone — see isBoundToSession.
-  const reloadFromDisk = (path: string, disk: { content: string; hash?: string }) => {
+  const reloadFromDisk = (path: string, disk: { content: string; hash?: string; ours?: boolean }) => {
+    if (isBoundToSession(path) && disk.ours === false) {
+      const tab = tabsRef.current.find(item => item.path === path);
+      if (tab) showExternalConflict(tab, disk);
+      return;
+    }
     if (isBoundToSession(path)) {
       setTabs(prev => prev.map(item => item.path === path ? { ...item, diskHash: disk.hash } : item));
       return;
@@ -1991,7 +2003,10 @@ export default function App() {
     }
     if (response.status === 409) {
       const shared = collabRef.current?.workspace;
-      if (data.hash && (isBoundToSession(tab.path) || shared?.metaOf(tab.path)?.kind === 'text')) {
+      // All of this assumes the session wrote what is on disk. When the server
+      // says it did not (`ours` is false: the desktop app, or another program,
+      // changed the file while a browser had it open), fall through and ask.
+      if (data.hash && data.ours !== false && (isBoundToSession(tab.path) || shared?.metaOf(tab.path)?.kind === 'text')) {
         if (isBoundToSession(tab.path)) {
           // This buffer is the session's merged document, so it is the version
           // to keep, and nothing is being discarded by writing it. Saving it
@@ -2237,6 +2252,7 @@ export default function App() {
       // request outright, which is a preview that goes blank between compiles
       // rather than one that changes over.
       setPdfUrl(prev => { if (prev) releaseLater(prev); return url; });
+      setPdfMain(mainFile);
       setErrorLogs(null);
       setCompileError(null);
 
@@ -2756,6 +2772,30 @@ export default function App() {
     // The same holds as for the save after a pause: not before the backend has
     // answered, and not while a question about a changed file waits on a reply.
     canSave: backendReady && !externalConflict };
+
+  // Export reads the files from disk, so whatever is on screen is saved first.
+  // When that cannot happen (a question about a changed file is waiting), the
+  // export stops rather than quietly leaving the unsaved text out.
+  const saveForExport = async () => {
+    const { ready, canSave, tabs: open, active } = leavingRef.current;
+    const unsaved = open.filter(tab => isProjectTextPath(tab.path))
+      .map(tab => ({ tab, text: (tab.path === active ? liveText(tab.path) : undefined) ?? tab.content }))
+      .filter(({ tab, text }) => tab.isDirty || text !== tab.content);
+    if (!unsaved.length) return;
+    if (!ready || !canSave) throw new Error('Some open files are not saved yet. Answer any question about a file changed outside Hilbert, then export again.');
+    await Promise.all(unsaved.map(async ({ tab, text }) => {
+      const hash = await writeTab({ ...tab, content: text });
+      setTabs(prev => prev.map(t => t.path === tab.path ? { ...t, isDirty: t.content !== text, diskHash: hash } : t));
+    }));
+    // A newer save of the same file (the one when the window loses focus, say)
+    // takes the place of ours in its queue, and ours then returns before that
+    // one has written anything. Wait for the queue to empty.
+    for (const { tab } of unsaved) {
+      for (let pending = savesInFlight.current.get(tab.path), n = 0; pending && n < 20; pending = savesInFlight.current.get(tab.path), n++) {
+        await pending;
+      }
+    }
+  };
   useEffect(() => {
     const saveNow = () => {
       const { ready, canSave, tabs: open, active, main } = leavingRef.current;
@@ -3590,6 +3630,7 @@ export default function App() {
     setHistoryEpoch(n => n + 1);
     setErrorLogs(null);
     setPdfUrl(prev => { if (prev) releaseLater(prev); return null; });
+    setPdfMain(null);
     if (projectDisplayName) setProjectName(projectDisplayName);
     const tree: FileNode[] = await (await fetch(`${API}/workspace`)).json();
     setFileTree(tree);
@@ -8254,7 +8295,7 @@ ${byline ? `
                 url={pdfUrl}
                 onReverseSync={reverseSync}
                 onWordCount={handlePdfWordCount}
-                downloadName={`${(projectName || 'document').replace(/\s+/g, '_')}.pdf`}
+                downloadName={`${exportStem(pdfMain || currentMain) || 'document'}.pdf`}
                 initialViewState={restoredPdfView}
                 onViewStateChange={handlePdfViewState}
               />
@@ -8492,7 +8533,7 @@ ${byline ? `
         </div>
       )}
       {codeRunner && <Boundary name="Code Runner" onClose={() => setCodeRunner(null)}><Suspense fallback={null}><CodeRunnerModal {...codeRunner} onClose={() => setCodeRunner(null)} onInsert={(code) => { insertCode(code); setCodeRunner(null); }} onInsertEquation={(latex, codeBlock) => { insertEquationFromLatex(latex, codeBlock); setCodeRunner(null); }} onChanged={async (paths) => { void fetchTree(); for (const path of paths || []) await mirrorLocalPath(path); }} /></Suspense></Boundary>}
-      {showSaveAs && activeTab && <Suspense fallback={null}><SaveAsModal onClose={() => setShowSaveAs(false)} fileName={activeTabPath} content={activeTab.content} pdfUrl={pdfUrl} projectName={projectName} mainFile={currentMain} /></Suspense>}
+      {showSaveAs && activeTab && <Suspense fallback={null}><SaveAsModal onClose={() => setShowSaveAs(false)} onBeforeExport={saveForExport} pdfUrl={!pdfMain || pdfMain === currentMain ? pdfUrl : null} projectName={projectName} mainFile={currentMain} /></Suspense>}
       {showHtmlPreview && <Suspense fallback={null}><HtmlPreviewModal mainFile={currentMain} onClose={() => setShowHtmlPreview(false)} /></Suspense>}
       {showPlot3D && <Boundary name="3D Plot Studio" onClose={() => setShowPlot3D(false)}><Suspense fallback={null}><Plot3DStudio onClose={() => setShowPlot3D(false)} onInsert={(code) => { insertCode(code); setShowPlot3D(false); fetchTree(); }} onSaved={(path) => { void mirrorLocalPath(path); void fetchTree(); }} /></Suspense></Boundary>}
       {showPlotStudio && <Boundary name="Plot Studio" onClose={() => setShowPlotStudio(false)}><Suspense fallback={null}><PlotStudio onClose={() => setShowPlotStudio(false)} onInsert={(code) => insertCode(code)} onEnsureSetup={ensureSetup} onOpenInteractive={() => setShowPlot3D(true)} /></Suspense></Boundary>}

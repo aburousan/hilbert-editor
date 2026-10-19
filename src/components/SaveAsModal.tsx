@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { API } from '../api';
+import { exportStem } from '../exportName';
 
 type Fmt = 'pdf' | 'png' | 'svg' | 'html' | 'bundle' | 'typ' | 'folder';
 
@@ -40,10 +41,9 @@ const REVEAL = (() => {
   return 'Show in file manager';
 })();
 
-export default function SaveAsModal({ onClose, fileName, content, pdfUrl, projectName, mainFile }: {
+export default function SaveAsModal({ onClose, onBeforeExport, pdfUrl, projectName, mainFile }: {
   onClose: () => void;
-  fileName: string;
-  content: string;
+  onBeforeExport: () => Promise<void>;
   pdfUrl: string | null;
   projectName: string;
   mainFile: string;
@@ -61,9 +61,13 @@ export default function SaveAsModal({ onClose, fileName, content, pdfUrl, projec
   const [busy, setBusy] = useState(false);
   const [preflight, setPreflight] = useState<{ ok: boolean; error?: string; checks?: { label: string; ok: boolean; advisory?: boolean }[] } | null>(null);
 
-  const defaultName = (projectName || fileName.replace(/\.typ$/, '') || 'document').replace(/\s+/g, '_');
-  const [nameInput, setNameInput] = useState(defaultName);
-  const baseName = nameInput.trim().replace(/\s+/g, '_') || defaultName;
+  // Every format except Project exports the main file, so it is named after
+  // that file, not after the folder (issue #41). Project zips the folder.
+  // The project's title can be typed freely, so keep out what Windows does not
+  // allow in a file name.
+  const defaultName = (fmt === 'folder' ? projectName.trim().replace(/\s+/g, '_').replace(/[<>:"/\\|?*]/g, '-') : exportStem(mainFile)) || 'document';
+  const [nameInput, setNameInput] = useState<string | null>(null); // null until the person types a name
+  const baseName = (nameInput ?? '').trim().replace(/\s+/g, '_') || defaultName;
   const ext = fmt === 'typ' ? 'typ' : (fmt === 'folder' || fmt === 'bundle') ? 'zip' : fmt;
 
   const pickFmt = (f: Fmt) => { setFmt(f); localStorage.setItem('export_fmt', f); };
@@ -102,7 +106,12 @@ export default function SaveAsModal({ onClose, fileName, content, pdfUrl, projec
 
   // Browser fallback when there's no native dialog (dev in a plain browser).
   const browserFallback = async () => {
-    if (fmt === 'typ') { download(new Blob([content], { type: 'text/plain' }), `${baseName}.typ`); say(`Downloaded ${baseName}.typ`); return; }
+    if (fmt === 'typ') {
+      // The same file the desktop app copies, byte for byte: the main file.
+      const res = await fetch(`${API}/workspace/raw?path=${encodeURIComponent(mainFile)}`);
+      if (!res.ok) { say('Could not read the main file.', true); return; }
+      download(await res.blob(), `${baseName}.typ`); say(`Downloaded ${baseName}.typ`); return;
+    }
     if (fmt === 'pdf') {
       if (!pdfUrl) { say('No compiled PDF yet — recompile first.', true); return; }
       download(await (await fetch(pdfUrl)).blob(), `${baseName}.pdf`);
@@ -122,6 +131,7 @@ export default function SaveAsModal({ onClose, fileName, content, pdfUrl, projec
     setPreflight(null);
     say('Running Typst accessibility checks…');
     try {
+      await onBeforeExport();
       const response = await fetch(`${API}/export/preflight`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -140,6 +150,12 @@ export default function SaveAsModal({ onClose, fileName, content, pdfUrl, projec
   const doSave = async () => {
     setBusy(true); say('Choose where to save…');
     try {
+      try { await onBeforeExport(); }
+      catch (error) {
+        const reason = error instanceof Error && error.message !== 'external-conflict' ? error.message : 'Could not save the open files.';
+        say(`${reason} Nothing was exported.`, true);
+        return;
+      }
       const endpoint = fmt === 'folder' ? `${API}/export/project/native` : `${API}/export/native`;
       const payload = fmt === 'folder' ? { name: baseName, open: openAfter } : opts();
       const res = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
@@ -196,7 +212,10 @@ export default function SaveAsModal({ onClose, fileName, content, pdfUrl, projec
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 12, border: '1px solid var(--border-color)', borderRadius: 8, minHeight: 132 }}>
             <label style={field}>
               <span style={labelTxt}>File name</span>
-              <input style={inputStyle} value={nameInput} onChange={e => setNameInput(e.target.value)} spellCheck={false} placeholder={defaultName} />
+              <input style={inputStyle} value={nameInput ?? defaultName} onChange={e => setNameInput(e.target.value)} spellCheck={false} placeholder={defaultName} />
+              <span style={{ ...labelTxt, fontWeight: 400 }}>
+                {fmt === 'folder' ? 'The whole project folder, as a zip.' : <>Exports the main file, <b>{mainFile}</b>.</>}
+              </span>
             </label>
 
             {fmt !== 'typ' && fmt !== 'folder' && fmt !== 'bundle' && (

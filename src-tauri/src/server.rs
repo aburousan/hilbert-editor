@@ -22,7 +22,7 @@ use std::{
     fs,
     path::{Component, Path, PathBuf},
     process::Stdio,
-    sync::{atomic::{AtomicU64, Ordering}, Arc, LazyLock, Mutex, RwLock},
+    sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, LazyLock, Mutex, RwLock},
     time::{Duration, Instant, SystemTime},
 };
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
@@ -446,6 +446,7 @@ impl AppState {
         let room_secret = hosted_secret("room", &access_token, &workspace);
         let key_secret = hosted_secret("key", &access_token, &workspace);
         let mut state = Self::new(workspace, dist);
+        HOSTED_PATHS.store(true, Ordering::Relaxed);
         // An explicit API token remains an operator override. Without one, derive
         // a strong, stable one from the hosted sign-in secret so the desktop
         // shell's bearer path behaves the same across a restart. Browsers no
@@ -570,6 +571,22 @@ fn lexical_resolve(base: &Path, p: &str) -> PathBuf {
     result
 }
 
+// Set once a hosted server starts. Its browsers may then not touch any `.git`
+// folder: its config and hooks name programs that git runs, so a file written
+// there is code that runs on this computer, on the next git command here or the
+// owner's own, whatever ALLOW_CODE_EXECUTION says. Reading is closed too, since
+// the config can hold a remote's credentials.
+static HOSTED_PATHS: AtomicBool = AtomicBool::new(false);
+
+// `.git` in any folder, the way the file system will see it: case does not
+// matter on macOS and Windows, and Windows drops trailing dots and spaces.
+fn names_git_folder(relative: &Path) -> bool {
+    relative.components().any(|c| match c {
+        Component::Normal(name) => name.to_string_lossy().trim_end_matches(['.', ' ']).eq_ignore_ascii_case(".git"),
+        _ => false,
+    })
+}
+
 // Confine a user-supplied path to the workspace. The lexical check rejects
 // traversal, while canonicalizing the nearest existing ancestor also prevents
 // an in-workspace symlink from redirecting reads or writes outside the project.
@@ -581,6 +598,10 @@ fn safe_workspace_path(ws: &Path, p: &str) -> Option<PathBuf> {
     if target != ws && !target.starts_with(ws) {
         return None;
     }
+    let hosted = HOSTED_PATHS.load(Ordering::Relaxed);
+    if hosted && target.strip_prefix(ws).map_or(true, names_git_folder) {
+        return None;
+    }
 
     let canonical_ws = fs::canonicalize(ws).ok()?;
     let mut existing = target.as_path();
@@ -589,6 +610,10 @@ fn safe_workspace_path(ws: &Path, p: &str) -> Option<PathBuf> {
     }
     let canonical_existing = fs::canonicalize(existing).ok()?;
     if canonical_existing != canonical_ws && !canonical_existing.starts_with(&canonical_ws) {
+        return None;
+    }
+    // A link elsewhere in the project can lead into `.git` under another name.
+    if hosted && canonical_existing.strip_prefix(&canonical_ws).map_or(true, names_git_folder) {
         return None;
     }
     Some(target)
@@ -1277,13 +1302,27 @@ async fn workspace_file_state(State(st): St, Query(q): Q) -> Response {
     let Some(full) = q.get("path").and_then(|p| safe_workspace_path(&st.ws(), p)) else {
         return json_err(StatusCode::BAD_REQUEST, "Invalid path");
     };
-    match fs::read_to_string(&full) {
-        Ok(content) => {
-            let hash = format!("{:016x}", content_hash(&content));
+    // Under the save lock, so a save cannot land between reading the file and
+    // looking up what this server last wrote to it.
+    let read = {
+        let full = full.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = FILE_SAVE.lock().unwrap_or_else(|e| e.into_inner());
+            fs::read_to_string(&full).map(|content| {
+                let raw = content_hash(&content);
+                (content, raw, saved_here(&full, raw))
+            })
+        })
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+    };
+    match read {
+        Ok((content, raw, ours)) => {
+            let hash = format!("{raw:016x}");
             if q.get("content").map(String::as_str) == Some("0") {
-                Json(json!({ "hash": hash })).into_response()
+                Json(json!({ "hash": hash, "ours": ours })).into_response()
             } else {
-                Json(json!({ "content": content, "hash": hash })).into_response()
+                Json(json!({ "content": content, "hash": hash, "ours": ours })).into_response()
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1335,7 +1374,7 @@ async fn workspace_file_post(State(st): St, Query(q): Q, headers: HeaderMap, bod
     let expected = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()).map(str::to_string);
     enum Saved {
         Written,
-        Conflict { current: String, hash: String },
+        Conflict { current: String, hash: String, ours: bool },
     }
     let written = {
         let (target, bytes) = (full.clone(), content.clone());
@@ -1344,29 +1383,40 @@ async fn workspace_file_post(State(st): St, Query(q): Q, headers: HeaderMap, bod
         // else the page is asking for meanwhile.
         tokio::task::spawn_blocking(move || -> std::io::Result<Saved> {
             let _guard = FILE_SAVE.lock().unwrap_or_else(|e| e.into_inner());
+            let mut last = LAST_SAVED.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(expected) = expected {
                 let current = fs::read_to_string(&target).unwrap_or_default();
-                let hash = format!("{:016x}", content_hash(&current));
-                if expected != hash {
-                    return Ok(Saved::Conflict { current, hash });
+                let hash = content_hash(&current);
+                if expected != format!("{hash:016x}") {
+                    let ours = last.get(&target) == Some(&hash);
+                    return Ok(Saved::Conflict { current, hash: format!("{hash:016x}"), ours });
                 }
             }
             if let Some(parent) = target.parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            write_atomic(&target, &bytes).map(|_| Saved::Written)
+            write_atomic(&target, &bytes)?;
+            last.insert(target, content_hash(&String::from_utf8_lossy(&bytes)));
+            drop(last);
+            Ok(Saved::Written)
         })
         .await
         .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
     };
     let written = match written {
-        Ok(Saved::Conflict { current, hash }) => {
+        Ok(Saved::Conflict { current, hash, ours }) => {
             return (
                 StatusCode::CONFLICT,
                 Json(json!({
                     "error": "The file changed outside Hilbert.",
                     "content": current,
                     "hash": hash,
+                    // Whether what is on disk is this server's own last save of
+                    // the file, from any window or browser it serves. When it is
+                    // not, something else wrote it (another copy of Hilbert on
+                    // the same folder, say), and the editor must ask before
+                    // writing over it.
+                    "ours": ours,
                 })),
             )
                 .into_response();
@@ -1481,7 +1531,15 @@ async fn workspace_upload(State(st): St, Query(q): Q, body: Bytes) -> Response {
     if let Some(parent) = full.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    match write_atomic(&full, &body) {
+    // Under the save lock, like a save, so the note of what was written always
+    // matches the file.
+    let written = tokio::task::spawn_blocking(move || {
+        let _guard = FILE_SAVE.lock().unwrap_or_else(|e| e.into_inner());
+        write_atomic(&full, &body).map(|_| note_saved_here(full, &body))
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+    match written {
         Ok(_) => {
             st.note_write();
             "OK".into_response()
@@ -2913,17 +2971,27 @@ async fn init_template(State(st): St, body: Bytes) -> Response {
         if let Ok(rd) = fs::read_dir(&ws) {
             for entry in rd.flatten() {
                 if is_app_scratch(&entry.file_name()) { continue; }
+                // A hosted browser may not touch the owner's repository.
+                if st.remote_mode() && names_git_folder(Path::new(&entry.file_name())) { continue; }
                 let path = entry.path();
                 let _ = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
             }
         }
     }
+    let arriving: Vec<std::ffi::OsString> = fs::read_dir(&target)
+        .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
     if let Err(e) = move_dir_contents(&target, &ws) {
         cleanup(&staging);
         return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not write the template into the workspace: {e}"));
     }
     cleanup(&staging);
     st.note_write();
+    // This server wrote these, so a shared session must not be told they
+    // changed outside Hilbert.
+    for name in &arriving {
+        note_tree_saved_here(&ws.join(name));
+    }
 
     let files: Vec<String> = fs::read_dir(&ws)
         .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
@@ -3591,6 +3659,20 @@ async fn git_timed(ws: &Path, args: &[&str], ms: u64) -> CmdOut {
     }
 }
 
+// git reads an argument that starts with a dash as an option, and some of its
+// options name a program to run (`git push --receive-pack=...`). An address or
+// a branch name never starts with one, so refuse those outright.
+fn git_option_like(value: &str) -> bool {
+    value.trim_start().starts_with('-')
+}
+
+// On a hosted server a repository address must be on the network. A local path
+// or file:// would let a browser push into another repository on this computer.
+fn network_remote(url: &str) -> bool {
+    static SCP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[^/]").unwrap());
+    url.starts_with("https://") || url.starts_with("ssh://") || SCP.is_match(url)
+}
+
 fn is_repo(ws: &Path) -> bool {
     ws.join(".git").exists()
 }
@@ -3656,6 +3738,9 @@ async fn git_remote(State(st): St, body: Bytes) -> Response {
     let Some(url) = jstr(&v, "url").filter(|u| !u.is_empty()) else {
         return json_err(StatusCode::BAD_REQUEST, "Repository URL required.");
     };
+    if git_option_like(url) || (st.remote_mode() && !network_remote(url)) {
+        return json_err(StatusCode::BAD_REQUEST, "That is not a repository address.");
+    }
     let has = git(&ws, &["remote", "get-url", "origin"]).await;
     let r = if has.code == Some(0) {
         git(&ws, &["remote", "set-url", "origin", url]).await
@@ -3707,6 +3792,9 @@ async fn git_push(State(st): St, body: Bytes) -> Response {
     let url = jstr(&v, "url").unwrap_or("");
     let token = jstr(&v, "token").unwrap_or("");
     let branch = jstr(&v, "branch").filter(|b| !b.is_empty()).unwrap_or("main");
+    if git_option_like(url) || git_option_like(branch) || (st.remote_mode() && !url.is_empty() && !network_remote(url)) {
+        return json_err(StatusCode::BAD_REQUEST, "That is not a repository address or branch name.");
+    }
 
     // Keep `origin` pointed at the clean URL — the token is never written into
     // .git/config (the settings panel promises it isn't stored). It's injected
@@ -3787,6 +3875,11 @@ fn copy_all(dir: &Path, ws: &Path, folder: &Path, count: &mut u64) -> std::io::R
 }
 
 async fn drive_sync(State(st): St, body: Bytes) -> Response {
+    // It copies the project into any folder named in the request, so a browser
+    // could use it to write files anywhere on this computer.
+    if st.remote_mode() {
+        return json_err(StatusCode::FORBIDDEN, "Copying the project to a folder is not available on a hosted server.");
+    }
     let v = parse_json(&body);
     let Some(folder) = jstr(&v, "folder").filter(|f| !f.is_empty()) else {
         return json_err(StatusCode::BAD_REQUEST, "Target folder path required.");
@@ -4366,6 +4459,10 @@ async fn tools(State(st): St) -> Response {
 // Add an interpreter the user pointed us at. Registering it here is what later
 // lets /exec run it: the runner only ever launches a path present in this list.
 async fn tools_interpreter_add(State(st): St, body: Bytes) -> Response {
+    // Checking an interpreter means running the program at the path given.
+    if st.remote_mode() && !st.allow_exec {
+        return json_err(StatusCode::FORBIDDEN, "Code execution is disabled on this server (ALLOW_CODE_EXECUTION=0).");
+    }
     let v = parse_json(&body);
     let lang = jstr(&v, "lang").unwrap_or("").to_string();
     let path = jstr(&v, "path").unwrap_or("").trim().to_string();
@@ -8135,6 +8232,30 @@ static HISTORY_WRITE: Mutex<()> = Mutex::new(());
 static RECOVERY_WRITE: Mutex<()> = Mutex::new(());
 // Held across a save's If-Match check and its write; see workspace_file_post.
 static FILE_SAVE: Mutex<()> = Mutex::new(());
+// The hash of what this process last wrote to each file, through a save or an
+// upload (a shared session writes the files nobody has open that way). A file
+// whose contents match was written by this server, for one of its windows or
+// browsers; one that does not was changed by something else.
+static LAST_SAVED: LazyLock<Mutex<HashMap<PathBuf, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn note_saved_here(path: PathBuf, bytes: &[u8]) {
+    let hash = content_hash(&String::from_utf8_lossy(bytes));
+    LAST_SAVED.lock().unwrap_or_else(|e| e.into_inner()).insert(path, hash);
+}
+
+fn note_tree_saved_here(path: &Path) {
+    if path.is_dir() {
+        for entry in fs::read_dir(path).into_iter().flatten().flatten() {
+            note_tree_saved_here(&entry.path());
+        }
+    } else if let Ok(bytes) = fs::read(path) {
+        note_saved_here(path.to_path_buf(), &bytes);
+    }
+}
+
+fn saved_here(path: &Path, hash: u64) -> bool {
+    LAST_SAVED.lock().unwrap_or_else(|e| e.into_inner()).get(path) == Some(&hash)
+}
 
 fn history_dir() -> PathBuf {
     if let Ok(p) = std::env::var("HILBERT_HISTORY_DIR") {
@@ -8591,6 +8712,35 @@ pub async fn serve(listener: std::net::TcpListener, state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_folders_are_recognised_as_the_file_system_sees_them() {
+        for path in [".git/config", ".GIT/config", ".git./hooks/pre-commit", ".git /config", "sub/.git/config", ".git"] {
+            assert!(names_git_folder(Path::new(path)), "{path}");
+        }
+        for path in ["main.typ", ".gitignore", "chapters/git/notes.typ", ".github/workflows/x.yml", "my.git.typ"] {
+            assert!(!names_git_folder(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn git_arguments_that_read_as_options_are_refused() {
+        assert!(git_option_like("--receive-pack=touch /tmp/x"));
+        assert!(git_option_like(" -c core.sshCommand=x"));
+        assert!(!git_option_like("https://github.com/someone/thesis.git"));
+        assert!(!git_option_like("main"));
+        assert!(!git_option_like("feature-x"));
+    }
+
+    #[test]
+    fn a_hosted_server_pushes_only_to_network_addresses() {
+        for url in ["https://github.com/someone/thesis.git", "ssh://git@host/x.git", "git@github.com:someone/thesis.git"] {
+            assert!(network_remote(url), "{url}");
+        }
+        for url in ["/home/someone/other-repo", "file:///home/someone/other-repo", "../other", "C:\\repos\\x", "ext::sh -c x"] {
+            assert!(!network_remote(url), "{url}");
+        }
+    }
 
     fn temp_workspace(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

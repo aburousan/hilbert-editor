@@ -65,6 +65,7 @@
     "test:problems": "node scripts/test-problems-clear.mjs",
     "test:external": "node scripts/test-external-change.mjs",
     "test:browser": "node scripts/test-browser-serve.mjs",
+    "test:exportname": "node scripts/test-export-name.mjs",
     "bench:preview": "node scripts/bench-preview.mjs",
     "test:symbolic": "python3 scripts/test-symbolic.py",
     "test:webkit": "python3 scripts/test-linux-webkit.py dist"
