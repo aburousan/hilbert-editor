@@ -41,10 +41,9 @@ const REVEAL = (() => {
   return 'Show in file manager';
 })();
 
-export default function SaveAsModal({ onClose, onBeforeExport, pdfUrl, projectName, mainFile }: {
+export default function SaveAsModal({ onClose, onBeforeExport, projectName, mainFile }: {
   onClose: () => void;
   onBeforeExport: () => Promise<void>;
-  pdfUrl: string | null;
   projectName: string;
   mainFile: string;
 }) {
@@ -113,8 +112,11 @@ export default function SaveAsModal({ onClose, onBeforeExport, pdfUrl, projectNa
       download(await res.blob(), `${baseName}.typ`); say(`Downloaded ${baseName}.typ`); return;
     }
     if (fmt === 'pdf') {
-      if (!pdfUrl) { say('No compiled PDF yet — recompile first.', true); return; }
-      download(await (await fetch(pdfUrl)).blob(), `${baseName}.pdf`);
+      // Compiled now, from the files just saved. The preview's PDF can be from
+      // before that save, or from another main file.
+      const res = await fetch(`${API}/compile?main=${encodeURIComponent(mainFile)}`, { method: 'POST' });
+      if (!res.ok) { say((await res.json().catch(() => ({}))).error || 'The document does not compile, so there is no PDF to export.', true); return; }
+      download(await res.blob(), `${baseName}.pdf`);
       say(`Downloaded ${baseName}.pdf (export options apply in the desktop app)`);
       return;
     }

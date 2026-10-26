@@ -1383,12 +1383,11 @@ async fn workspace_file_post(State(st): St, Query(q): Q, headers: HeaderMap, bod
         // else the page is asking for meanwhile.
         tokio::task::spawn_blocking(move || -> std::io::Result<Saved> {
             let _guard = FILE_SAVE.lock().unwrap_or_else(|e| e.into_inner());
-            let mut last = LAST_SAVED.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(expected) = expected {
                 let current = fs::read_to_string(&target).unwrap_or_default();
                 let hash = content_hash(&current);
                 if expected != format!("{hash:016x}") {
-                    let ours = last.get(&target) == Some(&hash);
+                    let ours = saved_here(&target, hash);
                     return Ok(Saved::Conflict { current, hash: format!("{hash:016x}"), ours });
                 }
             }
@@ -1396,8 +1395,7 @@ async fn workspace_file_post(State(st): St, Query(q): Q, headers: HeaderMap, bod
                 let _ = fs::create_dir_all(parent);
             }
             write_atomic(&target, &bytes)?;
-            last.insert(target, content_hash(&String::from_utf8_lossy(&bytes)));
-            drop(last);
+            note_saved_here(target, &bytes);
             Ok(Saved::Written)
         })
         .await
@@ -1495,9 +1493,23 @@ async fn workspace_file_delete(State(st): St, Query(q): Q) -> Response {
     if full == ws {
         return text_err(StatusCode::BAD_REQUEST, "Invalid path");
     }
-    let res = match fs::metadata(&full) {
-        Ok(m) if m.is_dir() => fs::remove_dir_all(&full),
-        _ => fs::remove_file(&full),
+    // Under the save lock, and the note of who wrote it goes only once it is gone.
+    let res = {
+        let full = full.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = FILE_SAVE.lock().unwrap_or_else(|e| e.into_inner());
+            let key = saved_key(&full);
+            let res = match fs::metadata(&full) {
+                Ok(m) if m.is_dir() => fs::remove_dir_all(&full),
+                _ => fs::remove_file(&full),
+            };
+            if res.is_ok() {
+                LAST_SAVED.lock().unwrap_or_else(|e| e.into_inner()).retain(|saved, _| !saved.starts_with(&key));
+            }
+            res
+        })
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
     };
     match res {
         Ok(_) => {
@@ -1531,9 +1543,16 @@ async fn workspace_upload(State(st): St, Query(q): Q, body: Bytes) -> Response {
     if let Some(parent) = full.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    // Under the save lock, like a save, so the note of what was written always
-    // matches the file.
+    // Text goes under the save lock, like a save, so the note of what was
+    // written always matches the file. Pictures and other binary files are never
+    // open in an editor, so they need no note, and a large one written to a slow
+    // disk must not hold up every window's saves meanwhile.
+    let text = std::str::from_utf8(&body).is_ok();
     let written = tokio::task::spawn_blocking(move || {
+        if !text {
+            forget_saved_under(&full);
+            return write_atomic(&full, &body);
+        }
         let _guard = FILE_SAVE.lock().unwrap_or_else(|e| e.into_inner());
         write_atomic(&full, &body).map(|_| note_saved_here(full, &body))
     })
@@ -3669,8 +3688,24 @@ fn git_option_like(value: &str) -> bool {
 // On a hosted server a repository address must be on the network. A local path
 // or file:// would let a browser push into another repository on this computer.
 fn network_remote(url: &str) -> bool {
-    static SCP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[^/]").unwrap());
-    url.starts_with("https://") || url.starts_with("ssh://") || SCP.is_match(url)
+    // URL form: only network schemes, spelled as git spells them. `file://` and
+    // the like are refused.
+    if let Some((scheme, _)) = url.split_once("://") {
+        return matches!(scheme, "https" | "http" | "ssh" | "git");
+    }
+    // `<transport>::<address>` runs a helper program named by the transport.
+    if url.split_once("::").is_some_and(|(transport, _)| {
+        !transport.is_empty() && transport.chars().all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))
+    }) {
+        return false;
+    }
+    // scp form, `[user@]host:path`, an IPv6 host in brackets allowed. A bare host
+    // of one letter is a Windows drive (`C:\...`), so that form needs a user; git
+    // itself treats a colon after a slash as a local path.
+    static SCP: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^(?:[A-Za-z0-9._-]+@(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])|[A-Za-z0-9][A-Za-z0-9.-]+):").unwrap()
+    });
+    SCP.is_match(url) && !url.split(':').next().is_some_and(|host| host.contains('/'))
 }
 
 fn is_repo(ws: &Path) -> bool {
@@ -8238,9 +8273,21 @@ static FILE_SAVE: Mutex<()> = Mutex::new(());
 // browsers; one that does not was changed by something else.
 static LAST_SAVED: LazyLock<Mutex<HashMap<PathBuf, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+// Keyed by the file's real path, so one folder reached two ways (`C:\Work` and
+// `C:\work`, or through a link) is still one file.
+fn saved_key(path: &Path) -> PathBuf {
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn note_saved_here(path: PathBuf, bytes: &[u8]) {
     let hash = content_hash(&String::from_utf8_lossy(bytes));
-    LAST_SAVED.lock().unwrap_or_else(|e| e.into_inner()).insert(path, hash);
+    LAST_SAVED.lock().unwrap_or_else(|e| e.into_inner()).insert(saved_key(&path), hash);
+}
+
+// A deleted file or folder is no longer this server's to vouch for.
+fn forget_saved_under(path: &Path) {
+    let key = saved_key(path);
+    LAST_SAVED.lock().unwrap_or_else(|e| e.into_inner()).retain(|saved, _| !saved.starts_with(&key));
 }
 
 fn note_tree_saved_here(path: &Path) {
@@ -8254,7 +8301,8 @@ fn note_tree_saved_here(path: &Path) {
 }
 
 fn saved_here(path: &Path, hash: u64) -> bool {
-    LAST_SAVED.lock().unwrap_or_else(|e| e.into_inner()).get(path) == Some(&hash)
+    let key = saved_key(path);
+    LAST_SAVED.lock().unwrap_or_else(|e| e.into_inner()).get(&key) == Some(&hash)
 }
 
 fn history_dir() -> PathBuf {
@@ -8734,10 +8782,13 @@ mod tests {
 
     #[test]
     fn a_hosted_server_pushes_only_to_network_addresses() {
-        for url in ["https://github.com/someone/thesis.git", "ssh://git@host/x.git", "git@github.com:someone/thesis.git"] {
+        for url in ["https://github.com/someone/thesis.git", "ssh://git@host/x.git", "git@github.com:someone/thesis.git",
+                    "git@example.org:/srv/git/thesis.git", "example.org:thesis.git", "git@x:repo.git",
+                    "git@[::1]:repo.git", "host:dir::repo.git"] {
             assert!(network_remote(url), "{url}");
         }
-        for url in ["/home/someone/other-repo", "file:///home/someone/other-repo", "../other", "C:\\repos\\x", "ext::sh -c x"] {
+        for url in ["/home/someone/other-repo", "file:///home/someone/other-repo", "../other", "C:\\repos\\x", "ext::sh -c x",
+                    "./dir:with/colon", "FILE:///x", "SSH://host/repo.git", "C:repo"] {
             assert!(!network_remote(url), "{url}");
         }
     }

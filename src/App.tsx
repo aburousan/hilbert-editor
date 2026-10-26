@@ -2783,17 +2783,22 @@ export default function App() {
       .filter(({ tab, text }) => tab.isDirty || text !== tab.content);
     if (!unsaved.length) return;
     if (!ready || !canSave) throw new Error('Some open files are not saved yet. Answer any question about a file changed outside Hilbert, then export again.');
-    await Promise.all(unsaved.map(async ({ tab, text }) => {
-      const hash = await writeTab({ ...tab, content: text });
-      setTabs(prev => prev.map(t => t.path === tab.path ? { ...t, isDirty: t.content !== text, diskHash: hash } : t));
-    }));
+    await Promise.all(unsaved.map(({ tab, text }) => writeTab({ ...tab, content: text })));
     // A newer save of the same file (the one when the window loses focus, say)
     // takes the place of ours in its queue, and ours then returns before that
-    // one has written anything. Wait for the queue to empty.
+    // one has written anything, and that one can still fail. Wait for the
+    // queue to empty, then believe only what the file itself holds.
     for (const { tab } of unsaved) {
       for (let pending = savesInFlight.current.get(tab.path), n = 0; pending && n < 20; pending = savesInFlight.current.get(tab.path), n++) {
         await pending;
       }
+    }
+    for (const { tab, text } of unsaved) {
+      const disk = await readFileState(tab.path);
+      const now = (tab.path === leavingRef.current.active ? liveText(tab.path) : undefined)
+        ?? tabsRef.current.find(t => t.path === tab.path)?.content;
+      if (disk.content !== text && disk.content !== now) throw new Error(`Could not save ${tab.path}.`);
+      setTabs(prev => prev.map(t => t.path === tab.path ? { ...t, isDirty: t.content !== disk.content, diskHash: disk.hash } : t));
     }
   };
   useEffect(() => {
@@ -2895,6 +2900,12 @@ export default function App() {
         // tab: the hashes come back together and only changed files are fetched.
         const watched = tabsRef.current.filter(t => /\.(typ|bib|txt|md|csv|json|ya?ml|toml|xml|tex|html|css|js)$/i.test(t.path));
         if (!watched.length) return;
+        // Which save of each file this check started after. A save that starts
+        // and finishes while the check is reading would otherwise go unseen: the
+        // check would then apply the older copy it read, over the tab that save
+        // had just written, and the newest typing would vanish from the editor.
+        const savesAtStart = new Map(watched.map(t => [t.path, saveGeneration.current.get(t.path)]));
+        const savedSince = (path: string) => saveGeneration.current.get(path) !== savesAtStart.get(path);
         let states: Record<string, string | null> = {};
         try {
           const r = await fetch(`${API}/workspace/files/state`, {
@@ -2911,7 +2922,7 @@ export default function App() {
           // holds text we wrote while our note of what we wrote is still the
           // previous one — and reading it here would report our own save as an
           // outside edit. Leave the file to the next tick.
-          if (savesInFlight.current.has(tab.path)) continue;
+          if (savesInFlight.current.has(tab.path) || savedSince(tab.path)) continue;
           const hash = states[tab.path];
           const current = tabsRef.current.find(item => item.path === tab.path);
           if (!hash || stopped || !current || (current.diskHash && hash === current.diskHash)) continue;
@@ -2922,7 +2933,7 @@ export default function App() {
           // below also skip dirty tabs for the same reason — a tab that turned
           // dirty mid-flight gets the conflict prompt on the next tick instead.
           const fresh = tabsRef.current.find(item => item.path === tab.path);
-          if (!fresh || savesInFlight.current.has(tab.path)) continue;
+          if (!fresh || savesInFlight.current.has(tab.path) || savedSince(tab.path)) continue;
           // The batched hashes above are a screening pass, and a save of our own
           // can land between that request and this read. Judge the conflict on
           // what the file holds now: if it matches the tab's baseline, or the
@@ -8533,7 +8544,7 @@ ${byline ? `
         </div>
       )}
       {codeRunner && <Boundary name="Code Runner" onClose={() => setCodeRunner(null)}><Suspense fallback={null}><CodeRunnerModal {...codeRunner} onClose={() => setCodeRunner(null)} onInsert={(code) => { insertCode(code); setCodeRunner(null); }} onInsertEquation={(latex, codeBlock) => { insertEquationFromLatex(latex, codeBlock); setCodeRunner(null); }} onChanged={async (paths) => { void fetchTree(); for (const path of paths || []) await mirrorLocalPath(path); }} /></Suspense></Boundary>}
-      {showSaveAs && activeTab && <Suspense fallback={null}><SaveAsModal onClose={() => setShowSaveAs(false)} onBeforeExport={saveForExport} pdfUrl={!pdfMain || pdfMain === currentMain ? pdfUrl : null} projectName={projectName} mainFile={currentMain} /></Suspense>}
+      {showSaveAs && activeTab && <Suspense fallback={null}><SaveAsModal onClose={() => setShowSaveAs(false)} onBeforeExport={saveForExport} projectName={projectName} mainFile={currentMain} /></Suspense>}
       {showHtmlPreview && <Suspense fallback={null}><HtmlPreviewModal mainFile={currentMain} onClose={() => setShowHtmlPreview(false)} /></Suspense>}
       {showPlot3D && <Boundary name="3D Plot Studio" onClose={() => setShowPlot3D(false)}><Suspense fallback={null}><Plot3DStudio onClose={() => setShowPlot3D(false)} onInsert={(code) => { insertCode(code); setShowPlot3D(false); fetchTree(); }} onSaved={(path) => { void mirrorLocalPath(path); void fetchTree(); }} /></Suspense></Boundary>}
       {showPlotStudio && <Boundary name="Plot Studio" onClose={() => setShowPlotStudio(false)}><Suspense fallback={null}><PlotStudio onClose={() => setShowPlotStudio(false)} onInsert={(code) => insertCode(code)} onEnsureSetup={ensureSetup} onOpenInteractive={() => setShowPlot3D(true)} /></Suspense></Boundary>}
