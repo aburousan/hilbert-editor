@@ -4,6 +4,50 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.2.9
+
+Export now suggests the name of your document and not the name of the folder. The preview takes in each new PDF faster. Using Hilbert from a web browser is much safer now. And a rare case where the last words you typed could disappear is fixed.
+
+### Export uses the document's name
+
+Opening a folder and then a file in it, Save As / Export suggested the folder's name for the PDF (issue #41). It now suggests the name of the main file, which is the file that is actually exported, so `myfile.typ` gives `myfile.pdf`. Only Project export, which zips the whole folder, keeps the folder's name. The export window also says which file it exports. A name you type stays when you change the format. The download button in the preview uses the same name too.
+
+Export now saves your open files first, so the exported file has everything you typed. If a question about a file changed outside Hilbert is still waiting, export stops and tells you to answer it first, so nothing is exported with your newest text left out.
+
+### A quicker preview
+
+The preview used to start a new PDF reader in the background for every compile. It now keeps one and reuses it. Taking in each new PDF went from about 40 to 90 ms down to a few ms, so each update reaches the screen about 40 ms sooner on a Mac and about 100 ms sooner on Linux.
+
+### A safer browser mode
+
+When you serve a project to browsers with `hilbert --serve` (Help → Use in a Browser), people signed in from a browser could do more on your computer than they should. Now:
+
+- they cannot read or change anything in a `.git` folder, where a changed setting could make git run a program on your computer
+- copying the project to another folder on your computer is turned off for them
+- git push only goes to network addresses, never to another folder on your computer. Odd addresses that git would read as options are refused
+- adding a Python, Julia or Wolfram program is turned off when running code is turned off
+- if the desktop app and a browser change the same file, the browser now asks which version to keep instead of saving over the desktop's change
+- the Use in a Browser window now says plainly that over plain http on a network the sign-in token is not encrypted, so use it only on a network you trust or use HTTPS or an SSH tunnel
+
+### Fixes
+
+- Hilbert checks every two seconds whether an open file changed outside it. If one of your own saves finished while that check was reading the file, the check could put the older copy back and the words you had just typed disappeared from the editor. The check now notices the save and waits for the next round.
+- A text file uploaded into a shared project no longer races with saves of the same file. Large pictures no longer hold up saving in other windows while they are written.
+
+### Install or update
+
+If you already have Hilbert from a download, it offers this update on its own. Package managers:
+
+```bash
+winget upgrade --exact --id Aburousan.Hilbert      # Windows
+brew upgrade --cask hilbert                        # macOS
+sudo apt update && sudo apt install hilbert        # Debian and Ubuntu
+```
+
+With Rust installed, `cargo install --git https://github.com/aburousan/hilbert-editor --features embed-ui` builds it from source and installs it as `hilbert`.
+
+---
+
 ## 0.2.8
 
 The Problems list now clears the moment you fix a mistake. A file your document reads, changed outside Hilbert, now shows in the preview by itself. Opening Hilbert's own address in a browser explains what to do instead of showing an editor that cannot save, and Help has a new way to use Hilbert in a browser. The preview is a little quicker on small and medium documents. And there is a new theme for the Pujas.
