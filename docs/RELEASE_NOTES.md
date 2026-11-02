@@ -4,6 +4,28 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.2.10
+
+This release is about one thing: Hilbert must never lose your files.
+
+### Delete moves to the Trash
+
+The file tree is the real folder on your disk. Deleting from it used to remove files for good, after asking only "Delete N items?" (issue #42). Now it moves them to the Trash (the Recycle Bin on Windows), where you can get them back. Where there is no Trash, they go to the project's hidden .hilbert/trash folder, and if even that fails, nothing is deleted. The question now says that the files leave the folder on your disk, pressing Enter no longer confirms it, and the button on each row is a trash icon.
+
+### Close Folder
+
+File → Close Folder clears the list and goes back to Hilbert's own folder without touching any file.
+
+### Nothing is replaced without asking
+
+New File, new whiteboards, Open File, Import Folder, uploads, fonts, data import, dragging files in, Compress, templates, setting up git and pictures from code cells no longer write over a file that is already there. Where it makes sense Hilbert asks first, and the old file goes to the Trash. Opening or closing a folder saves what you typed first.
+
+### Getting files back from History
+
+Hilbert keeps every version of files you edit in it outside the project. scripts/recover-from-history.py writes them back out into a folder of your choice.
+
+---
+
 ## 0.2.9
 
 Export now suggests the name of your document and not the name of the folder. The preview takes in each new PDF faster. Using Hilbert from a web browser is much safer now. And a rare case where the last words you typed could disappear is fixed.
