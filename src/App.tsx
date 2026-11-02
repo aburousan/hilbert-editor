@@ -3043,7 +3043,9 @@ export default function App() {
       onSubmit: async (v) => {
         const name = (v.name || '').trim();
         if (!name || name.endsWith('/')) return;
-        await fetch(`${API}/workspace/file?path=${encodeURIComponent(name)}`, { method: 'POST', body: '' });
+        // Never over a file that is already there: that emptied it.
+        const created = await fetch(`${API}/workspace/file?create=1&path=${encodeURIComponent(name)}`, { method: 'POST', body: '' });
+        if (created.status === 409) { notify(`${name} already exists, so it was opened instead.`, 'info'); openFile(name); return; }
         await mirrorLocalPath(name, '', true);
         fetchTree();
         openFile(name);
@@ -3214,12 +3216,7 @@ export default function App() {
 
     if (e.key === 'Backspace' || e.key === 'Delete') {
       e.preventDefault();
-      if (!await confirmDialog(`Delete ${selectedPaths.length} items?`, { danger: true, confirmLabel: 'Delete' })) return;
-      for (const p of selectedPaths) {
-        const response = await fetch(`${API}/workspace/file?path=${encodeURIComponent(p)}`, { method: 'DELETE' });
-        if (response.ok) mirrorLocalDelete(p);
-      }
-      setSelectedPaths([]); fetchTree();
+      await trashFromTree(selectedPaths);
     } else if (e.key === 'Enter') {
       e.preventDefault();
       handleRename();
@@ -3280,14 +3277,19 @@ export default function App() {
       if (dropped.length > 0) {
         const files = dropped;
         for (const file of files) {
-          const newPath = targetDir ? `${targetDir}/${file.name}` : file.name;
+          const wanted = targetDir ? `${targetDir}/${file.name}` : file.name;
           const arrayBuffer = await file.arrayBuffer();
-          await fetch(`${API}/workspace/upload?path=${encodeURIComponent(newPath)}`, {
+          // A file dropped in never replaces one already there: it gets a free
+          // name next to it instead.
+          const response = await fetch(`${API}/workspace/upload?unique=1&path=${encodeURIComponent(wanted)}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/octet-stream' },
             body: arrayBuffer
           });
-          await mirrorLocalPath(newPath);
+          const placed = response.ok ? ((await response.json().catch(() => ({}))).path || wanted) : null;
+          if (!placed) { notify(`Could not add ${file.name}.`); continue; }
+          if (placed !== wanted) notify(`${file.name} was already there, so the new one is ${placed.split('/').pop()}.`, 'info');
+          await mirrorLocalPath(placed);
         }
         fetchTree();
         return;
@@ -3388,22 +3390,75 @@ export default function App() {
     } catch {}
   };
 
-  const deleteEntry = async (e: React.MouseEvent, path: string, isDir: boolean) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (!await confirmDialog(`Delete ${isDir ? 'folder' : 'file'} "${path}"?${isDir ? '\nAll of its contents will be removed.' : ''}`, { danger: true, confirmLabel: 'Delete' })) return;
-    try {
-      const response = await fetch(`${API}/workspace/file?path=${encodeURIComponent(path)}`, { method: 'DELETE' });
-      if (response.ok) mirrorLocalDelete(path);
-    } catch {}
+  // Delete in the file tree moves things to the Trash (issue #42). The tree is
+  // the folder on disk, not a list of names, so the question says that plainly
+  // and points to Close Folder for someone who only wants the list gone.
+  const trashFromTree = async (chosen: string[]) => {
+    // A folder takes what is inside it along, so a file chosen inside a chosen
+    // folder is not sent on its own as well.
+    const paths = chosen.filter(p => !chosen.some(q => q !== p && p.startsWith(q + '/')));
+    if (!paths.length) return;
+    const one = paths.length === 1;
+    const what = one ? `“${paths[0].split('/').pop()}”` : `${paths.length} items`;
+    const message = `Move ${what} to the Trash?\n\n`
+      + `This takes ${one ? 'it' : 'them'} out of the folder on your disk, not only out of this list. `
+      + `Folders go with everything inside them. You can get ${one ? 'it' : 'them'} back from the Trash `
+      + `(the Recycle Bin on Windows).\n\nTo clear the list without deleting anything, use File → Close Folder.`;
+    if (!await confirmDialog(message, { danger: true, confirmLabel: 'Move to Trash' })) return;
+    const moved: string[] = [], failed: string[] = [];
+    let intoProject = false;
+    for (const path of paths) {
+      try {
+        const response = await fetch(`${API}/workspace/file?path=${encodeURIComponent(path)}`, { method: 'DELETE' });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) { failed.push(path); continue; }
+        moved.push(path);
+        if (data.trash === 'project') intoProject = true;
+        mirrorLocalDelete(path);
+      } catch { failed.push(path); }
+    }
+    const gone = (path: string) => moved.some(p => path === p || path.startsWith(p + '/'));
     setTabs(prev => {
-      const remaining = prev.filter(t => t.path !== path && !t.path.startsWith(path + '/'));
-      if (activeTabPath === path || activeTabPath.startsWith(path + '/')) {
-        setActiveTabPath(remaining.length ? remaining[remaining.length - 1].path : '');
-      }
+      const remaining = prev.filter(t => !gone(t.path));
+      if (gone(activeTabPath)) setActiveTabPath(remaining.length ? remaining[remaining.length - 1].path : '');
       return remaining;
     });
+    setSelectedPaths([]);
     fetchTree();
+    if (failed.length) notify(`Could not move ${failed.length === 1 ? `“${failed[0].split('/').pop()}”` : `${failed.length} items`} to the Trash, so ${failed.length === 1 ? 'it was' : 'they were'} not deleted.`);
+    else if (intoProject) notify(`Moved ${what} to the project's .hilbert/trash folder, since there is no Trash to use here.`, 'info');
+    else notify(`Moved ${what} to the Trash.`, 'info');
+  };
+  const deleteEntry = (e: React.MouseEvent, path: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    void trashFromTree([path]);
+  };
+
+  // A file brought in from outside the project never quietly replaces one that
+  // is already there. 'ask' offers to replace it, the old one going to the
+  // Trash first; 'keepBoth' puts the new one under a free name beside it.
+  // Gives the path written, or null when nothing was.
+  const placeNewFile = async (path: string, body: string | ArrayBuffer, mode: 'ask' | 'keepBoth' = 'ask'): Promise<string | null> => {
+    const write = (query: string) => fetch(`${API}/workspace/upload?${query}&path=${encodeURIComponent(path)}`,
+      { method: 'POST', body, headers: { 'Content-Type': 'application/octet-stream' } });
+    if (mode === 'keepBoth') {
+      const response = await write('unique=1');
+      return response.ok ? ((await response.json().catch(() => ({}))).path || path) : null;
+    }
+    const first = await write('create=1');
+    if (first.ok) return path;
+    if (first.status !== 409) return null;
+    // The same text already there (a diagram's data file saved again): nothing to ask.
+    if (typeof body === 'string') {
+      const there = await fetch(`${API}/workspace/raw?path=${encodeURIComponent(path)}`).then(r => r.ok ? r.text() : null).catch(() => null);
+      if (there === body) return path;
+    }
+    if (!await confirmDialog(`${path} is already in the project. Replace it?\n\nThe one there now goes to the Trash (the Recycle Bin on Windows), so you can get it back.`, { danger: true, confirmLabel: 'Replace' })) return null;
+    const trashed = await fetch(`${API}/workspace/file?path=${encodeURIComponent(path)}`, { method: 'DELETE' });
+    if (!trashed.ok) { notify(`Could not move the old ${path} to the Trash, so it was not replaced.`); return null; }
+    mirrorLocalDelete(path);
+    return (await write('create=1')).ok ? path : null;
   };
 
   const handleDuplicate = async (node?: FileNode) => {
@@ -3458,16 +3513,17 @@ export default function App() {
         fields: [{ key: 'folder', label: 'Destination folder', default: allImages ? 'images' : '', placeholder: '(project root)', hint: 'Leave blank to upload into the project root' }],
         onSubmit: async (v) => {
           const folder = (v.folder || '').trim().replace(/^\/+|\/+$/g, '');
+          const placed: string[] = [];
           for (const file of files) {
-            const path = folder ? `${folder}/${file.name}` : file.name;
-            const buf = await file.arrayBuffer();
-            await fetch(`${API}/workspace/upload?path=${encodeURIComponent(path)}`, { method: 'POST', body: buf, headers: { 'Content-Type': 'application/octet-stream' } });
+            const path = await placeNewFile(folder ? `${folder}/${file.name}` : file.name, await file.arrayBuffer());
+            if (!path) continue;
+            placed.push(path);
             await mirrorLocalPath(path);
           }
           await fetchTree();
-          if (files.length === 1) {
+          if (files.length === 1 && placed.length === 1) {
             const file = files[0];
-            const path = folder ? `${folder}/${file.name}` : file.name;
+            const path = placed[0];
             const ext = (file.name.split('.').pop() || '').toLowerCase();
             if (IMG_EXT.includes(ext)) insertCode(`\n#figure(\n  image("${path}", width: 80%),\n  caption: [],\n)\n`);
           }
@@ -3539,8 +3595,9 @@ export default function App() {
       if (!file) return;
       const buf = await file.arrayBuffer();
       const detected = readFontFamily(buf) || file.name.replace(/\.(ttf|otf)$/i, '');
-      await fetch(`${API}/workspace/upload?path=${encodeURIComponent('fonts/' + file.name)}`, { method: 'POST', body: buf, headers: { 'Content-Type': 'application/octet-stream' } });
-      await mirrorLocalPath('fonts/' + file.name);
+      const fontPath = await placeNewFile('fonts/' + file.name, buf);
+      if (!fontPath) return;
+      await mirrorLocalPath(fontPath);
       await fetchTree();
       setInputModal({
         title: 'Import Font',
@@ -3561,8 +3618,10 @@ export default function App() {
       const file = input.files?.[0];
       if (!file) return;
       const text = await file.text();
-      const name = file.name;
-      await fetch(`${API}/workspace/file?path=${encodeURIComponent(name)}`, { method: 'POST', body: text, headers: { 'Content-Type': 'text/plain' } });
+      // Brought in beside any file of the same name, never over it.
+      const name = await placeNewFile(file.name, text, 'keepBoth');
+      if (!name) { notify(`Could not add ${file.name} to the project.`); return; }
+      if (name !== file.name) notify(`${file.name} is already in the project, so this one is ${name}.`, 'info');
       await mirrorLocalPath(name, text, true);
       await fetchTree();
       setTabs(prev => prev.find(t => t.path === name)
@@ -3584,20 +3643,22 @@ export default function App() {
       if (!files.length) return;
       if (files.length > 400 && !await confirmDialog(`Import ${files.length} files? This may take a moment.`, { confirmLabel: 'Import' })) return;
       const TEXT_EXT = ['typ', 'bib', 'txt', 'md', 'csv', 'json', 'yml', 'yaml', 'toml', 'xml', 'tex', 'html', 'css', 'js'];
+      let renamed = 0;
       for (const f of files) {
         const rel = (f as any).webkitRelativePath || f.name;
         if (rel.includes('/.') || rel.includes('node_modules/')) continue;
         const ext = (f.name.split('.').pop() || '').toLowerCase();
+        // Beside any file of the same name, never over it.
         if (TEXT_EXT.includes(ext)) {
           const text = await f.text();
-          await fetch(`${API}/workspace/file?path=${encodeURIComponent(rel)}`, { method: 'POST', body: text, headers: { 'Content-Type': 'text/plain' } });
-          await mirrorLocalPath(rel, text, true);
+          const placed = await placeNewFile(rel, text, 'keepBoth');
+          if (placed) { await mirrorLocalPath(placed, text, true); if (placed !== rel) renamed++; }
         } else {
-          const buf = await f.arrayBuffer();
-          await fetch(`${API}/workspace/upload?path=${encodeURIComponent(rel)}`, { method: 'POST', body: buf, headers: { 'Content-Type': 'application/octet-stream' } });
-          await mirrorLocalPath(rel);
+          const placed = await placeNewFile(rel, await f.arrayBuffer(), 'keepBoth');
+          if (placed) { await mirrorLocalPath(placed); if (placed !== rel) renamed++; }
         }
       }
+      if (renamed) notify(`${renamed} file${renamed === 1 ? ' was' : 's were'} already in the project, so the imported ${renamed === 1 ? 'one has' : 'ones have'} new names beside them.`, 'info');
       await fetchTree();
     };
     input.click();
@@ -3820,10 +3881,17 @@ export default function App() {
   // - Other browsers → folder picker that imports a working copy (no write-back).
   // Desktop: repoint the backend at an absolute path (also used by Open Recent).
   const openFolderPathAsRootRef = useRef<(folder: string) => Promise<void>>(async () => {});
-  const openFolderPathAsRoot = async (folder: string) => {
+  const openFolderPathAsRoot = async (folder: string, ensure = false, remember = true) => {
+    // What is typed and not yet saved goes to disk before the folder changes;
+    // once the tabs are gone there is nothing left to save it from.
+    try { await saveForExport(); }
+    catch (error) {
+      notify(`${error instanceof Error && error.message !== 'external-conflict' ? error.message.replace(/export again\.$/, 'try again.') : 'Could not save the open files.'} The folder was not changed.`);
+      return;
+    }
     try {
       if (collabRef.current) disposeProjectSession();
-      const res = await fetch(`${API}/workspace/root`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: folder }) });
+      const res = await fetch(`${API}/workspace/root`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: folder, ensure }) });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) { notify(data.error || 'Could not open that folder.'); return; }
       dirHandleRef.current = null;   // desktop backend edits the folder directly
@@ -3831,10 +3899,24 @@ export default function App() {
       selectRecoveryWorkspace(folder);
       const name = folder.replace(/[/\\]+$/, '').split(/[/\\]/).pop() || 'Project';
       await loadWorkspace(name);
-      addRecentFolder({ name, path: folder });
+      if (remember) addRecentFolder({ name, path: folder });
     } catch { notify('Could not reach the local server.'); }
   };
   openFolderPathAsRootRef.current = openFolderPathAsRoot;
+
+  // File → Close Folder: the tree stops showing this folder and Hilbert goes
+  // back to its own folder. Nothing on disk is touched. Without it, the only
+  // way to empty the list was Delete, which empties the folder (issue #42).
+  const closeFolder = async () => {
+    try {
+      const info = await (await fetch(`${API}/workspace/root`)).json();
+      if (info.hosted) { notify('A hosted workspace stays open on the server.', 'info'); return; }
+      if (!info.defaultRoot) return;
+      if (info.root === info.defaultRoot) { notify('This is Hilbert’s own folder, so there is no other folder to close.', 'info'); return; }
+      if (collabRef.current && !await confirmDialog('Closing the folder ends the shared session for this window. Close it?', { confirmLabel: 'Close Folder' })) return;
+      await openFolderPathAsRoot(info.defaultRoot, true, false);
+    } catch { notify('Could not close the folder.'); }
+  };
   // The backend is already on this project; the window only needs to know it.
   const adoptProjectRef = useRef<(root: string) => Promise<void>>(async () => {});
   adoptProjectRef.current = async (root: string) => {
@@ -4050,7 +4132,7 @@ export default function App() {
   // write the (possibly Excel-converted) data into the workspace and drop the
   // matching Typst read snippet at the cursor.
   const handleDataImport = async ({ filename, content, snippet }: { filename: string; content: string; snippet: string }) => {
-    await fetch(`${API}/workspace/file?path=${encodeURIComponent(filename)}`, { method: 'POST', body: content, headers: { 'Content-Type': 'text/plain' } });
+    if (!await placeNewFile(filename, content)) return;
     await mirrorLocalPath(filename, content, true);
     await fetchTree();
     insertCode('\n' + snippet + '\n\n');
@@ -5094,8 +5176,9 @@ ${byline ? `
         const dummySvg = `<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><text y="50">Please save drawing...</text></svg>`;
         const svgBlob = new Blob([dummySvg], { type: 'image/svg+xml' });
         
-        await fetch(`${API}/workspace/file?path=${encodeURIComponent(excalidrawFile)}`, { method: 'POST', body: '' });
-        await fetch(`${API}/workspace/upload?path=${encodeURIComponent(svgFile)}`, { method: 'POST', body: svgBlob, headers: { 'Content-Type': 'application/octet-stream' } });
+        const created = await fetch(`${API}/workspace/file?create=1&path=${encodeURIComponent(excalidrawFile)}`, { method: 'POST', body: '' });
+        if (created.status === 409) { notify(`A drawing called ${base} already exists. Choose another name.`); return; }
+        await fetch(`${API}/workspace/upload?create=1&path=${encodeURIComponent(svgFile)}`, { method: 'POST', body: svgBlob, headers: { 'Content-Type': 'application/octet-stream' } });
         await mirrorLocalPath(excalidrawFile);
         await mirrorLocalPath(svgFile);
         
@@ -6137,7 +6220,7 @@ ${byline ? `
                 <>
                   <span className="tree-name">{node.name}</span>
                   {getGitStatusForPath(node.path, true) && <div style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--accent)', marginLeft: 'auto', marginRight: '6px' }} />}
-                  <button className="tree-del" title="Delete folder" onClick={(e) => deleteEntry(e, node.path, true)}>×</button>
+                  <button className="tree-del" title="Move folder to the Trash" aria-label="Move folder to the Trash" onClick={(e) => deleteEntry(e, node.path)}><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg></button>
                 </>
               )}
             </div>
@@ -6171,7 +6254,7 @@ ${byline ? `
                     const color = '#f59e0b'; // Yellow for 'M'
                     return <span style={{ marginLeft: node.path === currentMain ? '0' : 'auto', marginRight: '4px', fontSize: '0.65rem', color, fontWeight: 'bold' }}>{stat}</span>;
                   })()}
-                  <button className="tree-del" title="Delete file" onClick={(e) => deleteEntry(e, node.path, false)}>×</button>
+                  <button className="tree-del" title="Move file to the Trash" aria-label="Move file to the Trash" onClick={(e) => deleteEntry(e, node.path)}><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg></button>
                 </>
               )}
             </div>
@@ -7068,6 +7151,7 @@ ${byline ? `
     { category: 'File', title: 'New File...', run: createNewFile },
     { category: 'File', title: 'Open File...', run: openFromDisk },
     { category: 'File', title: 'Open Folder as Workspace...', run: openFolderAsRoot },
+    ...(IS_NATIVE_APP ? [{ category: 'File', title: 'Close Folder', run: closeFolder }] : []),
     { category: 'File', title: 'Import Folder into Project...', run: openFolderFromDisk },
     { category: 'File', title: 'Import Font (.ttf / .otf)...', run: importFont },
     { category: 'File', title: 'New from Template...', run: () => setShowTemplateInstaller(true) },
@@ -7263,6 +7347,7 @@ ${byline ? `
                   <div className="dropdown-item" onClick={() => { openNewWindow(); setActiveMenu(null); }}>New Window</div>
                   <div className="dropdown-item" onClick={() => { openFromDisk(); setActiveMenu(null); }}>Open File...</div>
                   <div className="dropdown-item" onClick={() => { openFolderAsRoot(); setActiveMenu(null); }}>Open Folder... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.72rem' }}>as workspace</span></div>
+                  {IS_NATIVE_APP && <div className="dropdown-item" onClick={() => { void closeFolder(); setActiveMenu(null); }}>Close Folder <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.72rem' }}>keeps the files</span></div>}
                   <div className="dropdown-item has-submenu">
                     <span>Open Recent</span><span className="submenu-arrow">›</span>
                     <div className="submenu">
@@ -8410,10 +8495,10 @@ ${byline ? `
         editorRef.current.executeEdits('packages', [{ range: new monaco!.Range(1, 1, 1, 1), text: `#import "@preview/${pkg.name}:${pkg.version}": *\n`, forceMoveMarkers: true }]);
         setShowPackageInstaller(false);
       }} /></Suspense></Boundary>}
-      {showTemplateInstaller && <Boundary name="Templates" onClose={() => setShowTemplateInstaller(false)}><Suspense fallback={null}><TemplateInstaller onClose={() => setShowTemplateInstaller(false)} onInsert={handleInitTemplate} onUseBuiltin={handleUseBuiltin} /></Suspense></Boundary>}
+      {showTemplateInstaller && <Boundary name="Templates" onClose={() => setShowTemplateInstaller(false)}><Suspense fallback={null}><TemplateInstaller onClose={() => setShowTemplateInstaller(false)} onInsert={handleInitTemplate} onUseBuiltin={handleUseBuiltin} confirmAction={confirmDialog} /></Suspense></Boundary>}
       {showDiagramBuilder && <Suspense fallback={null}><DiagramBuilder onClose={() => setShowDiagramBuilder(false)} onInsert={(code, imports) => { if (imports) ensureRule(imports, imports); insertCode(code); setShowDiagramBuilder(false); }}
         onSaveFile={async (filename, content) => {
-          await fetch(`${API}/workspace/file?path=${encodeURIComponent(filename)}`, { method: 'POST', body: content, headers: { 'Content-Type': 'text/plain' } });
+          if (!await placeNewFile(filename, content)) throw new Error(`${filename} was not saved.`);
           await mirrorLocalPath(filename, content, true);
           await fetchTree();
         }} /></Suspense>}
@@ -8528,7 +8613,9 @@ ${byline ? `
           <div className="modal-content" style={{ width: '420px' }} onClick={e => e.stopPropagation()}
             onKeyDown={e => {
               if (e.key === 'Escape') { confirmModal.resolve(false); setConfirmModal(null); }
-              if (e.key === 'Enter') { confirmModal.resolve(true); setConfirmModal(null); }
+              // Enter never confirms something that cannot be taken back in one step:
+              // Delete then Enter in the file tree was two keystrokes from losing files.
+              if (e.key === 'Enter' && !confirmModal.danger) { confirmModal.resolve(true); setConfirmModal(null); }
             }}>
             <div className="modal-header">
               <h2>Confirm</h2>
@@ -8536,8 +8623,8 @@ ${byline ? `
             </div>
             <div className="modal-body" style={{ whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>{confirmModal.message}</div>
             <div className="modal-footer">
-              <button className="btn-ghost" onClick={() => { confirmModal.resolve(false); setConfirmModal(null); }}>Cancel</button>
-              <button className={confirmModal.danger ? 'btn-danger' : 'btn-primary'} autoFocus
+              <button className="btn-ghost" autoFocus={!!confirmModal.danger} onClick={() => { confirmModal.resolve(false); setConfirmModal(null); }}>Cancel</button>
+              <button className={confirmModal.danger ? 'btn-danger' : 'btn-primary'} autoFocus={!confirmModal.danger}
                 onClick={() => { confirmModal.resolve(true); setConfirmModal(null); }}>{confirmModal.confirmLabel || 'OK'}</button>
             </div>
           </div>
@@ -8634,19 +8721,17 @@ ${byline ? `
                     if (!name) return;
                     const response = await fetch(`${API}/workspace/compress`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths, archiveName: name }) });
                     if (response.ok) await mirrorLocalPath(name);
+                    else notify((await response.json().catch(() => ({}))).error || 'Could not make the archive.');
                     fetchTree();
                   },
                 });
               }}>Compress {selectedPaths.length > 1 ? `(${selectedPaths.length})` : ''}</div>
               <div className="dropdown-divider"></div>
               <div className="dropdown-item" style={{ color: '#ef4444' }} onClick={async () => {
-                if (!await confirmDialog(`Delete ${selectedPaths.length} items?`, { danger: true, confirmLabel: 'Delete' })) return;
-                for (const p of selectedPaths) {
-                  const response = await fetch(`${API}/workspace/file?path=${encodeURIComponent(p)}`, { method: 'DELETE' });
-                  if (response.ok) mirrorLocalDelete(p);
-                }
-                setSelectedPaths([]); fetchTree(); setContextMenu(null);
-              }}>Delete {selectedPaths.length > 1 ? `(${selectedPaths.length})` : ''}</div>
+                const paths = selectedPaths;
+                setContextMenu(null);
+                await trashFromTree(paths);
+              }}>Move to Trash {selectedPaths.length > 1 ? `(${selectedPaths.length})` : ''}</div>
               <div className="dropdown-divider"></div>
               <div className="dropdown-item" onClick={() => { revealInFileManager(contextMenu.node!.path); setContextMenu(null); }}>Reveal in File Manager</div>
               <div className="dropdown-item" onClick={() => { copyToClipboard(contextMenu.node!.path); setContextMenu(null); }}>Copy Relative Path</div>

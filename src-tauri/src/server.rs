@@ -1190,7 +1190,11 @@ async fn workspace_subtree(State(st): St, Query(q): Q) -> Response {
 }
 
 async fn workspace_root_get(State(st): St) -> Response {
-    Json(json!({ "root": st.ws().to_string_lossy() })).into_response()
+    // Where File → Close Folder goes back to: the folder Hilbert starts in.
+    let default = std::env::var_os("TYPST_WORKSPACE").map(PathBuf::from).unwrap_or_else(|| {
+        dirs::document_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join("Documents")).join("Hilbert")
+    });
+    Json(json!({ "root": st.ws().to_string_lossy(), "defaultRoot": default.to_string_lossy(), "hosted": st.remote_mode() })).into_response()
 }
 
 async fn workspace_root_post(State(st): St, body: Bytes) -> Response {
@@ -1230,6 +1234,11 @@ async fn workspace_root_post(State(st): St, body: Bytes) -> Response {
                 );
             }
         }
+    }
+    // File → Close Folder goes back to Hilbert's own folder, which may never have
+    // been made if every session so far opened a folder of its own.
+    if v.get("ensure").and_then(Value::as_bool).unwrap_or(false) {
+        let _ = fs::create_dir_all(&resolved);
     }
     match fs::metadata(&resolved) {
         Ok(m) if m.is_dir() => {}
@@ -1273,19 +1282,69 @@ async fn workspace_root_post(State(st): St, body: Bytes) -> Response {
 
 // Empty the current workspace (browser "Open Folder" imports into it).
 async fn workspace_clear(State(st): St) -> Response {
+    // A hosted workspace is the server's own project folder.
+    if st.remote_mode() {
+        return json_err(StatusCode::FORBIDDEN, "A hosted workspace cannot be cleared from a browser.");
+    }
     let ws = st.ws();
     let rd = match fs::read_dir(&ws) {
         Ok(r) => r,
         Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
+    // Into the Trash, like a delete from the file tree, and nothing more once
+    // one of them cannot go: whatever is left stays where it is.
     for entry in rd.flatten() {
-        if entry.file_name() == ".git" {
+        if entry.file_name() == ".git" || is_app_scratch(&entry.file_name()) {
             continue;
         }
-        let p = entry.path();
-        let _ = if p.is_dir() { fs::remove_dir_all(&p) } else { fs::remove_file(&p) };
+        if let Err(e) = move_to_trash(&ws, &entry.path(), false) {
+            return json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Could not move {} to the Trash, so it and the rest were left in place: {e}", entry.file_name().to_string_lossy()),
+            );
+        }
     }
     Json(json!({ "ok": true })).into_response()
+}
+
+enum Trashed {
+    System,
+    Project(PathBuf),
+}
+
+// Deleting from the file tree never destroys anything (issue #42): the folder
+// on disk is the person's work, and the tree is a view of it, not a list of
+// names. An entry goes to the system Trash (the Recycle Bin on Windows) where
+// it can be put back the usual way. Where there is none (some network shares
+// and Linux setups) or on a hosted server, whose Trash nobody looks at, it is
+// moved into the project's .hilbert/trash folder instead. If neither works,
+// nothing is deleted.
+fn move_to_trash(ws: &Path, path: &Path, hosted: bool) -> std::io::Result<Trashed> {
+    // HILBERT_PROJECT_TRASH=1 skips the system Trash, so tests leave nothing in
+    // the Trash of whoever runs them.
+    let system = !hosted && std::env::var("HILBERT_PROJECT_TRASH").ok().as_deref() != Some("1");
+    if system && trash::delete(path).is_ok() && fs::symlink_metadata(path).is_err() {
+        return Ok(Trashed::System);
+    }
+    // A folder of its own for every deleted entry, made with create_dir so it
+    // is new: two entries with the same name deleted in the same millisecond
+    // (notes.typ and chapters/notes.typ, say) must not land on one another,
+    // since a rename onto an existing file replaces it.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let base = hilbert_dir(ws).join("trash");
+    fs::create_dir_all(&base)?;
+    let stamp = SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let dir = loop {
+        let dir = base.join(format!("{stamp}-{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+        match fs::create_dir(&dir) {
+            Ok(()) => break dir,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let target = dir.join(path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("item")));
+    fs::rename(path, &target)?;
+    Ok(Trashed::Project(target))
 }
 
 async fn workspace_file_get(State(st): St, Query(q): Q) -> Response {
@@ -1356,6 +1415,10 @@ async fn workspace_file_post(State(st): St, Query(q): Q, headers: HeaderMap, bod
     let Some(full) = q.get("path").and_then(|p| safe_workspace_path(&st.ws(), p)) else {
         return text_err(StatusCode::BAD_REQUEST, "Invalid path");
     };
+    // New File and the like: never over a file that is already there.
+    if q.get("create").is_some() && fs::symlink_metadata(&full).is_ok() {
+        return json_err(StatusCode::CONFLICT, "A file with that name already exists.");
+    }
     // Accept both a raw text body and JSON { content } — like express.text/json.
     let is_json = headers
         .get(header::CONTENT_TYPE)
@@ -1494,15 +1557,16 @@ async fn workspace_file_delete(State(st): St, Query(q): Q) -> Response {
         return text_err(StatusCode::BAD_REQUEST, "Invalid path");
     }
     // Under the save lock, and the note of who wrote it goes only once it is gone.
+    if fs::symlink_metadata(&full).is_err() {
+        return text_err(StatusCode::NOT_FOUND, "Not found");
+    }
+    let hosted = st.remote_mode();
     let res = {
-        let full = full.clone();
+        let (full, ws) = (full.clone(), ws.clone());
         tokio::task::spawn_blocking(move || {
             let _guard = FILE_SAVE.lock().unwrap_or_else(|e| e.into_inner());
             let key = saved_key(&full);
-            let res = match fs::metadata(&full) {
-                Ok(m) if m.is_dir() => fs::remove_dir_all(&full),
-                _ => fs::remove_file(&full),
-            };
+            let res = move_to_trash(&ws, &full, hosted);
             if res.is_ok() {
                 LAST_SAVED.lock().unwrap_or_else(|e| e.into_inner()).retain(|saved, _| !saved.starts_with(&key));
             }
@@ -1512,14 +1576,25 @@ async fn workspace_file_delete(State(st): St, Query(q): Q) -> Response {
         .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
     };
     match res {
-        Ok(_) => {
+        Ok(trashed) => {
             st.note_write();
-            "OK".into_response()
+            let place = match trashed {
+                Trashed::System => json!({ "ok": true, "trash": "system" }),
+                Trashed::Project(target) => json!({
+                    "ok": true,
+                    "trash": "project",
+                    "path": target.strip_prefix(&ws).unwrap_or(&target).to_string_lossy().replace('\\', "/"),
+                }),
+            };
+            Json(place).into_response()
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             text_err(StatusCode::NOT_FOUND, "Not found")
         }
-        Err(_) => text_err(StatusCode::INTERNAL_SERVER_ERROR, "Error"),
+        Err(error) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not move it to the Trash, so it was not deleted: {error}"),
+        ),
     }
 }
 
@@ -1539,6 +1614,9 @@ async fn workspace_upload(State(st): St, Query(q): Q, body: Bytes) -> Response {
     };
     if q.get("unique").is_some() {
         return upload_under_a_free_name(&st, q.get("path").map(String::as_str).unwrap_or(""), &body);
+    }
+    if q.get("create").is_some() && fs::symlink_metadata(&full).is_ok() {
+        return json_err(StatusCode::CONFLICT, "A file with that name already exists.");
     }
     if let Some(parent) = full.parent() {
         let _ = fs::create_dir_all(parent);
@@ -2303,6 +2381,9 @@ async fn workspace_compress(State(st): St, body: Bytes) -> Response {
     let Some(out_path) = safe_workspace_path(&ws, archive_name) else {
         return json_err(StatusCode::BAD_REQUEST, "Invalid archive name");
     };
+    if fs::symlink_metadata(&out_path).is_ok() {
+        return json_err(StatusCode::CONFLICT, format!("{archive_name} already exists. Choose another name."));
+    }
     let mut selected: Vec<PathBuf> = Vec::new();
     for p in paths {
         if let Some(full) = p.as_str().and_then(|s| safe_workspace_path(&ws, s)) {
@@ -2992,8 +3073,14 @@ async fn init_template(State(st): St, body: Bytes) -> Response {
                 if is_app_scratch(&entry.file_name()) { continue; }
                 // A hosted browser may not touch the owner's repository.
                 if st.remote_mode() && names_git_folder(Path::new(&entry.file_name())) { continue; }
-                let path = entry.path();
-                let _ = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
+                // To the Trash, like any delete (issue #42), and the template is
+                // not put in over whatever could not be moved.
+                if let Err(e) = move_to_trash(&ws, &entry.path(), st.remote_mode()) {
+                    cleanup(&staging);
+                    return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!(
+                        "Could not move {} to the Trash, so the folder was left as it was: {e}",
+                        entry.file_name().to_string_lossy()));
+                }
             }
         }
     }
@@ -3760,7 +3847,11 @@ async fn git_init(State(st): St) -> Response {
         return json_err(StatusCode::INTERNAL_SERVER_ERROR, if init.stderr.is_empty() { "git init failed".into() } else { init.stderr });
     }
     git_init_defaults(&ws).await;
-    let _ = fs::write(ws.join(".gitignore"), ".hilbert/\n*.pdf\n.DS_Store\n");
+    // A .gitignore the project already has is the person's own; leave it be.
+    let ignore = ws.join(".gitignore");
+    if fs::symlink_metadata(&ignore).is_err() {
+        let _ = fs::write(&ignore, ".hilbert/\n*.pdf\n.DS_Store\n");
+    }
     Json(json!({ "ok": true, "message": "Initialized empty Git repository." })).into_response()
 }
 
@@ -4782,22 +4873,49 @@ fn safe_image_name(name: &str) -> bool {
     }
 }
 
+fn file_sha256(path: &Path) -> Option<String> {
+    fs::read(path).ok().map(|bytes| Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect())
+}
+
 fn promote_images(ws: &Path, run_dir: &Path, names: &[String]) -> Vec<String> {
     if names.is_empty() { return Vec::new(); }
     let assets = ws.join("assets");
     let _ = fs::create_dir_all(&assets);
+    // What a code cell put in assets/ before, by name and content. A cell run
+    // again may replace its own earlier picture, but never one of the person's
+    // that happens to share the name: that gets a free name beside it instead.
+    let record_path = hilbert_dir(ws).join("promoted-images.json");
+    let mut record: HashMap<String, String> = fs::read_to_string(&record_path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
     let mut out = Vec::new();
     for name in names.iter().filter(|name| safe_image_name(name)) {
         let from = run_dir.join(name);
-        let to = assets.join(name);
+        let mut placed = name.clone();
+        let mut to = assets.join(&placed);
+        if fs::symlink_metadata(&to).is_ok() && record.get(&placed) != file_sha256(&to).as_ref() {
+            let (stem, ext) = name.rsplit_once('.').map(|(s, e)| (s.to_string(), format!(".{e}"))).unwrap_or((name.clone(), String::new()));
+            let mut n = 2;
+            loop {
+                placed = format!("{stem}-{n}{ext}");
+                to = assets.join(&placed);
+                if fs::symlink_metadata(&to).is_err() { break; }
+                n += 1;
+            }
+        }
         // rename is atomic within one filesystem; fall back to copy+remove.
         if fs::rename(&from, &to).is_ok()
             || (fs::copy(&from, &to).is_ok() && { let _ = fs::remove_file(&from); true })
         {
-            out.push(format!("assets/{name}"));
+            if let Some(hash) = file_sha256(&to) { record.insert(placed.clone(), hash); }
+            out.push(format!("assets/{placed}"));
         } else if from.exists() {
             out.push(format!(".hilbert/run/{name}"));
         }
+    }
+    if let Ok(text) = serde_json::to_string(&record) {
+        let _ = fs::write(&record_path, text);
     }
     out.sort();
     out

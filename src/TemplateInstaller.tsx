@@ -6,13 +6,14 @@ interface TemplateInstallerProps {
   onInsert: (result: { code: string; entrypoint?: string }) => void;
   onUseBuiltin: (tpl: BuiltinTemplate) => void;
   onClose: () => void;
+  confirmAction: (message: string, opts?: { danger?: boolean; confirmLabel?: string }) => Promise<boolean>;
 }
 
 import { API } from './api';
 import { notify } from './notify';
 import { BUILTIN_TEMPLATES, type BuiltinTemplate } from './builtinTemplates';
 
-export function TemplateInstaller({ onInsert, onUseBuiltin, onClose }: TemplateInstallerProps) {
+export function TemplateInstaller({ onInsert, onUseBuiltin, onClose, confirmAction }: TemplateInstallerProps) {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<Template[]>([]);
   const [loading, setLoading] = useState(false);
@@ -97,10 +98,12 @@ export function TemplateInstaller({ onInsert, onUseBuiltin, onClose }: TemplateI
         const info = await res.json().catch(() => ({}));
         const count = info.entries ?? 0;
         const where = info.workspace ? `\n\n${info.workspace}` : '';
-        const ok = confirm(
+        const ok = await confirmAction(
           `“${pkg.name}” is a whole project, so it needs an empty folder.\n\n`
-          + `This folder already has ${count} item${count === 1 ? '' : 's'} in it, and they would be `
-          + `deleted permanently.${where}\n\nReplace everything in this folder?`
+          + `This folder already has ${count} item${count === 1 ? '' : 's'} in it. They would be moved to the Trash `
+          + `(the Recycle Bin on Windows), and you can get them back from there.${where}\n\n`
+          + `Move everything in this folder to the Trash and start from the template?`,
+          { danger: true, confirmLabel: 'Move to Trash' },
         );
         if (ok) await handleInitTemplate(pkg, true);
         return;

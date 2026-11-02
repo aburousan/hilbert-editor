@@ -308,7 +308,9 @@ export default function DiagramBuilder({ onClose, onInsert, onSaveFile }: { onCl
       for (const it of scene) {
         if (it.type === 'datacurve' && it.dataFile && it.dataContent && !seen.has(it.dataFile)) {
           seen.add(it.dataFile);
-          await onSaveFile(it.dataFile, it.dataContent);
+          // Not saved (the person kept the file already there): do not insert a
+          // diagram that would read data it did not mean.
+          try { await onSaveFile(it.dataFile, it.dataContent); } catch { return; }
         }
       }
     }
