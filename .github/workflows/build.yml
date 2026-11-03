@@ -149,6 +149,9 @@ jobs:
             echo "::error::libwayland still bundled after strip"; exit 1
           fi
           rm -f "$APP"
+          # Extraction leaves some folders readable by their owner only, and
+          # appimagetool now refuses those: the AppImage runs as other users.
+          chmod -R a+rX squashfs-root
           APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 ./appimagetool squashfs-root "$APP"
           test -f "$APP"
           echo "APP=$APP" >> "$GITHUB_ENV"
