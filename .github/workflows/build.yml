@@ -27,10 +27,10 @@ jobs:
           - os: ubuntu-22.04        # Linux: AppImage + .deb
             args: ""
             rust_target: ""
-          - os: macos-14            # macOS Apple Silicon: .app + .dmg
+          - os: macos-15            # macOS Apple Silicon: .app + .dmg
             args: "--target aarch64-apple-darwin"
             rust_target: "aarch64-apple-darwin"
-          - os: macos-14            # macOS Intel: cross-compiled on Apple Silicon
+          - os: macos-15            # macOS Intel: cross-compiled on Apple Silicon
             args: "--target x86_64-apple-darwin"      # (the macos-13 Intel runner is unreliable — never gets assigned)
             rust_target: "x86_64-apple-darwin"
           - os: windows-latest      # Windows x64: .msi + .exe (NSIS)

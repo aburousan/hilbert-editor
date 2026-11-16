@@ -4,6 +4,28 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.2.11
+
+You can now write maths by hand, or use a picture of it, and get Typst. On Linux you can also hide Hilbert's own title bar.
+
+### Write maths by hand
+
+Insert → Write Maths by Hand opens a pad. Write a formula with a pen, a finger or the mouse, or several lines of a system of equations. When you pause, Hilbert reads it and shows the Typst in a box you can edit, with a preview made by Typst itself, and Insert puts it in your document. If the Typst does not compile, Hilbert uses the LaTeX through mitex instead, so what you wrote still goes in.
+
+It reads pictures too. Choose a photo, screenshot or scan with From a picture, paste one (Ctrl+V, or ⌘V on a Mac) or drop it on the pad. Hilbert traces the writing back into strokes, shows them on the pad so you can fix any, and reads them the same way. It can read printed formulas from a paper or a screenshot too.
+
+The reading is done by ink2latex, a small model that runs on your own computer. Your writing never leaves it. The model is not part of Hilbert: the first time, the pad offers to download it (about 48 MB) into Hilbert's data folder. Its weights were trained on Google's MathWriting set, so the handwriting feature is for noncommercial use, with credit. Everything else in Hilbert stays MIT.
+
+### Draw a Symbol knows your handwriting better
+
+Once the model is downloaded, Draw a Symbol lists its guesses first and the old matcher fills in after them. On real handwritten symbols the right one now comes first far more often. Without the model, Draw a Symbol works as before.
+
+### Hide the title bar on Linux
+
+On Wayland, GTK draws a title bar on every window, and a tiling window manager such as sway cannot take it away (issue #43). Settings now has "Hide Hilbert's own title bar" in the Linux app. It takes effect the next time Hilbert starts, and your window manager then moves and resizes the window.
+
+---
+
 ## 0.2.10
 
 This release is about one thing: Hilbert must never lose your files.
