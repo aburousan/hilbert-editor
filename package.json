@@ -67,6 +67,7 @@
     "test:browser": "node scripts/test-browser-serve.mjs",
     "test:exportname": "node scripts/test-export-name.mjs",
     "test:treedelete": "node scripts/test-tree-delete.mjs",
+    "test:titlebar": "node scripts/test-title-bar.mjs",
     "stress": "node scripts/stress-session.mjs",
     "bench:preview": "node scripts/bench-preview.mjs",
     "test:symbolic": "python3 scripts/test-symbolic.py",

@@ -8599,6 +8599,18 @@ fn settings_file() -> PathBuf {
     hilbert_config_dir().join("settings.json")
 }
 
+// Settings → Hide Hilbert's own title bar (issue #43). On Wayland GTK draws a
+// title bar on every decorated window, and a tiling window manager like sway
+// cannot take it away. Read when a window is built, so it takes effect on the
+// next start.
+pub fn linux_title_bar_hidden() -> bool {
+    fs::read_to_string(settings_file())
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|settings| settings.get("linuxHideTitleBar").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
 async fn settings_get() -> Response {
     match fs::read_to_string(settings_file()) {
         Ok(s) if !s.trim().is_empty() => ([(header::CONTENT_TYPE, "application/json")], s).into_response(),

@@ -60,9 +60,14 @@ type SettingsProps = {
   textDirection: TextDirection, onTextDirection: (d: TextDirection) => void,
   compileDelay: number, onCompileDelay: (n: number) => void,
   historyInterval: number, onHistoryInterval: (n: number) => void,
+  hideTitleBar: boolean, onHideTitleBar: (on: boolean) => void,
 };
 
-export default function AppSettingsModal({ onClose, initialTab, initialSearch, onDictionaryChange, theme, onTheme, fontSize, onFontSize, textDirection, onTextDirection, compileDelay, onCompileDelay, historyInterval, onHistoryInterval }: SettingsProps) {
+// The desktop app on Linux: the only place the title-bar choice means anything.
+const LINUX_APP = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+  && /Linux/.test(navigator.userAgent) && !/Android/.test(navigator.userAgent);
+
+export default function AppSettingsModal({ onClose, initialTab, initialSearch, onDictionaryChange, theme, onTheme, fontSize, onFontSize, textDirection, onTextDirection, compileDelay, onCompileDelay, historyInterval, onHistoryInterval, hideTitleBar, onHideTitleBar }: SettingsProps) {
   const saveKeys = keys('⌘S');
   const [activeTab, setActiveTab] = useState<'general' | 'spelling' | 'interpreters' | 'git' | 'cloud'>(initialTab || 'general');
   const [tools, setTools] = useState<Tools | null>(null);
@@ -350,6 +355,18 @@ export default function AppSettingsModal({ onClose, initialTab, initialSearch, o
                     The newest 40 versions of each file are kept, and they survive closing Hilbert.
                   </span>
                 </label>
+                {LINUX_APP && (
+                  <label style={{ ...labelStyle, flexDirection: 'row', alignItems: 'flex-start', gap: 8 }}>
+                    <input type="checkbox" checked={hideTitleBar} onChange={e => onHideTitleBar(e.target.checked)} style={{ marginTop: 3 }} />
+                    <span>
+                      Hide Hilbert’s own title bar
+                      <span style={{ display: 'block', fontSize: '12px', color: 'var(--text-muted)' }}>
+                        For tiling window managers such as sway, which draw no title bar of their own. Your window manager
+                        then moves and resizes the window. Takes effect the next time Hilbert starts.
+                      </span>
+                    </span>
+                  </label>
+                )}
                 <label style={labelStyle}>
                   Inserted diagram quality — <b style={{ color: 'var(--text-main)' }}>{exportDpi} DPI</b>
                   <input type="range" min={96} max={500} step={8} value={exportDpi}

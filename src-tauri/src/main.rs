@@ -695,6 +695,9 @@ fn open_instance_window(
     let url: tauri::Url = format!("http://127.0.0.1:{port}").parse().unwrap();
     let window = tauri::WebviewWindowBuilder::new(handle, &label, tauri::WebviewUrl::External(url))
         .title("Hilbert")
+        // Linux only: without decorations the window manager alone moves and
+        // resizes the window. Off unless asked for in Settings.
+        .decorations(!(cfg!(target_os = "linux") && server::linux_title_bar_hidden()))
         .inner_size(1440.0, 920.0)
         .min_inner_size(900.0, 600.0)
         // Avoid showing a default-sized window for one frame before its saved
