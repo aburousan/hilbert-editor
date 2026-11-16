@@ -70,9 +70,9 @@ export function features(input: Stroke[]): number[][] {
   return rows;
 }
 
-type Box = [number, number, number, number];
+export type Box = [number, number, number, number];
 
-function bands(ids: number[], boxes: Box[], axis: 0 | 1): number[][] {
+export function bands(ids: number[], boxes: Box[], axis: 0 | 1): number[][] {
   const lo = axis ? 1 : 0, hi = axis ? 3 : 2;
   let groups: [number, number, number[]][] = [];
   const sorted = [...ids].sort((a, b) => boxes[a][lo] - boxes[b][lo] || boxes[a][1 - axis] - boxes[b][1 - axis] || a - b);

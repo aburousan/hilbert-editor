@@ -166,6 +166,67 @@ try {
     // Mouse positions are whole pixels, so a close call can go the other way.
     check('ink drawn on the pad is read as the reference reads it', readSame >= tried.length - 2, `${readSame}/${tried.length}`);
     check('every reading is previewed by compiling it', previewed === tried.length, `${previewed}/${tried.length}`);
+
+    // 2b. Pictures: handwriting drawn as a picture (black pen on white, like a
+    // photo of a page) through the picture button, a typeset formula pasted,
+    // and one picture dropped on the pad. Each is traced, read and previewed.
+    const picture = (strokes, pen = 3) => page.evaluate((strokes, pen) => {
+      const pts = strokes.flat(), pad = 30;
+      const [x0, y0] = [Math.min(...pts.map(p => p[0])), Math.min(...pts.map(p => p[1]))];
+      const [w, h] = [Math.max(...pts.map(p => p[0])) - x0, Math.max(...pts.map(p => p[1])) - y0];
+      const k = 160 / Math.max(1, h), c = document.createElement('canvas');
+      c.width = Math.round(w * k) + 2 * pad; c.height = Math.round(h * k) + 2 * pad;
+      const g = c.getContext('2d'); g.fillStyle = 'white'; g.fillRect(0, 0, c.width, c.height);
+      g.strokeStyle = 'black'; g.lineWidth = pen; g.lineCap = g.lineJoin = 'round';
+      for (const s of strokes) { g.beginPath(); s.forEach(([x, y], i) => (i ? g.lineTo : g.moveTo).call(g, (x - x0) * k + pad, (y - y0) * k + pad)); if (s.length === 1) g.lineTo((s[0][0] - x0) * k + pad + .5, (s[0][1] - y0) * k + pad); g.stroke(); }
+      return c.toDataURL('image/png');
+    }, strokes, pen);
+    const readNow = async () => {
+      await page.waitForFunction(() => /Read from a picture|No writing found|Could not read/.test(document.querySelector('.modal-content').innerText), { timeout: 30000 });
+      await page.waitForFunction(() => !/Reading…/.test(document.querySelector('.modal-content').innerText) && document.querySelector('.modal-content textarea')?.value.trim(), { timeout: 60000 }).catch(() => {});
+      await page.waitForFunction(() => !/Reading…/.test(document.querySelector('.modal-content').innerText), { timeout: 60000 });
+      return page.evaluate(() => ({ code: document.querySelector('.modal-content textarea').value, note: document.querySelector('.modal-content').innerText.match(/Read from a picture[^\n]*|No writing found[^\n]*|Could not read[^\n]*/)?.[0] || '' }));
+    };
+    const deliver = (how, dataUrl) => page.evaluate(async (how, dataUrl) => {
+      const blob = await (await fetch(dataUrl)).blob();
+      const file = new File([blob], 'maths.png', { type: 'image/png' }), dt = new DataTransfer();
+      dt.items.add(file);
+      [...document.querySelectorAll('.modal-content button')].find(b => b.textContent === 'Clear').click();
+      if (how === 'button') { const input = document.querySelector('.modal-content input[type=file]'); input.files = dt.files; input.dispatchEvent(new Event('change', { bubbles: true })); }
+      if (how === 'paste') document.querySelector('.modal-content textarea').dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+      if (how === 'drop') { const c = document.querySelector('.modal-content canvas'); c.dispatchEvent(new DragEvent('dragover', { dataTransfer: dt, bubbles: true, cancelable: true })); c.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true })); }
+    }, how, dataUrl);
+    let pictureSame = 0, pictureRead = 0;
+    const pics = ref.slice(10, 16);
+    for (const r of pics) {
+      await deliver('button', await picture(r.strokes));
+      const got = await readNow();
+      if (got.code.trim()) pictureRead++;
+      const expected = (await page.evaluate(t => window.__ink.tokensToTypst(t), r.python)) ?? '';
+      if (got.code === expected) pictureSame++;
+      console.log(`     picture #${r.index}: ${got.code === expected ? 'same ' : 'other'} ${got.code.slice(0, 60)}`);
+    }
+    check('a picture of handwriting is traced and read', pictureRead === pics.length, `${pictureRead}/${pics.length} read, ${pictureSame} the same as the pen strokes`);
+    // A typeset formula, rendered by Typst, pasted from the clipboard.
+    const typeset = await page.evaluate(async () => {
+      const r = await fetch('/render/snippet', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: '#set page(width: auto, height: auto, margin: 12pt, fill: white)\n#set text(size: 28pt)\n$ x^2 + y^2 = 1 $' });
+      const b = await r.blob(); return await new Promise(res => { const f = new FileReader(); f.onload = () => res(f.result); f.readAsDataURL(b); });
+    });
+    await deliver('paste', typeset);
+    const pasted = await readNow();
+    console.log(`     pasted typeset x^2 + y^2 = 1 → ${pasted.code}`);
+    check('a pasted picture is read (typeset x² + y² = 1)', /x\^2\s*\+\s*y\^2\s*=\s*1/.test(pasted.code.replace(/\s+/g, ' ')), pasted.code);
+    await deliver('drop', await picture(ref[16].strokes));
+    const dropped = await readNow();
+    check('a dropped picture is read', !!dropped.code.trim() && /Read from a picture/.test(dropped.note), dropped.code.slice(0, 60));
+    // A blank picture says so instead of reading nothing.
+    await deliver('button', await page.evaluate(() => { const c = document.createElement('canvas'); c.width = 300; c.height = 100; const g = c.getContext('2d'); g.fillStyle = 'white'; g.fillRect(0, 0, 300, 100); return c.toDataURL('image/png'); }));
+    await page.waitForFunction(() => /No writing found/.test(document.querySelector('.modal-content').innerText), { timeout: 20000 }).then(() => check('a blank picture says no writing was found', true)).catch(() => check('a blank picture says no writing was found', false));
+    // Back to a drawn formula for the insert below.
+    await page.evaluate(() => [...document.querySelectorAll('.modal-content button')].find(b => b.textContent === 'Clear').click());
+    await draw('.modal-content canvas', tried[tried.length - 1].strokes);
+    await page.waitForFunction(() => document.querySelector('.modal-content textarea')?.value.trim(), { timeout: 60000 });
+    await page.waitForFunction(() => !/Reading…/.test(document.querySelector('.modal-content').innerText), { timeout: 60000 });
     const code = await page.evaluate(() => document.querySelector('.modal-content textarea').value);
     await page.evaluate(() => [...document.querySelectorAll('.modal-content button')].find(b => b.textContent === 'Insert').click());
     // Autosave writes it; read what reached the file.

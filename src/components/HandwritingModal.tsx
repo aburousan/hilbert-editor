@@ -3,11 +3,14 @@ import { API } from '../api';
 import type { Stroke } from '../ink/features';
 import { InkReader, inkStatus, installInk, type InkStatus } from '../ink/reader';
 import { toLatex, tokensToTypst } from '../ink/ink2typst';
+import { fileToStrokes } from '../ink/photo';
 
 // Insert → Write Maths by Hand. Strokes are read by the ink2latex model in the
 // page itself (nothing leaves the computer), turned into Typst, checked by
 // compiling a preview, and inserted. When the Typst does not compile, the LaTeX
 // goes in through mitex instead, which reads any LaTeX the model can write.
+// A picture (a photo, screenshot or scan; chosen, pasted or dropped) is first
+// traced back into strokes, which the r3-photo model was trained to read.
 
 export type Handwritten = { typst: string } | { latex: string };
 
@@ -30,6 +33,8 @@ export default function HandwritingModal({ onClose, onInsert }: { onClose: () =>
   const [useLatex, setUseLatex] = useState(false);
   const [preview, setPreview] = useState<{ url: string | null; error: string | null }>({ url: null, error: null });
   const [reading, setReading] = useState(false);
+  const [pictureNote, setPictureNote] = useState('');
+  const fileRef = useRef<HTMLInputElement | null>(null);
   const openRef = useRef(true);
 
   const openReader = useCallback(async () => {
@@ -171,8 +176,44 @@ export default function HandwritingModal({ onClose, onInsert }: { onClose: () =>
     strokesRef.current = next;
     revisionRef.current++;
     redraw();
-    if (next.length) schedule(); else { setResult(null); setCode(''); }
+    if (next.length) schedule(); else { setResult(null); setCode(''); setPictureNote(''); }
   };
+
+  // A picture replaces the ink with its traced strokes, fitted into the pad,
+  // so they can be seen, undone or added to before it is read.
+  const usePicture = async (file: Blob) => {
+    const revision = ++revisionRef.current;
+    setPictureNote('Tracing the picture…');
+    try {
+      const traced = await fileToStrokes(file);
+      if (revision !== revisionRef.current || !openRef.current) return;
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      if (!traced.length) { setPictureNote('No writing found in this picture. Try a closer, clearer one.'); return; }
+      const pts = traced.flat();
+      const [x0, y0] = [Math.min(...pts.map(p => p[0])), Math.min(...pts.map(p => p[1]))];
+      const [w, h] = [Math.max(...pts.map(p => p[0])) - x0, Math.max(...pts.map(p => p[1])) - y0];
+      const scale = Math.min((canvas.width - 80) / Math.max(1, w), (canvas.height - 80) / Math.max(1, h));
+      const dx = (canvas.width - w * scale) / 2, dy = (canvas.height - h * scale) / 2;
+      changeInk(traced.map(stroke => stroke.map(([x, y, t]) => [(x - x0) * scale + dx, (y - y0) * scale + dy, t] as [number, number, number])));
+      setPictureNote('Read from a picture. Undo or draw to correct it.');
+    } catch (error) {
+      if (revision === revisionRef.current) setPictureNote(`Could not read this picture: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  // A picture on the clipboard (a screenshot, say) is read; text pastes as usual.
+  useEffect(() => {
+    if (phase !== 'ready') return;
+    const onPaste = (e: ClipboardEvent) => {
+      const file = [...(e.clipboardData?.items || [])].find(i => i.kind === 'file' && i.type.startsWith('image/'))?.getAsFile();
+      if (!file) return;
+      e.preventDefault(); e.stopPropagation();
+      void usePicture(file);
+    };
+    window.addEventListener('paste', onPaste, true);
+    return () => window.removeEventListener('paste', onPaste, true);
+  });
 
   const insert = () => {
     if (!code.trim()) return;
@@ -224,6 +265,7 @@ export default function HandwritingModal({ onClose, onInsert }: { onClose: () =>
             <>
               <div className="form-hint" style={{ margin: 0 }}>
                 Write one formula, or several lines, with a pen, finger or mouse. It is read when you pause.
+                You can also use a picture of maths: choose one, paste it (Ctrl+V, ⌘V on a Mac) or drop it on the pad.
               </div>
               <canvas
                 ref={canvasRef}
@@ -234,11 +276,19 @@ export default function HandwritingModal({ onClose, onInsert }: { onClose: () =>
                 onPointerMove={move}
                 onPointerUp={up}
                 onPointerCancel={up}
+                onDragOver={e => { if ([...e.dataTransfer.items].some(i => i.type.startsWith('image/'))) e.preventDefault(); }}
+                onDrop={e => {
+                  const file = [...e.dataTransfer.files].find(f => f.type.startsWith('image/'));
+                  if (file) { e.preventDefault(); e.stopPropagation(); void usePicture(file); }
+                }}
               />
               <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                 <button className="btn-ghost" onClick={() => changeInk(strokesRef.current.slice(0, -1))}>Undo stroke</button>
                 <button className="btn-ghost" onClick={() => changeInk([])}>Clear</button>
-                {reading && <span style={muted}>Reading…</span>}
+                <button className="btn-ghost" onClick={() => fileRef.current?.click()}>From a picture…</button>
+                <input ref={fileRef} type="file" accept="image/*" style={{ display: 'none' }}
+                  onChange={e => { const file = e.target.files?.[0]; e.target.value = ''; if (file) void usePicture(file); }} />
+                {reading ? <span style={muted}>Reading…</span> : pictureNote && <span style={muted}>{pictureNote}</span>}
               </div>
               <label className="form-field" style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                 <span>{useLatex ? 'LaTeX (inserted through mitex)' : 'Typst'}</span>
