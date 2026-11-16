@@ -73,6 +73,7 @@ const CodeRunnerModal = lazy(() => import('./components/CodeRunnerModal'));
 const SaveAsModal = lazy(() => import('./components/SaveAsModal'));
 const HtmlPreviewModal = lazy(() => import('./components/HtmlPreviewModal'));
 const SymbolDraw = lazy(() => import('./components/SymbolDraw'));
+const HandwritingModal = lazy(() => import('./components/HandwritingModal'));
 const DataImportModal = lazy(() => import('./components/DataImportModal'));
 const RefManager = lazy(() => import('./components/RefManager'));
 const BibManager = lazy(() => import('./components/BibManager'));
@@ -1130,6 +1131,7 @@ export default function App() {
   const [showPlot3D, setShowPlot3D] = useState(false);
   const [showPlotStudio, setShowPlotStudio] = useState(false);
   const [showSymbolDraw, setShowSymbolDraw] = useState(false);
+  const [showHandwriting, setShowHandwriting] = useState(false);
 
   const [showRefManager, setShowRefManager] = useState(false);
   const [showBibManager, setShowBibManager] = useState(false);
@@ -4211,6 +4213,22 @@ export default function App() {
     insertCode(context || model?.getLanguageId() !== 'typst' ? name + ' ' : '$' + name + '$');
   };
 
+  // Write Maths by Hand: Typst goes in as is inside maths, else as a display
+  // equation; LaTeX the converter could not take goes in through mitex.
+  const insertHandwritten = (value: { typst: string } | { latex: string }) => {
+    if ('latex' in value) { insertEquationFromLatex(value.latex); return; }
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    const selection = editor?.getSelection();
+    let context: OpenBlock = null;
+    if (model && selection) {
+      const prefix = model.getValueInRange({ startLineNumber: 1, startColumn: 1,
+        endLineNumber: selection.startLineNumber, endColumn: selection.startColumn });
+      for (const line of prefix.split('\n')) context = blockAfter(line, context);
+    }
+    insertCode(context || model?.getLanguageId() !== 'typst' ? value.typst + ' ' : '$ ' + value.typst + ' $');
+  };
+
   const graphemeSafeSelection = (model: any, selection: any) => {
     if (!selection || selection.isEmpty() || !monaco) return selection;
     const source = model.getValue();
@@ -7251,6 +7269,7 @@ ${byline ? `
     { category: 'Math', title: 'Cancel / Strike Term...', run: insertCancel },
     { category: 'Math', title: 'Math & Physics Symbols...', hint: keys('⌘⇧P'), run: () => setShowSymbolPicker(true) },
     { category: 'Math', title: 'Draw a Symbol → Typst...', hint: keys('⌘⇧Y'), run: () => setShowSymbolDraw(true) },
+    { category: 'Math', title: 'Write Maths by Hand → Typst...', run: () => setShowHandwriting(true) },
     { category: 'Math', title: 'Compute Selection (simplify / solve)...', hint: keys('⌘⇧U'), run: computeSelection },
     { category: 'Lists', title: 'Bullet List', run: () => makeList('-') },
     { category: 'Lists', title: 'Numbered List', run: () => makeList('+') },
@@ -7485,6 +7504,7 @@ ${byline ? `
                       <div className="dropdown-header">Symbols &amp; Compute</div>
                       <div className="dropdown-item" onClick={() => { setShowSymbolPicker(true); setActiveMenu(null); }}>Math &amp; Physics Symbols... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘⇧P')}</span></div>
                       <div className="dropdown-item" onClick={() => { setShowSymbolDraw(true); setActiveMenu(null); }}>Draw a Symbol → Typst (experimental)... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘⇧Y')}</span></div>
+                      <div className="dropdown-item" onClick={() => { setShowHandwriting(true); setActiveMenu(null); }}>Write Maths by Hand → Typst (experimental)...</div>
                       <div className="dropdown-item" onClick={() => { computeSelection(); setActiveMenu(null); }}>Compute Selection (simplify / solve)... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘⇧U')}</span></div>
                     </div>
                   </div>
@@ -8641,6 +8661,7 @@ ${byline ? `
       {showPlotStudio && <Boundary name="Plot Studio" onClose={() => setShowPlotStudio(false)}><Suspense fallback={null}><PlotStudio onClose={() => setShowPlotStudio(false)} onInsert={(code) => insertCode(code)} onEnsureSetup={ensureSetup} onOpenInteractive={() => setShowPlot3D(true)} /></Suspense></Boundary>}
       {showCalloutBuilder && <Boundary name="Boxed Aside" onClose={() => setShowCalloutBuilder(false)}><Suspense fallback={null}><CalloutBuilder onClose={() => setShowCalloutBuilder(false)} onInsert={(code) => { insertCode(code); setShowCalloutBuilder(false); }} /></Suspense></Boundary>}
       {showSymbolDraw && <Boundary name="Draw a Symbol" onClose={() => setShowSymbolDraw(false)}><Suspense fallback={null}><SymbolDraw onClose={() => setShowSymbolDraw(false)} onInsert={(name) => { insertMathSymbol(name); setShowSymbolDraw(false); }} /></Suspense></Boundary>}
+      {showHandwriting && <Boundary name="Write Maths by Hand" onClose={() => setShowHandwriting(false)}><Suspense fallback={null}><HandwritingModal onClose={() => setShowHandwriting(false)} onInsert={(value) => { insertHandwritten(value); setShowHandwriting(false); }} /></Suspense></Boundary>}
       {showRefManager && activeTab && <Suspense fallback={null}><RefManager content={activeTab.content} onClose={() => setShowRefManager(false)} onJump={jumpToLine} onInsertRef={(name) => insertCode(`@${name}`)} /></Suspense>}
       {showBibManager && <Suspense fallback={null}><BibManager onClose={() => setShowBibManager(false)} onCite={(key) => { insertCode(`@${key}`); ensureBibliography(); }} onEnsureBib={ensureBibliography} onChanged={(paths) => { void fetchTree(); for (const path of paths || []) void mirrorLocalPath(path); }} /></Suspense>}
       

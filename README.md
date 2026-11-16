@@ -317,3 +317,12 @@ MIT; see [LICENSE](LICENSE). Built and maintained by
 [Kazi Abu Rousan](https://rousan.netlify.app/). Bundled third-party software:
 [quiver](https://github.com/varkor/quiver) (MIT, © varkor) with
 [KaTeX](https://katex.org/) (MIT) under `public/quiver/`.
+
+Handwriting (Insert → Write Maths by Hand, and Draw a Symbol) uses
+[ink2latex](https://github.com/aburousan/ink2latex) by Kazi Abu Rousan. Its stroke
+code in `src/ink/` is MIT like the rest of Hilbert. The trained model is not part of
+Hilbert: it is downloaded only when you click Download, from the ink2latex release,
+together with [onnxruntime-web](https://github.com/microsoft/onnxruntime) (MIT) to run
+it. The model weights are CC BY-NC-SA 4.0 because they were trained on MathWriting
+(Gervais et al., 2024, Google Research), so the handwriting feature is for
+noncommercial use, with credit. Everything else in Hilbert stays MIT.

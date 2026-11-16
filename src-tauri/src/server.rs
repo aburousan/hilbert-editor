@@ -5561,6 +5561,172 @@ async fn packages_installed(State(_st): St) -> Response {
 static PKG_NAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[\w-]+$").unwrap());
 static PKG_VER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[\w.]+$").unwrap());
 
+// ---------------------------------------------------------------------------
+// Handwriting: the ink2latex model, downloaded only when the person asks.
+//
+// The trained weights are CC BY-NC-SA (they are trained on MathWriting), so they
+// are never part of Hilbert's own files: they come from the ink2latex release,
+// with the onnxruntime-web files that run them, into Hilbert's own data folder.
+// Every file has a fixed address and a fixed SHA-256; nothing about the
+// download comes from the page. The page asks for the files by name from a
+// fixed list.
+// ---------------------------------------------------------------------------
+
+const INK_MODEL_ZIP: (&str, &str) = (
+    "https://github.com/aburousan/ink2latex/releases/download/v1.0/r3-photo-onnx.zip",
+    "f5b9d15e9c259aaf65ff27075512d31f83497aa1a913e5e7e07bc033bfd2dae2",
+);
+// (name kept, member in the zip, SHA-256)
+const INK_MODEL_FILES: [(&str, &str, &str); 3] = [
+    ("encoder.onnx", "r3-photo-onnx/encoder.onnx", "6d1c9ecea0b16c166c4a5bcd6aa651d84e155de63269f2b723813f2cfe9befde"),
+    ("decoder.onnx", "r3-photo-onnx/decoder.onnx", "559be7d00c9256699eb9a9f9cafb7b0b497b02e9301998bdcc240b27b16af2f5"),
+    ("vocab.json", "r3-photo-onnx/vocab.json", "5bb5b43c9c92bc72028a50f8f5a02aad637d0803ee21eec45b8f9e1820696577"),
+];
+// (name kept, address, SHA-256)
+const INK_RUNTIME_FILES: [(&str, &str, &str); 3] = [
+    ("ort.wasm.min.js", "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.js", "65e09376df69107e881b5c34d2d37aed333a366b6d941073ec518168e269b87d"),
+    ("ort-wasm-simd-threaded.mjs", "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort-wasm-simd-threaded.mjs", "30dd851d9c00622940500f71ddd2ff8820c5cb65270816080175b958705385a8"),
+    ("ort-wasm-simd-threaded.wasm", "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort-wasm-simd-threaded.wasm", "71aef04959c5c1b6de461b6538e2058e306610034a85aad2742d0c7fd4533fe4"),
+];
+// What the download weighs, for the question before it starts.
+const INK_DOWNLOAD_BYTES: u64 = 36_696_521 + 48_327 + 20_856 + 11_210_254;
+static INK_INSTALLING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn ink_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("HILBERT_INK_DIR") {
+        return PathBuf::from(p);
+    }
+    hilbert_config_dir().join("ink2latex")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn ink_expected(name: &str) -> Option<&'static str> {
+    INK_MODEL_FILES.iter().map(|(n, _, h)| (*n, *h))
+        .chain(INK_RUNTIME_FILES.iter().map(|(n, _, h)| (*n, *h)))
+        .find(|(n, _)| *n == name)
+        .map(|(_, h)| h)
+}
+
+// Installed means every file is there with the right contents.
+fn ink_installed() -> bool {
+    let dir = ink_dir();
+    INK_MODEL_FILES.iter().map(|(n, _, _)| *n).chain(INK_RUNTIME_FILES.iter().map(|(n, _, _)| *n))
+        .all(|name| fs::read(dir.join(name)).is_ok_and(|bytes| Some(sha256_hex(&bytes).as_str()) == ink_expected(name)))
+}
+
+async fn ink_status(State(st): St) -> Response {
+    Json(json!({
+        "installed": ink_installed(),
+        "downloadBytes": INK_DOWNLOAD_BYTES,
+        "canInstall": !st.remote_mode(),
+        "model": "ink2latex r3-photo by Kazi Abu Rousan",
+        "weightsLicense": "CC BY-NC-SA 4.0 (trained on MathWriting, Gervais et al. 2024, Google Research)",
+        "source": "https://github.com/aburousan/ink2latex",
+    })).into_response()
+}
+
+async fn ink_fetch(st: &AppState, url: &str, limit: usize) -> Result<Vec<u8>, String> {
+    let response = st.http.get(url).timeout(Duration::from_secs(600)).send().await.map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("{url} answered {}", response.status()));
+    }
+    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+    if bytes.len() > limit {
+        return Err(format!("{url} sent more than expected"));
+    }
+    Ok(bytes.to_vec())
+}
+
+async fn ink_install(State(st): St) -> Response {
+    // On a hosted server the download would land on the server for everyone;
+    // whoever runs it installs the model from the desktop app.
+    if st.remote_mode() {
+        return json_err(StatusCode::FORBIDDEN, "The handwriting model is installed from the desktop app, not from a browser.");
+    }
+    let Ok(_one_at_a_time) = INK_INSTALLING.try_lock() else {
+        return json_err(StatusCode::CONFLICT, "The handwriting model is already being downloaded.");
+    };
+    if ink_installed() {
+        return Json(json!({ "ok": true })).into_response();
+    }
+    let mut files: Vec<(&str, Vec<u8>)> = Vec::new();
+    // The model, from the ink2latex release, checked whole and then file by file.
+    let zip_bytes = match ink_fetch(&st, INK_MODEL_ZIP.0, 64 << 20).await {
+        Ok(b) => b,
+        Err(e) => return json_err(StatusCode::BAD_GATEWAY, format!("Could not download the handwriting model: {e}")),
+    };
+    if sha256_hex(&zip_bytes) != INK_MODEL_ZIP.1 {
+        return json_err(StatusCode::BAD_GATEWAY, "The downloaded handwriting model is not the expected file, so it was not used.");
+    }
+    let extracted = tokio::task::spawn_blocking(move || -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+        use std::io::Read as _;
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for (name, member, hash) in INK_MODEL_FILES {
+            let mut entry = archive.by_name(member).map_err(|_| format!("{member} is missing from the model"))?;
+            let mut bytes = Vec::new();
+            entry.by_ref().take(64 << 20).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+            if sha256_hex(&bytes) != hash {
+                return Err(format!("{name} in the model is not the expected file"));
+            }
+            out.push((name, bytes));
+        }
+        Ok(out)
+    }).await.unwrap_or_else(|e| Err(e.to_string()));
+    match extracted {
+        Ok(model) => files.extend(model),
+        Err(e) => return json_err(StatusCode::BAD_GATEWAY, format!("Could not unpack the handwriting model: {e}")),
+    }
+    // The runtime that runs it in the page.
+    for (name, url, hash) in INK_RUNTIME_FILES {
+        match ink_fetch(&st, url, 32 << 20).await {
+            Ok(bytes) if sha256_hex(&bytes) == hash => files.push((name, bytes)),
+            Ok(_) => return json_err(StatusCode::BAD_GATEWAY, format!("The downloaded {name} is not the expected file, so it was not used.")),
+            Err(e) => return json_err(StatusCode::BAD_GATEWAY, format!("Could not download {name}: {e}")),
+        }
+    }
+    let dir = ink_dir();
+    if let Err(e) = fs::create_dir_all(&dir) {
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+    for (name, bytes) in &files {
+        if let Err(e) = write_atomic(&dir.join(name), bytes) {
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not save {name}: {e}"));
+        }
+    }
+    Json(json!({ "ok": ink_installed() })).into_response()
+}
+
+async fn ink_remove(State(st): St) -> Response {
+    if st.remote_mode() {
+        return json_err(StatusCode::FORBIDDEN, "The handwriting model is managed from the desktop app.");
+    }
+    for name in INK_MODEL_FILES.iter().map(|(n, _, _)| *n).chain(INK_RUNTIME_FILES.iter().map(|(n, _, _)| *n)) {
+        let _ = fs::remove_file(ink_dir().join(name));
+    }
+    let _ = fs::remove_dir(ink_dir());
+    Json(json!({ "ok": true })).into_response()
+}
+
+async fn ink_file(axum::extract::Path(name): axum::extract::Path<String>) -> Response {
+    let Some(_) = ink_expected(&name) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mime = match name.rsplit('.').next() {
+        Some("wasm") => "application/wasm",
+        Some("js") | Some("mjs") => "text/javascript",
+        Some("json") => "application/json",
+        _ => "application/octet-stream",
+    };
+    match fs::read(ink_dir().join(&name)) {
+        Ok(bytes) => ([(header::CONTENT_TYPE, mime), (header::CACHE_CONTROL, "no-cache")], bytes).into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 async fn packages_download(State(_st): St, body: Bytes) -> Response {
     let v = parse_json(&body);
     let name = jstr(&v, "name").unwrap_or("");
@@ -8749,6 +8915,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/packages", get(packages_search))
         .route("/packages/installed", get(packages_installed))
         .route("/packages/download", post(packages_download))
+        .route("/ink/status", get(ink_status))
+        .route("/ink/install", post(ink_install))
+        .route("/ink/remove", post(ink_remove))
+        .route("/ink/file/{name}", get(ink_file))
         .route("/packages/remove", post(packages_remove))
         .route("/git/status", get(git_status))
         .route("/git/init", post(git_init))

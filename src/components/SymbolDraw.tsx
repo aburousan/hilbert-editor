@@ -1,9 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
+import { InkReader, inkStatus } from '../ink/reader';
+import { symbolGlyph, symbolToTypst } from '../ink/ink2typst';
 
 // ---------------------------------------------------------------------------
 // Draw a maths/physics symbol with the mouse/trackpad and get the Typst code.
 //
-// Fully offline, no trained model. Each glyph is rendered and reduced two ways:
+// Fully offline. When the ink2latex handwriting model has been downloaded
+// (Write Maths by Hand), its guesses are listed first; the matcher below always
+// works without it. Each glyph is rendered and reduced two ways:
 // (1) a blurred 32×32 ink map (area overlap), and (2) its 1-pixel *skeleton*
 // (Zhang–Suen thinning) as a normalized point cloud. A drawing is matched with a
 // blend of cosine similarity on (1) and the $P greedy-cloud recognizer on (2) —
@@ -371,6 +375,29 @@ export default function SymbolDraw({ onClose, onInsert }: { onClose: () => void;
   const [ready, setReady] = useState(false);
   const resultsRef = useRef(results);
   resultsRef.current = results;
+  // With the handwriting model installed (Write Maths by Hand downloads it),
+  // its guesses come first and the template matcher fills in after them.
+  // Without it nothing changes: nothing is downloaded from here.
+  const readerRef = useRef<InkReader | null>(null);
+  const [model, setModel] = useState<'none' | 'loading' | 'on'>('none');
+  const revisionRef = useRef(0);
+
+  useEffect(() => {
+    let active = true;
+    void inkStatus().then(async status => {
+      if (!active || !status?.installed) return;
+      setModel('loading');
+      try {
+        const reader = await InkReader.open();
+        if (!active) { void reader.close(); return; }
+        readerRef.current = reader;
+        setModel('on');
+        recognize();
+      } catch { if (active) setModel('none'); }
+    });
+    return () => { active = false; void readerRef.current?.close(); readerRef.current = null; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -424,6 +451,7 @@ export default function SymbolDraw({ onClose, onInsert }: { onClose: () => void;
     e.preventDefault();
     drawingRef.current = true;
     pointerRef.current = e.pointerId;
+    revisionRef.current++;
     setResults([]);
     strokesRef.current.push([pos(e)]);
     try { canvasRef.current?.setPointerCapture(e.pointerId); } catch { /* ignore */ }
@@ -483,11 +511,25 @@ export default function SymbolDraw({ onClose, onInsert }: { onClose: () => void;
     scored.sort((a, b) => b.score - a.score);
     // A symbol can have several template variants (font + hand-drawn) — show it once.
     const seen = new Set<string>();
-    setResults(scored.filter(r => !seen.has(r.name) && seen.add(r.name)).slice(0, 10));
+    const matched = scored.filter(r => !seen.has(r.name) && seen.add(r.name)).slice(0, 10);
+    setResults(matched);
+    const reader = readerRef.current;
+    if (!reader) return;
+    const revision = ++revisionRef.current;
+    const strokes = strokesRef.current.map(s => s.map(p => [p.x, p.y] as [number, number]));
+    void reader.rankSymbol(strokes, 8).then(ranked => {
+      if (revision !== revisionRef.current || !strokesRef.current.length) return;
+      const guesses = ranked
+        .filter((r, i) => i < 3 || r.p > 0.02)
+        .map(r => ({ name: symbolToTypst(r.token), ch: symbolGlyph(r.token), score: r.p }))
+        .filter((r): r is { name: string; ch: string; score: number } => r.name !== null);
+      const glyphs = new Set(guesses.map(r => r.ch));
+      setResults([...guesses, ...matched.filter(r => !glyphs.has(r.ch))].slice(0, 10));
+    }).catch(() => {});
   };
 
-  const clear = () => { drawingRef.current = false; pointerRef.current = null; strokesRef.current = []; setResults([]); redraw(); };
-  const undo = () => { strokesRef.current.pop(); redraw(); strokesRef.current.length ? recognize() : setResults([]); };
+  const clear = () => { revisionRef.current++; drawingRef.current = false; pointerRef.current = null; strokesRef.current = []; setResults([]); redraw(); };
+  const undo = () => { revisionRef.current++; strokesRef.current.pop(); redraw(); strokesRef.current.length ? recognize() : setResults([]); };
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -515,6 +557,8 @@ export default function SymbolDraw({ onClose, onInsert }: { onClose: () => void;
                 <button className="btn-ghost" onClick={clear}>Clear</button>
                 <button className="btn-ghost" onClick={undo} title="Remove the last stroke (Backspace)">Undo stroke</button>
                 {!ready && <span className="form-hint" style={{ margin: 0 }}>Preparing recognizer…</span>}
+                {ready && model === 'loading' && <span className="form-hint" style={{ margin: 0 }}>Starting the handwriting model…</span>}
+                {ready && model === 'on' && <span className="form-hint" style={{ margin: 0 }} title="ink2latex by Kazi Abu Rousan; weights CC BY-NC-SA 4.0, trained on MathWriting">Handwriting model on</span>}
               </div>
               <div className="form-hint" style={{ marginTop: 6 }}>Enter inserts the top match · 1–9 pick another</div>
             </div>
