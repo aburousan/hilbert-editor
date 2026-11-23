@@ -816,22 +816,45 @@ fn arg_value(flag: &str) -> Option<String> {
     None
 }
 
-// WebKitGTK draws into a buffer it hands to the compositor over DMA-BUF. On a
-// good number of Linux setups that handoff quietly produces nothing at all and
-// the window comes up black — no error, no warning, the app otherwise running
-// fine underneath. NVIDIA's driver, nouveau, virtual machines and remote
-// desktops are the usual ones; confirmed here on a Quadro P400 on nouveau,
-// black every time until this is set and correct every time after.
+// WebKitGTK draws into a buffer it hands to the compositor over DMA-BUF. On
+// some Linux setups that handoff quietly produces nothing at all and the window
+// comes up black — no error, no warning, the app otherwise running fine
+// underneath. Confirmed here on a Quadro P400 on nouveau, black every time
+// until WEBKIT_DISABLE_DMABUF_RENDERER=1 is set and correct every time after;
+// NVIDIA's own driver, virtual machines and remote desktops are the other usual
+// ones (Tauri's Linux graphics notes name NVIDIA first).
 //
-// The older path it falls back to costs a little compositing performance and
-// nothing else, so the only machines that lose anything are the ones where the
-// fast path already worked. Leave it overridable for them.
+// That older path draws every frame on the CPU, though. Set for everyone, it
+// held a 3440x1440 screen on KDE Wayland with an RTX 2060 and WebKitGTK 2.54 to
+// about 14 frames a second, typing and scrolling both lagging, and the
+// reporter's WEBKIT_DISABLE_DMABUF_RENDERER=0 fixed it at once (issue #46).
+// So it is used only where a black window is likely (see dmabuf_risky), and
+// Settings → GPU drawing, or HILBERT_SOFTWARE_RENDERING=0 / =1, decides it
+// either way. A WEBKIT_DISABLE_DMABUF_RENDERER already set is always obeyed.
 #[cfg(target_os = "linux")]
 fn avoid_blank_webkit_window() {
-    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
-        // The first line of main, before there is a second thread to read it.
-        unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1") };
+    let forced = std::env::var("HILBERT_SOFTWARE_RENDERING").ok();
+    let choice = server::linux_gpu_drawing();
+    let drivers = gpu_drivers();
+    let risky = dmabuf_risky(&drivers);
+    let reason;
+    if let Some(value) = std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER") {
+        reason = format!("WEBKIT_DISABLE_DMABUF_RENDERER={} set outside Hilbert", value.to_string_lossy());
+    } else {
+        let off = match (forced.as_deref(), choice.as_str()) {
+            (Some("1"), _) => { reason = "off: HILBERT_SOFTWARE_RENDERING=1".to_string(); true }
+            (Some("0"), _) => { reason = "on: HILBERT_SOFTWARE_RENDERING=0".to_string(); false }
+            (_, "off") => { reason = "off: chosen in Settings".to_string(); true }
+            (_, "on") => { reason = "on: chosen in Settings".to_string(); false }
+            _ => { reason = format!("{}: automatic", if risky { "off" } else { "on" }); risky }
+        };
+        if off {
+            // The first line of main, before there is a second thread to read it.
+            unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1") };
+        }
     }
+    let shown = if drivers.is_empty() { "none found".to_string() } else { drivers.join(", ") };
+    server::set_graphics_note(format!("GPU drawing (DMA-BUF) {reason}; GPU drivers: {shown}"));
     // Without a GPU WebKit still composites the page in layers, only in
     // software, and every frame then costs far more than drawing it plainly.
     // Measured on an i5 laptop with no GPU in reach: turning compositing off cut
@@ -842,6 +865,34 @@ fn avoid_blank_webkit_window() {
     if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() && !gpu_in_reach() {
         unsafe { std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1") };
     }
+}
+
+// The kernel drivers behind this machine's display devices (nouveau, nvidia,
+// i915, amdgpu, virtio_gpu...), from /sys/class/drm.
+#[cfg(target_os = "linux")]
+fn gpu_drivers() -> Vec<String> {
+    let mut found: Vec<String> = fs::read_dir("/sys/class/drm")
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| fs::read_link(e.path().join("device/driver")).ok())
+                .filter_map(|link| link.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort();
+    found.dedup();
+    found
+}
+
+// Where the DMA-BUF handoff is known to come up black: nouveau (seen here),
+// NVIDIA's own driver, virtual and remote displays, and no GPU at all. A
+// laptop with both Intel and NVIDIA counts as NVIDIA. Intel and AMD on Mesa
+// keep the fast path.
+#[cfg(target_os = "linux")]
+fn dmabuf_risky(drivers: &[String]) -> bool {
+    const RISKY: [&str; 10] = ["nouveau", "nvidia", "virtio_gpu", "virtio-pci", "vmwgfx", "qxl", "bochs-drm", "cirrus", "vboxvideo", "hyperv_drm"];
+    !gpu_in_reach() || drivers.iter().any(|d| RISKY.contains(&d.as_str()) || d.starts_with("nvidia"))
 }
 
 #[cfg(target_os = "linux")]

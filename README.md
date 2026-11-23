@@ -276,9 +276,14 @@ the port on a network, read the hosted-workspace section of
 - **It sits on "Compiling…" and won't finish.** Past a few seconds the status bar says
   *still waiting on Typst*; saving still works meanwhile. Recompile to start over, and
   **Help → Copy Diagnostics** records every line `typst watch` emitted.
-- **Typing feels slow on Linux.** Usually WebKit has no GPU to draw with, as in a
-  virtual machine, over `ssh -X`, or without graphics drivers. Hilbert switches to plain
-  drawing when it can tell; if it can't, start it with `HILBERT_SOFTWARE_RENDERING=1`.
+- **Typing and scrolling lag on Linux.** On NVIDIA, nouveau and virtual machines
+  Hilbert draws without the GPU by default, because there WebKit's GPU path can leave
+  the window black. If your window is slow rather than black, set **Settings → GPU
+  drawing** to **On** and restart (or start Hilbert with `HILBERT_SOFTWARE_RENDERING=0`).
+  If a window comes up black, start it with `HILBERT_SOFTWARE_RENDERING=1` and set
+  GPU drawing back to **Off**. With no GPU at all (a virtual machine, `ssh -X`, no
+  graphics drivers) Hilbert switches to plain drawing by itself. **Help → Copy
+  Diagnostics** shows which way it went, on its `graphics:` line.
 - **A template fails with an error inside `@preview/…`.** A package compatibility
   problem, not the editor: some Typst Universe templates pull in helper packages
   written for an older Typst. Your own document is fine.

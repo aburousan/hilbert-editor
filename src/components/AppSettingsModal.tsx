@@ -61,13 +61,14 @@ type SettingsProps = {
   compileDelay: number, onCompileDelay: (n: number) => void,
   historyInterval: number, onHistoryInterval: (n: number) => void,
   hideTitleBar: boolean, onHideTitleBar: (on: boolean) => void,
+  gpuDrawing: 'auto' | 'on' | 'off', onGpuDrawing: (v: 'auto' | 'on' | 'off') => void,
 };
 
 // The desktop app on Linux: the only place the title-bar choice means anything.
 const LINUX_APP = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
   && /Linux/.test(navigator.userAgent) && !/Android/.test(navigator.userAgent);
 
-export default function AppSettingsModal({ onClose, initialTab, initialSearch, onDictionaryChange, theme, onTheme, fontSize, onFontSize, textDirection, onTextDirection, compileDelay, onCompileDelay, historyInterval, onHistoryInterval, hideTitleBar, onHideTitleBar }: SettingsProps) {
+export default function AppSettingsModal({ onClose, initialTab, initialSearch, onDictionaryChange, theme, onTheme, fontSize, onFontSize, textDirection, onTextDirection, compileDelay, onCompileDelay, historyInterval, onHistoryInterval, hideTitleBar, onHideTitleBar, gpuDrawing, onGpuDrawing }: SettingsProps) {
   const saveKeys = keys('⌘S');
   const [activeTab, setActiveTab] = useState<'general' | 'spelling' | 'interpreters' | 'git' | 'cloud'>(initialTab || 'general');
   const [tools, setTools] = useState<Tools | null>(null);
@@ -364,6 +365,22 @@ export default function AppSettingsModal({ onClose, initialTab, initialSearch, o
                         For tiling window managers such as sway, which draw no title bar of their own. Your window manager
                         then moves and resizes the window. Takes effect the next time Hilbert starts.
                       </span>
+                    </span>
+                  </label>
+                )}
+                {LINUX_APP && (
+                  <label style={labelStyle}>
+                    GPU drawing
+                    <select style={inputStyle} value={gpuDrawing} onChange={e => onGpuDrawing(e.target.value as 'auto' | 'on' | 'off')}>
+                      <option value="auto">Automatic</option>
+                      <option value="on">On (fast)</option>
+                      <option value="off">Off (safe)</option>
+                    </select>
+                    <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                      On draws the window with the GPU and is much smoother. Automatic turns it off on NVIDIA, nouveau and
+                      virtual machines, where it can leave the window black; if typing and scrolling lag there, try On.
+                      If the window then comes up black, start Hilbert with HILBERT_SOFTWARE_RENDERING=1 and set this back.
+                      Takes effect the next time Hilbert starts.
                     </span>
                   </label>
                 )}

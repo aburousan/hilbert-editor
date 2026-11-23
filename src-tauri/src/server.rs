@@ -7536,6 +7536,9 @@ async fn diagnostics(State(st): St) -> Response {
         None => lines.push("tinymist:  not found".into()),
     }
     lines.push(format!("PATH:      {}", std::env::var("PATH").unwrap_or_default()));
+    if let Some(note) = GRAPHICS_NOTE.get() {
+        lines.push(format!("graphics:  {note}"));
+    }
     lines.push(String::new());
     lines.push(recent_log());
     ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], lines.join("\n")).into_response()
@@ -8775,6 +8778,25 @@ pub fn linux_title_bar_hidden() -> bool {
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|settings| settings.get("linuxHideTitleBar").and_then(Value::as_bool))
         .unwrap_or(false)
+}
+
+// Settings → GPU drawing (issue #46): "auto" (the default), "on" or "off".
+// Read once at startup, before WebKit starts, so it applies on the next start.
+#[cfg(target_os = "linux")]
+pub fn linux_gpu_drawing() -> String {
+    fs::read_to_string(settings_file())
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|settings| settings.get("linuxGpuDrawing").and_then(Value::as_str).map(str::to_string))
+        .filter(|v| v == "on" || v == "off")
+        .unwrap_or_else(|| "auto".to_string())
+}
+
+// What startup decided about WebKit's drawing, for the diagnostics.
+static GRAPHICS_NOTE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+#[cfg(target_os = "linux")]
+pub fn set_graphics_note(note: String) {
+    let _ = GRAPHICS_NOTE.set(note);
 }
 
 async fn settings_get() -> Response {

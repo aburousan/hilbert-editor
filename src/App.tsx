@@ -669,6 +669,7 @@ export default function App() {
   const [historyInterval, setHistoryInterval] = useState<number>(0);
   const [errorsCompiledFrom, setErrorsCompiledFrom] = useState<Record<string, string>>({});
   const [hideTitleBar, setHideTitleBar] = useState(false);
+  const [gpuDrawing, setGpuDrawing] = useState<'auto' | 'on' | 'off'>('auto');
   const [compileDelay, setCompileDelay] = useState<number>(() => {
     const saved = Number(localStorage.getItem('compile_delay'));
     // Move former defaults to the faster value once. After migration, every
@@ -1645,6 +1646,7 @@ export default function App() {
         if (delay !== null) setCompileDelay(delay);
         if (HISTORY_INTERVALS.includes(saved.historyInterval)) setHistoryInterval(saved.historyInterval);
         if (typeof saved.linuxHideTitleBar === 'boolean') setHideTitleBar(saved.linuxHideTitleBar);
+        if (['auto', 'on', 'off'].includes(saved.linuxGpuDrawing)) setGpuDrawing(saved.linuxGpuDrawing);
         if (saved.panels && typeof saved.panels === 'object') setPanels(p => ({ ...p, ...saved.panels }));
         // Sizes are clamped on the way back in as well as while dragging: a file
         // written by a bigger screen shouldn't be able to push the preview off
@@ -1698,10 +1700,11 @@ export default function App() {
           plotFormat: getPlotFormat(),
           ...(IS_NATIVE_APP ? { toolbarHidden: hiddenToolbarTools } : {}),
           linuxHideTitleBar: hideTitleBar,
+          linuxGpuDrawing: gpuDrawing,
         }),
       }).catch(() => {});
     }, 400);
-  }, [settingsLoaded, prefsRevision, editorFontSize, editorTextDir, theme, compileDelay, historyInterval, panels, sidebarWidth, editorWidth, treeHeight, problemsHeight, hiddenToolbarTools, hideTitleBar]);
+  }, [settingsLoaded, prefsRevision, editorFontSize, editorTextDir, theme, compileDelay, historyInterval, panels, sidebarWidth, editorWidth, treeHeight, problemsHeight, hiddenToolbarTools, hideTitleBar, gpuDrawing]);
 
   // Interpreter choices are made in two different dialogs and land in
   // localStorage rather than in this component's state, so nothing above would
@@ -8602,7 +8605,8 @@ ${byline ? `
         textDirection={editorTextDir} onTextDirection={setEditorTextDir}
         compileDelay={compileDelay} onCompileDelay={setCompileDelay}
         historyInterval={historyInterval} onHistoryInterval={setHistoryInterval}
-        hideTitleBar={hideTitleBar} onHideTitleBar={setHideTitleBar} /></Suspense>}
+        hideTitleBar={hideTitleBar} onHideTitleBar={setHideTitleBar}
+        gpuDrawing={gpuDrawing} onGpuDrawing={setGpuDrawing} /></Suspense>}
       {showLabelGraph && <Suspense fallback={null}><LabelGraph
         mainFile={currentMain}
         onClose={() => setShowLabelGraph(false)}
