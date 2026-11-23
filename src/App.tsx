@@ -8557,6 +8557,10 @@ ${byline ? `
             <div className="about-version">An offline editor for Typst · Unofficial</div>
             <div className="about-version">Version {__APP_VERSION__}</div>
             <div className="about-author">Created by <a href="https://rousan.netlify.app/" target="_blank" rel="noreferrer" style={{ color: 'inherit', fontWeight: 600, textDecoration: 'underline', textDecorationColor: 'var(--accent)' }}>Kazi Abu Rousan</a></div>
+            <div className="about-other-app">
+              Also by him: <a href="https://play.google.com/store/apps/details?id=in.rousan.spandita" target="_blank" rel="noreferrer">SpanNote</a>, handwritten notes on a tablet
+              <span className="about-badge">Android only</span>
+            </div>
             {/* Two routes, because one of them does not work from India: Indian
                 cards are routinely refused by international card processors, so
                 Sponsors fails for the people most likely to be reading this. */}

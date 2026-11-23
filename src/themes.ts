@@ -10,7 +10,8 @@ export type ThemeId =
   | 'typst-midnight'
   | 'typst-contrast'
   | 'typst-cosmos'
-  | 'typst-puja';
+  | 'typst-puja'
+  | 'typst-christmas';
 
 export interface ThemeInfo {
   id: ThemeId;
@@ -29,6 +30,7 @@ export const THEMES: ThemeInfo[] = [
   { id: 'typst-contrast', label: 'High Contrast', note: 'Maximum legibility over subtlety', dark: true },
   { id: 'typst-cosmos', label: 'Cosmos', note: 'The cosmic microwave background behind your work', dark: true },
   { id: 'typst-puja', label: 'Puja', note: 'Kash flowers in an autumn dusk, for Durga Puja', dark: true },
+  { id: 'typst-christmas', label: 'Christmas', note: 'A small lit tree in a cold, dark house, and frosted buttons', dark: true },
 ];
 
 export const DEFAULT_THEME: ThemeId = 'typst-dark';

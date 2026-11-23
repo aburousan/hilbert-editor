@@ -317,6 +317,24 @@ export function setupTypstLanguage(monacoInstance: any) {
       'editorHoverWidget.statusBarBackground': '#221c11',
     });
 
+    // Christmas: the dark syntax colours on cold blue glass, the lit tree faint behind.
+    variant('typst-christmas', 'vs-dark', DARK_RULES, {
+      'editor.background': '#101e3488',
+      'editorGutter.background': '#101e3488',
+      'editor.foreground': '#eef5ff',
+      'editorLineNumber.foreground': '#6f87ab',
+      'editorLineNumber.activeForeground': '#c4d6ee',
+      'editor.lineHighlightBackground': '#d2e6ff0d',
+      'editor.selectionBackground': '#f1c36a40',
+      'editorCursor.foreground': '#f1c36a',
+      'editorIndentGuide.background1': '#1e2a40',
+      'editorBracketMatch.border': '#f1c36a',
+      'editorHoverWidget.background': '#1a2b47',
+      'editorHoverWidget.border': '#3b5478',
+      'editorHoverWidget.foreground': '#eef5ff',
+      'editorHoverWidget.statusBarBackground': '#15233b',
+    });
+
     // Deliberately not the dark rules: several of them are mid-tone pastels that
     // are exactly what this theme exists to avoid.
     variant('typst-contrast', 'vs-dark', [

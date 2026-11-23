@@ -203,6 +203,90 @@
 :root[data-theme="puja"] .preview-pane { background-color: transparent; }
 :root[data-theme="puja"] .pdf-scroll { background: rgba(22, 18, 10, 0.28); }
 
+/* Christmas: from a dark hallway, a bare room with snow at the window and one
+   small tree lit far off, the only warm thing in it. Cold, with a little hope.
+   Painted by scripts/make-christmas-theme.py, not taken from a photograph.
+   Frosted blue glass, icy text, and candlelight for the accent. */
+:root[data-theme="christmas"] {
+  /* Icy blue glass: light enough for the frozen window to show, dark enough that
+     text over the bright frost at the edges stays well above 5 to 1. */
+  --bg-color: rgba(16, 30, 52, 0.62);
+  --panel-bg: rgba(18, 32, 56, 0.70);
+  --panel-lighter: rgba(40, 62, 98, 0.78);
+  --panel-elevated: #1a2b47;
+  --text-main: #eef5ff;
+  --text-muted: #b2c6e2;
+  --text-faint: #7d93b4;
+  --accent: #f3c66e;
+  --accent-color: #f3c66e;
+  --accent-hover: #f8d894;
+  --accent-soft: rgba(243, 198, 110, 0.16);
+  --accent-line: rgba(243, 198, 110, 0.5);
+  --border-color: rgba(205, 230, 255, 0.26);
+  --border-soft: rgba(205, 230, 255, 0.14);
+  --hover-color: rgba(215, 235, 255, 0.12);
+  --header-top: rgba(22, 38, 64, 0.74);
+  --on-accent: #1a1406;
+  --error-bg: #6d1c1c;
+  --error-text: #fecaca;
+  --shadow-lg: 0 20px 44px -14px rgba(0, 10, 30, 0.75), 0 6px 16px -8px rgba(0, 10, 30, 0.6);
+  /* Frost: a fine grain of ice, a tiny SVG noise tile drawn once and repeated. */
+  --frost-grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='96' height='96'%3E%3Cfilter id='f'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='1.3' numOctaves='2' seed='12'/%3E%3CfeColorMatrix values='0 0 0 0 0.9 0 0 0 0 0.95 0 0 0 0 1 0 0 0 1.4 -0.8'/%3E%3C/filter%3E%3Crect width='96' height='96' filter='url(%23f)' opacity='0.35'/%3E%3C/svg%3E");
+  color-scheme: dark;
+}
+:root[data-theme="christmas"] body {
+  background-color: #0b0e16;
+  background-image: url("/themes/christmas-1080.webp");
+  background-image: -webkit-image-set(url("/themes/christmas-1080.webp") 1x, url("/themes/christmas.webp") 2x);
+  background-image: image-set(url("/themes/christmas-1080.webp") 1x, url("/themes/christmas.webp") 2x);
+  background-size: cover;
+  background-position: 35% center;
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+}
+:root[data-theme="christmas"] .preview-pane { background-color: transparent; }
+:root[data-theme="christmas"] .pdf-scroll { background: rgba(8, 11, 19, 0.30); }
+
+/* Frosted buttons. No live blur behind each one (fifty of them would cost every
+   frame, worst on Linux without GPU drawing): clear pale ice with a bright rim
+   and a grain of frost, the same in every engine. Hovered, a little candlelight. */
+:root[data-theme="christmas"] .tool-btn,
+:root[data-theme="christmas"] .btn-ghost,
+:root[data-theme="christmas"] .btn-share,
+:root[data-theme="christmas"] .seg button:not(.active) {
+  background-color: rgba(195, 222, 255, 0.13);
+  background-image: var(--frost-grain), linear-gradient(180deg, rgba(240, 248, 255, 0.22), rgba(170, 205, 245, 0.06) 55%, rgba(150, 190, 240, 0.10));
+  border: 1px solid rgba(215, 236, 255, 0.34);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), inset 0 -1px 2px rgba(120, 165, 220, 0.18), 0 1px 3px rgba(0, 10, 30, 0.25);
+  color: #f2f8ff;
+}
+:root[data-theme="christmas"] .tool-btn:not(:disabled):hover,
+:root[data-theme="christmas"] .btn-ghost:hover,
+:root[data-theme="christmas"] .btn-share:hover,
+:root[data-theme="christmas"] .seg button:not(.active):hover {
+  background-color: rgba(215, 235, 255, 0.24);
+  border-color: rgba(235, 246, 255, 0.55);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5), 0 0 14px -2px rgba(243, 198, 110, 0.45);
+  color: #ffffff;
+}
+/* Frosted rims on the big panes: a bright top edge, like ice catching light. */
+:root[data-theme="christmas"] .modal-content,
+:root[data-theme="christmas"] .dropdown-menu {
+  border-color: rgba(215, 236, 255, 0.35);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), var(--shadow-lg);
+}
+:root[data-theme="christmas"] .btn-primary,
+:root[data-theme="christmas"] .tool-btn.primary,
+:root[data-theme="christmas"] .seg button.active {
+  background-image: var(--frost-grain), linear-gradient(180deg, #f8dc9c 0%, #e9b558 100%);
+  border: 1px solid rgba(255, 240, 205, 0.55);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45), 0 0 14px -4px rgba(241, 195, 106, 0.55);
+  color: var(--on-accent);
+}
+:root[data-theme="christmas"] .btn-primary:disabled { box-shadow: none; }
+/* Dialogs stay solid: reading them matters more than seeing past them. */
+:root[data-theme="christmas"] .modal-content { background-color: var(--panel-elevated); }
+
 /* Everything here is decided by contrast rather than taste: pure black, white
    text, borders that are actually visible, and an accent bright enough to carry
    dark text on it. It is meant to be legible first and handsome second. */
@@ -849,6 +933,13 @@ body {
 }
 .about-author { font-size: 0.9rem; color: var(--text-main); }
 .about-author b { font-weight: 600; }
+.about-other-app { margin-top: 6px; font-size: 0.82rem; color: var(--text-muted); }
+.about-other-app a { color: var(--accent-hover); font-weight: 600; text-decoration: none; }
+.about-other-app a:hover { text-decoration: underline; }
+.about-badge {
+  margin-left: 6px; padding: 1px 7px; border-radius: 999px; font-size: 0.72rem;
+  border: 1px solid var(--accent-line); color: var(--text-main); white-space: nowrap;
+}
 .about-links {
   display: flex;
   justify-content: center;
