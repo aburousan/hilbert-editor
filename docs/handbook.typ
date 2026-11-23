@@ -1521,7 +1521,7 @@ On Windows and Linux, read #kbd("⌘") as #kbd("Ctrl").
   [#kbd("⌘⇧N")], [Toggle numbering at the cursor],
   [#kbd("⌘⇧M")], [Matrix Studio],
   [#kbd("⌘⇧P")], [Maths and physics symbols],
-  [#kbd("⌘⇧Y")], [Draw a symbol],
+  [#kbd("⌘⇧Y")], [Write maths by hand],
   [#kbd("⌘⇧U")], [Compute selection — simplify, solve, integrate],
   [#kbd("⌘⇧H")], [Full-width horizontal line],
   [#kbd("⌘⇧B")], [Code block],
@@ -1568,7 +1568,7 @@ On Windows and Linux, read #kbd("⌘") as #kbd("Ctrl").
   [Numbered Equation], [Equation Templates], [Insert Physics — physica],
   [Matrix Studio], [Matrix with augmentation lines], [Conditional / Piecewise],
   [Over / Under Brace], [Cancel / Strike Term], [Maths & Physics Symbols],
-  [Draw a Symbol], [Compute Selection — simplify / solve],
+  [Write Maths by Hand], [Compute Selection — simplify / solve],
 ))
 #cat("Lists and text", (
   [Bullet List], [Numbered List], [Nested List], [Term / Definition List],

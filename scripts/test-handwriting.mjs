@@ -1,4 +1,4 @@
-// Write Maths by Hand, and the handwriting model inside Draw a Symbol.
+// Write Maths by Hand: the handwriting model, its dialog and single symbols.
 //
 //   INK_DIR=~/somewhere INK_SAMPLES=~/somewhere node scripts/test-handwriting.mjs
 //
@@ -12,7 +12,7 @@
 // Checks: nothing about the model is fetched until asked for; the page never
 // talks to any other host; the backend serves only its fixed files, signed in;
 // the app reads exactly what Python onnxruntime reads; ink drawn on the pad is
-// read, previewed by compiling, and inserted; Draw a Symbol uses the model.
+// read, previewed by compiling, and inserted; single handwritten symbols are read.
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
@@ -96,13 +96,7 @@ try {
   };
   const closeModal = async () => { await page.keyboard.press('Escape'); await sleep(300); };
 
-  // Draw a Symbol before anything is installed: the matcher alone, nothing fetched.
   if (!installedAtStart) {
-    await openInsertItem('Draw a Symbol');
-    await page.waitForSelector('.modal-content canvas');
-    await sleep(1500);
-    check('Draw a Symbol without the model fetches nothing of it', modelFetches.length === 0, modelFetches.join(' '));
-    await closeModal();
     await openInsertItem('Write Maths by Hand');
     await page.waitForFunction(() => /Download the model/.test(document.querySelector('.modal-content')?.innerText || ''), { timeout: 20000 });
     const offer = await page.evaluate(() => document.querySelector('.modal-content').innerText);
@@ -138,20 +132,50 @@ try {
     const ref = JSON.parse(readFileSync(join(samples, 'ref40.json'), 'utf8'));
     // 1. The same strokes through the app's reader and through Python onnxruntime.
     await page.addScriptTag({ content: bundle });
-    const ours = await page.evaluate(async inks => {
-      const reader = await window.__ink.InkReader.open();
+    // The model runs in a worker (issue #45); where a worker cannot start it
+    // runs on the page instead, and must read the same there.
+    const readAll = (where, inks) => page.evaluate(async (where, inks) => {
+      const reader = await window.__ink.InkReader.open(where);
       const out = [];
       for (const strokes of inks) out.push((await reader.read(strokes)).flat());
       await reader.close();
-      return out;
-    }, ref.map(r => r.strokes));
+      return { out, where: reader.where };
+    }, where, inks);
+    const { out: ours, where } = await readAll('worker', ref.map(r => r.strokes));
+    check('the model runs in a worker', where === 'worker', where);
     const same = ref.filter((r, i) => JSON.stringify(ours[i]) === JSON.stringify(r.python)).length;
     check('the app reads exactly what Python onnxruntime reads', same === ref.length, `${same}/${ref.length} the same`);
     ref.forEach((r, i) => { if (JSON.stringify(ours[i]) !== JSON.stringify(r.python)) console.log(`     #${r.index}: python ${r.python.join(' ')} | app ${ours[i].join(' ')}`); });
+    const onPage = await readAll('page', ref.slice(0, 10).map(r => r.strokes));
+    const samePage = ref.slice(0, 10).filter((r, i) => JSON.stringify(onPage.out[i]) === JSON.stringify(r.python)).length;
+    check('on the page (no worker) it reads the same', onPage.where === 'page' && samePage === 10, `${samePage}/10, ${onPage.where}`);
+
+    // While the longest ink is read, the page itself stays free for the pen:
+    // its longest task, with the model in a worker and on the page.
+    const longest = [...ref].sort((a, b) => b.strokes.flat().length - a.strokes.flat().length)[0];
+    const busy = where => page.evaluate(async (where, strokes) => {
+      const reader = await window.__ink.InkReader.open(where);
+      const tasks = [];
+      const observer = new PerformanceObserver(list => tasks.push(...list.getEntries().map(e => e.duration)));
+      observer.observe({ type: 'longtask' });
+      const start = performance.now();
+      await reader.read(strokes);
+      const took = performance.now() - start;
+      await new Promise(r => setTimeout(r, 50));
+      observer.disconnect(); await reader.close();
+      return { took, longest: Math.max(0, ...tasks), count: tasks.length };
+    }, where, longest.strokes);
+    const [inWorker, inPage] = [await busy('worker'), await busy('page')];
+    console.log(`     longest ink (${longest.strokes.flat().length} points): worker read ${Math.round(inWorker.took)} ms, longest page task ${Math.round(inWorker.longest)} ms; ` +
+      `on the page read ${Math.round(inPage.took)} ms, longest task ${Math.round(inPage.longest)} ms (${inPage.count} over 50 ms)`);
+    check('reading a long formula never holds the page up (pen input stays smooth)', inWorker.longest < 50, `longest task ${Math.round(inWorker.longest)} ms`);
 
     // 2. Drawn on the pad with the mouse: read, previewed, inserted.
     let readSame = 0, previewed = 0;
     const tried = ref.slice(0, 8);
+    // Where the pad is: it must not move as results and previews come and go (issue #45).
+    const padAt = () => page.evaluate(() => { const r = document.querySelector('.modal-content canvas').getBoundingClientRect(); return `${Math.round(r.left)},${Math.round(r.top)} ${Math.round(r.width)}x${Math.round(r.height)}`; });
+    const padPlaces = new Set([await padAt()]);
     for (const r of tried) {
       await page.evaluate(() => [...document.querySelectorAll('.modal-content button')].find(b => b.textContent === 'Clear').click());
       await draw('.modal-content canvas', r.strokes);
@@ -162,7 +186,9 @@ try {
       if (code === expected) readSame++;
       const shown = await page.waitForFunction(() => document.querySelector('.modal-content img[alt="Preview"]') || /error|compile/i.test(document.querySelector('.modal-content').innerText), { timeout: 30000 }).then(() => true).catch(() => false);
       if (shown && await page.$('.modal-content img[alt="Preview"]')) previewed++;
+      padPlaces.add(await padAt());
     }
+    check('the pad stays where it is while readings and previews change', padPlaces.size === 1, [...padPlaces].join(' | '));
     // Mouse positions are whole pixels, so a close call can go the other way.
     check('ink drawn on the pad is read as the reference reads it', readSame >= tried.length - 2, `${readSame}/${tried.length}`);
     check('every reading is previewed by compiling it', previewed === tried.length, `${previewed}/${tried.length}`);
@@ -235,31 +261,32 @@ try {
     const text = await page.evaluate(async () => (await fetch('/workspace/file?path=main.typ')).text());
     check('Insert puts it in the document as an equation, after the heading', saved && text.startsWith('= Handwriting'), JSON.stringify(text.slice(0, 160)));
 
-    // 3. Draw a Symbol with the model on: real handwritten ∫, ≤ and θ.
+    // 3. One symbol on its own (what Draw a Symbol used to do): real
+    // handwritten ∫, ≤, θ, ∇ and others, read on the same pad.
     const decode = s => s.replace(/&gt;/g, '>').replace(/&lt;/g, '<').replace(/&amp;/g, '&');
     const inks = readdirSync(join(samples, 'symbols-raw')).filter(f => f.endsWith('.inkml')).map(f => {
       const xml = readFileSync(join(samples, 'symbols-raw', f), 'utf8');
       return { label: decode(/<annotation type="label">([^<]*)</.exec(xml)[1]),
         strokes: [...xml.matchAll(/<trace[^>]*>([^<]*)<\/trace>/g)].map(m => m[1].trim().split(',').map(p => p.trim().split(/\s+/).map(Number))) };
     });
-    await openInsertItem('Draw a Symbol');
-    await page.waitForFunction(() => /Handwriting model on/.test(document.querySelector('.modal-content')?.innerText || ''), { timeout: 60000 });
-    check('Draw a Symbol starts the model when it is installed', true);
-    const want = { '\\int': 'integral', '\\le': '<=', '\\leq': '<=', '\\ge': '>=', '\\theta': 'theta', '\\sum': 'sum', '\\alpha': 'alpha',
-      '\\infty': 'infinity', '\\partial': 'partial', '\\pi': 'pi', '\\lambda': 'lambda', '\\mu': 'mu', '\\sigma': 'sigma', '\\Delta': 'Delta',
-      '\\nabla': 'nabla', '\\pm': '±', '\\times': '×', '\\in': '∈', '\\forall': '∀', '\\exists': '∃', '\\rightarrow': '->', '\\neq': '!=' };
-    let top = 0, offered = 0, tried2 = 0;
-    for (const ink of inks.filter(i => want[i.label]).slice(0, 10)) {
-      tried2++;
+    await openInsertItem('Write Maths by Hand');
+    await page.waitForSelector('.modal-content canvas', { timeout: 60000 });
+    const symbolInks = inks.filter(i => /^\\[A-Za-z]+$/.test(i.label)).slice(0, 12);
+    let symbolsRead = 0, symbolsOffered = 0;
+    for (const ink of symbolInks) {
       await page.evaluate(() => [...document.querySelectorAll('.modal-content button')].find(b => b.textContent.trim() === 'Clear').click());
       await draw('.modal-content canvas', ink.strokes, 0.7);
-      await sleep(1500);
-      const names = await page.evaluate(() => [...document.querySelectorAll('.modal-content button[title^="Insert"]')].map(b => b.title.replace(/^Insert\s+/, '')));
-      if (names[0] === want[ink.label]) top++;
-      if (names.slice(0, 5).includes(want[ink.label])) offered++;
-      console.log(`     ${ink.label.padEnd(9)} → ${names.slice(0, 4).join(', ')}`);
+      await page.waitForFunction(() => document.querySelector('.modal-content textarea')?.value.trim(), { timeout: 60000 }).catch(() => {});
+      await page.waitForFunction(() => !/Reading…/.test(document.querySelector('.modal-content').innerText), { timeout: 60000 });
+      await sleep(300);
+      const got = await page.evaluate(() => document.querySelector('.modal-content textarea').value.trim());
+      const offered = await page.evaluate(() => [...document.querySelectorAll('.modal-content button[title^="Insert  "]')].map(b => b.title.slice(8)));
+      const expected = await page.evaluate(t => window.__ink.tokensToTypst([t]), ink.label);
+      if (got === expected) symbolsRead++;
+      if (got === expected || offered.includes(expected)) symbolsOffered++;
+      console.log(`     ${ink.label.padEnd(10)} → ${got}${offered.length ? `   choices: ${offered.join(' ')}` : ''}${got === expected || offered.includes(expected) ? '' : `   (expected ${expected})`}`);
     }
-    check('Draw a Symbol with the model: right symbol among the first five', offered >= tried2 - 2, `${offered}/${tried2} (first: ${top}/${tried2})`);
+    check('a single handwritten symbol is read, or offered among the choices', symbolInks.length > 0 && symbolsOffered >= symbolInks.length - 2, `${symbolsOffered}/${symbolInks.length} (read first time: ${symbolsRead})`);
     await closeModal();
 
     // 4. Memory: the model is let go each time the pad closes. WebAssembly

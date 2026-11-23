@@ -31,7 +31,8 @@ export const TOOLBAR_GROUPS = [
       { id: 'center', label: 'Center selection' },
       { id: 'matrix', label: 'Matrix editor', shortcut: 'Ctrl/⌘ Shift M' },
       { id: 'symbols', label: 'Greek & physics symbols', shortcut: 'Ctrl/⌘ Shift P' },
-      { id: 'draw-symbol', label: 'Draw symbol' },
+      // (The id stays from Draw a Symbol, so toolbars people arranged keep it.)
+      { id: 'draw-symbol', label: 'Write maths by hand', shortcut: 'Ctrl/⌘ Shift Y' },
     ],
   },
   {

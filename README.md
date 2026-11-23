@@ -318,7 +318,7 @@ MIT; see [LICENSE](LICENSE). Built and maintained by
 [quiver](https://github.com/varkor/quiver) (MIT, © varkor) with
 [KaTeX](https://katex.org/) (MIT) under `public/quiver/`.
 
-Handwriting (Insert → Write Maths by Hand, and Draw a Symbol) uses
+Handwriting (Insert → Write Maths by Hand) uses
 [ink2latex](https://github.com/aburousan/ink2latex) by Kazi Abu Rousan. Its stroke
 code in `src/ink/` is MIT like the rest of Hilbert. The trained model is not part of
 Hilbert: it is downloaded only when you click Download, from the ink2latex release,

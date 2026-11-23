@@ -196,22 +196,11 @@ try {
   await page.waitForFunction(async () => (await (await fetch('/workspace/file?path=main.typ')).text()).includes('#align(center, canvas('), { timeout: 15000 });
   execFileSync(process.env.TYPST_BIN || 'typst', ['compile', '--package-path', join(root, 'src-tauri/resources/typst-packages'), join(ws, 'main.typ'), join(ws, 'inserted.pdf')], { timeout: 30000 });
 
-  await command('Draw a Symbol');
-  await page.waitForFunction(() => !document.querySelector('.modal-content').textContent.includes('Preparing recognizer'), { timeout: 30000 });
-  const rect = await (await page.$('.modal-content canvas')).boundingBox();
-  for (let i = 0; i < 72; i++) {
-    const t = 2 * Math.PI * i / 71;
-    const d = 1 + Math.sin(t) ** 2;
-    await page.mouse.move(rect.x + 140 + 100 * Math.cos(t) / d, rect.y + 140 + 72 * Math.sin(t) * Math.cos(t) / d);
-    if (i === 0) await page.mouse.down();
-  }
-  await page.mouse.up();
-  await page.waitForSelector('.modal-content button[title="Insert  infinity"]');
-  await page.screenshot({ path: join(artifacts, 'symbol.png') });
-  await button('Undo stroke');
-  assert.equal(await page.$$eval('.modal-content button[title^="Insert  "]', els => els.length), 0);
+  // Draw a Symbol is gone; its command and shortcut open Write Maths by Hand.
+  await command('Write Maths by Hand');
+  await page.waitForFunction(() => /Write Maths by Hand/.test(document.querySelector('.modal-content')?.textContent || ''), { timeout: 15000 });
   await page.click('.modal-content .close-btn');
-  console.log('Symbol drawing: pointer strokes recognize infinity; undo clears candidates.');
+  console.log('Write Maths by Hand opens from the command palette.');
 
   if (process.env.TEST_PYTHON) {
     await command('Run Python');
