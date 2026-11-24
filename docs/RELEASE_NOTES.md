@@ -4,6 +4,38 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.2.12
+
+Writing maths by hand is smoother, Linux draws much faster on many machines, and there is a Christmas theme.
+
+### Writing maths by hand, smoother
+
+The pad no longer jumps while you write (issue #45). It used to sit in the middle of the window, so each time the preview under it changed height, the pad moved under your pen. Now it stays still.
+
+Long formulas no longer make the ink choppy. The handwriting model now reads in the background, so the pen never waits for it, however long the formula is.
+
+The pad now looks like the ink2latex demo. Above it are Undo, Pen, Eraser, Clear, Picture and Paste. The eraser removes a stroke you touch, and the eraser end of a pen works too. Below it, "Read when I pause" reads by itself as before. Turn it off and use Read now if you would rather convert only when you ask.
+
+### Draw a Symbol is now part of Write Maths by Hand
+
+The same pad reads a single symbol. A symbol on its own is easy to misread (an integral sign can look like an S), so when you write one, Hilbert also shows its next best guesses to pick from. Ctrl+Shift+Y (⌘⇧Y on a Mac) and the toolbar button now open Write Maths by Hand. A few symbols the model never learned (up and down arrows, therefore, star and ℓ) can no longer be drawn. Type them or use the symbol picker.
+
+### Linux: faster drawing on most machines
+
+To stop the window coming up black with some graphics drivers, Hilbert drew every frame on the CPU on every Linux machine. On many machines that made typing and scrolling lag badly (issue #46, whose reporter found the cause). Now Hilbert does that only where a black window is likely: NVIDIA and nouveau drivers, virtual machines, and machines with no GPU. Intel and AMD get fast GPU drawing.
+
+Settings now has GPU drawing, with Automatic, On and Off. If you use an NVIDIA card and the window is slow rather than black, set it to On and restart Hilbert. If the window ever comes up black, start Hilbert with HILBERT_SOFTWARE_RENDERING=1 and set it back to Off. Help → Copy Diagnostics shows which one was chosen.
+
+### A Christmas theme
+
+A small lit tree in a cold room, seen through a window that has frozen over, with frost on the glass and snow outside. The buttons are frosted ice. Choose it with the theme button at the top, or in Settings → Theme.
+
+### SpanNote
+
+About now links to SpanNote, a handwritten notes app by the same author. It is for Android only.
+
+---
+
 ## 0.2.11
 
 You can now write maths by hand, or use a picture of it, and get Typst. On Linux you can also hide Hilbert's own title bar.
