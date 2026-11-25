@@ -14,7 +14,7 @@ import { useProofread } from './proofread';
 import { useTinymistDiagnostics, type EditorProblem } from './tinymistDiagnostics';
 import ProofreadPanel from './components/ProofreadPanel';
 import { tokenizeLine, tokenizeRenderedText, tokenizeTypstMathSource, bestMatch, blockEquationStart, usableFocus, type SyncPayload } from './syncMatch';
-import { commentEdits, commentTokenFor } from './commentLines';
+import { commentEditsForRanges, commentTokenFor } from './commentLines';
 import { snapUtf16OffsetToGrapheme, snapUtf16RangeToGraphemes } from './unicodeRanges';
 import type { PdfHandle, PdfViewState } from './components/PdfPreview';
 const PackageInstaller = lazy(() => import('./PackageInstaller').then(module => ({ default: module.PackageInstaller })));
@@ -4674,24 +4674,25 @@ export default function App() {
     wrapSelection(open, close);
   };
 
-  // Comment or uncomment the current line, or every line the selection touches.
-  // It only uncomments when all of them are already commented, which is what
-  // makes the one key a toggle.
+  // Comment or uncomment the current line, or every line the selection touches —
+  // with several cursors, every line any of them is on (issue #51). It only
+  // uncomments when all of them are already commented, which is what makes the
+  // one key a toggle.
   const toggleComment = () => {
     const editor = editorRef.current;
     const model = editor?.getModel();
-    const selection = editor?.getSelection();
-    if (!editor || !model || !selection) return;
+    const selections = editor?.getSelections();
+    if (!editor || !model || !selections?.length) return;
 
-    const first = selection.startLineNumber;
-    // A selection that stops at the very start of a line doesn't reach into it.
-    const last = selection.endLineNumber > first && selection.endColumn === 1
-      ? selection.endLineNumber - 1
-      : selection.endLineNumber;
-
-    const texts: string[] = [];
-    for (let n = first; n <= last; n++) texts.push(model.getLineContent(n));
-    const edits = commentEdits(texts, first, commentTokenFor(activeTabRef.current?.path || ''));
+    const ranges = selections.map((selection: any) => {
+      const first = selection.startLineNumber;
+      // A selection that stops at the very start of a line doesn't reach into it.
+      const last = selection.endLineNumber > first && selection.endColumn === 1
+        ? selection.endLineNumber - 1
+        : selection.endLineNumber;
+      return { first, last };
+    });
+    const edits = commentEditsForRanges(ranges, n => model.getLineContent(n), commentTokenFor(activeTabRef.current?.path || ''));
     if (!edits.length) return;
 
     editor.pushUndoStop();

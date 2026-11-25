@@ -19,7 +19,7 @@ function loadTypeScriptModule(relativePath) {
   return module.exports;
 }
 
-const { commentEdits, commentTokenFor } = loadTypeScriptModule('src/commentLines.ts');
+const { commentEdits, commentEditsForRanges, commentTokenFor } = loadTypeScriptModule('src/commentLines.ts');
 
 // Apply edits the way Monaco does: every range is in the coordinates of the
 // text as it was before any of them were applied.
@@ -87,5 +87,29 @@ assert.deepEqual(
 // A multi-character token is matched as a whole.
 assert.equal(toggle('local x = 1', '--'), '-- local x = 1');
 assert.equal(toggle('-- local x = 1', '--'), 'local x = 1');
+
+// Several cursors (issue #51). `cursors` are 1-based line spans, as Monaco's selections give them.
+function toggleAt(text, cursors, token = '//') {
+  const lines = text.split('\n');
+  return applyEdits(text, commentEditsForRanges(cursors.map(([first, last = first]) => ({ first, last })), n => lines[n - 1], token));
+}
+// The reported case: three cursors on three lines, made from the bottom up, comment all three, the same
+// as a selection over them; and the same cursors uncomment them again.
+const three = 'a\nb\nc';
+assert.equal(toggleAt(three, [[3], [2], [1]]), '// a\n// b\n// c');
+assert.equal(toggleAt(three, [[3], [2], [1]]), toggle(three));
+assert.equal(toggleAt('// a\n// b\n// c', [[1], [2], [3]]), three);
+// Cursors far apart each get their line, lined up at their own indent, and nothing in between changes.
+assert.equal(toggleAt('a\nkeep\n    b\nkeep\n  c', [[1], [3], [5]], '#'), '# a\nkeep\n    # b\nkeep\n  # c');
+// Two cursors on one line, or overlapping selections, toggle that line once.
+assert.equal(toggleAt('a\nb', [[1], [1]]), '// a\nb');
+assert.equal(toggleAt('a\nb\nc\nd', [[1, 3], [2, 4]]), '// a\n// b\n// c\n// d');
+// One decision for all cursors: mixed lines are all commented, never some commented and some uncommented.
+assert.equal(toggleAt('// a\nkeep\nb', [[1], [3]]), '// // a\nkeep\n// b');
+// A blank line under a cursor is left alone; all-blank does nothing.
+assert.equal(toggleAt('a\n\nb', [[1], [2], [3]]), '// a\n\n// b');
+assert.deepEqual(commentEditsForRanges([{ first: 1, last: 1 }], () => '  ', '#'), []);
+// One cursor behaves exactly as before.
+assert.equal(toggleAt('  a\n    b', [[1, 2]], '#'), toggle('  a\n    b', '#'));
 
 console.log('comment-lines tests passed');
