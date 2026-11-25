@@ -69,6 +69,7 @@
     "test:treedelete": "node scripts/test-tree-delete.mjs",
     "test:titlebar": "node scripts/test-title-bar.mjs",
     "test:handwriting": "node scripts/test-handwriting.mjs",
+    "test:print": "node scripts/test-print-and-new-file.mjs",
     "stress": "node scripts/stress-session.mjs",
     "bench:preview": "node scripts/bench-preview.mjs",
     "test:symbolic": "python3 scripts/test-symbolic.py",

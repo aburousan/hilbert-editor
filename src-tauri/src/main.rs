@@ -674,6 +674,7 @@ fn open_instance_window(
     st.session_file = session;
     let state = Arc::new(st);
     *state.app.lock().unwrap() = Some(handle.clone());
+    *state.window_label.lock().unwrap() = Some(label.clone());
     // "New Window" from any window opens another one in this same process.
     // Window creation must happen on the main thread on macOS.
     let opener = handle.clone();

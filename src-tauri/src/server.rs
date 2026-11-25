@@ -185,6 +185,8 @@ pub struct AppState {
     pub universe: tokio::sync::Mutex<Option<(Instant, Arc<Vec<Pkg>>)>>,
     pub http: reqwest::Client,
     pub app: Mutex<Option<tauri::AppHandle>>,
+    // The desktop window this backend serves (its Tauri label), so the window can be asked to print itself.
+    pub window_label: Mutex<Option<String>>,
     // Windows persist their session separately, so a second window never
     // overwrites the project the first one will restore on the next launch.
     pub session_file: PathBuf,
@@ -429,6 +431,7 @@ impl AppState {
             universe: tokio::sync::Mutex::new(None),
             http: reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10)).build().unwrap(),
             app: Mutex::new(None),
+            window_label: Mutex::new(None),
             session_file: session_file(),
             open_window: Mutex::new(None),
             shutdown,
@@ -6060,6 +6063,26 @@ async fn desktop_pick_folder(State(st): St) -> Response {
     Json(json!({ "path": path })).into_response()
 }
 
+// Print the PDF preview (issue #48). The page has already drawn the PDF's pages into a layer that only
+// shows when printing; this asks the window itself to print, which works where window.print() does not
+// (WKWebView on macOS ignores it). Not a desktop window (a browser, a hosted server): ok is false and the
+// page falls back to window.print().
+async fn desktop_print(State(st): St) -> Response {
+    use tauri::Manager;
+    let app = st.app.lock().unwrap().clone();
+    let label = st.window_label.lock().unwrap().clone();
+    let (Some(app), Some(label)) = (app, label) else {
+        return Json(json!({ "ok": false })).into_response();
+    };
+    let Some(window) = app.get_webview_window(&label) else {
+        return Json(json!({ "ok": false })).into_response();
+    };
+    match window.print() {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(error) => json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not print: {error}")),
+    }
+}
+
 fn allowed_external_url(raw: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(raw) else { return false };
     match url.scheme() {
@@ -8964,6 +8987,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/template/render-preview", post(builtin_preview))
         .route("/bib/fetch", post(bib_fetch))
         .route("/desktop/pick-folder", post(desktop_pick_folder))
+        .route("/desktop/print", post(desktop_print))
         .route("/desktop/open", post(desktop_open))
         .route("/diagnostics", get(diagnostics))
         .route("/lsp/status", get(lsp_status))

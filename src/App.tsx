@@ -2692,6 +2692,8 @@ export default function App() {
       const key = e.key.toLowerCase();
       if (key === 's' && !e.shiftKey) { e.preventDefault(); saveActiveFile(); return; }
       if (key === 'k' && !e.shiftKey) { e.preventDefault(); setShowPalette(v => !v); return; }
+      // Left alone, the webview prints the app window itself (issue #48).
+      if (key === 'p' && !e.shiftKey && !e.altKey) { e.preventDefault(); e.stopPropagation(); void printPreviewRef.current(); return; }
       // Switching files. Ctrl+Tab and Ctrl/⌘+PageUp/PageDown work everywhere;
       // ⌘⌥←/→ is the macOS habit. These have to beat Monaco, which takes Tab
       // for indentation, so they stop the event as well as consuming it. Not
@@ -3042,13 +3044,25 @@ export default function App() {
 
   const createNewFile = (basePath?: string | React.MouseEvent) => {
     const dir = typeof basePath === 'string' ? basePath : undefined;
+    // Issue #49: Hilbert is a Typst editor, so a name typed with no extension gets .typ; the box (remembered)
+    // keeps a name as typed, for the extensionless files common on Unix (Makefile, LICENSE).
+    let addTyp = true;
+    try { addTyp = localStorage.getItem('hilbert.newFileAddsTyp') !== 'off'; } catch { /* default on */ }
     setInputModal({
       title: 'New File',
       submitLabel: 'Create',
-      fields: [{ key: 'name', label: 'File name', default: dir ? `${dir}/` : '', placeholder: 'chapters/intro.typ', hint: 'Use a slash for a subfolder, e.g. chapters/intro.typ' }],
+      fields: [
+        { key: 'name', label: 'File name', default: dir ? `${dir}/` : '', placeholder: 'chapters/intro', hint: 'Use a slash for a subfolder, e.g. chapters/intro' },
+        { key: 'addTyp', label: 'Add .typ when the name has no extension', type: 'checkbox', default: addTyp ? 'true' : 'false' },
+      ],
       onSubmit: async (v) => {
-        const name = (v.name || '').trim();
+        let name = (v.name || '').trim();
         if (!name || name.endsWith('/')) return;
+        const wantTyp = v.addTyp !== 'false';
+        try { localStorage.setItem('hilbert.newFileAddsTyp', wantTyp ? 'on' : 'off'); } catch { /* only a convenience */ }
+        // An extension is a dot inside the last part of the path; a leading dot (.gitignore) counts as named.
+        const base = name.slice(name.lastIndexOf('/') + 1);
+        if (wantTyp && !base.includes('.')) name += '.typ';
         // Never over a file that is already there: that emptied it.
         const created = await fetch(`${API}/workspace/file?create=1&path=${encodeURIComponent(name)}`, { method: 'POST', body: '' });
         if (created.status === 409) { notify(`${name} already exists, so it was opened instead.`, 'info'); openFile(name); return; }
@@ -3058,6 +3072,20 @@ export default function App() {
       },
     });
   };
+
+  // Ctrl/Cmd+P (issue #48): print the compiled PDF, not the app window.
+  const printPreview = async () => {
+    if (!pdfUrl) { notify('Nothing to print yet: the preview has not compiled.', 'info'); return; }
+    notify('Preparing the pages to print…', 'info');
+    try {
+      const { printPdf } = await import('./printPdf');
+      await printPdf(pdfUrl);
+    } catch (error) {
+      notify(`Could not print: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+  const printPreviewRef = useRef(printPreview);
+  printPreviewRef.current = printPreview;
 
   const createNewFolder = (basePath?: string | React.MouseEvent) => {
     const dir = typeof basePath === 'string' ? basePath : undefined;
@@ -7158,6 +7186,7 @@ ${byline ? `
   // open (not memoised) so each command closes over current state.
   const paletteCommands = (): PaletteCommand[] => [
     { category: 'File', title: 'New File...', run: createNewFile },
+    { category: 'File', title: 'Print PDF Preview...', hint: keys('⌘P'), run: () => { void printPreview(); } },
     { category: 'File', title: 'Open File...', run: openFromDisk },
     { category: 'File', title: 'Open Folder as Workspace...', run: openFolderAsRoot },
     ...(IS_NATIVE_APP ? [{ category: 'File', title: 'Close Folder', run: closeFolder }] : []),
@@ -7355,6 +7384,7 @@ ${byline ? `
                   <div className="dropdown-item" onClick={createNewFile}>New File...</div>
                   <div className="dropdown-item" onClick={() => { openNewWindow(); setActiveMenu(null); }}>New Window</div>
                   <div className="dropdown-item" onClick={() => { openFromDisk(); setActiveMenu(null); }}>Open File...</div>
+                  <div className="dropdown-item" onClick={() => { void printPreview(); setActiveMenu(null); }}>Print PDF Preview... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.75rem' }}>{keys('⌘P')}</span></div>
                   <div className="dropdown-item" onClick={() => { openFolderAsRoot(); setActiveMenu(null); }}>Open Folder... <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.72rem' }}>as workspace</span></div>
                   {IS_NATIVE_APP && <div className="dropdown-item" onClick={() => { void closeFolder(); setActiveMenu(null); }}>Close Folder <span style={{ marginLeft: 'auto', opacity: 0.5, fontSize: '0.72rem' }}>keeps the files</span></div>}
                   <div className="dropdown-item has-submenu">
