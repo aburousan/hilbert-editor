@@ -1111,13 +1111,15 @@ fn main() {
             let dist = std::env::var("TYPST_DIST")
                 .map(PathBuf::from)
                 .ok()
-                .or_else(|| resource_dir.as_ref().map(|r| r.join("dist")))
+                .filter(|d| d.exists())
+                .or_else(|| resource_dir.as_ref().map(|r| r.join("dist")).filter(|d| d.exists()))
                 .or_else(|| {
                     cfg!(debug_assertions)
                         .then(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dist"))
+                        .filter(|d| d.exists())
                 })
-                .filter(|d| d.exists())
-                .or_else(embedded_dist);
+                .or_else(embedded_dist)
+                .and_then(|d| d.canonicalize().ok().or(Some(d)));
 
             // A file handed over by the system decides which project opens: its
             // own folder. Otherwise reopen the last project if its folder still
