@@ -71,6 +71,8 @@
     "test:handwriting": "node scripts/test-handwriting.mjs",
     "test:print": "node scripts/test-print-and-new-file.mjs",
     "test:multicursor-comment": "node scripts/test-multicursor-comment.mjs",
+    "test:typst-paths": "node scripts/test-typst-paths.mjs",
+    "test:open-include": "node scripts/test-open-include.mjs",
     "stress": "node scripts/stress-session.mjs",
     "bench:preview": "node scripts/bench-preview.mjs",
     "test:symbolic": "python3 scripts/test-symbolic.py",

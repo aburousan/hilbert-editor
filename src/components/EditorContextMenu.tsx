@@ -21,8 +21,10 @@ type Item =
   | { kind: 'divider' }
   | { kind: 'item'; label: string; keys?: string; disabled?: boolean; run: () => void | Promise<void> };
 
-export default function EditorContextMenu({ at, editor, onClose }: {
+export default function EditorContextMenu({ at, editor, onClose, openPath }: {
   at: { x: number, y: number },
+  // A path in #include, #import, image(...) under the click (issue #50): shown first.
+  openPath?: { label: string; hint: string; run: () => void },
   editor: ClipboardEditor & {
     getAction(id: string): { run(): void | Promise<void> } | null;
     trigger(source: string, action: string, payload: unknown): void;
@@ -55,6 +57,10 @@ export default function EditorContextMenu({ at, editor, onClose }: {
   const trigger = (id: string) => () => { editor.focus(); editor.getAction(id)?.run(); };
 
   const items: Item[] = [
+    ...(openPath ? [
+      { kind: 'item' as const, label: openPath.label, keys: openPath.hint, run: openPath.run },
+      { kind: 'divider' as const },
+    ] : []),
     { kind: 'item', label: 'Cut', keys: `${mod}X`, run: () => cutEditorSelection(editor) },
     { kind: 'item', label: 'Copy', keys: `${mod}C`, run: () => copyEditorSelection(editor) },
     { kind: 'item', label: 'Paste', keys: `${mod}V`, run: () => pasteEditorClipboard(editor) },

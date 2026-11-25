@@ -89,6 +89,7 @@ import type { ProjectSync } from './projectCollab';
 import { isProjectTextPath } from './projectFileTypes';
 import { deriveWorkspaceStatus } from './workspaceStatus';
 import { inactiveModelsToDiscard, limitNotebookResults } from './performanceLimits';
+import { resolveTypstPath, typstPathAt, typstPathLinks, universeUrl, type TypstPathLink } from './typstPaths';
 import './index.css';
 import './PackageInstaller.css';
 
@@ -925,7 +926,7 @@ export default function App() {
   const [settingsSearch, setSettingsSearch] = useState('');
   const [activeMenu, setActiveMenu] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, node?: FileNode, type: 'file' | 'folder' | 'empty' } | null>(null);
-  const [editorMenu, setEditorMenu] = useState<{ x: number, y: number } | null>(null);
+  const [editorMenu, setEditorMenu] = useState<{ x: number, y: number, path?: { link: TypstPathLink, fromFile: string } } | null>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
   // The menu opens at the click point and grows down and to the right, so a
   // right-click low in the file tree or near the right edge would run it off
@@ -1200,6 +1201,7 @@ export default function App() {
   resizeLayoutRef.current = { sidebarVisible, sidebarWidth, mirrored };
   const toggleNumberingRef = useRef<() => void>(() => {});
   const toggleCommentRef = useRef<() => void>(() => {});
+  const openTypstPathRef = useRef<(link: TypstPathLink, fromFile: string) => void>(() => {});
 
   const monaco = useMonaco();
 
@@ -1231,7 +1233,15 @@ export default function App() {
         .some((s: any) => !s.isEmpty() && s.containsPosition(position));
       if (position && !inSelection) editor.setPosition(position);
       editor.focus();
-      setEditorMenu({ x: ev.clientX, y: ev.clientY });
+      // A path in #include, #import, image(...) under the click gets an Open entry (issue #50).
+      const model = editor.getModel?.();
+      const caret = editor.getPosition?.();
+      const link = model && caret && model.getLanguageId?.() === 'typst'
+        ? typstPathAt(model.getLineContent(caret.lineNumber), caret.column) : null;
+      setEditorMenu({
+        x: ev.clientX, y: ev.clientY,
+        path: link ? { link, fromFile: String(model.uri.path || '').replace(/^\/+/, '') } : undefined,
+      });
     };
     document.addEventListener('contextmenu', openEditorMenu, true);
     return () => document.removeEventListener('contextmenu', openEditorMenu, true);
@@ -1469,6 +1479,48 @@ export default function App() {
     monaco.editor.getModels().forEach(toLf);
     const created = monaco.editor.onDidCreateModel(toLf);
     return () => created.dispose();
+  }, [monaco]);
+  // Issue #50: the paths in #include, #import, image(...) and the like are links. Cmd/Ctrl+click opens
+  // the file in Hilbert (a package import opens its Typst Universe page). The link carries what to open in
+  // its own address, so the opener needs nothing from the model that made it.
+  useEffect(() => {
+    if (!monaco) return;
+    const encode = (value: unknown) => btoa(unescape(encodeURIComponent(JSON.stringify(value))))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const decode = (text: string) => JSON.parse(decodeURIComponent(escape(atob(text.replace(/-/g, '+').replace(/_/g, '/')))));
+    const links = monaco.languages.registerLinkProvider('typst', {
+      provideLinks: (model: any) => {
+        const fromFile = String(model.uri.path || '').replace(/^\/+/, '');
+        const out: any[] = [];
+        const count = model.getLineCount();
+        for (let n = 1; n <= count && out.length < 2000; n++) {
+          const text = model.getLineContent(n);
+          if (!text.includes('"')) continue;
+          for (const link of typstPathLinks(text)) {
+            const target = link.kind === 'file' ? resolveTypstPath(fromFile, link.raw) : null;
+            out.push({
+              range: { startLineNumber: n, startColumn: link.startColumn, endLineNumber: n, endColumn: link.endColumn },
+              url: `hilbert-open:///${encode({ link, fromFile })}`,
+              tooltip: link.kind === 'package'
+                ? (universeUrl(link) ? `Open ${link.name} ${link.version} on Typst Universe` : `${link.raw} is a local package`)
+                : target ? `Open ${target}` : 'Points outside the project',
+            });
+          }
+        }
+        return { links: out };
+      },
+    });
+    const opener = monaco.editor.registerLinkOpener({
+      open: async (resource: any) => {
+        if (resource?.scheme !== 'hilbert-open') return false;
+        try {
+          const { link, fromFile } = decode(String(resource.path || '').replace(/^\/+/, ''));
+          openTypstPathRef.current(link, fromFile);
+        } catch { /* a link this code did not make */ }
+        return true;
+      },
+    });
+    return () => { links.dispose(); opener.dispose(); };
   }, [monaco]);
   useEffect(() => {
     if (!monaco) return;
@@ -4701,6 +4753,31 @@ export default function App() {
     editor.focus();
   };
   toggleCommentRef.current = toggleComment;
+
+  // Issue #50: open what a path in the source points at. A file opens in its own tab (an image or a PDF
+  // as a preview); a .typ that does not exist yet can be created; a package import opens its Typst
+  // Universe page, or says it is a local package.
+  const openTypstPath = async (link: TypstPathLink, fromFile: string) => {
+    if (link.kind === 'package') {
+      const url = universeUrl(link);
+      if (url) window.open(url, '_blank', 'noopener,noreferrer');
+      else notify(`${link.raw} is a local package, kept outside this project.`, 'info');
+      return;
+    }
+    const target = resolveTypstPath(fromFile, link.raw);
+    if (!target) { notify(`"${link.raw}" points outside the project.`, 'info'); return; }
+    let exists = false;
+    try { exists = (await fetch(`${API}/workspace/raw?path=${encodeURIComponent(target)}`, { method: 'HEAD' })).ok; } catch { /* treat as missing */ }
+    if (exists) { await openFileRef.current(target); return; }
+    if (!target.toLowerCase().endsWith('.typ')) { notify(`${target} was not found in the project.`, 'info'); return; }
+    if (!(await confirmDialog(`${target} does not exist yet. Create it?`, { confirmLabel: 'Create' }))) return;
+    const created = await fetch(`${API}/workspace/file?create=1&path=${encodeURIComponent(target)}`, { method: 'POST', body: '' });
+    if (!created.ok && created.status !== 409) { notify(`Could not create ${target}.`); return; }
+    if (created.ok) await mirrorLocalPath(target, '', true);
+    void fetchTree();
+    await openFileRef.current(target);
+  };
+  openTypstPathRef.current = (link, fromFile) => { void openTypstPath(link, fromFile); };
 
   // --- Insert helpers (all driven by the styled InputModal) -------------------
   const docLabels = () => {
@@ -8382,6 +8459,40 @@ ${byline ? `
                         keybindings: [monacoInstance.KeyMod.CtrlCmd | monacoInstance.KeyMod.Shift | monacoInstance.KeyCode.KeyX],
                         run: () => flipLineDirectionRef.current(),
                       });
+                      // Issue #50: open the path under the caret from the command palette (F1). The
+                      // right-click menu (EditorContextMenu) and Cmd/Ctrl+click do the same; these
+                      // only show up while the caret is on such a path.
+                      const onTypstFile = e.createContextKey<boolean>('hilbertOnTypstFile', false);
+                      const onTypstPackage = e.createContextKey<boolean>('hilbertOnTypstPackage', false);
+                      const pathUnderCaret = () => {
+                        const model = e.getModel(); const position = e.getPosition();
+                        if (!model || !position || model.getLanguageId() !== 'typst') return null;
+                        return typstPathAt(model.getLineContent(position.lineNumber), position.column);
+                      };
+                      const updatePathKeys = () => {
+                        const link = pathUnderCaret();
+                        onTypstFile.set(link?.kind === 'file');
+                        onTypstPackage.set(link?.kind === 'package');
+                      };
+                      e.onDidChangeCursorPosition(updatePathKeys);
+                      e.onDidChangeModel(updatePathKeys);
+                      const openUnderCaret = () => {
+                        const link = pathUnderCaret();
+                        const model = e.getModel();
+                        if (link && model) openTypstPathRef.current(link, String(model.uri.path || '').replace(/^\/+/, ''));
+                      };
+                      e.addAction({
+                        id: 'hilbert.openTypstPath',
+                        label: 'Open File',
+                        precondition: 'hilbertOnTypstFile',
+                        run: openUnderCaret,
+                      });
+                      e.addAction({
+                        id: 'hilbert.openTypstPackage',
+                        label: 'Open Package Page on Typst Universe',
+                        precondition: 'hilbertOnTypstPackage',
+                        run: openUnderCaret,
+                      });
                       // The editor exists from here on, so a cursor position held
                       // over from the last session can finally be applied. It
                       // wins: it's the most specific thing we know about where
@@ -8698,7 +8809,16 @@ ${byline ? `
       {showSymbolPicker && <Suspense fallback={null}><SymbolPicker onClose={() => setShowSymbolPicker(false)} onInsert={(code) => { insertCode(code + ' '); setShowSymbolPicker(false); }} /></Suspense>}
 
       {editorMenu && editorRef.current && (
-        <EditorContextMenu at={editorMenu} editor={editorRef.current} onClose={() => setEditorMenu(null)} />
+        <EditorContextMenu
+          at={editorMenu}
+          editor={editorRef.current}
+          onClose={() => setEditorMenu(null)}
+          openPath={editorMenu.path ? {
+            label: editorMenu.path.link.kind === 'package' ? 'Open Package Page on Typst Universe' : 'Open File',
+            hint: editorMenu.path.link.kind === 'package' ? editorMenu.path.link.raw : (resolveTypstPath(editorMenu.path.fromFile, editorMenu.path.link.raw) ?? ''),
+            run: () => { const p = editorMenu.path!; openTypstPathRef.current(p.link, p.fromFile); },
+          } : undefined}
+        />
       )}
 
       {contextMenu && (
