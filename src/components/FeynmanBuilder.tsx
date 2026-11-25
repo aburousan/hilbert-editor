@@ -15,8 +15,22 @@ type EdgeKind = 'fermion' | 'antifermion' | 'photon' | 'gluon' | 'scalar' | 'gho
 type LoopKind = 'plain' | 'scalar' | 'photon' | 'gluon';
 type LoopFill = 'none' | 'hatched' | 'shaded';
 
-type Edge = { id: number, type: 'edge', kind: EdgeKind, from: Pt, to: Pt, bend: number, thickness: number, amplitude: number, endArrow: boolean, label: string, side: 1 | -1, color?: string };
-type Loop = { id: number, type: 'loop', kind: LoopKind, fill: LoopFill, center: Pt, radius: number, thickness: number, amplitude: number, label: string, color?: string, arrow?: 0 | 1 | -1 };
+// For loop-integral notes (IBP): a line can be faded (dotted grey, a line taken out, as in a spanning
+// tree) or hidden (keeps its place for snapping, draws nothing); dots on a line mark a raised power of
+// that propagator; a momentum arrow runs beside a line or loop, on its label's side.
+type LineStyle = 'normal' | 'faded' | 'hidden';
+type Edge = {
+  id: number, type: 'edge', kind: EdgeKind, from: Pt, to: Pt, bend: number, thickness: number, amplitude: number,
+  endArrow: boolean, label: string, side: 1 | -1, color?: string,
+  arc?: boolean,                         // bent as a true circular arc rather than a quadratic curve
+  dots?: number, style?: LineStyle, mom?: 0 | 1 | -1,
+  labelAt?: 'mid' | 'start' | 'end',     // an external leg's p_1 sits past its outer end
+};
+type Loop = {
+  id: number, type: 'loop', kind: LoopKind, fill: LoopFill, center: Pt, radius: number, thickness: number, amplitude: number,
+  label: string, color?: string, arrow?: 0 | 1 | -1,
+  labelBelow?: string, style?: LineStyle, mom?: 0 | 1 | -1,
+};
 type Vertex = { id: number, type: 'vertex', at: Pt, size: number, color?: string };
 type TextEl = { id: number, type: 'text', at: Pt, text: string, color?: string };
 type El = Edge | Loop | Vertex | TextEl;
@@ -68,17 +82,75 @@ const pathLen = (a: Pt, c: Pt, b: Pt) => {
   return len;
 };
 
+// A line's shape, whatever it is: straight, a quadratic curve, or a circular arc whose middle sits `bend`
+// px off the chord (the same meaning of bend in both, so the bend handle works the same).
+type Curve = { pt: (t: number) => Pt, tan: (t: number) => Pt, len: number, arc: null | { c: Pt, r: number, a0: number, sweep: number } };
+type Shape = { from: Pt, to: Pt, bend: number, arc?: boolean };
+
+function arcOf(a: Pt, b: Pt, bend: number) {
+  const len = Math.hypot(b.x - a.x, b.y - a.y);
+  if (!bend || len < 1) return null;
+  const nx = -(b.y - a.y) / len, ny = (b.x - a.x) / len;
+  const h = len / 2, s = Math.abs(bend);
+  const r = (h * h + s * s) / (2 * s);
+  const m = { x: (a.x + b.x) / 2 + nx * bend, y: (a.y + b.y) / 2 + ny * bend };   // the arc's middle
+  const sg = Math.sign(bend);
+  const c = { x: m.x - nx * sg * r, y: m.y - ny * sg * r };
+  const a0 = Math.atan2(a.y - c.y, a.x - c.x), am = Math.atan2(m.y - c.y, m.x - c.x);
+  const span = s <= h ? 2 * Math.asin(Math.min(1, h / r)) : 2 * Math.PI - 2 * Math.asin(Math.min(1, h / r));
+  // Go whichever way round passes through the middle.
+  const wrap = (v: number) => Math.atan2(Math.sin(v), Math.cos(v));
+  const sweep = Math.abs(wrap(a0 + span / 2 - am)) < Math.abs(wrap(a0 - span / 2 - am)) ? span : -span;
+  return { c, r, a0, sweep };
+}
+
+function curveOf(e: Shape): Curve {
+  const arc = e.arc ? arcOf(e.from, e.to, e.bend) : null;
+  if (arc) {
+    const { c, r, a0, sweep } = arc;
+    return {
+      pt: t => ({ x: c.x + r * Math.cos(a0 + sweep * t), y: c.y + r * Math.sin(a0 + sweep * t) }),
+      tan: t => { const g = a0 + sweep * t, s = Math.sign(sweep); return { x: -Math.sin(g) * s, y: Math.cos(g) * s }; },
+      len: r * Math.abs(sweep),
+      arc,
+    };
+  }
+  const c = ctrlPt(e.from, e.to, e.bend);
+  return { pt: t => bezPt(e.from, c, e.to, t), tan: t => bezTan(e.from, c, e.to, t), len: pathLen(e.from, c, e.to), arc: null };
+}
+
+// SVG path of a line's own shape.
+function shapePath(e: Shape): string {
+  const cv = curveOf(e);
+  if (cv.arc) {
+    const { r, sweep } = cv.arc;
+    return `M${e.from.x},${e.from.y} A${r},${r} 0 ${Math.abs(sweep) > Math.PI ? 1 : 0} ${sweep > 0 ? 1 : 0} ${e.to.x},${e.to.y}`;
+  }
+  if (!e.bend) return `M${e.from.x},${e.from.y} L${e.to.x},${e.to.y}`;
+  const c = ctrlPt(e.from, e.to, e.bend);
+  return `M${e.from.x},${e.from.y} Q${c.x},${c.y} ${e.to.x},${e.to.y}`;
+}
+
+// A line shifted sideways by `off` px, as a polyline (the rails of a double line).
+function offsetPath(cv: Curve, off: number): string {
+  const pts: string[] = [];
+  for (let i = 0; i <= 32; i++) {
+    const p = cv.pt(i / 32), d = cv.tan(i / 32);
+    pts.push(`${(p.x - d.y * off).toFixed(1)},${(p.y + d.x * off).toFixed(1)}`);
+  }
+  return 'M' + pts.join(' L');
+}
+
 // SVG preview path for a Wilson line: a sawtooth along the path, the usual way
 // a gauge link is drawn so it cannot be mistaken for a propagator.
-function zigzagPath(a: Pt, b: Pt, bend: number, amp: number): string {
-  const c = ctrlPt(a, b, bend);
-  const len = pathLen(a, c, b);
+function zigzagPath(cv: Curve, amp: number): string {
+  const len = cv.len;
   const teeth = Math.max(3, Math.round(len / 14));
   const N = teeth * 8;
   const pts: string[] = [];
   for (let i = 0; i <= N; i++) {
     const t = i / N, u = 2 * Math.PI * teeth * t;
-    const p = bezPt(a, c, b, t), d = bezTan(a, c, b, t);
+    const p = cv.pt(t), d = cv.tan(t);
     // A triangle wave, rather than the sine the photon uses.
     const wave = (2 / Math.PI) * Math.asin(Math.sin(u));
     pts.push(`${(p.x - d.y * amp * wave).toFixed(1)},${(p.y + d.x * amp * wave).toFixed(1)}`);
@@ -87,15 +159,14 @@ function zigzagPath(a: Pt, b: Pt, bend: number, amp: number): string {
 }
 
 // SVG preview path for a wavy / coiled edge (approximates what cetz renders)
-function decoPath(a: Pt, b: Pt, bend: number, kind: 'photon' | 'gluon', amp: number): string {
-  const c = ctrlPt(a, b, bend);
-  const len = pathLen(a, c, b);
+function decoPath(cv: Curve, kind: 'photon' | 'gluon', amp: number): string {
+  const len = cv.len;
   const cycles = Math.max(3, Math.round(len / (kind === 'photon' ? 13 : 12)));
   const N = cycles * 14;
   const pts: string[] = [];
   for (let i = 0; i <= N; i++) {
     const t = i / N, u = 2 * Math.PI * cycles * t;
-    const p = bezPt(a, c, b, t), d = bezTan(a, c, b, t);
+    const p = cv.pt(t), d = cv.tan(t);
     const nx = -d.y, ny = d.x;
     let x = p.x, y = p.y;
     if (kind === 'photon') { x += nx * amp * Math.sin(u); y += ny * amp * Math.sin(u); }
@@ -150,64 +221,121 @@ const dashStroke = (th: number, dash: string, c?: string) =>
 const paintOf = (c?: string) => tint(c) ?? 'black';
 const previewCol = (c: string | undefined, isSel: boolean) => isSel ? '#7c3aed' : (c && c.toLowerCase() !== '#000000' ? c : '#111');
 
+// Where a line's label goes: beside its middle, or past an end for an external leg's momentum. With a
+// momentum arrow on that side, the label moves out past the arrow.
+function edgeLabelPos(e: Edge): Pt {
+  const cv = curveOf(e);
+  if (e.labelAt === 'start' || e.labelAt === 'end') {
+    const t = e.labelAt === 'start' ? 0 : 1, p = cv.pt(t), d = cv.tan(t), k = e.labelAt === 'start' ? -16 : 16;
+    return { x: p.x + d.x * k, y: p.y + d.y * k };
+  }
+  const m = cv.pt(0.5), d = cv.tan(0.5);
+  const off = (14 + e.amplitude + (e.mom ? 11 : 0)) * e.side;
+  return { x: m.x - d.y * off, y: m.y + d.x * off };
+}
+
+// The momentum arrow beside a line: the middle part of the line, moved to the label's side.
+const MOM_GAP = 10;
+function edgeMomentum(e: Edge): { a: Pt, m: Pt, b: Pt, straight: boolean } | null {
+  if (!e.mom) return null;
+  const cv = curveOf(e);
+  const off = (MOM_GAP + (e.kind === 'photon' || e.kind === 'gluon' || e.kind === 'wilson' ? e.amplitude : 0)) * e.side;
+  const at = (t: number) => { const p = cv.pt(t), d = cv.tan(t); return { x: p.x - d.y * off, y: p.y + d.x * off }; };
+  const [t0, t1] = e.mom === 1 ? [0.3, 0.7] : [0.7, 0.3];
+  return { a: at(t0), m: at(0.5), b: at(t1), straight: !e.bend };
+}
+
+const fadedStroke = (th: number) => `(thickness: ${num(th)}pt, paint: luma(62%), dash: "densely-dotted")`;
+
 function edgeCode(e: Edge): string[] {
   const out: string[] = [];
+  if (e.style === 'hidden') return out;
+  const faded = e.style === 'faded';
+  const cv = curveOf(e);
+  const len = cv.len;
+  const shapeCode = (a: Pt, b: Pt, m: Pt, cc: Pt) => cv.arc
+    ? `arc-through(${cx(a)}, ${cx(m)}, ${cx(b)}`
+    : e.bend === 0 ? `line(${cx(a)}, ${cx(b)}` : `bezier(${cx(a)}, ${cx(b)}, ${cx(cc)}`;
   const c = ctrlPt(e.from, e.to, e.bend);
-  const len = pathLen(e.from, e.to.x === e.from.x && e.to.y === e.from.y ? e.from : c, e.to);
-  const mkBase = (a: Pt, b: Pt, cc: Pt) => e.bend === 0
-    ? `line(${cx(a)}, ${cx(b)}`
-    : `bezier(${cx(a)}, ${cx(b)}, ${cx(cc)}`;
-  const base = mkBase(e.from, e.to, c);
-
-  if (e.kind === 'wilson') {
-    const teeth = Math.max(3, Math.round(len / 14));
-    out.push(`  decorations.zigzag(${base}), stroke: ${strokeOf(e.thickness, e.color)}, amplitude: ${num(e.amplitude / UNIT)}, segments: ${teeth})`);
-    const m = bezPt(e.from, c, e.to, 0.5), d = bezTan(e.from, c, e.to, 0.5), ex = 3.2;
-    out.push(`  mark(${cx({ x: m.x - d.x * ex, y: m.y - d.y * ex })}, ${cx({ x: m.x + d.x * ex, y: m.y + d.y * ex })}, symbol: ">", fill: ${paintOf(e.color)}, stroke: ${paintOf(e.color)}, scale: ${num(Math.max(0.8, e.thickness * 0.8))})`);
-    return out;
-  }
-
-  if (e.kind === 'photon' || e.kind === 'gluon') {
-    const fn = e.kind === 'photon' ? 'wave' : 'coil';
-    const segs = Math.max(3, Math.round(len / (e.kind === 'photon' ? 13 : 12)));
-    out.push(`  decorations.${fn}(${base}), stroke: ${strokeOf(e.thickness, e.color)}, amplitude: ${num(e.amplitude / UNIT)}, segments: ${segs})`);
-    return out;
-  }
+  const base = shapeCode(e.from, e.to, cv.pt(0.5), c);
+  const plainStroke = faded ? fadedStroke(e.thickness) : strokeOf(e.thickness, e.color);
 
   // An arrowhead somewhere along the edge (dir +1 points forward, -1 backward).
   const midMark = (t: number, dir: number) => {
-    const m = bezPt(e.from, c, e.to, t), d = bezTan(e.from, c, e.to, t), ex = 3.2;
+    if (faded) return;
+    const m = cv.pt(t), d = cv.tan(t), ex = 3.2;
     const p1 = { x: m.x - dir * d.x * ex, y: m.y - dir * d.y * ex };
     const p2 = { x: m.x + dir * d.x * ex, y: m.y + dir * d.y * ex };
     out.push(`  mark(${cx(p1)}, ${cx(p2)}, symbol: ">", fill: ${paintOf(e.color)}, stroke: ${paintOf(e.color)}, scale: ${num(Math.max(0.8, e.thickness * 0.8))})`);
   };
 
-  // Double line: two parallel rails offset along the chord normal.
-  if (e.kind === 'double') {
-    const l0 = Math.hypot(e.to.x - e.from.x, e.to.y - e.from.y) || 1;
-    const nx = -(e.to.y - e.from.y) / l0, ny = (e.to.x - e.from.x) / l0;
-    for (const s of [1, -1]) {
-      const o = (p: Pt): Pt => ({ x: p.x + nx * DBL * s, y: p.y + ny * DBL * s });
-      out.push(`  ${mkBase(o(e.from), o(e.to), o(c))}, stroke: ${strokeOf(e.thickness, e.color)})`);
+  if (e.kind === 'wilson') {
+    const teeth = Math.max(3, Math.round(len / 14));
+    out.push(`  decorations.zigzag(${base}), stroke: ${plainStroke}, amplitude: ${num(e.amplitude / UNIT)}, segments: ${teeth})`);
+    midMark(0.5, 1);
+  } else if (e.kind === 'photon' || e.kind === 'gluon') {
+    const fn = e.kind === 'photon' ? 'wave' : 'coil';
+    const segs = Math.max(3, Math.round(len / (e.kind === 'photon' ? 13 : 12)));
+    out.push(`  decorations.${fn}(${base}), stroke: ${plainStroke}, amplitude: ${num(e.amplitude / UNIT)}, segments: ${segs})`);
+  } else if (e.kind === 'double') {
+    // Two rails, each the line moved sideways (an arc's rails are arcs with the same centre).
+    for (const sg of [1, -1]) {
+      const o = (t: number): Pt => { const p = cv.pt(t), d = cv.tan(t); return { x: p.x - d.y * DBL * sg, y: p.y + d.x * DBL * sg }; };
+      const l0 = Math.hypot(e.to.x - e.from.x, e.to.y - e.from.y) || 1;
+      const nx = -(e.to.y - e.from.y) / l0, ny = (e.to.x - e.from.x) / l0;
+      const oc = { x: c.x + nx * DBL * sg, y: c.y + ny * DBL * sg };
+      out.push(`  ${shapeCode(o(0), o(1), o(0.5), oc)}, stroke: ${plainStroke})`);
     }
     if (e.endArrow) midMark(0.94, 1);
-    return out;
+  } else {
+    const stroke = faded ? fadedStroke(e.thickness)
+      : (e.kind === 'scalar' || e.kind === 'cscalar') ? dashStroke(e.thickness, 'dashed', e.color)
+      : e.kind === 'ghost' ? dashStroke(e.thickness, 'dotted', e.color) : strokeOf(e.thickness, e.color);
+    const mark = e.endArrow && !faded ? `, mark: (end: ">", fill: ${paintOf(e.color)})` : '';
+    out.push(`  ${base}, stroke: ${stroke}${mark})`);
+    // Directional arrows in the middle of the propagator.
+    if (e.kind === 'fermion' || e.kind === 'cscalar' || e.kind === 'ghost') midMark(0.5, 1);
+    else if (e.kind === 'antifermion') midMark(0.5, -1);
+    else if (e.kind === 'majorana') { midMark(0.4, 1); midMark(0.6, -1); } // two clashing arrows
   }
 
-  const stroke = (e.kind === 'scalar' || e.kind === 'cscalar') ? dashStroke(e.thickness, 'dashed', e.color)
-    : e.kind === 'ghost' ? dashStroke(e.thickness, 'dotted', e.color) : strokeOf(e.thickness, e.color);
-  const mark = e.endArrow ? `, mark: (end: ">", fill: ${paintOf(e.color)})` : '';
-  out.push(`  ${base}, stroke: ${stroke}${mark})`);
-  // Directional arrows in the middle of the propagator.
-  if (e.kind === 'fermion' || e.kind === 'cscalar' || e.kind === 'ghost') midMark(0.5, 1);
-  else if (e.kind === 'antifermion') midMark(0.5, -1);
-  else if (e.kind === 'majorana') { midMark(0.4, 1); midMark(0.6, -1); } // two clashing arrows
+  // Dots: the propagator raised to a higher power, one dot per extra power.
+  const dots = Math.max(0, Math.min(4, e.dots ?? 0));
+  for (let i = 1; i <= dots; i++)
+    out.push(`  circle(${cx(cv.pt(i / (dots + 1)))}, radius: ${num(DOT_R / UNIT)}, fill: ${faded ? 'luma(62%)' : paintOf(e.color)}, stroke: none)`);
+
+  const mom = faded ? null : edgeMomentum(e);
+  if (mom) {
+    const paint = paintOf(e.color);
+    out.push(mom.straight
+      ? `  line(${cx(mom.a)}, ${cx(mom.b)}, stroke: 0.7pt + ${paint}, mark: (end: ">", fill: ${paint}))`
+      : `  arc-through(${cx(mom.a)}, ${cx(mom.m)}, ${cx(mom.b)}, stroke: 0.7pt + ${paint}, mark: (end: ">", fill: ${paint}))`);
+  }
+  if (e.label.trim()) out.push(`  content(${cx(edgeLabelPos(e))}, ${mathContent(e.label.trim(), faded ? '#9e9e9e' : e.color)})`);
   return out;
 }
 
+const DOT_R = 3.2;
+
+// A loop's momentum arrow: an arc just outside the top of the circle, clockwise for 1.
+function loopMomentum(l: Loop): { a: Pt, m: Pt, b: Pt } | null {
+  if (!l.mom) return null;
+  const R = l.radius + MOM_GAP + (l.kind === 'photon' || l.kind === 'gluon' ? l.amplitude : 0);
+  const at = (deg: number) => ({ x: l.center.x + R * Math.cos(deg * Math.PI / 180), y: l.center.y + R * Math.sin(deg * Math.PI / 180) });
+  // SVG angles grow clockwise on screen; -90 is the top.
+  const [d0, d1] = l.mom === 1 ? [-125, -55] : [-55, -125];
+  return { a: at(d0), m: at(-90), b: at(d1) };
+}
+
+const loopLabelAbove = (l: Loop): Pt => ({ x: l.center.x, y: l.center.y - l.radius - 14 - (l.mom ? 12 : 0) - (l.kind === 'photon' || l.kind === 'gluon' ? l.amplitude : 0) });
+const loopLabelBelow = (l: Loop): Pt => ({ x: l.center.x, y: l.center.y + l.radius + 14 + (l.kind === 'photon' || l.kind === 'gluon' ? l.amplitude : 0) });
+
 function loopCode(l: Loop): string[] {
   const out: string[] = [];
-  if (l.kind === 'plain' || l.kind === 'scalar') {
+  if (l.style === 'hidden') return out;
+  if (l.style === 'faded') {
+    out.push(`  circle(${cx(l.center)}, radius: ${num(l.radius / UNIT)}, stroke: ${fadedStroke(l.thickness)})`);
+  } else if (l.kind === 'plain' || l.kind === 'scalar') {
     const fill = l.fill === 'shaded' ? `, fill: ${tint(l.color) ? `${tint(l.color)}.lighten(70%)` : 'gray.lighten(50%)'}` : '';
     // A scalar runs dashed, loop or line.
     const stroke = l.kind === 'scalar' ? dashStroke(l.thickness, 'dashed', l.color) : strokeOf(l.thickness, l.color);
@@ -217,7 +345,7 @@ function loopCode(l: Loop): string[] {
     const segs = Math.max(6, Math.round(2 * Math.PI * l.radius / (l.kind === 'photon' ? 13 : 12)));
     out.push(`  decorations.${fn}(circle(${cx(l.center)}, radius: ${num(l.radius / UNIT)}), stroke: ${strokeOf(l.thickness, l.color)}, amplitude: ${num(l.amplitude / UNIT)}, segments: ${segs})`);
   }
-  if (l.fill === 'hatched') {
+  if (l.fill === 'hatched' && l.style !== 'faded') {
     // 45° chords across the circle — version-proof hatching without pattern fills
     const r = l.radius, spacing = Math.max(8, r / 3.2);
     const ux = Math.SQRT1_2, uy = -Math.SQRT1_2, nx = Math.SQRT1_2, ny = Math.SQRT1_2;
@@ -230,7 +358,7 @@ function loopCode(l: Loop): string[] {
   }
   // Fermion-flow arrows tangent to the circle, one at the top and one at the
   // bottom so the rotation reads at a glance. arrow: 1 = clockwise, -1 = ccw.
-  if (l.arrow) {
+  if (l.arrow && l.style !== 'faded') {
     const ex = 3.2, sc = num(Math.max(0.8, l.thickness * 0.8));
     for (const [py, dir] of [[l.center.y - l.radius, l.arrow], [l.center.y + l.radius, -l.arrow]] as const) {
       const p1 = { x: l.center.x - dir * ex, y: py };
@@ -238,6 +366,14 @@ function loopCode(l: Loop): string[] {
       out.push(`  mark(${cx(p1)}, ${cx(p2)}, symbol: ">", fill: ${paintOf(l.color)}, stroke: ${paintOf(l.color)}, scale: ${sc})`);
     }
   }
+  const mom = l.style === 'faded' ? null : loopMomentum(l);
+  if (mom) {
+    const paint = paintOf(l.color);
+    out.push(`  arc-through(${cx(mom.a)}, ${cx(mom.m)}, ${cx(mom.b)}, stroke: 0.7pt + ${paint}, mark: (end: ">", fill: ${paint}))`);
+  }
+  const ink = l.style === 'faded' ? '#9e9e9e' : l.color;
+  if (l.label.trim()) out.push(`  content(${cx(loopLabelAbove(l))}, ${mathContent(l.label.trim(), ink)})`);
+  if (l.labelBelow?.trim()) out.push(`  content(${cx(loopLabelBelow(l))}, ${mathContent(l.labelBelow.trim(), ink)})`);
   return out;
 }
 
@@ -253,58 +389,75 @@ const T = (x: number, y: number): Pt => ({ x, y });
 // Pure, so the examples browser can draw a thumbnail with the very same lines
 // the canvas uses.
 function drawEdge(e: Edge, selected: number | null) {
-  const c = ctrlPt(e.from, e.to, e.bend);
-  const col = previewCol(e.color, e.id === selected);
-  const pathFor = (a: Pt, b: Pt, cc: Pt) => e.bend === 0
-    ? `M${a.x},${a.y} L${b.x},${b.y}`
-    : `M${a.x},${a.y} Q${cc.x},${cc.y} ${b.x},${b.y}`;
-  const basePath = pathFor(e.from, e.to, c);
+  const isSel = e.id === selected;
+  const cv = curveOf(e);
+  const faded = e.style === 'faded', hidden = e.style === 'hidden';
+  // Faded draws grey and dotted, as it prints; hidden prints nothing but stays faintly visible here so it
+  // can still be picked.
+  const col = isSel ? '#7c3aed' : hidden ? '#cbd5e1' : faded ? '#9e9e9e' : previewCol(e.color, false);
+  const basePath = shapePath(e);
   const parts: React.ReactNode[] = [];
   const midArrow = (t: number, back: boolean) => {
-    const m = bezPt(e.from, c, e.to, t), d = bezTan(e.from, c, e.to, t);
+    if (faded || hidden) return;
+    const m = cv.pt(t), d = cv.tan(t);
     parts.push(<polygon key={`a${t}-${back}`} points={arrowPts(m, d, 5 + e.thickness * 1.5, back)} fill={col} />);
   };
+  const lineDash = hidden ? '3 6' : faded ? '1.5 3' : undefined;
   if (e.kind === 'photon' || e.kind === 'gluon') {
-    parts.push(<path key="p" d={decoPath(e.from, e.to, e.bend, e.kind, e.amplitude)} fill="none" stroke={col} strokeWidth={e.thickness} />);
+    parts.push(<path key="p" d={decoPath(cv, e.kind, e.amplitude)} fill="none" stroke={col} strokeWidth={e.thickness} strokeDasharray={lineDash} />);
   } else if (e.kind === 'wilson') {
-    parts.push(<path key="p" d={zigzagPath(e.from, e.to, e.bend, e.amplitude)} fill="none" stroke={col} strokeWidth={e.thickness} />);
+    parts.push(<path key="p" d={zigzagPath(cv, e.amplitude)} fill="none" stroke={col} strokeWidth={e.thickness} strokeDasharray={lineDash} />);
     midArrow(0.5, false); // a gauge link runs one way; show which
   } else if (e.kind === 'double') {
-    const l0 = Math.hypot(e.to.x - e.from.x, e.to.y - e.from.y) || 1;
-    const nx = -(e.to.y - e.from.y) / l0, ny = (e.to.x - e.from.x) / l0;
-    for (const s of [1, -1]) {
-      const o = (p: Pt): Pt => ({ x: p.x + nx * DBL * s, y: p.y + ny * DBL * s });
-      parts.push(<path key={`d${s}`} d={pathFor(o(e.from), o(e.to), o(c))} fill="none" stroke={col} strokeWidth={e.thickness} />);
-    }
+    for (const sg of [1, -1]) parts.push(<path key={`d${sg}`} d={offsetPath(cv, DBL * sg)} fill="none" stroke={col} strokeWidth={e.thickness} strokeDasharray={lineDash} />);
     if (e.endArrow) midArrow(0.94, false);
   } else {
-    const dash = (e.kind === 'scalar' || e.kind === 'cscalar') ? '8 5' : e.kind === 'ghost' ? '2 5' : undefined;
+    const dash = lineDash ?? ((e.kind === 'scalar' || e.kind === 'cscalar') ? '8 5' : e.kind === 'ghost' ? '2 5' : undefined);
     parts.push(<path key="p" d={basePath} fill="none" stroke={col} strokeWidth={e.thickness} strokeDasharray={dash} />);
     if (e.kind === 'fermion' || e.kind === 'cscalar' || e.kind === 'ghost') midArrow(0.5, false);
     else if (e.kind === 'antifermion') midArrow(0.5, true);
     else if (e.kind === 'majorana') { midArrow(0.4, false); midArrow(0.6, true); }
   }
-  if (e.endArrow && e.kind !== 'photon' && e.kind !== 'gluon' && e.kind !== 'double' && e.kind !== 'wilson') {
-    const d = bezTan(e.from, c, e.to, 1);
+  if (e.endArrow && !faded && !hidden && e.kind !== 'photon' && e.kind !== 'gluon' && e.kind !== 'double' && e.kind !== 'wilson') {
+    const d = cv.tan(1);
     parts.push(<polygon key="e" points={arrowPts(e.to, d, 5 + e.thickness * 1.5, false)} fill={col} />);
   }
-  if (e.label.trim()) {
-    const m = bezPt(e.from, c, e.to, 0.5), d = bezTan(e.from, c, e.to, 0.5);
-    const off = (14 + e.amplitude) * e.side;
-    parts.push(<text key="l" x={m.x - d.y * off} y={m.y + d.x * off} fontSize="13" fontStyle="italic" fontFamily="Georgia, serif" textAnchor="middle" dominantBaseline="middle" fill={col}>{prettyLabel(e.label)}</text>);
+  if (!hidden) {
+    const dots = Math.max(0, Math.min(4, e.dots ?? 0));
+    for (let i = 1; i <= dots; i++) {
+      const p = cv.pt(i / (dots + 1));
+      parts.push(<circle key={`dot${i}`} cx={p.x} cy={p.y} r={DOT_R} fill={col} />);
+    }
+    const mom = faded ? null : edgeMomentum(e);
+    if (mom) {
+      const c = { x: 2 * mom.m.x - (mom.a.x + mom.b.x) / 2, y: 2 * mom.m.y - (mom.a.y + mom.b.y) / 2 };
+      const d0 = { x: mom.b.x - c.x, y: mom.b.y - c.y }, l0 = Math.hypot(d0.x, d0.y) || 1;
+      parts.push(<path key="mom" d={mom.straight ? `M${mom.a.x},${mom.a.y} L${mom.b.x},${mom.b.y}` : `M${mom.a.x},${mom.a.y} Q${c.x},${c.y} ${mom.b.x},${mom.b.y}`} fill="none" stroke={col} strokeWidth={0.9} />);
+      const dir = mom.straight ? (() => { const v = { x: mom.b.x - mom.a.x, y: mom.b.y - mom.a.y }, l = Math.hypot(v.x, v.y) || 1; return { x: v.x / l, y: v.y / l }; })() : { x: d0.x / l0, y: d0.y / l0 };
+      parts.push(<polygon key="moma" points={arrowPts(mom.b, dir, 4.5, false)} fill={col} />);
+    }
+    if (e.label.trim()) {
+      const at = edgeLabelPos(e);
+      parts.push(<text key="l" x={at.x} y={at.y} fontSize="13" fontStyle="italic" fontFamily="Georgia, serif" textAnchor="middle" dominantBaseline="middle" fill={col}>{prettyLabel(e.label)}</text>);
+    }
   }
-return <g key={e.id}>{parts}</g>;
+  return <g key={e.id}>{parts}</g>;
 }
 
 function drawLoop(l: Loop, selected: number | null) {
-  const col = previewCol(l.color, l.id === selected);
+  const isSel = l.id === selected;
+  const faded = l.style === 'faded', hidden = l.style === 'hidden';
+  const col = isSel ? '#7c3aed' : hidden ? '#cbd5e1' : faded ? '#9e9e9e' : previewCol(l.color, false);
   const parts: React.ReactNode[] = [];
-  if (l.kind === 'plain' || l.kind === 'scalar') {
+  if (faded || hidden) {
+    parts.push(<circle key="c" cx={l.center.x} cy={l.center.y} r={l.radius} fill="none" stroke={col} strokeWidth={l.thickness} strokeDasharray={hidden ? '3 6' : '1.5 3'} />);
+    if (hidden) return <g key={l.id}>{parts}</g>;
+  } else if (l.kind === 'plain' || l.kind === 'scalar') {
     parts.push(<circle key="c" cx={l.center.x} cy={l.center.y} r={l.radius} fill={l.fill === 'shaded' ? (tint(l.color) ? `${l.color}44` : '#d4d4d4') : 'none'} stroke={col} strokeWidth={l.thickness} strokeDasharray={l.kind === 'scalar' ? '8 5' : undefined} />);
   } else {
     parts.push(<path key="c" d={decoCirclePath(l.center, l.radius, l.kind, l.amplitude)} fill="none" stroke={col} strokeWidth={l.thickness} />);
   }
-  if (l.fill === 'hatched') {
+  if (l.fill === 'hatched' && !faded) {
     const r = l.radius, spacing = Math.max(8, r / 3.2);
     const hs: React.ReactNode[] = [];
     for (let cD = -r + spacing, i = 0; cD < r - 1; cD += spacing, i++) {
@@ -316,17 +469,113 @@ function drawLoop(l: Loop, selected: number | null) {
     }
     parts.push(<g key="h">{hs}</g>);
   }
-  if (l.arrow) {
+  if (l.arrow && !faded) {
     const size = 4 + l.thickness * 2;
     parts.push(<polygon key="a1" points={arrowPts({ x: l.center.x, y: l.center.y - l.radius }, { x: l.arrow, y: 0 }, size, false)} fill={col} />);
     parts.push(<polygon key="a2" points={arrowPts({ x: l.center.x, y: l.center.y + l.radius }, { x: -l.arrow, y: 0 }, size, false)} fill={col} />);
   }
-  if (l.label.trim())
-    parts.push(<text key="l" x={l.center.x} y={l.center.y - l.radius - 14} fontSize="13" fontStyle="italic" fontFamily="Georgia, serif" textAnchor="middle" dominantBaseline="middle" fill={col}>{prettyLabel(l.label)}</text>);
-return <g key={l.id}>{parts}</g>;
+  const mom = faded ? null : loopMomentum(l);
+  if (mom) {
+    const R = Math.hypot(mom.m.x - l.center.x, mom.m.y - l.center.y);
+    parts.push(<path key="mom" d={`M${mom.a.x},${mom.a.y} A${R},${R} 0 0 ${l.mom === 1 ? 1 : 0} ${mom.b.x},${mom.b.y}`} fill="none" stroke={col} strokeWidth={0.9} />);
+    const g = (l.mom === 1 ? -55 : -125) * Math.PI / 180, sg = l.mom === 1 ? 1 : -1;
+    parts.push(<polygon key="moma" points={arrowPts(mom.b, { x: -Math.sin(g) * sg, y: Math.cos(g) * sg }, 4.5, false)} fill={col} />);
+  }
+  const label = (key: string, text: string, at: Pt) =>
+    <text key={key} x={at.x} y={at.y} fontSize="13" fontStyle="italic" fontFamily="Georgia, serif" textAnchor="middle" dominantBaseline="middle" fill={col}>{prettyLabel(text)}</text>;
+  if (l.label.trim()) parts.push(label('l', l.label, loopLabelAbove(l)));
+  if (l.labelBelow?.trim()) parts.push(label('lb', l.labelBelow, loopLabelBelow(l)));
+  return <g key={l.id}>{parts}</g>;
 }
 
 type Example = { name: string; group: string; note?: string; make: () => El[] };
+
+// The bend that makes a circular arc from p to q follow the circle (centre c) the short way round
+// (for the examples' quarter circles).
+function bendOnCircle(c: Pt, p: Pt, q: Pt): number {
+  const r = Math.hypot(p.x - c.x, p.y - c.y);
+  const mid = { x: (p.x + q.x) / 2, y: (p.y + q.y) / 2 };
+  const len = Math.hypot(q.x - p.x, q.y - p.y) || 1;
+  const nx = -(q.y - p.y) / len, ny = (q.x - p.x) / len;
+  let ux = mid.x - c.x, uy = mid.y - c.y;
+  const ul = Math.hypot(ux, uy);
+  if (ul < 1e-6) { ux = nx; uy = ny; } else { ux /= ul; uy /= ul; }   // a diameter: bulge to the normal side
+  const m = { x: c.x + r * ux, y: c.y + r * uy };
+  return Math.round(((m.x - mid.x) * nx + (m.y - mid.y) * ny) * 10) / 10;
+}
+
+// The bend that makes a circular arc from p to q pass through m.
+function bendThrough(p: Pt, q: Pt, m: Pt): number {
+  const len = Math.hypot(q.x - p.x, q.y - p.y) || 1;
+  const nx = -(q.y - p.y) / len, ny = (q.x - p.x) / len;
+  return Math.round(((m.x - (p.x + q.x) / 2) * nx + (m.y - (p.y + q.y) / 2) * ny) * 10) / 10;
+}
+
+const LOOP_TO_EDGE: Record<LoopKind, EdgeKind> = { plain: 'plain', scalar: 'scalar', photon: 'photon', gluon: 'gluon' };
+
+// A circle cut into arcs at the points on it (vertices and line ends), so each piece can be labelled,
+// dotted or faded on its own: the shape of a loop-integral graph. With fewer than two points on it, it is
+// cut at its left and right.
+function splitLoop(l: Loop, els: El[], nextId: () => number): Edge[] {
+  const on: Pt[] = [];
+  const consider = (p: Pt) => {
+    if (Math.abs(Math.hypot(p.x - l.center.x, p.y - l.center.y) - l.radius) > 6) return;
+    if (!on.some(q => Math.hypot(q.x - p.x, q.y - p.y) < 4)) on.push(p);
+  };
+  for (const e of els) {
+    if (e.id === l.id) continue;
+    if (e.type === 'vertex') consider(e.at);
+    else if (e.type === 'edge') { consider(e.from); consider(e.to); }
+  }
+  if (on.length < 2) on.splice(0, on.length, { x: l.center.x - l.radius, y: l.center.y }, { x: l.center.x + l.radius, y: l.center.y });
+  // Put the points exactly on the circle and go round clockwise on screen.
+  const angle = (p: Pt) => Math.atan2(p.y - l.center.y, p.x - l.center.x);
+  const pts = on.map(p => { const a = angle(p); return { a, p: { x: l.center.x + l.radius * Math.cos(a), y: l.center.y + l.radius * Math.sin(a) } }; })
+    .sort((u, v) => u.a - v.a);
+  const kind: EdgeKind = l.arrow ? (l.arrow === 1 ? 'fermion' : 'antifermion') : LOOP_TO_EDGE[l.kind];
+  const arcs = pts.map((u, i) => {
+    const v = pts[(i + 1) % pts.length];
+    let span = v.a - u.a;
+    if (span <= 0) span += 2 * Math.PI;
+    // Through the circle's point halfway round, so a half circle bulges the way the arc actually goes.
+    const mid = u.a + span / 2;
+    const bend = bendThrough(u.p, v.p, { x: l.center.x + l.radius * Math.cos(mid), y: l.center.y + l.radius * Math.sin(mid) });
+    return {
+      id: nextId(), type: 'edge', kind, from: u.p, to: v.p, bend, arc: true,
+      thickness: l.thickness, amplitude: l.amplitude, endArrow: false, label: '', side: bend >= 0 ? 1 : -1, color: l.color,
+      style: l.style,
+    } as Edge;
+  });
+  // The circle's labels go to the arcs at its top and bottom.
+  const midY = (e: Edge) => curveOf(e).pt(0.5).y;
+  if (l.label.trim() && arcs.length) arcs.reduce((a, b) => midY(b) < midY(a) ? b : a).label = l.label;
+  if (l.labelBelow?.trim() && arcs.length) arcs.reduce((a, b) => midY(b) > midY(a) ? b : a).label = l.labelBelow;
+  if (l.mom && arcs.length) {
+    const top = arcs.reduce((a, b) => midY(b) < midY(a) ? b : a);
+    top.mom = l.mom;           // arcs run clockwise, the same sense as mom 1
+  }
+  return arcs;
+}
+
+// Numbers the internal lines 1, 2, 3 … in the order they were drawn, the way loop-integral notes label
+// propagators. A line is internal when both ends touch something else; external legs, hidden lines and
+// lines with a label of their own (other than a number) are left alone.
+function numberLines(els: El[]): El[] {
+  const touches = (p: Pt, self: number) => els.some(o => {
+    if (o.id === self) return false;
+    if (o.type === 'vertex') return Math.hypot(o.at.x - p.x, o.at.y - p.y) < 6;
+    if (o.type === 'edge') return Math.hypot(o.from.x - p.x, o.from.y - p.y) < 4 || Math.hypot(o.to.x - p.x, o.to.y - p.y) < 4;
+    if (o.type === 'loop') return Math.abs(Math.hypot(p.x - o.center.x, p.y - o.center.y) - o.radius) < 6;
+    return false;
+  });
+  let n = 0;
+  return els.map(e => {
+    if (e.type !== 'edge' || e.style === 'hidden') return e;
+    if (e.label.trim() && !/^\d+$/.test(e.label.trim())) return e;
+    if (!touches(e.from, e.id) || !touches(e.to, e.id)) return e;
+    return { ...e, label: String(++n) };
+  });
+}
 
 // Shorthands for the examples below. A diagram is mostly the same four lines
 // with different particles on them, and spelling every field out each time
@@ -488,8 +737,8 @@ const boundsOf = (els: El[]) => {
     x2 = Math.max(x2, p.x + pad); y2 = Math.max(y2, p.y + pad);
   };
   for (const e of els) {
-    if (e.type === 'edge') { see(e.from, 14); see(e.to, 14); }
-    else if (e.type === 'loop') see(e.center, e.radius + 18);
+    if (e.type === 'edge') { see(e.from, 14); see(e.to, 14); see(curveOf(e).pt(0.5), 14); if (e.label.trim()) see(edgeLabelPos(e), 12); }
+    else if (e.type === 'loop') see(e.center, e.radius + 18 + (e.mom ? 12 : 0));
     else see(e.at, 16);
   }
   if (!Number.isFinite(x1)) return { x: 0, y: 0, w: W, h: H };
@@ -509,12 +758,71 @@ function ExampleThumb({ els, height = 96 }: { els: El[]; height?: number }) {
 }
 
 const exampleGroups = () => {
-  const all = [...EXAMPLES, ...ADVANCED];
-  const order = ['QED', 'Electroweak', 'QCD', 'Scalar', 'Advanced QCD'];
+  const all = [...EXAMPLES, ...ADVANCED, ...IBP];
+  const order = ['QED', 'Electroweak', 'QCD', 'Scalar', 'Advanced QCD', 'IBP / loop integrals'];
   return order
     .map(group => ({ group, items: all.filter(e => e.group === group) }))
     .filter(g => g.items.length);
 };
+
+// Graphs for loop-integral notes (IBP, spanning trees, Symanzik polynomials): plain lines, circular arcs
+// cut at the vertices, numbered propagators, dots for raised powers, faded lines for cut ones.
+const ln = (from: Pt, to: Pt, extra: Partial<Edge> = {}): Edge =>
+  ({ id: tid++, type: 'edge', kind: 'plain', from, to, bend: 0, thickness: 1.2, amplitude: 5, endArrow: false, label: '', side: 1, ...extra });
+const arcE = (c: Pt, from: Pt, to: Pt, extra: Partial<Edge> = {}): Edge => {
+  const bend = bendOnCircle(c, from, to);
+  return ln(from, to, { arc: true, bend, side: bend >= 0 ? 1 : -1, ...extra });
+};
+
+// The one-loop bubble with four legs: p1, p2 in on the left, p3, p4 out on the right, loop momentum
+// ell on top (with its arrow) and ell - p below.
+const bubble = (extraBottom: Partial<Edge> = {}, legs = true): El[] => {
+  const L = T(270, 200), R = T(410, 200);
+  return [
+    ...(legs ? [
+      ln(T(160, 110), L, { label: 'p_1', labelAt: 'start' }),
+      ln(T(160, 290), L, { label: 'p_2', labelAt: 'start' }),
+      ln(R, T(520, 110), { label: 'p_3', labelAt: 'end' }),
+      ln(R, T(520, 290), { label: 'p_4', labelAt: 'end' }),
+    ] : [ln(T(160, 200), L, { label: 'p', labelAt: 'start' }), ln(R, T(520, 200), { label: 'p', labelAt: 'end' })]),
+    ln(L, R, { arc: true, bend: -70, label: 'ell', side: -1, mom: 1 }),
+    ln(L, R, { arc: true, bend: 70, label: 'ell - p', side: 1, ...extraBottom }),
+  ];
+};
+
+// The two-loop graph: a circle with a chord, legs left and right; lines 1, 2 on the left (bottom, top),
+// 3, 4 on the right (bottom, top), 5 the chord.
+const twoLoop = (cut: number[] = []): El[] => {
+  const C = T(340, 200), Lp = T(260, 200), Rp = T(420, 200), Tp = T(340, 120), Bp = T(340, 280);
+  const style = (n: number): Partial<Edge> => cut.includes(n) ? { style: 'faded' } : {};
+  return [
+    ln(T(180, 200), Lp), ln(Rp, T(500, 200)),
+    arcE(C, Bp, Lp, { label: '1', ...style(1) }),
+    arcE(C, Lp, Tp, { label: '2', ...style(2) }),
+    arcE(C, Rp, Bp, { label: '3', ...style(3) }),
+    arcE(C, Tp, Rp, { label: '4', ...style(4) }),
+    ln(Tp, Bp, { label: '5', side: -1, ...style(5) }),
+  ];
+};
+
+const IBP: Example[] = [
+  { name: 'One-loop bubble', group: 'IBP / loop integrals', note: 'p₁ … p₄, loop momentum ℓ and ℓ − p', make: () => bubble() },
+  { name: 'Bubble with a dot', group: 'IBP / loop integrals', note: 'a dot raises that propagator’s power by one', make: () => bubble({ dots: 1 }, false) },
+  {
+    name: 'One-loop box', group: 'IBP / loop integrals', note: 'four numbered propagators',
+    make: () => {
+      const a = T(280, 140), b = T(400, 140), c = T(400, 260), d = T(280, 260);
+      return [
+        ln(T(200, 80), a, { label: 'p_1', labelAt: 'start' }), ln(T(480, 80), b, { label: 'p_2', labelAt: 'start' }),
+        ln(c, T(480, 320), { label: 'p_3', labelAt: 'end' }), ln(d, T(200, 320), { label: 'p_4', labelAt: 'end' }),
+        ln(a, b, { label: '1', side: -1, mom: 1 }), ln(b, c, { label: '2', side: -1 }),
+        ln(c, d, { label: '3', side: -1 }), ln(d, a, { label: '4', side: -1 }),
+      ];
+    },
+  },
+  { name: 'Two-loop graph, lines numbered', group: 'IBP / loop integrals', note: 'five propagators', make: () => twoLoop() },
+  { name: 'Two-loop graph, lines 1 and 3 cut', group: 'IBP / loop integrals', note: 'a spanning tree: cut lines faded', make: () => twoLoop([1, 3]) },
+];
 
 // The older diagrams, kept: the loops and gauge links a research student needs.
 const ADVANCED: Example[] = [
@@ -670,9 +978,9 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
         const d = Math.hypot(e.center.x - p.x, e.center.y - p.y);
         if (Math.abs(d - e.radius) < 9 || (e.fill !== 'none' && d < e.radius)) return e.id;
       } else {
-        const c = ctrlPt(e.from, e.to, e.bend);
+        const cv = curveOf(e);
         for (let t = 0; t <= 24; t++) {
-          const q = bezPt(e.from, c, e.to, t / 24);
+          const q = cv.pt(t / 24);
           if (Math.hypot(q.x - p.x, q.y - p.y) < 8 + e.amplitude) return e.id;
         }
       }
@@ -714,10 +1022,7 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
   };
 
   const handlePoints = (e: El): ['from' | 'to' | 'bend' | 'radius', Pt][] => {
-    if (e.type === 'edge') {
-      const c = ctrlPt(e.from, e.to, e.bend);
-      return [['from', e.from], ['to', e.to], ['bend', bezPt(e.from, c, e.to, 0.5)]];
-    }
+    if (e.type === 'edge') return [['from', e.from], ['to', e.to], ['bend', curveOf(e).pt(0.5)]];
     if (e.type === 'loop') return [['radius', { x: e.center.x + e.radius, y: e.center.y }]];
     return [];
   };
@@ -819,17 +1124,7 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
   const genCode = useCallback(() => {
     const lines: string[] = [];
     for (const e of els) if (e.type === 'loop') lines.push(...loopCode(e));
-    for (const e of els) if (e.type === 'edge') {
-      lines.push(...edgeCode(e));
-      if (e.label.trim()) {
-        const c = ctrlPt(e.from, e.to, e.bend);
-        const m = bezPt(e.from, c, e.to, 0.5), d = bezTan(e.from, c, e.to, 0.5);
-        const off = (14 + e.amplitude) * e.side;
-        lines.push(`  content(${cx({ x: m.x - d.y * off, y: m.y + d.x * off })}, ${mathContent(e.label.trim(), e.color)})`);
-      }
-    }
-    for (const e of els) if (e.type === 'loop' && e.label.trim())
-      lines.push(`  content(${cx({ x: e.center.x, y: e.center.y - e.radius - 14 })}, ${mathContent(e.label.trim(), e.color)})`);
+    for (const e of els) if (e.type === 'edge') lines.push(...edgeCode(e));
     for (const e of els) if (e.type === 'vertex')
       lines.push(`  circle(${cx(e.at)}, radius: ${num(e.size / UNIT)}, fill: ${paintOf(e.color)}, stroke: none)`);
     for (const e of els) if (e.type === 'text' && e.text.trim())
@@ -941,6 +1236,8 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
               <button className="btn-ghost" onClick={() => setShowExamples(true)}>Examples…</button>
               <button className="btn-ghost" onClick={undo} disabled={!historyRef.current.canUndo()} title={keys('Undo (⌘Z)')} aria-label="Undo">↶</button>
               <button className="btn-ghost" onClick={redo} disabled={!historyRef.current.canRedo()} title={keys('Redo (⌘⇧Z)')} aria-label="Redo">↷</button>
+              <button className="btn-ghost" disabled={!els.some(e => e.type === 'edge')} onClick={() => commit(numberLines(els))}
+                title="Label the internal lines 1, 2, 3 … in the order they were drawn (external legs and named lines are left alone)">Number lines</button>
               <button className="btn-ghost" disabled={!els.length} onClick={() => { commit([]); setSelected(null); }}>Clear</button>
             </div>
 
@@ -981,7 +1278,26 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
                 {colorField(sel.color)}
                 {(sel.kind === 'photon' || sel.kind === 'gluon') &&
                   field(`Wiggle size — ${num(sel.amplitude / UNIT)}`, <input type="range" min="2" max="14" step="0.5" value={sel.amplitude} onChange={e => update({ amplitude: Number(e.target.value) })} />)}
-                {field(`Bend — ${sel.bend}`, <input type="range" min="-100" max="100" step="5" value={sel.bend} onChange={e => update({ bend: Number(e.target.value) })} />)}
+                {field(`Bend — ${sel.bend}`, <input type="range" min="-150" max="150" step="5" value={sel.bend} onChange={e => update({ bend: Number(e.target.value) })} />)}
+                <label className="form-check" title="Bend as a piece of a circle instead of a parabola-like curve">
+                  <input type="checkbox" checked={!!sel.arc} onChange={e => update({ arc: e.target.checked })} />
+                  Circular arc
+                </label>
+                {field('Style', (
+                  <select value={sel.style ?? 'normal'} onChange={e => update({ style: e.target.value as LineStyle })}>
+                    <option value="normal">Normal</option>
+                    <option value="faded">Faded (a cut / removed line)</option>
+                    <option value="hidden">Hidden (keeps its place, not drawn)</option>
+                  </select>
+                ))}
+                {field(`Dots — ${sel.dots ?? 0}`, <input type="range" min="0" max="4" step="1" value={sel.dots ?? 0} title="Each dot raises this propagator's power by one" onChange={e => update({ dots: Number(e.target.value) })} />)}
+                {field('Momentum arrow', (
+                  <select value={sel.mom ?? 0} onChange={e => update({ mom: Number(e.target.value) as 0 | 1 | -1 })}>
+                    <option value={0}>None</option>
+                    <option value={1}>Along the line →</option>
+                    <option value={-1}>Against the line ←</option>
+                  </select>
+                ))}
                 {sel.kind !== 'photon' && sel.kind !== 'gluon' && (
                   <label className="form-check">
                     <input type="checkbox" checked={sel.endArrow} onChange={e => update({ endArrow: e.target.checked })} />
@@ -989,10 +1305,17 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
                   </label>
                 )}
                 {field('Label (Typst math)', <input type="text" value={sel.label} onChange={e => update({ label: e.target.value })} placeholder="e.g. gamma, p_1" />)}
-                {sel.label.trim() !== '' && (
+                {sel.label.trim() !== '' && field('Label position', (
+                  <select value={sel.labelAt ?? 'mid'} onChange={e => update({ labelAt: e.target.value as Edge['labelAt'] })}>
+                    <option value="mid">Beside the middle</option>
+                    <option value="start">Past the start (an incoming leg)</option>
+                    <option value="end">Past the end (an outgoing leg)</option>
+                  </select>
+                ))}
+                {(sel.label.trim() !== '' || sel.mom) && (sel.labelAt ?? 'mid') === 'mid' && (
                   <label className="form-check">
                     <input type="checkbox" checked={sel.side === -1} onChange={e => update({ side: e.target.checked ? -1 : 1 })} />
-                    Label on the other side
+                    Label and arrow on the other side
                   </label>
                 )}
               </>
@@ -1027,7 +1350,30 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
                 {colorField(sel.color)}
                 {sel.kind !== 'plain' &&
                   field(`Wiggle size — ${num(sel.amplitude / UNIT)}`, <input type="range" min="2" max="14" step="0.5" value={sel.amplitude} onChange={e => update({ amplitude: Number(e.target.value) })} />)}
+                {field('Style', (
+                  <select value={sel.style ?? 'normal'} onChange={e => update({ style: e.target.value as LineStyle })}>
+                    <option value="normal">Normal</option>
+                    <option value="faded">Faded (a cut / removed line)</option>
+                    <option value="hidden">Hidden (keeps its place, not drawn)</option>
+                  </select>
+                ))}
+                {field('Momentum arrow', (
+                  <select value={sel.mom ?? 0} onChange={e => update({ mom: Number(e.target.value) as 0 | 1 | -1 })}>
+                    <option value={0}>None</option>
+                    <option value={1}>Clockwise, over the top ↻</option>
+                    <option value={-1}>Counter-clockwise, over the top ↺</option>
+                  </select>
+                ))}
                 {field('Label (above, Typst math)', <input type="text" value={sel.label} onChange={e => update({ label: e.target.value })} />)}
+                {field('Label (below, Typst math)', <input type="text" value={sel.labelBelow ?? ''} onChange={e => update({ labelBelow: e.target.value })} placeholder="e.g. ell - p" />)}
+                <button className="btn-ghost" style={{ marginTop: '6px', width: '100%' }} disabled={sel.fill !== 'none'}
+                  title={sel.fill !== 'none' ? 'Only an open circle can be cut into arcs' : 'Cut the circle into arcs at the vertices and line ends on it, so each piece can be numbered, dotted or faded'}
+                  onClick={() => {
+                    const loopEl = sel;
+                    const arcs = splitLoop(loopEl, els, () => idRef.current++);
+                    commit(els.flatMap(e => e.id === loopEl.id ? arcs : [e]));
+                    setSelected(null);
+                  }}>Split into arcs at the vertices</button>
               </>
             )}
 

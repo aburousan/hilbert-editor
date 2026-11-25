@@ -74,6 +74,7 @@
     "test:typst-paths": "node scripts/test-typst-paths.mjs",
     "test:open-include": "node scripts/test-open-include.mjs",
     "test:tree-order": "node scripts/test-tree-order.mjs",
+    "test:feynman-ibp": "node scripts/test-feynman-ibp.mjs",
     "stress": "node scripts/stress-session.mjs",
     "bench:preview": "node scripts/bench-preview.mjs",
     "test:symbolic": "python3 scripts/test-symbolic.py",
