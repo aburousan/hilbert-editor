@@ -23,6 +23,8 @@ type Edge = {
   id: number, type: 'edge', kind: EdgeKind, from: Pt, to: Pt, bend: number, thickness: number, amplitude: number,
   endArrow: boolean, label: string, side: 1 | -1, color?: string,
   arc?: boolean,                         // bent as a true circular arc rather than a quadratic curve
+  ellipse?: boolean,                     // bent as half an ellipse (the usual hadron-correlator outline)
+  sub?: Sub,                             // a piece of a line that was split: part t0..t1 of that line's shape
   dots?: number, style?: LineStyle, mom?: 0 | 1 | -1,
   labelAt?: 'mid' | 'start' | 'end',     // an external leg's p_1 sits past its outer end
 };
@@ -31,9 +33,21 @@ type Loop = {
   label: string, color?: string, arrow?: 0 | 1 | -1,
   labelBelow?: string, style?: LineStyle, mom?: 0 | 1 | -1,
 };
-type Vertex = { id: number, type: 'vertex', at: Pt, size: number, color?: string };
+// A split line remembers the shape it was cut from (its ends and bend) and which part of it it is, so a
+// piece follows exactly the curve the whole line had.
+type Sub = { from: Pt, to: Pt, bend: number, t0: number, t1: number };
+type VertexShape = 'dot' | 'cross' | 'open' | 'hidden';
+type Vertex = { id: number, type: 'vertex', at: Pt, size: number, color?: string, shape?: VertexShape };
 type TextEl = { id: number, type: 'text', at: Pt, text: string, color?: string };
-type El = Edge | Loop | Vertex | TextEl;
+// An oval: the interpolating-operator blobs of a hadron correlator, or a shaded region behind lines. Its
+// fill can cover one half only; it is always drawn behind the lines.
+type OvalFill = 'none' | 'shaded' | 'gradient' | 'hatched';
+type Half = 'whole' | 'left' | 'right' | 'top' | 'bottom';
+type Oval = {
+  id: number, type: 'oval', center: Pt, rx: number, ry: number, fill: OvalFill, half?: Half,
+  outline: boolean, thickness: number, color?: string,
+};
+type El = Edge | Loop | Vertex | TextEl | Oval;
 
 const W = 680, H = 400, GRID = 20, UNIT = 40; // 40 px = 1 cetz unit
 const gridLines = (step: number) => {
@@ -85,7 +99,25 @@ const pathLen = (a: Pt, c: Pt, b: Pt) => {
 // A line's shape, whatever it is: straight, a quadratic curve, or a circular arc whose middle sits `bend`
 // px off the chord (the same meaning of bend in both, so the bend handle works the same).
 type Curve = { pt: (t: number) => Pt, tan: (t: number) => Pt, len: number, arc: null | { c: Pt, r: number, a0: number, sweep: number } };
-type Shape = { from: Pt, to: Pt, bend: number, arc?: boolean };
+type Shape = { from: Pt, to: Pt, bend: number, arc?: boolean, ellipse?: boolean, sub?: Sub };
+type BaseShape = { from: Pt, to: Pt, bend: number, arc?: boolean, ellipse?: boolean };
+
+const sampledLen = (pt: (t: number) => Pt, n = 48) => {
+  let len = 0, p = pt(0);
+  for (let i = 1; i <= n; i++) { const q = pt(i / n); len += Math.hypot(q.x - p.x, q.y - p.y); p = q; }
+  return len;
+};
+
+// Half an ellipse over the chord: the chord is its long axis and `bend` the other half-axis, so the line
+// leaves both ends square to the chord. Point at angle φ = πt: M − U·h·cos φ + N·bend·sin φ.
+function ellipseFrame(s: BaseShape) {
+  const len = Math.hypot(s.to.x - s.from.x, s.to.y - s.from.y) || 1;
+  const U = { x: (s.to.x - s.from.x) / len, y: (s.to.y - s.from.y) / len }, N = { x: -U.y, y: U.x };
+  const M = { x: (s.from.x + s.to.x) / 2, y: (s.from.y + s.to.y) / 2 }, h = len / 2, b = s.bend;
+  const at = (f: number): Pt => ({ x: M.x - U.x * h * Math.cos(f) + N.x * b * Math.sin(f), y: M.y - U.y * h * Math.cos(f) + N.y * b * Math.sin(f) });
+  const d = (f: number): Pt => ({ x: U.x * h * Math.sin(f) + N.x * b * Math.cos(f), y: U.y * h * Math.sin(f) + N.y * b * Math.cos(f) });
+  return { at, d };
+}
 
 function arcOf(a: Pt, b: Pt, bend: number) {
   const len = Math.hypot(b.x - a.x, b.y - a.y);
@@ -105,6 +137,21 @@ function arcOf(a: Pt, b: Pt, bend: number) {
 }
 
 function curveOf(e: Shape): Curve {
+  if (e.sub) {
+    // A piece: the same curve as the line it came from, between t0 and t1.
+    const base = curveOf({ from: e.sub.from, to: e.sub.to, bend: e.sub.bend, arc: e.arc, ellipse: e.ellipse });
+    const { t0, t1 } = e.sub, k = t1 - t0;
+    const pt = (t: number) => base.pt(t0 + k * t);
+    return { pt, tan: t => { const d = base.tan(t0 + k * t); return k >= 0 ? d : { x: -d.x, y: -d.y }; }, len: sampledLen(pt), arc: null };
+  }
+  if (e.ellipse && e.bend) {
+    const { at, d } = ellipseFrame(e);
+    const pt = (t: number) => at(Math.PI * t);
+    return {
+      pt, tan: t => { const v = d(Math.PI * t), l = Math.hypot(v.x, v.y) || 1; return { x: v.x / l, y: v.y / l }; },
+      len: sampledLen(pt), arc: null,
+    };
+  }
   const arc = e.arc ? arcOf(e.from, e.to, e.bend) : null;
   if (arc) {
     const { c, r, a0, sweep } = arc;
@@ -122,6 +169,11 @@ function curveOf(e: Shape): Curve {
 // SVG path of a line's own shape.
 function shapePath(e: Shape): string {
   const cv = curveOf(e);
+  if (e.sub || (e.ellipse && e.bend)) {
+    const pts: string[] = [];
+    for (let i = 0; i <= 48; i++) { const p = cv.pt(i / 48); pts.push(`${p.x.toFixed(1)},${p.y.toFixed(1)}`); }
+    return 'M' + pts.join(' L');
+  }
   if (cv.arc) {
     const { r, sweep } = cv.arc;
     return `M${e.from.x},${e.from.y} A${r},${r} 0 ${Math.abs(sweep) > Math.PI ? 1 : 0} ${sweep > 0 ? 1 : 0} ${e.to.x},${e.to.y}`;
@@ -245,6 +297,33 @@ function edgeMomentum(e: Edge): { a: Pt, m: Pt, b: Pt, straight: boolean } | nul
   return { a: at(t0), m: at(0.5), b: at(t1), straight: !e.bend };
 }
 
+// The cetz call that draws a line's own shape, left open for its style (`…, stroke: …)`). A piece of a
+// split line is drawn as exactly that part: a sub-arc through three of its points, the quadratic's own
+// sub-curve, or the ellipse as cubic quarters (exact up to drawing precision).
+const lerp = (a: Pt, b: Pt, t: number): Pt => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+function shapeCall(e: Shape): string {
+  const s: BaseShape = e.sub ? { from: e.sub.from, to: e.sub.to, bend: e.sub.bend, arc: e.arc, ellipse: e.ellipse } : e;
+  const [t0, t1] = e.sub ? [e.sub.t0, e.sub.t1] : [0, 1];
+  const base = curveOf(s);
+  if (!s.bend) return `line(${cx(base.pt(t0))}, ${cx(base.pt(t1))}`;
+  if (s.ellipse) {
+    const { at, d } = ellipseFrame(s);
+    const f0 = Math.PI * t0, f1 = Math.PI * t1, n = Math.max(1, Math.ceil(Math.abs(f1 - f0) / (Math.PI / 2) - 1e-9));
+    const parts: string[] = [];
+    for (let i = 0; i < n; i++) {
+      const a = f0 + (f1 - f0) * i / n, b = f0 + (f1 - f0) * (i + 1) / n, k = 4 / 3 * Math.tan((b - a) / 4);
+      const pa = at(a), pb = at(b), da = d(a), db = d(b);
+      parts.push(`bezier(${cx(pa)}, ${cx(pb)}, ${cx({ x: pa.x + k * da.x, y: pa.y + k * da.y })}, ${cx({ x: pb.x - k * db.x, y: pb.y - k * db.y })})`);
+    }
+    return `merge-path({ ${parts.join('; ')} }`;
+  }
+  if (base.arc) return `arc-through(${cx(base.pt(t0))}, ${cx(base.pt((t0 + t1) / 2))}, ${cx(base.pt(t1))}`;
+  // The control point of the quadratic's part between t0 and t1 (its blossom at t0, t1).
+  const c = ctrlPt(s.from, s.to, s.bend);
+  const cc = lerp(lerp(s.from, c, t0), lerp(c, s.to, t0), t1);
+  return `bezier(${cx(base.pt(t0))}, ${cx(base.pt(t1))}, ${cx(cc)}`;
+}
+
 const fadedStroke = (th: number) => `(thickness: ${num(th)}pt, paint: luma(62%), dash: "densely-dotted")`;
 
 function edgeCode(e: Edge): string[] {
@@ -257,7 +336,9 @@ function edgeCode(e: Edge): string[] {
     ? `arc-through(${cx(a)}, ${cx(m)}, ${cx(b)}`
     : e.bend === 0 ? `line(${cx(a)}, ${cx(b)}` : `bezier(${cx(a)}, ${cx(b)}, ${cx(cc)}`;
   const c = ctrlPt(e.from, e.to, e.bend);
-  const base = shapeCode(e.from, e.to, cv.pt(0.5), c);
+  const base = shapeCall(e);
+  // merge-path draws no marks of its own, so an end arrow there is a separate mark.
+  const ownMarks = !base.startsWith('merge-path');
   const plainStroke = faded ? fadedStroke(e.thickness) : strokeOf(e.thickness, e.color);
 
   // An arrowhead somewhere along the edge (dir +1 points forward, -1 backward).
@@ -281,6 +362,10 @@ function edgeCode(e: Edge): string[] {
     // Two rails, each the line moved sideways (an arc's rails are arcs with the same centre).
     for (const sg of [1, -1]) {
       const o = (t: number): Pt => { const p = cv.pt(t), d = cv.tan(t); return { x: p.x - d.y * DBL * sg, y: p.y + d.x * DBL * sg }; };
+      if (e.sub || e.ellipse) {
+        out.push(`  line(${Array.from({ length: 33 }, (_, i) => cx(o(i / 32))).join(', ')}, stroke: ${plainStroke})`);
+        continue;
+      }
       const l0 = Math.hypot(e.to.x - e.from.x, e.to.y - e.from.y) || 1;
       const nx = -(e.to.y - e.from.y) / l0, ny = (e.to.x - e.from.x) / l0;
       const oc = { x: c.x + nx * DBL * sg, y: c.y + ny * DBL * sg };
@@ -291,8 +376,12 @@ function edgeCode(e: Edge): string[] {
     const stroke = faded ? fadedStroke(e.thickness)
       : (e.kind === 'scalar' || e.kind === 'cscalar') ? dashStroke(e.thickness, 'dashed', e.color)
       : e.kind === 'ghost' ? dashStroke(e.thickness, 'dotted', e.color) : strokeOf(e.thickness, e.color);
-    const mark = e.endArrow && !faded ? `, mark: (end: ">", fill: ${paintOf(e.color)})` : '';
+    const mark = e.endArrow && !faded && ownMarks ? `, mark: (end: ">", fill: ${paintOf(e.color)})` : '';
     out.push(`  ${base}, stroke: ${stroke}${mark})`);
+    if (e.endArrow && !faded && !ownMarks) {
+      const back = cv.pt(Math.max(0, 1 - 6 / (cv.len || 1)));
+      out.push(`  mark(${cx(back)}, ${cx(e.to)}, symbol: ">", fill: ${paintOf(e.color)}, stroke: ${paintOf(e.color)}, scale: ${num(Math.max(0.8, e.thickness * 0.8))})`);
+    }
     // Directional arrows in the middle of the propagator.
     if (e.kind === 'fermion' || e.kind === 'cscalar' || e.kind === 'ghost') midMark(0.5, 1);
     else if (e.kind === 'antifermion') midMark(0.5, -1);
@@ -316,6 +405,134 @@ function edgeCode(e: Edge): string[] {
 }
 
 const DOT_R = 3.2;
+// Canvas labels: a font with the combining marks Typst math uses (the arrow of arrow(p), a bar), listed
+// first since a missing mark does not fall back to the next font.
+const LABEL_FONT = "'STIX Two Text', 'Times New Roman', Georgia, serif";
+
+// ---- ovals and vertex shapes ----
+const HALF_START: Record<Exclude<Half, 'whole'>, number> = { right: -90, left: 90, top: 0, bottom: 180 };   // cetz angles, y up
+
+// The hatching chords of an oval (45°, as for a hatched circle), cut to the filled half.
+function ovalHatch(o: Oval): [Pt, Pt][] {
+  const out: [Pt, Pt][] = [];
+  const sp = Math.max(7, (o.rx + o.ry) / 2 / 3.2);
+  const u = { x: Math.SQRT1_2, y: -Math.SQRT1_2 }, n = { x: Math.SQRT1_2, y: Math.SQRT1_2 };
+  const R = Math.sqrt((o.rx * o.rx + o.ry * o.ry) / 2);
+  const half = o.half ?? 'whole';
+  for (let cD = -R + sp; cD < R - 1; cD += sp) {
+    const A = (u.x / o.rx) ** 2 + (u.y / o.ry) ** 2;
+    const B = 2 * (n.x * cD * u.x / o.rx ** 2 + n.y * cD * u.y / o.ry ** 2);
+    const C = (n.x * cD / o.rx) ** 2 + (n.y * cD / o.ry) ** 2 - 1;
+    const disc = B * B - 4 * A * C;
+    if (disc <= 0) continue;
+    let s1 = (-B - Math.sqrt(disc)) / (2 * A), s2 = (-B + Math.sqrt(disc)) / (2 * A);
+    if (half !== 'whole') {
+      // Keep the part where a0 + a1·s ≥ 0.
+      const [a0, a1] = half === 'right' ? [n.x * cD, u.x] : half === 'left' ? [-n.x * cD, -u.x]
+        : half === 'top' ? [-n.y * cD, -u.y] : [n.y * cD, u.y];
+      const lim = -a0 / a1;
+      if (a1 > 0) s1 = Math.max(s1, lim); else s2 = Math.min(s2, lim);
+    }
+    if (s2 - s1 < 1) continue;
+    const p = (s: number): Pt => ({ x: o.center.x + n.x * cD + u.x * s, y: o.center.y + n.y * cD + u.y * s });
+    out.push([p(s1), p(s2)]);
+  }
+  return out;
+}
+
+function ovalFillCode(o: Oval): string | null {
+  if (o.fill === 'shaded') return tint(o.color) ? `${tint(o.color)}.lighten(70%)` : 'gray.lighten(50%)';
+  if (o.fill === 'gradient') {
+    const c = tint(o.color) ?? 'luma(60%)';
+    return `gradient.radial(${c}.lighten(55%), ${c}, ${c}.darken(35%), center: (35%, 30%), radius: 80%)`;
+  }
+  return null;
+}
+
+function ovalCode(o: Oval): string[] {
+  const out: string[] = [];
+  const r = `(${num(o.rx / UNIT)}, ${num(o.ry / UNIT)})`;
+  const stroke = o.outline ? strokeOf(o.thickness, o.color) : 'none';
+  const fill = ovalFillCode(o), half = o.half ?? 'whole';
+  if (fill && half !== 'whole') {
+    out.push(`  arc(${cx(o.center)}, start: ${HALF_START[half]}deg, delta: 180deg, radius: ${r}, anchor: "origin", mode: "CLOSE", fill: ${fill}, stroke: none)`);
+    if (o.outline) out.push(`  circle(${cx(o.center)}, radius: ${r}, stroke: ${stroke})`);
+  } else if (fill || o.outline) {
+    out.push(`  circle(${cx(o.center)}, radius: ${r}, ${fill ? `fill: ${fill}, ` : ''}stroke: ${stroke})`);
+  }
+  if (o.fill === 'hatched')
+    for (const [a, b] of ovalHatch(o)) out.push(`  line(${cx(a)}, ${cx(b)}, stroke: ${strokeOf(Math.max(0.4, o.thickness * 0.45), o.color)})`);
+  return out;
+}
+
+const CROSS = 1.3;   // a cross's arm, in dot radii
+function vertexCode(v: Vertex): string[] {
+  const shape = v.shape ?? 'dot';
+  if (shape === 'hidden') return [];
+  if (shape === 'cross') {
+    const a = v.size * CROSS, st = `1.2pt + ${paintOf(v.color)}`;
+    return [
+      `  line(${cx({ x: v.at.x - a, y: v.at.y - a })}, ${cx({ x: v.at.x + a, y: v.at.y + a })}, stroke: ${st})`,
+      `  line(${cx({ x: v.at.x - a, y: v.at.y + a })}, ${cx({ x: v.at.x + a, y: v.at.y - a })}, stroke: ${st})`,
+    ];
+  }
+  if (shape === 'open') return [`  circle(${cx(v.at)}, radius: ${num(v.size / UNIT)}, fill: white, stroke: 1pt + ${paintOf(v.color)})`];
+  return [`  circle(${cx(v.at)}, radius: ${num(v.size / UNIT)}, fill: ${paintOf(v.color)}, stroke: none)`];
+}
+
+// Cut a line in two at t (0 < t < 1). Both pieces keep the line's exact curve: a straight line gives two
+// straight lines, a circular arc two arcs of the same circle, and a curve or half ellipse two pieces that
+// remember it. Label, dots and momentum arrow stay with the longer piece (an end label with its end).
+function splitEdge(e: Edge, t: number, nextId: () => number): [Edge, Edge] {
+  const cv = curveOf(e);
+  const raw = cv.pt(t), P = { x: Math.round(raw.x * 10) / 10, y: Math.round(raw.y * 10) / 10 };
+  const s: Sub = e.sub ?? { from: e.from, to: e.to, bend: e.bend, t0: 0, t1: 1 };
+  const tm = s.t0 + (s.t1 - s.t0) * t;
+  let a: Edge, b: Edge;
+  if (!s.bend) {
+    a = { ...e, sub: undefined, to: P, bend: 0 };
+    b = { ...e, sub: undefined, from: P, bend: 0 };
+  } else if (e.arc && !e.ellipse) {
+    a = { ...e, sub: undefined, to: P, bend: bendThrough(e.from, P, cv.pt(t / 2)) };
+    b = { ...e, sub: undefined, from: P, bend: bendThrough(P, e.to, cv.pt((1 + t) / 2)) };
+  } else {
+    a = { ...e, to: P, sub: { ...s, t1: tm } };
+    b = { ...e, from: P, sub: { ...s, t0: tm } };
+  }
+  a = { ...a, id: nextId(), endArrow: false };
+  b = { ...b, id: nextId() };
+  const firstKeeps = e.labelAt === 'start' || (e.labelAt !== 'end' && t >= 0.5);
+  const bare = { label: '', dots: 0, mom: 0 as const, labelAt: undefined };
+  return firstKeeps ? [a, { ...b, ...bare }] : [{ ...a, ...bare }, b];
+}
+
+// The t on a line nearest to p, and how far p is from it.
+function nearestOnCurve(e: Edge, p: Pt): { t: number, dist: number } {
+  const cv = curveOf(e);
+  let best = { t: 0, dist: Infinity };
+  for (let i = 0; i <= 400; i++) {
+    const q = cv.pt(i / 400), dist = Math.hypot(q.x - p.x, q.y - p.y);
+    if (dist < best.dist) best = { t: i / 400, dist };
+  }
+  // Then narrow it down between the neighbouring samples.
+  let lo = Math.max(0, best.t - 1 / 400), hi = Math.min(1, best.t + 1 / 400);
+  const d = (t: number) => { const q = cv.pt(t); return Math.hypot(q.x - p.x, q.y - p.y); };
+  for (let i = 0; i < 40; i++) {
+    const m1 = lo + (hi - lo) / 3, m2 = hi - (hi - lo) / 3;
+    if (d(m1) < d(m2)) hi = m2; else lo = m1;
+  }
+  const t = (lo + hi) / 2;
+  return d(t) < best.dist ? { t, dist: d(t) } : best;
+}
+
+// A piece of a split line, made an ordinary line again (when its ends or bend are edited): a curve with
+// the same middle, or a circular arc through the same middle for a piece of a half ellipse.
+function detachPiece(e: Edge): Edge {
+  if (!e.sub) return e;
+  const mid = curveOf(e).pt(0.5);
+  const { sub: _sub, ...rest } = e;
+  return { ...rest, arc: e.arc || e.ellipse, ellipse: false, bend: bendThrough(e.from, e.to, mid) };
+}
 
 // A loop's momentum arrow: an arc just outside the top of the circle, clockwise for 1.
 function loopMomentum(l: Loop): { a: Pt, m: Pt, b: Pt } | null {
@@ -438,7 +655,7 @@ function drawEdge(e: Edge, selected: number | null) {
     }
     if (e.label.trim()) {
       const at = edgeLabelPos(e);
-      parts.push(<text key="l" x={at.x} y={at.y} fontSize="13" fontStyle="italic" fontFamily="Georgia, serif" textAnchor="middle" dominantBaseline="middle" fill={col}>{prettyLabel(e.label)}</text>);
+      parts.push(<text key="l" x={at.x} y={at.y} fontSize="13" fontStyle="italic" fontFamily={LABEL_FONT} textAnchor="middle" dominantBaseline="middle" fill={col}>{prettyLabel(e.label)}</text>);
     }
   }
   return <g key={e.id}>{parts}</g>;
@@ -482,11 +699,67 @@ function drawLoop(l: Loop, selected: number | null) {
     parts.push(<polygon key="moma" points={arrowPts(mom.b, { x: -Math.sin(g) * sg, y: Math.cos(g) * sg }, 4.5, false)} fill={col} />);
   }
   const label = (key: string, text: string, at: Pt) =>
-    <text key={key} x={at.x} y={at.y} fontSize="13" fontStyle="italic" fontFamily="Georgia, serif" textAnchor="middle" dominantBaseline="middle" fill={col}>{prettyLabel(text)}</text>;
+    <text key={key} x={at.x} y={at.y} fontSize="13" fontStyle="italic" fontFamily={LABEL_FONT} textAnchor="middle" dominantBaseline="middle" fill={col}>{prettyLabel(text)}</text>;
   if (l.label.trim()) parts.push(label('l', l.label, loopLabelAbove(l)));
   if (l.labelBelow?.trim()) parts.push(label('lb', l.labelBelow, loopLabelBelow(l)));
   return <g key={l.id}>{parts}</g>;
 }
+
+// Mix a #rrggbb colour with white (amount > 0) or black (amount < 0), for the preview of a shading.
+function mixHex(c: string, amount: number): string {
+  const m = /^#?([0-9a-f]{6})$/i.exec(c);
+  if (!m) return c;
+  const v = parseInt(m[1], 16), ch = [v >> 16, (v >> 8) & 255, v & 255];
+  const to = amount > 0 ? 255 : 0, k = Math.abs(amount);
+  return '#' + ch.map(x => Math.round(x + (to - x) * k).toString(16).padStart(2, '0')).join('');
+}
+
+function drawOval(o: Oval, selected: number | null, idPrefix = 'c') {
+  const isSel = o.id === selected;
+  const col = isSel ? '#7c3aed' : previewCol(o.color, false);
+  const base = tint(o.color) ? o.color! : '#9e9e9e';
+  const { x, y } = o.center, { rx, ry } = o;
+  const half = o.half ?? 'whole';
+  const gid = `ovalg-${idPrefix}-${o.id}`;
+  const parts: React.ReactNode[] = [];
+  const fill = o.fill === 'shaded' ? (tint(o.color) ? mixHex(o.color!, 0.7) : '#d4d4d4') : o.fill === 'gradient' ? `url(#${gid})` : null;
+  if (o.fill === 'gradient') parts.push(
+    <defs key="d"><radialGradient id={gid} cx="35%" cy="30%" r="80%">
+      <stop offset="0" stopColor={mixHex(base, 0.55)} /><stop offset="0.5" stopColor={base} /><stop offset="1" stopColor={mixHex(base, -0.35)} />
+    </radialGradient></defs>);
+  if (fill) {
+    if (half === 'whole') parts.push(<ellipse key="f" cx={x} cy={y} rx={rx} ry={ry} fill={fill} stroke="none" />);
+    else {
+      const [a, b] = half === 'right' ? [[x, y - ry], [x, y + ry]] : half === 'left' ? [[x, y + ry], [x, y - ry]]
+        : half === 'top' ? [[x - rx, y], [x + rx, y]] : [[x + rx, y], [x - rx, y]];
+      parts.push(<path key="f" d={`M${a[0]},${a[1]} A${rx},${ry} 0 0 1 ${b[0]},${b[1]} Z`} fill={fill} stroke="none" />);
+    }
+  }
+  if (o.fill === 'hatched')
+    parts.push(<g key="h">{ovalHatch(o).map(([p, q], i) => <line key={i} x1={p.x} y1={p.y} x2={q.x} y2={q.y} stroke={col} strokeWidth={Math.max(0.4, o.thickness * 0.45)} />)}</g>);
+  // Without an outline it still shows faintly here, so it can be found and picked; it prints none.
+  parts.push(<ellipse key="o" cx={x} cy={y} rx={rx} ry={ry} fill="none"
+    stroke={o.outline ? col : (isSel ? '#7c3aed' : '#cbd5e1')} strokeWidth={o.outline ? o.thickness : 1} strokeDasharray={o.outline ? undefined : '3 5'} />);
+  return <g key={o.id}>{parts}</g>;
+}
+
+function drawVertex(v: Vertex, selected: number | null) {
+  const col = previewCol(v.color, v.id === selected);
+  const shape = v.shape ?? 'dot';
+  if (shape === 'cross') {
+    const a = v.size * CROSS;
+    return <g key={v.id}>
+      <line x1={v.at.x - a} y1={v.at.y - a} x2={v.at.x + a} y2={v.at.y + a} stroke={col} strokeWidth={1.6} />
+      <line x1={v.at.x - a} y1={v.at.y + a} x2={v.at.x + a} y2={v.at.y - a} stroke={col} strokeWidth={1.6} />
+    </g>;
+  }
+  if (shape === 'open') return <circle key={v.id} cx={v.at.x} cy={v.at.y} r={v.size} fill="#fff" stroke={col} strokeWidth={1.3} />;
+  if (shape === 'hidden') return <circle key={v.id} cx={v.at.x} cy={v.at.y} r={Math.max(3, v.size)} fill="none" stroke={v.id === selected ? '#7c3aed' : '#cbd5e1'} strokeDasharray="2 2" />;
+  return <circle key={v.id} cx={v.at.x} cy={v.at.y} r={v.size} fill={col} />;
+}
+
+// Ovals first: they sit behind every line, on the canvas as in the document.
+const behindFirst = (els: El[]) => [...els.filter(e => e.type === 'oval'), ...els.filter(e => e.type !== 'oval')];
 
 type Example = { name: string; group: string; note?: string; make: () => El[] };
 
@@ -739,6 +1012,7 @@ const boundsOf = (els: El[]) => {
   for (const e of els) {
     if (e.type === 'edge') { see(e.from, 14); see(e.to, 14); see(curveOf(e).pt(0.5), 14); if (e.label.trim()) see(edgeLabelPos(e), 12); }
     else if (e.type === 'loop') see(e.center, e.radius + 18 + (e.mom ? 12 : 0));
+    else if (e.type === 'oval') { see({ x: e.center.x - e.rx, y: e.center.y - e.ry }, 4); see({ x: e.center.x + e.rx, y: e.center.y + e.ry }, 4); }
     else see(e.at, 16);
   }
   if (!Number.isFinite(x1)) return { x: 0, y: 0, w: W, h: H };
@@ -749,17 +1023,18 @@ function ExampleThumb({ els, height = 96 }: { els: El[]; height?: number }) {
   const b = boundsOf(els);
   return (
     <svg viewBox={`${b.x} ${b.y} ${b.w} ${b.h}`} style={{ width: '100%', height, display: 'block' }} aria-hidden>
-      {els.map(e => (e.type === 'edge' ? drawEdge(e, null)
+      {behindFirst(els).map(e => (e.type === 'edge' ? drawEdge(e, null)
         : e.type === 'loop' ? drawLoop(e, null)
-        : e.type === 'vertex' ? <circle key={e.id} cx={e.at.x} cy={e.at.y} r={e.size} fill="#111" />
-        : <text key={e.id} x={e.at.x} y={e.at.y} fontSize="13" fontStyle="italic" fontFamily="Georgia, serif" textAnchor="middle" dominantBaseline="middle" fill="#111">{prettyLabel(e.text)}</text>))}
+        : e.type === 'oval' ? drawOval(e, null, 't')
+        : e.type === 'vertex' ? drawVertex(e, null)
+        : <text key={e.id} x={e.at.x} y={e.at.y} fontSize="13" fontStyle="italic" fontFamily={LABEL_FONT} textAnchor="middle" dominantBaseline="middle" fill="#111">{prettyLabel(e.text)}</text>))}
     </svg>
   );
 }
 
 const exampleGroups = () => {
-  const all = [...EXAMPLES, ...ADVANCED, ...IBP];
-  const order = ['QED', 'Electroweak', 'QCD', 'Scalar', 'Advanced QCD', 'IBP / loop integrals'];
+  const all = [...EXAMPLES, ...ADVANCED, ...IBP, ...HADRON];
+  const order = ['QED', 'Electroweak', 'QCD', 'Scalar', 'Advanced QCD', 'Hadron correlators', 'IBP / loop integrals'];
   return order
     .map(group => ({ group, items: all.filter(e => e.group === group) }))
     .filter(g => g.items.length);
@@ -822,6 +1097,81 @@ const IBP: Example[] = [
   },
   { name: 'Two-loop graph, lines numbered', group: 'IBP / loop integrals', note: 'five propagators', make: () => twoLoop() },
   { name: 'Two-loop graph, lines 1 and 3 cut', group: 'IBP / loop integrals', note: 'a spanning tree: cut lines faded', make: () => twoLoop([1, 3]) },
+];
+
+// Hadron correlators as lattice notes draw them: quark lines between a source and a sink, a current
+// inserted on one of them, interpolating operators as ovals.
+const HC = 'Hadron correlators';
+const quark = (from: Pt, to: Pt, extra: Partial<Edge> = {}): Edge =>
+  ({ id: tid++, type: 'edge', kind: 'fermion', from, to, bend: 0, thickness: 1.2, amplitude: 5, endArrow: false, label: '', side: 1, ...extra });
+const mark = (at: Pt, shape: VertexShape, size = 3.2, color?: string): Vertex => ({ id: tid++, type: 'vertex', at, size, shape, color });
+const oval = (center: Pt, rx: number, ry: number, extra: Partial<Oval> = {}): Oval =>
+  ({ id: tid++, type: 'oval', center, rx, ry, fill: 'shaded', half: 'whole', outline: true, thickness: 1, ...extra });
+
+// A baryon two-point panel: operator ovals at both ends, three quark lines (u, u, d), and the sign and
+// the term's name. `lines` gives each line's left and right heights, so exchanged lines cross.
+const baryonPanel = (sign: string, name: string, lines: [number, number][] = [[160, 160], [200, 200], [240, 240]]): El[] => {
+  const xl = 181, xr = 499, flav = ['u', 'u', 'd'];
+  return [
+    oval(T(170, 200), 11, 56), oval(T(510, 200), 11, 56),
+    ...lines.map(([yl, yr]) => ln(T(xl, yl), T(xr, yr), { thickness: 1 })),
+    ...[160, 200, 240].flatMap((y, i) => [
+      note(T(205, y - 11), flav[i]), note(T(475, y - 11), flav[i]),
+      note(T(150, y), ['a', 'b', 'c'][i]), note(T(532, y), ["a'", "b'", "c'"][i]),
+    ]),
+    note(T(118, 200), sign), note(T(340, 300), name),
+  ];
+};
+
+const HADRON: Example[] = [
+  {
+    name: 'Proton three-point function', group: HC, note: 'a current on one valence line; part of it coloured',
+    make: () => {
+      const L = T(160, 210), R = T(520, 210);
+      // Lines run sink to source (right to left), the top one cut where the current attaches.
+      const [toInsertion, fromInsertion] = splitEdge(quark(R, L, { ellipse: true, bend: 75 }), 0.5, () => tid++);
+      return [
+        toInsertion, { ...fromInsertion, color: '#c0504d' },
+        quark(R, L), quark(R, L, { ellipse: true, bend: -75 }),
+        { id: tid++, type: 'edge', kind: 'photon', from: T(340, 135), to: T(340, 88), bend: 0, thickness: 1, amplitude: 4, endArrow: false, label: '', side: 1 },
+        mark(T(340, 135), 'cross', 3), mark(L, 'dot', 3.5), mark(R, 'dot', 3.5),
+        note(T(404, 96), 'J(arrow(x)_1, t_1)'),
+        note(T(122, 258), "chi_(H')(arrow(x), t)"), note(T(562, 258), 'macron(chi)_H (arrow(0), 0)'),
+      ];
+    },
+  },
+  {
+    name: 'Fixed-sink sequential source', group: HC, note: 'half the hadron shaded; the current carries q',
+    make: () => {
+      const L = T(170, 210), R = T(510, 210), blue = '#1f3fd1';
+      return [
+        oval(T(340, 210), 170, 70, { fill: 'gradient', half: 'right', outline: false, color: '#b0702f' }),
+        quark(L, R, { ellipse: true, bend: -70, color: blue, thickness: 1.6 }),
+        quark(L, R, { color: blue, thickness: 1.6 }),
+        quark(L, R, { ellipse: true, bend: 70, color: blue, thickness: 1.6 }),
+        { id: tid++, type: 'edge', kind: 'photon', from: T(340, 140), to: T(340, 66), bend: 0, thickness: 1.2, amplitude: 5, endArrow: false, label: 'arrow(q)', side: 1, color: '#dc2626' },
+        mark(T(340, 140), 'cross', 4),
+        note(T(138, 214), 'arrow(p)_i'), note(T(544, 214), 'arrow(p)_f'),
+      ];
+    },
+  },
+  {
+    name: 'Baryon contraction: current on a line', group: HC, note: 'operator ovals, direct pairing',
+    make: () => [...baryonPanel('+', '1_u "(Term 1)"'), mark(T(340, 160), 'dot', 3)],
+  },
+  {
+    name: 'Baryon contraction: exchanged', group: HC, note: 'the two u lines swap ends',
+    make: () => [...baryonPanel('-', '2_u "(Term 2)"', [[160, 200], [200, 160], [240, 240]]), mark(T(276.4, 172), 'dot', 3)],
+  },
+  {
+    name: 'Baryon contraction: disconnected loop', group: HC, note: 'the current on a closed quark loop',
+    make: () => [
+      ...baryonPanel('+', 'B_"direct" L_u'),
+      loop(T(340, 78), 20),
+      mark(T(340, 58), 'dot', 3), note(T(340, 78), 'u'),
+      glu(T(326, 92), T(215, 160)), glu(T(354, 92), T(465, 160)),
+    ],
+  },
 ];
 
 // The older diagrams, kept: the loops and gauge links a research student needs.
@@ -909,7 +1259,9 @@ const ADVANCED: Example[] = [
 // ---- component ---------------------------------------------------------------
 export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => void, onInsert: (code: string, imports?: string) => void }) {
   const [els, setEls] = useState<El[]>([]);
-  const [tool, setTool] = useState<'select' | 'edge' | 'loop' | 'vertex' | 'text'>('edge');
+  const [tool, setTool] = useState<'select' | 'edge' | 'loop' | 'oval' | 'vertex' | 'text'>('edge');
+  // Waiting for a click on the selected line, to cut it there.
+  const [splitting, setSplitting] = useState(false);
   const [edgeKind, setEdgeKind] = useState<EdgeKind>('fermion');
   const [selected, setSelected] = useState<number | null>(null);
   const [draft, setDraft] = useState<{ a: Pt, b: Pt } | null>(null);
@@ -924,7 +1276,7 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
   const draftRef = useRef<{ a: Pt, b: Pt } | null>(null);
   const elsRef = useRef(els);
   elsRef.current = els;
-  const dragRef = useRef<null | { mode: 'draw' | 'move' | 'from' | 'to' | 'bend' | 'radius', start: Pt, snapshot: El[] }>(null);
+  const dragRef = useRef<null | { mode: 'draw' | 'move' | 'from' | 'to' | 'bend' | 'radius' | 'rx' | 'ry', start: Pt, snapshot: El[] }>(null);
 
   const commit = (next: El[], key?: string) => {
     historyRef.current.record(elsRef.current, key);
@@ -956,6 +1308,9 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
       else if (e.type === 'loop') a.push(
         { x: e.center.x + e.radius, y: e.center.y }, { x: e.center.x - e.radius, y: e.center.y },
         { x: e.center.x, y: e.center.y + e.radius }, { x: e.center.x, y: e.center.y - e.radius });
+      else if (e.type === 'oval') a.push(
+        { x: e.center.x + e.rx, y: e.center.y }, { x: e.center.x - e.rx, y: e.center.y },
+        { x: e.center.x, y: e.center.y + e.ry }, { x: e.center.x, y: e.center.y - e.ry });
     }
     return a;
   };
@@ -970,9 +1325,14 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
   };
 
   const hitTest = (p: Pt): number | null => {
-    for (let i = els.length - 1; i >= 0; i--) {
-      const e = els[i];
-      if (e.type === 'vertex') { if (Math.hypot(e.at.x - p.x, e.at.y - p.y) < 9) return e.id; }
+    // Lines and the rest first: an oval lies behind them.
+    const order = [...els.filter(e => e.type === 'oval'), ...els.filter(e => e.type !== 'oval')];
+    for (let i = order.length - 1; i >= 0; i--) {
+      const e = order[i];
+      if (e.type === 'oval') {
+        const rho = Math.hypot((p.x - e.center.x) / e.rx, (p.y - e.center.y) / e.ry);
+        if (Math.abs(rho - 1) * Math.min(e.rx, e.ry) < 8 || (e.fill !== 'none' && rho < 1)) return e.id;
+      } else if (e.type === 'vertex') { if (Math.hypot(e.at.x - p.x, e.at.y - p.y) < 9) return e.id; }
       else if (e.type === 'text') { if (Math.hypot(e.at.x - p.x, e.at.y - p.y) < 16) return e.id; }
       else if (e.type === 'loop') {
         const d = Math.hypot(e.center.x - p.x, e.center.y - p.y);
@@ -993,7 +1353,22 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
     ev.preventDefault();
     ev.currentTarget.setPointerCapture(ev.pointerId);
     const p = mouse(ev);
-    if (tool === 'edge' || tool === 'loop') {
+    if (splitting) {
+      setSplitting(false);
+      if (sel?.type === 'edge') {
+        // On a vertex or line end that sits on the line, cut exactly there.
+        let at = p;
+        for (const q of anchors()) if (Math.hypot(q.x - p.x, q.y - p.y) < 12 && nearestOnCurve(sel, q).dist < 4) { at = q; break; }
+        const { t, dist } = nearestOnCurve(sel, at);
+        if (dist < 14 && t > 0.03 && t < 0.97) {
+          const pieces = splitEdge(sel, t, () => idRef.current++);
+          commit(els.flatMap(e => e.id === sel.id ? pieces : [e]));
+          setSelected(pieces[0].id);
+        }
+        return;
+      }
+    }
+    if (tool === 'edge' || tool === 'loop' || tool === 'oval') {
       dragRef.current = { mode: 'draw', start: snap(p), snapshot: els };
       draftRef.current = { a: snap(p), b: snap(p) };
       setDraft(draftRef.current);
@@ -1021,9 +1396,10 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
     if (hit != null) dragRef.current = { mode: 'move', start: p, snapshot: els };
   };
 
-  const handlePoints = (e: El): ['from' | 'to' | 'bend' | 'radius', Pt][] => {
+  const handlePoints = (e: El): ['from' | 'to' | 'bend' | 'radius' | 'rx' | 'ry', Pt][] => {
     if (e.type === 'edge') return [['from', e.from], ['to', e.to], ['bend', curveOf(e).pt(0.5)]];
     if (e.type === 'loop') return [['radius', { x: e.center.x + e.radius, y: e.center.y }]];
+    if (e.type === 'oval') return [['rx', { x: e.center.x + e.rx, y: e.center.y }], ['ry', { x: e.center.x, y: e.center.y - e.ry }]];
     return [];
   };
 
@@ -1043,13 +1419,18 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
     const next = d.snapshot.map(e => {
       if (e.id !== selected) return e;
       if (d.mode === 'move') {
-        if (e.type === 'edge') return { ...e, from: { x: e.from.x + dx, y: e.from.y + dy }, to: { x: e.to.x + dx, y: e.to.y + dy } };
-        if (e.type === 'loop') return { ...e, center: { x: e.center.x + dx, y: e.center.y + dy } };
+        const sh = (q: Pt) => ({ x: q.x + dx, y: q.y + dy });
+        if (e.type === 'edge') return { ...e, from: sh(e.from), to: sh(e.to), ...(e.sub ? { sub: { ...e.sub, from: sh(e.sub.from), to: sh(e.sub.to) } } : {}) };
+        if (e.type === 'loop' || e.type === 'oval') return { ...e, center: sh(e.center) };
         return { ...e, at: { x: (e as Vertex | TextEl).at.x + dx, y: (e as Vertex | TextEl).at.y + dy } } as El;
       }
-      if (e.type === 'edge' && d.mode === 'from') return { ...e, from: snap(p) };
-      if (e.type === 'edge' && d.mode === 'to') return { ...e, to: snap(p) };
+      // Reshaping a piece of a split line makes it a line of its own.
+      if (e.type === 'edge' && d.mode === 'from') return { ...detachPiece(e), from: snap(p) };
+      if (e.type === 'edge' && d.mode === 'to') return { ...detachPiece(e), to: snap(p) };
+      if (e.type === 'oval' && d.mode === 'rx') return { ...e, rx: Math.max(6, Math.round(Math.abs(p.x - e.center.x))) };
+      if (e.type === 'oval' && d.mode === 'ry') return { ...e, ry: Math.max(6, Math.round(Math.abs(p.y - e.center.y))) };
       if (e.type === 'edge' && d.mode === 'bend') {
+        e = detachPiece(e);
         const len = Math.hypot(e.to.x - e.from.x, e.to.y - e.from.y) || 1;
         const nx = -(e.to.y - e.from.y) / len, ny = (e.to.x - e.from.x) / len;
         const mx = (e.from.x + e.to.x) / 2, my = (e.from.y + e.to.y) / 2;
@@ -1079,6 +1460,9 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
         const amp = edgeKind === 'gluon' ? 7 : 5;
         checkpoint(d.snapshot);
         setEls([...d.snapshot, { id, type: 'edge', kind: edgeKind, from: a, to: b, bend: 0, thickness: th, amplitude: amp, endArrow: false, label: '', side: 1 }]);
+      } else if (tool === 'oval') {
+        checkpoint(d.snapshot);
+        setEls([...d.snapshot, { id, type: 'oval', center: a, rx: Math.max(10, Math.round(Math.abs(b.x - a.x))), ry: Math.max(10, Math.round(Math.abs(b.y - a.y))), fill: 'shaded', half: 'whole', outline: true, thickness: 1 }]);
       } else {
         checkpoint(d.snapshot);
         setEls([...d.snapshot, { id, type: 'loop', kind: 'plain', fill: 'none', center: a, radius: Math.max(15, Math.round(Math.hypot(b.x - a.x, b.y - a.y))), thickness: 1.2, amplitude: 5, label: '' }]);
@@ -1101,7 +1485,9 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
   const update = (patch: Partial<El>) => {
     const fields = Object.keys(patch);
     const key = fields.length === 1 ? `${selected}:${fields[0]}` : undefined;
-    commit(els.map(e => e.id === selected ? { ...e, ...patch } as El : e), key);
+    // Changing the bend or the shape of a piece of a split line makes it a line of its own.
+    const reshapes = 'bend' in patch || 'arc' in patch || 'ellipse' in patch;
+    commit(els.map(e => e.id === selected ? { ...(e.type === 'edge' && reshapes ? detachPiece(e) : e), ...patch } as El : e), key);
   };
   const removeSel = () => { if (selected != null) { commit(els.filter(e => e.id !== selected)); setSelected(null); } };
 
@@ -1109,6 +1495,7 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
     const onKey = (ev: KeyboardEvent) => {
       const tag = (ev.target as HTMLElement).tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (ev.key === 'Escape' && splitting) { ev.preventDefault(); ev.stopPropagation(); setSplitting(false); return; }
       if ((ev.key === 'Delete' || ev.key === 'Backspace') && selected != null) { ev.preventDefault(); removeSel(); }
       if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === 'z') {
         ev.preventDefault();
@@ -1123,10 +1510,10 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
   // ---- code generation ----
   const genCode = useCallback(() => {
     const lines: string[] = [];
+    for (const e of els) if (e.type === 'oval') lines.push(...ovalCode(e));
     for (const e of els) if (e.type === 'loop') lines.push(...loopCode(e));
     for (const e of els) if (e.type === 'edge') lines.push(...edgeCode(e));
-    for (const e of els) if (e.type === 'vertex')
-      lines.push(`  circle(${cx(e.at)}, radius: ${num(e.size / UNIT)}, fill: ${paintOf(e.color)}, stroke: none)`);
+    for (const e of els) if (e.type === 'vertex') lines.push(...vertexCode(e));
     for (const e of els) if (e.type === 'text' && e.text.trim())
       lines.push(`  content(${cx(e.at)}, ${mathContent(e.text.trim(), e.color)})`);
     const imports = `#import "@preview/cetz:0.3.4": canvas, draw, decorations\n`;
@@ -1170,11 +1557,12 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
 
   const [showExamples, setShowExamples] = useState(false);
   const code = useMemo(() => showCode ? genCode() : null, [showCode, genCode]);
-  const diagram = useMemo(() => els.map(e =>
+  const diagram = useMemo(() => behindFirst(els).map(e =>
     e.type === 'edge' ? renderEdge(e)
     : e.type === 'loop' ? renderLoop(e)
-    : e.type === 'vertex' ? <circle key={e.id} cx={e.at.x} cy={e.at.y} r={e.size} fill={previewCol(e.color, e.id === selected)} />
-    : <text key={e.id} x={e.at.x} y={e.at.y} fontSize="14" fontStyle="italic" fontFamily="Georgia, serif" textAnchor="middle" dominantBaseline="middle" fill={previewCol(e.color, e.id === selected)}>{prettyLabel(e.text) || '…'}</text>
+    : e.type === 'oval' ? drawOval(e, selected)
+    : e.type === 'vertex' ? drawVertex(e, selected)
+    : <text key={e.id} x={e.at.x} y={e.at.y} fontSize="14" fontStyle="italic" fontFamily={LABEL_FONT} textAnchor="middle" dominantBaseline="middle" fill={previewCol(e.color, e.id === selected)}>{prettyLabel(e.text) || '…'}</text>
   ), [els, selected, renderEdge, renderLoop]);
 
   return (
@@ -1224,8 +1612,8 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
           <div style={{ flex: '1 1 auto', minWidth: 0 }}>
             <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center', marginBottom: '8px' }}>
               <div className="seg">
-                {([['select', 'Select'], ['edge', 'Line'], ['loop', 'Circle'], ['vertex', 'Vertex'], ['text', 'Label']] as const).map(([t, name]) => (
-                  <button key={t} className={tool === t ? 'active' : ''} onClick={() => setTool(t)}>{name}</button>
+                {([['select', 'Select'], ['edge', 'Line'], ['loop', 'Circle'], ['oval', 'Oval'], ['vertex', 'Vertex'], ['text', 'Label']] as const).map(([t, name]) => (
+                  <button key={t} className={tool === t ? 'active' : ''} onClick={() => { setTool(t); setSplitting(false); }}>{name}</button>
                 ))}
               </div>
               {tool === 'edge' && (
@@ -1252,13 +1640,15 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
               <path d={GRID_MAJOR} fill="none" stroke="#cfd8e6" strokeWidth="1" />
               {diagram}
               {draft && tool === 'edge' && <line x1={draft.a.x} y1={draft.a.y} x2={draft.b.x} y2={draft.b.y} stroke="#7c3aed" strokeWidth="1.5" strokeDasharray="4 4" />}
+              {draft && tool === 'oval' && <ellipse cx={draft.a.x} cy={draft.a.y} rx={Math.max(2, Math.abs(draft.b.x - draft.a.x))} ry={Math.max(2, Math.abs(draft.b.y - draft.a.y))} fill="none" stroke="#7c3aed" strokeWidth="1.5" strokeDasharray="4 4" />}
               {draft && tool === 'loop' && <circle cx={draft.a.x} cy={draft.a.y} r={Math.max(2, Math.hypot(draft.b.x - draft.a.x, draft.b.y - draft.a.y))} fill="none" stroke="#7c3aed" strokeWidth="1.5" strokeDasharray="4 4" />}
               {sel && tool === 'select' && handlePoints(sel).map(([mode, p], i) => (
                 <circle key={i} cx={p.x} cy={p.y} r="6" fill="#fff" stroke="#7c3aed" strokeWidth="2" style={{ cursor: mode === 'bend' ? 'ns-resize' : 'move' }} />
               ))}
             </svg>
+            {splitting && <div className="form-hint" style={{ marginTop: '6px', color: '#7c3aed', fontWeight: 600 }}>Click the point on the selected line where it should be cut (Esc cancels).</div>}
             <div className="form-hint" style={{ marginTop: '6px' }}>
-              <b>Line / Circle</b>: click &amp; drag to draw. <b>Select</b>: click an element, then drag it or its handles
+              <b>Line / Circle / Oval</b>: click &amp; drag to draw (an oval from its centre). <b>Select</b>: click an element, then drag it or its handles
               (line endpoints snap to nearby vertices; the middle handle bends the line into an arc). <b>⌫</b> deletes, <b>{keys('⌘Z')}</b> undoes.
               The grid (bold lines = 1 unit) is a drawing guide only and is never added to the diagram.
             </div>
@@ -1279,10 +1669,16 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
                 {(sel.kind === 'photon' || sel.kind === 'gluon') &&
                   field(`Wiggle size — ${num(sel.amplitude / UNIT)}`, <input type="range" min="2" max="14" step="0.5" value={sel.amplitude} onChange={e => update({ amplitude: Number(e.target.value) })} />)}
                 {field(`Bend — ${sel.bend}`, <input type="range" min="-150" max="150" step="5" value={sel.bend} onChange={e => update({ bend: Number(e.target.value) })} />)}
-                <label className="form-check" title="Bend as a piece of a circle instead of a parabola-like curve">
-                  <input type="checkbox" checked={!!sel.arc} onChange={e => update({ arc: e.target.checked })} />
-                  Circular arc
-                </label>
+                {field('Bend shape', (
+                  <select value={sel.ellipse ? 'ellipse' : sel.arc ? 'arc' : 'curve'} onChange={e => update({ arc: e.target.value === 'arc', ellipse: e.target.value === 'ellipse' })}>
+                    <option value="curve">Curve</option>
+                    <option value="arc">Circular arc</option>
+                    <option value="ellipse">Half ellipse (leaves the ends square)</option>
+                  </select>
+                ))}
+                <button className="btn-ghost" style={{ width: '100%', marginBottom: '6px' }} disabled={sel.style === 'hidden'}
+                  title="Cut this line in two at a point you click, keeping its exact curve, so one part can have another colour, style or label"
+                  onClick={() => { setTool('select'); setSplitting(v => !v); }}>{splitting ? 'Cancel splitting' : 'Split line at a point…'}</button>
                 {field('Style', (
                   <select value={sel.style ?? 'normal'} onChange={e => update({ style: e.target.value as LineStyle })}>
                     <option value="normal">Normal</option>
@@ -1377,9 +1773,47 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
               </>
             )}
 
+            {sel?.type === 'oval' && (
+              <>
+                {field('Fill', (
+                  <select value={sel.fill} onChange={e => update({ fill: e.target.value as OvalFill })}>
+                    <option value="none">None</option>
+                    <option value="shaded">Shaded (flat)</option>
+                    <option value="gradient">Shading (3-D, from the colour)</option>
+                    <option value="hatched">Hatched</option>
+                  </select>
+                ))}
+                {sel.fill !== 'none' && field('Fill only', (
+                  <select value={sel.half ?? 'whole'} onChange={e => update({ half: e.target.value as Half })}>
+                    <option value="whole">The whole oval</option>
+                    <option value="left">The left half</option>
+                    <option value="right">The right half</option>
+                    <option value="top">The top half</option>
+                    <option value="bottom">The bottom half</option>
+                  </select>
+                ))}
+                <label className="form-check">
+                  <input type="checkbox" checked={sel.outline} onChange={e => update({ outline: e.target.checked })} />
+                  Outline
+                </label>
+                {field(`Width — ${num(2 * sel.rx / UNIT)}`, <input type="range" min="6" max="320" step="2" value={sel.rx} onChange={e => update({ rx: Number(e.target.value) })} />)}
+                {field(`Height — ${num(2 * sel.ry / UNIT)}`, <input type="range" min="6" max="190" step="2" value={sel.ry} onChange={e => update({ ry: Number(e.target.value) })} />)}
+                {sel.outline && field(`Thickness — ${num(sel.thickness)}pt`, <input type="range" min="0.4" max="3" step="0.1" value={sel.thickness} onChange={e => update({ thickness: Number(e.target.value) })} />)}
+                {colorField(sel.color)}
+              </>
+            )}
+
             {sel?.type === 'vertex' && (
               <>
-                {field(`Dot size — ${num(sel.size / UNIT)}`, <input type="range" min="1.5" max="7" step="0.5" value={sel.size} onChange={e => update({ size: Number(e.target.value) })} />)}
+                {field('Shape', (
+                  <select value={sel.shape ?? 'dot'} onChange={e => update({ shape: e.target.value as VertexShape })}>
+                    <option value="dot">Dot ●</option>
+                    <option value="cross">Cross × (an insertion)</option>
+                    <option value="open">Open circle ○</option>
+                    <option value="hidden">Hidden (a snap point only)</option>
+                  </select>
+                ))}
+                {field(`Size — ${num(sel.size / UNIT)}`, <input type="range" min="1.5" max="7" step="0.5" value={sel.size} onChange={e => update({ size: Number(e.target.value) })} />)}
                 {colorField(sel.color)}
               </>
             )}

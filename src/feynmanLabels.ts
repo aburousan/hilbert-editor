@@ -20,6 +20,9 @@ export const prettyLabel = (raw: string): string => {
   let text = raw.replace(/"([^"]*)"/g, (_, inner) => `\u0000${quoted.push(inner) - 1}\u0000`);
   // A bar over a letter, an italic aside, and the Greek names.
   text = text.replace(/\b(?:macron|overline|bar)\(([^()]*)\)/g, (_, inner) => `${inner}\u0304`);
+  text = text.replace(/\b(?:arrow|vec)\(([^()]*)\)/g, (_, inner) => `${inner}\u20d7`);
+  text = text.replace(/\bhat\(([^()]*)\)/g, (_, inner) => `${inner}\u0302`);
+  text = text.replace(/\btilde\(([^()]*)\)/g, (_, inner) => `${inner}\u0303`);
   text = text.replace(/\b(?:italic|upright|bold)\(([^()]*)\)/g, '$1');
   const greek = (word: string) => GREEK[word] ?? word;
   // A word between anything that is not a letter or digit — an underscore
@@ -33,7 +36,8 @@ export const prettyLabel = (raw: string): string => {
     const body = (braced ?? bare).replace(/(?<![A-Za-z0-9])[A-Za-z]+(?![A-Za-z0-9])/g, greek);
     return script(body, table) ?? `${mark}${body}`;
   };
-  text = text.replace(/\^(?:\{([^{}]*)\}|([A-Za-z0-9]+|[-+*]))/g, scripted(SUPERS, '^'));
-  text = text.replace(/_(?:\{([^{}]*)\}|([A-Za-z0-9]+|[-+]))/g, scripted(SUBS, '_'));
+  // Typst groups a script with parentheses, x_(i j); braces are accepted too.
+  text = text.replace(/\^(?:[{(]([^{}()]*)[})]|([A-Za-z0-9]+|[-+*]))/g, scripted(SUPERS, '^'));
+  text = text.replace(/_(?:[{(]([^{}()]*)[})]|([A-Za-z0-9]+|[-+]))/g, scripted(SUBS, '_'));
   return text.replace(/\u0000(\d+)\u0000/g, (_, i) => quoted[Number(i)]);
 };
