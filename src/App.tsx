@@ -90,6 +90,7 @@ import { isProjectTextPath } from './projectFileTypes';
 import { deriveWorkspaceStatus } from './workspaceStatus';
 import { inactiveModelsToDiscard, limitNotebookResults } from './performanceLimits';
 import { resolveTypstPath, typstPathAt, typstPathLinks, universeUrl, type TypstPathLink } from './typstPaths';
+import { loadFoldersFirst, orderTree, saveFoldersFirst } from './treeOrder';
 import './index.css';
 import './PackageInstaller.css';
 
@@ -602,6 +603,8 @@ export default function App() {
   const [externalConflict, setExternalConflict] = useState<ExternalConflict | null>(null);
   const [booted, setBooted] = useState(false);
   const [fileTree, setFileTree] = useState<FileNode[]>([]);
+  const [foldersFirst, setFoldersFirst] = useState<boolean>(loadFoldersFirst);
+  const toggleFoldersFirst = () => setFoldersFirst(on => { saveFoldersFirst(!on); return !on; });
   const fileTreeElRef = useRef<HTMLDivElement | null>(null);
   const pendingTreeRestoreRef = useRef<{ scrollTop?: number; activePath?: string; attempts: number } | null>(null);
   const lastTreeActiveRef = useRef('');
@@ -6474,7 +6477,7 @@ ${byline ? `
       return matches.length ? { path: tab.path, matches } : null;
     }).filter(Boolean) as SearchResult[];
   }, [tabs, treeSearch]);
-  const treeJsx = useMemo(() => renderTree(filterTree(fileTree, treeSearch, searchContentResults, dirtyTabMatches)), [fileTree, activeTabPath, loadingDirs, renamingPath, renameValue, selectedPaths, expandedDirs, currentMain, dirtyPathsKey, treeSearch, searchContentResults, dirtyTabMatches, filterTree]);
+  const treeJsx = useMemo(() => renderTree(orderTree(filterTree(fileTree, treeSearch, searchContentResults, dirtyTabMatches), foldersFirst)), [fileTree, foldersFirst, activeTabPath, loadingDirs, renamingPath, renameValue, selectedPaths, expandedDirs, currentMain, dirtyPathsKey, treeSearch, searchContentResults, dirtyTabMatches, filterTree]);
   // Restore the tree only after its folders/files have rendered. A saved pixel
   // offset preserves the exact browsing place; if the tree shape changed, keep
   // the active file visible. Retry while lazily expanded directories arrive so
@@ -7548,6 +7551,9 @@ ${byline ? `
                       <span className="dropdown-check">{panels[key] ? '✓' : ''}</span>{PANEL_LABELS[key]}
                     </div>
                   ))}
+                  <div className="dropdown-item" onClick={() => { toggleFoldersFirst(); setActiveMenu(null); }}>
+                    <span className="dropdown-check">{foldersFirst ? '✓' : ''}</span>Folders First in File Tree
+                  </div>
                   <div className="dropdown-divider"></div>
                   {(['editor', 'preview'] as const).map(key => (
                     <div key={key} className="dropdown-item" onClick={() => togglePanel(key)}>
@@ -8834,6 +8840,7 @@ ${byline ? `
                 setContextMenu(null);
               }}>Paste</div>
               <div className="dropdown-divider"></div>
+              <div className="dropdown-item" onClick={() => { toggleFoldersFirst(); setContextMenu(null); }}>{foldersFirst ? '✓ ' : ''}Folders First</div>
               <div className="dropdown-item" onClick={() => { fetchTree(); setContextMenu(null); }}>Refresh</div>
               <div className="dropdown-item" onClick={() => { revealInFileManager(); setContextMenu(null); }}>Reveal Workspace</div>
             </>
