@@ -49,7 +49,7 @@ try {
   assert.ok(bound, 'backend did not start');
   browser = await puppeteer.launch({ args: ['--no-sandbox'] });
   const page = await browser.newPage();
-  await page.setViewport({ width: 1400, height: 950 });
+  await page.setViewport({ width: 1400, height: 1400 });   // tall enough that the dialog does not scroll the canvas under the code box
   await page.setCookie({ name: 'hilbert_session', value: token, domain: '127.0.0.1', path: '/' });
   const errors = [];
   page.on('pageerror', e => errors.push(String(e)));
@@ -103,9 +103,20 @@ try {
 
   // 2. By hand: an oval, half filled; a line bent as a half ellipse and split; a cross vertex.
   await clickText('button', 'Clear');
-  const box = await (await page.$(svgSel)).boundingBox();
-  const at = (x, y) => ({ x: box.x + x * box.width / 680, y: box.y + y * box.height / 400 });
-  const drag = async (a, b) => { const p = at(...a), q = at(...b); await page.mouse.move(p.x, p.y); await page.mouse.down(); await page.mouse.move(q.x, q.y, { steps: 6 }); await page.mouse.up(); await sleep(120); };
+  // The canvas moves on screen as the side panel grows, so it is measured again for every point.
+  // It is also re-centred when the dialog's height changes, so wait until two readings agree.
+  const at = async (x, y) => {
+    let box = await (await page.$(svgSel)).boundingBox();
+    for (let i = 0; i < 20; i++) {
+      await sleep(60);
+      const again = await (await page.$(svgSel)).boundingBox();
+      const same = Math.abs(again.x - box.x) < 0.5 && Math.abs(again.y - box.y) < 0.5 && Math.abs(again.height - box.height) < 0.5;
+      box = again;
+      if (same) break;
+    }
+    return { x: box.x + x * box.width / 680, y: box.y + y * box.height / 400 };
+  };
+  const drag = async (a, b) => { const p = await at(...a), q = await at(...b); await page.mouse.move(p.x, p.y); await page.mouse.down(); await page.mouse.move(q.x, q.y, { steps: 6 }); await page.mouse.up(); await sleep(120); };
   const setSelect = (label, value) => page.evaluate((label, value) => {
     const f = [...document.querySelectorAll('label.form-field')].find(l => l.firstElementChild?.textContent.startsWith(label));
     const s = f?.querySelector('select');
@@ -123,6 +134,23 @@ try {
   await sleep(150);
   c = await code();
   check('…gives a half arc with the radial shading', /arc\(\(8\.5, 5\), start: -90deg, delta: 180deg, radius: \(4, 1\.5\), anchor: "origin", mode: "CLOSE", fill: gradient\.radial/.test(c));
+  check('oval outline: coiled, with clockwise arrows', await setSelect('Line type', 'gluon') && await setSelect('Fermion flow', '1'));
+  await sleep(150);
+  c = await code();
+  check('…a coil around the oval and two arrow marks', /decorations\.coil\(circle\(\(8\.5, 5\), radius: \(4, 1\.5\)\)/.test(c) && (c.match(/mark\(\([\d.]+, (6\.5|3\.5)\)/g) || []).length === 2);
+
+  // A circle shaded in 3-D, whole and then its left half only.
+  await clickText('.seg button', 'Circle');
+  await drag([100, 320], [140, 320]);
+  check('circle: 3-D shading', await setSelect('Fill', 'gradient'));
+  await sleep(150);
+  c = await code();
+  check('…the whole circle shaded', /circle\(\(2\.5, 2\), radius: 1, stroke: 1\.2pt, fill: gradient\.radial\(luma\(60%\)/.test(c), c.split('\n').find(l => l.includes('(2.5, 2)')));
+  check('circle: left half only', await setSelect('Fill only', 'left'));
+  await sleep(150);
+  c = await code();
+  check('…a shaded half-disc and the whole outline',
+    /arc\(\(2\.5, 2\), start: 90deg, delta: 180deg, radius: 1, anchor: "origin", mode: "CLOSE", fill: gradient\.radial/.test(c) && /circle\(\(2\.5, 2\), radius: 1, stroke: 1\.2pt\)/.test(c));
 
   await clickText('.seg button', 'Line');
   await drag([180, 200], [500, 200]);
@@ -138,7 +166,7 @@ try {
   check('half ellipse: two cubic quarters reaching the top at (8.5, 7)', /merge-path\(\{ bezier\(\(4\.5, 5\), \(8\.5, 7\)/.test(c), c.split('\n').find(l => l.includes('merge-path')));
   // Split at a third of the way along (angle π/3 from the start): x = 340 − 160·cos 60°, y = 200 − 80·sin 60°.
   check('split button', await clickText('button', 'Split line at a point…'));
-  const sp = at(340 - 160 * 0.5, 200 - 80 * Math.sin(Math.PI / 3));
+  const sp = await at(340 - 160 * 0.5, 200 - 80 * Math.sin(Math.PI / 3));
   await page.mouse.click(sp.x, sp.y);
   await sleep(200);
   c = await code();
@@ -152,13 +180,43 @@ try {
   c = await code();
   check('one piece red, the other black', /merge-path[^\n]*rgb\("#dc2626"\)/.test(c) && /merge-path[^\n]*stroke: 1\.2pt\)/.test(c));
   await clickText('.seg button', 'Vertex');
-  const v = at(600, 340); await page.mouse.click(v.x, v.y);
+  let v = await at(600, 340); await page.mouse.click(v.x, v.y);
   await clickText('.seg button', 'Select');
+  v = await at(600, 340);
   await page.mouse.click(v.x, v.y);
   check('vertex shape: cross', await setSelect('Shape', 'cross'));
   await sleep(120);
   c = await code();
   check('…draws two crossing lines', (c.match(/line\([^\n]*stroke: 1\.2pt \+ black\)/g) || []).length === 2);
+
+  // Several at once: a box around the circle, shift-click the cross, drag them together, duplicate, delete.
+  await clickText('.seg button', 'Select');
+  await page.keyboard.press('Escape');
+  await drag([50, 270], [150, 370]);
+  check('a box around the circle selects just it', await page.evaluate(() => [...document.querySelectorAll('label.form-field span')].some(s => s.textContent === 'Circle type')));
+  v = await at(600, 340);
+  await page.keyboard.down('Shift'); await page.mouse.click(v.x, v.y); await page.keyboard.up('Shift');
+  await sleep(150);
+  const howMany = () => page.evaluate(() => /(\d+) selected/.exec([...document.querySelectorAll('.form-hint b')].map(b => b.textContent).join(' '))?.[1]);
+  check('shift-click adds the cross: 2 selected', await howMany() === '2', await howMany());
+  await drag([100, 320], [140, 320]);
+  c = await code();
+  check('dragging one moves both', /arc\(\(3\.5, 2\)/.test(c) && !/arc\(\(2\.5, 2\)/.test(c) && /line\(\(15\.9, /.test(c), (c.match(/line\(\(1[45]\.[\d]+, [^\n]*1\.2pt \+ black/g) || []).join(' '));
+  await page.keyboard.down(mod); await page.keyboard.press('d'); await page.keyboard.up(mod);
+  await sleep(150);
+  c = await code();
+  check(`${mod}+D duplicates both, 20 px down and right`, /arc\(\(4, 1\.5\)/.test(c) && (c.match(/line\([^\n]*1\.2pt \+ black/g) || []).length === 4);
+  await page.keyboard.press('Backspace');
+  await sleep(150);
+  c = await code();
+  check('Delete removes the selected copies only', !/arc\(\(4, 1\.5\)/.test(c) && /arc\(\(3\.5, 2\)/.test(c));
+  await page.keyboard.down(mod); await page.keyboard.press('a'); await page.keyboard.up(mod);
+  await sleep(150);
+  const all = await howMany();
+  await page.evaluate(() => [...document.querySelectorAll('button[title="#2563eb"]')][0]?.click());
+  await sleep(150);
+  c = await code();
+  check(`${mod}+A selects everything (5) and a colour applies to all`, all === '5' && !/stroke: 1\.2pt\)|stroke: 1pt\)|\+ black/.test(c), `${all} selected`);
   const err = await compile('by-hand', c);
   check('the hand-made diagram compiles', !err, err);
   await shot('by-hand');

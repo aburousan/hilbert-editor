@@ -13,7 +13,7 @@ import { createHistory } from '../editHistory';
 type Pt = { x: number, y: number };
 type EdgeKind = 'fermion' | 'antifermion' | 'photon' | 'gluon' | 'scalar' | 'ghost' | 'plain' | 'double' | 'cscalar' | 'majorana' | 'wilson';
 type LoopKind = 'plain' | 'scalar' | 'photon' | 'gluon';
-type LoopFill = 'none' | 'hatched' | 'shaded';
+type LoopFill = 'none' | 'hatched' | 'shaded' | 'gradient';
 
 // For loop-integral notes (IBP): a line can be faded (dotted grey, a line taken out, as in a spanning
 // tree) or hidden (keeps its place for snapping, draws nothing); dots on a line mark a raised power of
@@ -30,7 +30,7 @@ type Edge = {
 };
 type Loop = {
   id: number, type: 'loop', kind: LoopKind, fill: LoopFill, center: Pt, radius: number, thickness: number, amplitude: number,
-  label: string, color?: string, arrow?: 0 | 1 | -1,
+  label: string, color?: string, arrow?: 0 | 1 | -1, half?: Half,
   labelBelow?: string, style?: LineStyle, mom?: 0 | 1 | -1,
 };
 // A split line remembers the shape it was cut from (its ends and bend) and which part of it it is, so a
@@ -46,6 +46,7 @@ type Half = 'whole' | 'left' | 'right' | 'top' | 'bottom';
 type Oval = {
   id: number, type: 'oval', center: Pt, rx: number, ry: number, fill: OvalFill, half?: Half,
   outline: boolean, thickness: number, color?: string,
+  kind?: LoopKind, arrow?: 0 | 1 | -1, amplitude?: number,   // the outline drawn like a circle's: dashed, wavy, coiled, with arrows
 };
 type El = Edge | Loop | Vertex | TextEl | Oval;
 
@@ -440,7 +441,7 @@ function ovalHatch(o: Oval): [Pt, Pt][] {
   return out;
 }
 
-function ovalFillCode(o: Oval): string | null {
+function ovalFillCode(o: { fill: string, color?: string }): string | null {
   if (o.fill === 'shaded') return tint(o.color) ? `${tint(o.color)}.lighten(70%)` : 'gray.lighten(50%)';
   if (o.fill === 'gradient') {
     const c = tint(o.color) ?? 'luma(60%)';
@@ -449,16 +450,30 @@ function ovalFillCode(o: Oval): string | null {
   return null;
 }
 
+// An oval's perimeter (Ramanujan), for spacing the wiggles of a wavy or coiled outline.
+const ovalPerimeter = (o: Oval) => Math.PI * (3 * (o.rx + o.ry) - Math.sqrt((3 * o.rx + o.ry) * (o.rx + 3 * o.ry)));
+
 function ovalCode(o: Oval): string[] {
   const out: string[] = [];
   const r = `(${num(o.rx / UNIT)}, ${num(o.ry / UNIT)})`;
-  const stroke = o.outline ? strokeOf(o.thickness, o.color) : 'none';
+  const kind = o.kind ?? 'plain', wiggly = kind === 'photon' || kind === 'gluon';
+  const stroke = !o.outline ? 'none' : kind === 'scalar' ? dashStroke(o.thickness, 'dashed', o.color) : strokeOf(o.thickness, o.color);
   const fill = ovalFillCode(o), half = o.half ?? 'whole';
   if (fill && half !== 'whole') {
     out.push(`  arc(${cx(o.center)}, start: ${HALF_START[half]}deg, delta: 180deg, radius: ${r}, anchor: "origin", mode: "CLOSE", fill: ${fill}, stroke: none)`);
-    if (o.outline) out.push(`  circle(${cx(o.center)}, radius: ${r}, stroke: ${stroke})`);
-  } else if (fill || o.outline) {
-    out.push(`  circle(${cx(o.center)}, radius: ${r}, ${fill ? `fill: ${fill}, ` : ''}stroke: ${stroke})`);
+    if (o.outline && !wiggly) out.push(`  circle(${cx(o.center)}, radius: ${r}, stroke: ${stroke})`);
+  } else if (fill || (o.outline && !wiggly)) {
+    out.push(`  circle(${cx(o.center)}, radius: ${r}, ${fill ? `fill: ${fill}, ` : ''}stroke: ${wiggly ? 'none' : stroke})`);
+  }
+  if (o.outline && wiggly) {
+    const segs = Math.max(6, Math.round(ovalPerimeter(o) / (kind === 'photon' ? 13 : 12)));
+    out.push(`  decorations.${kind === 'photon' ? 'wave' : 'coil'}(circle(${cx(o.center)}, radius: ${r}), stroke: ${strokeOf(o.thickness, o.color)}, amplitude: ${num((o.amplitude ?? 5) / UNIT)}, segments: ${segs})`);
+  }
+  // Flow arrows at the top and bottom, as on a circle (1 = clockwise on the page).
+  if (o.outline && o.arrow) {
+    const ex = 3.2, sc = num(Math.max(0.8, o.thickness * 0.8));
+    for (const [py, dir] of [[o.center.y - o.ry, o.arrow], [o.center.y + o.ry, -o.arrow]] as const)
+      out.push(`  mark(${cx({ x: o.center.x - dir * ex, y: py })}, ${cx({ x: o.center.x + dir * ex, y: py })}, symbol: ">", fill: ${paintOf(o.color)}, stroke: ${paintOf(o.color)}, scale: ${sc})`);
   }
   if (o.fill === 'hatched')
     for (const [a, b] of ovalHatch(o)) out.push(`  line(${cx(a)}, ${cx(b)}, stroke: ${strokeOf(Math.max(0.4, o.thickness * 0.45), o.color)})`);
@@ -553,16 +568,22 @@ function loopCode(l: Loop): string[] {
   if (l.style === 'faded') {
     out.push(`  circle(${cx(l.center)}, radius: ${num(l.radius / UNIT)}, stroke: ${fadedStroke(l.thickness)})`);
   } else if (l.kind === 'plain' || l.kind === 'scalar') {
-    const fill = l.fill === 'shaded' ? `, fill: ${tint(l.color) ? `${tint(l.color)}.lighten(70%)` : 'gray.lighten(50%)'}` : '';
+    const fillExpr = ovalFillCode(l), half = l.half ?? 'whole';
     // A scalar runs dashed, loop or line.
     const stroke = l.kind === 'scalar' ? dashStroke(l.thickness, 'dashed', l.color) : strokeOf(l.thickness, l.color);
-    out.push(`  circle(${cx(l.center)}, radius: ${num(l.radius / UNIT)}, stroke: ${stroke}${fill})`);
+    if (fillExpr && half !== 'whole') {
+      // Only one half filled: that half as a closed half-disc, then the whole circle's outline.
+      out.push(`  arc(${cx(l.center)}, start: ${HALF_START[half]}deg, delta: 180deg, radius: ${num(l.radius / UNIT)}, anchor: "origin", mode: "CLOSE", fill: ${fillExpr}, stroke: none)`);
+      out.push(`  circle(${cx(l.center)}, radius: ${num(l.radius / UNIT)}, stroke: ${stroke})`);
+    } else out.push(`  circle(${cx(l.center)}, radius: ${num(l.radius / UNIT)}, stroke: ${stroke}${fillExpr ? `, fill: ${fillExpr}` : ''})`);
   } else {
     const fn = l.kind === 'photon' ? 'wave' : 'coil';
     const segs = Math.max(6, Math.round(2 * Math.PI * l.radius / (l.kind === 'photon' ? 13 : 12)));
     out.push(`  decorations.${fn}(circle(${cx(l.center)}, radius: ${num(l.radius / UNIT)}), stroke: ${strokeOf(l.thickness, l.color)}, amplitude: ${num(l.amplitude / UNIT)}, segments: ${segs})`);
   }
-  if (l.fill === 'hatched' && l.style !== 'faded') {
+  if (l.fill === 'hatched' && l.style !== 'faded' && (l.half ?? 'whole') !== 'whole') {
+    for (const [a, b] of ovalHatch(circleAsOval(l))) out.push(`  line(${cx(a)}, ${cx(b)}, stroke: ${strokeOf(Math.max(0.4, l.thickness * 0.45), l.color)})`);
+  } else if (l.fill === 'hatched' && l.style !== 'faded') {
     // 45° chords across the circle — version-proof hatching without pattern fills
     const r = l.radius, spacing = Math.max(8, r / 3.2);
     const ux = Math.SQRT1_2, uy = -Math.SQRT1_2, nx = Math.SQRT1_2, ny = Math.SQRT1_2;
@@ -670,11 +691,14 @@ function drawLoop(l: Loop, selected: number | null) {
     parts.push(<circle key="c" cx={l.center.x} cy={l.center.y} r={l.radius} fill="none" stroke={col} strokeWidth={l.thickness} strokeDasharray={hidden ? '3 6' : '1.5 3'} />);
     if (hidden) return <g key={l.id}>{parts}</g>;
   } else if (l.kind === 'plain' || l.kind === 'scalar') {
-    parts.push(<circle key="c" cx={l.center.x} cy={l.center.y} r={l.radius} fill={l.fill === 'shaded' ? (tint(l.color) ? `${l.color}44` : '#d4d4d4') : 'none'} stroke={col} strokeWidth={l.thickness} strokeDasharray={l.kind === 'scalar' ? '8 5' : undefined} />);
+    parts.push(...drawFill({ center: l.center, rx: l.radius, ry: l.radius, fill: l.fill, color: l.color, half: l.half }, `loopg-${l.id}`));
+    parts.push(<circle key="c" cx={l.center.x} cy={l.center.y} r={l.radius} fill="none" stroke={col} strokeWidth={l.thickness} strokeDasharray={l.kind === 'scalar' ? '8 5' : undefined} />);
   } else {
     parts.push(<path key="c" d={decoCirclePath(l.center, l.radius, l.kind, l.amplitude)} fill="none" stroke={col} strokeWidth={l.thickness} />);
   }
-  if (l.fill === 'hatched' && !faded) {
+  if (l.fill === 'hatched' && !faded && (l.half ?? 'whole') !== 'whole') {
+    parts.push(<g key="h">{ovalHatch(circleAsOval(l)).map(([p, q], i) => <line key={i} x1={p.x} y1={p.y} x2={q.x} y2={q.y} stroke={col} strokeWidth={Math.max(0.4, l.thickness * 0.45)} />)}</g>);
+  } else if (l.fill === 'hatched' && !faded) {
     const r = l.radius, spacing = Math.max(8, r / 3.2);
     const hs: React.ReactNode[] = [];
     for (let cD = -r + spacing, i = 0; cD < r - 1; cD += spacing, i++) {
@@ -714,32 +738,72 @@ function mixHex(c: string, amount: number): string {
   return '#' + ch.map(x => Math.round(x + (to - x) * k).toString(16).padStart(2, '0')).join('');
 }
 
-function drawOval(o: Oval, selected: number | null, idPrefix = 'c') {
-  const isSel = o.id === selected;
-  const col = isSel ? '#7c3aed' : previewCol(o.color, false);
+const circleAsOval = (l: Loop): Oval =>
+  ({ id: l.id, type: 'oval', center: l.center, rx: l.radius, ry: l.radius, fill: l.fill === 'hatched' ? 'hatched' : 'none', half: l.half, outline: false, thickness: l.thickness, color: l.color });
+
+// The fill of an oval or circle on the canvas: flat or a radial shading, whole or one half.
+function drawFill(o: { center: Pt, rx: number, ry: number, fill: string, color?: string, half?: Half }, gid: string): React.ReactNode[] {
   const base = tint(o.color) ? o.color! : '#9e9e9e';
   const { x, y } = o.center, { rx, ry } = o;
   const half = o.half ?? 'whole';
-  const gid = `ovalg-${idPrefix}-${o.id}`;
   const parts: React.ReactNode[] = [];
   const fill = o.fill === 'shaded' ? (tint(o.color) ? mixHex(o.color!, 0.7) : '#d4d4d4') : o.fill === 'gradient' ? `url(#${gid})` : null;
+  if (!fill) return parts;
   if (o.fill === 'gradient') parts.push(
     <defs key="d"><radialGradient id={gid} cx="35%" cy="30%" r="80%">
       <stop offset="0" stopColor={mixHex(base, 0.55)} /><stop offset="0.5" stopColor={base} /><stop offset="1" stopColor={mixHex(base, -0.35)} />
     </radialGradient></defs>);
-  if (fill) {
-    if (half === 'whole') parts.push(<ellipse key="f" cx={x} cy={y} rx={rx} ry={ry} fill={fill} stroke="none" />);
-    else {
-      const [a, b] = half === 'right' ? [[x, y - ry], [x, y + ry]] : half === 'left' ? [[x, y + ry], [x, y - ry]]
-        : half === 'top' ? [[x - rx, y], [x + rx, y]] : [[x + rx, y], [x - rx, y]];
-      parts.push(<path key="f" d={`M${a[0]},${a[1]} A${rx},${ry} 0 0 1 ${b[0]},${b[1]} Z`} fill={fill} stroke="none" />);
-    }
+  if (half === 'whole') parts.push(<ellipse key="f" cx={x} cy={y} rx={rx} ry={ry} fill={fill} stroke="none" />);
+  else {
+    const [a, b] = half === 'right' ? [[x, y - ry], [x, y + ry]] : half === 'left' ? [[x, y + ry], [x, y - ry]]
+      : half === 'top' ? [[x - rx, y], [x + rx, y]] : [[x + rx, y], [x - rx, y]];
+    parts.push(<path key="f" d={`M${a[0]},${a[1]} A${rx},${ry} 0 0 1 ${b[0]},${b[1]} Z`} fill={fill} stroke="none" />);
   }
+  return parts;
+}
+
+// An oval's outline as a closed curve at even spacing along its length, for drawing wiggles around it.
+function ovalCurve(o: Oval): Curve {
+  // Anticlockwise on the page, so the wiggles' side (left of travel) is the outside, as cetz draws them.
+  const raw = (u: number): Pt => ({ x: o.center.x + o.rx * Math.cos(2 * Math.PI * u), y: o.center.y - o.ry * Math.sin(2 * Math.PI * u) });
+  const N = 240, cum = [0];
+  for (let i = 1; i <= N; i++) { const a = raw((i - 1) / N), b = raw(i / N); cum.push(cum[i - 1] + Math.hypot(b.x - a.x, b.y - a.y)); }
+  const len = cum[N];
+  const param = (t: number) => {
+    const target = t * len;
+    let lo = 0, hi = N;
+    while (hi - lo > 1) { const m = (lo + hi) >> 1; if (cum[m] < target) lo = m; else hi = m; }
+    return (lo + (target - cum[lo]) / ((cum[hi] - cum[lo]) || 1)) / N;
+  };
+  const pt = (t: number) => raw(param(t));
+  const tan = (t: number) => {
+    const u = 2 * Math.PI * param(t), v = { x: -o.rx * Math.sin(u), y: -o.ry * Math.cos(u) }, l = Math.hypot(v.x, v.y) || 1;
+    return { x: v.x / l, y: v.y / l };
+  };
+  return { pt, tan, len, arc: null };
+}
+
+function drawOval(o: Oval, selected: number | null, idPrefix = 'c') {
+  const isSel = o.id === selected;
+  const col = isSel ? '#7c3aed' : previewCol(o.color, false);
+  const { x, y } = o.center, { rx, ry } = o;
+  const parts: React.ReactNode[] = drawFill(o, `ovalg-${idPrefix}-${o.id}`);
   if (o.fill === 'hatched')
     parts.push(<g key="h">{ovalHatch(o).map(([p, q], i) => <line key={i} x1={p.x} y1={p.y} x2={q.x} y2={q.y} stroke={col} strokeWidth={Math.max(0.4, o.thickness * 0.45)} />)}</g>);
-  // Without an outline it still shows faintly here, so it can be found and picked; it prints none.
-  parts.push(<ellipse key="o" cx={x} cy={y} rx={rx} ry={ry} fill="none"
-    stroke={o.outline ? col : (isSel ? '#7c3aed' : '#cbd5e1')} strokeWidth={o.outline ? o.thickness : 1} strokeDasharray={o.outline ? undefined : '3 5'} />);
+  const kind = o.kind ?? 'plain';
+  if (o.outline && (kind === 'photon' || kind === 'gluon')) {
+    parts.push(<path key="o" d={decoPath(ovalCurve(o), kind, o.amplitude ?? 5)} fill="none" stroke={col} strokeWidth={o.thickness} />);
+  } else {
+    // Without an outline it still shows faintly here, so it can be found and picked; it prints none.
+    parts.push(<ellipse key="o" cx={x} cy={y} rx={rx} ry={ry} fill="none"
+      stroke={o.outline ? col : (isSel ? '#7c3aed' : '#cbd5e1')} strokeWidth={o.outline ? o.thickness : 1}
+      strokeDasharray={!o.outline ? '3 5' : kind === 'scalar' ? '8 5' : undefined} />);
+  }
+  if (o.outline && o.arrow) {
+    const size = 4 + o.thickness * 2;
+    parts.push(<polygon key="a1" points={arrowPts({ x, y: y - ry }, { x: o.arrow, y: 0 }, size, false)} fill={col} />);
+    parts.push(<polygon key="a2" points={arrowPts({ x, y: y + ry }, { x: -o.arrow, y: 0 }, size, false)} fill={col} />);
+  }
   return <g key={o.id}>{parts}</g>;
 }
 
@@ -756,6 +820,14 @@ function drawVertex(v: Vertex, selected: number | null) {
   if (shape === 'open') return <circle key={v.id} cx={v.at.x} cy={v.at.y} r={v.size} fill="#fff" stroke={col} strokeWidth={1.3} />;
   if (shape === 'hidden') return <circle key={v.id} cx={v.at.x} cy={v.at.y} r={Math.max(3, v.size)} fill="none" stroke={v.id === selected ? '#7c3aed' : '#cbd5e1'} strokeDasharray="2 2" />;
   return <circle key={v.id} cx={v.at.x} cy={v.at.y} r={v.size} fill={col} />;
+}
+
+// An element moved by (dx, dy), a split piece together with the line it was cut from.
+function shiftEl(e: El, dx: number, dy: number): El {
+  const sh = (q: Pt) => ({ x: q.x + dx, y: q.y + dy });
+  if (e.type === 'edge') return { ...e, from: sh(e.from), to: sh(e.to), ...(e.sub ? { sub: { ...e.sub, from: sh(e.sub.from), to: sh(e.sub.to) } } : {}) };
+  if (e.type === 'loop' || e.type === 'oval') return { ...e, center: sh(e.center) };
+  return { ...e, at: sh(e.at) };
 }
 
 // Ovals first: they sit behind every line, on the canvas as in the document.
@@ -1263,7 +1335,17 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
   // Waiting for a click on the selected line, to cut it there.
   const [splitting, setSplitting] = useState(false);
   const [edgeKind, setEdgeKind] = useState<EdgeKind>('fermion');
-  const [selected, setSelected] = useState<number | null>(null);
+  // The selection: `selected` is the element whose properties the panel shows; `extra` holds the others when
+  // several are selected (shift/⌘-click, a box dragged on empty canvas, ⌘A).
+  const [selected, setSelectedOne] = useState<number | null>(null);
+  const [extra, setExtra] = useState<number[]>([]);
+  const setSelected = (id: number | null) => { setSelectedOne(id); setExtra([]); };
+  const setSelection = (ids: number[]) => { setSelectedOne(ids[0] ?? null); setExtra(ids.slice(1)); };
+  const selIds = selected != null ? [selected, ...extra] : [];
+  const selSet = new Set(selIds);
+  const multi = extra.length > 0;
+  const selKey = selIds.join(',');
+  const [box, setBox] = useState<{ a: Pt, b: Pt } | null>(null);
   const [draft, setDraft] = useState<{ a: Pt, b: Pt } | null>(null);
   const [asFigure, setAsFigure] = useState(true);
   const [caption, setCaption] = useState('Feynman diagram');
@@ -1276,7 +1358,7 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
   const draftRef = useRef<{ a: Pt, b: Pt } | null>(null);
   const elsRef = useRef(els);
   elsRef.current = els;
-  const dragRef = useRef<null | { mode: 'draw' | 'move' | 'from' | 'to' | 'bend' | 'radius' | 'rx' | 'ry', start: Pt, snapshot: El[] }>(null);
+  const dragRef = useRef<null | { mode: 'draw' | 'move' | 'from' | 'to' | 'bend' | 'radius' | 'rx' | 'ry' | 'box', start: Pt, snapshot: El[], ids?: Set<number>, additive?: boolean }>(null);
 
   const commit = (next: El[], key?: string) => {
     historyRef.current.record(elsRef.current, key);
@@ -1297,7 +1379,8 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
     setEls(next); setSelected(null);
   };
 
-  const sel = els.find(e => e.id === selected) ?? null;
+  // One element selected: its own panel and handles. Several: the shared panel, no handles.
+  const sel = multi ? null : els.find(e => e.id === selected) ?? null;
 
   // Anchor points other elements can snap to (vertices, edge ends, loop compass points)
   const anchors = (): Pt[] => {
@@ -1319,8 +1402,12 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
     return { x: Math.round(p.x / (GRID / 2)) * (GRID / 2), y: Math.round(p.y / (GRID / 2)) * (GRID / 2) };
   };
 
+  // Where the canvas was on screen when the current press began. A drag is measured against that, so if
+  // the dialog moves while the button is down (selecting an element changes the side panel), a click still
+  // moves nothing.
+  const pressRectRef = useRef<DOMRect | null>(null);
   const mouse = (ev: React.MouseEvent): Pt => {
-    const r = svgRef.current!.getBoundingClientRect();
+    const r = (dragRef.current && pressRectRef.current) || svgRef.current!.getBoundingClientRect();
     return { x: (ev.clientX - r.left) * (W / r.width), y: (ev.clientY - r.top) * (H / r.height) };
   };
 
@@ -1352,6 +1439,7 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
     if (!ev.isPrimary || ev.button !== 0) return;
     ev.preventDefault();
     ev.currentTarget.setPointerCapture(ev.pointerId);
+    pressRectRef.current = svgRef.current!.getBoundingClientRect();
     const p = mouse(ev);
     if (splitting) {
       setSplitting(false);
@@ -1392,8 +1480,29 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
       }
     }
     const hit = hitTest(p);
-    setSelected(hit);
-    if (hit != null) dragRef.current = { mode: 'move', start: p, snapshot: els };
+    if (ev.shiftKey || ev.metaKey || ev.ctrlKey) {
+      // Add to or take out of the selection; on empty canvas, a box that adds what it covers.
+      if (hit != null) setSelection(selSet.has(hit) ? selIds.filter(id => id !== hit) : [...selIds, hit]);
+      else { dragRef.current = { mode: 'box', start: p, snapshot: els, additive: true }; setBox({ a: p, b: p }); }
+      return;
+    }
+    if (hit == null) {
+      setSelected(null);
+      dragRef.current = { mode: 'box', start: p, snapshot: els };
+      setBox({ a: p, b: p });
+      return;
+    }
+    // Dragging one of several selected elements moves them all.
+    if (!(multi && selSet.has(hit))) setSelected(hit);
+    dragRef.current = { mode: 'move', start: p, snapshot: els, ids: multi && selSet.has(hit) ? new Set(selIds) : new Set([hit]) };
+  };
+
+  // The points that must lie inside a dragged box for an element to be picked by it.
+  const keyPoints = (e: El): Pt[] => {
+    if (e.type === 'edge') return [e.from, e.to, curveOf(e).pt(0.5)];
+    if (e.type === 'loop') return [{ x: e.center.x - e.radius, y: e.center.y - e.radius }, { x: e.center.x + e.radius, y: e.center.y + e.radius }];
+    if (e.type === 'oval') return [{ x: e.center.x - e.rx, y: e.center.y - e.ry }, { x: e.center.x + e.rx, y: e.center.y + e.ry }];
+    return [e.at];
   };
 
   const handlePoints = (e: El): ['from' | 'to' | 'bend' | 'radius' | 'rx' | 'ry', Pt][] => {
@@ -1407,6 +1516,7 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
     const d = dragRef.current;
     if (!d) return;
     const p = mouse(ev);
+    if (d.mode === 'box') { setBox({ a: d.start, b: p }); return; }
     if (d.mode === 'draw') {
       const next = { a: d.start, b: snap(p) };
       if (draftRef.current?.b.x !== next.b.x || draftRef.current?.b.y !== next.b.y) {
@@ -1417,13 +1527,8 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
     }
     const dx = p.x - d.start.x, dy = p.y - d.start.y;
     const next = d.snapshot.map(e => {
-      if (e.id !== selected) return e;
-      if (d.mode === 'move') {
-        const sh = (q: Pt) => ({ x: q.x + dx, y: q.y + dy });
-        if (e.type === 'edge') return { ...e, from: sh(e.from), to: sh(e.to), ...(e.sub ? { sub: { ...e.sub, from: sh(e.sub.from), to: sh(e.sub.to) } } : {}) };
-        if (e.type === 'loop' || e.type === 'oval') return { ...e, center: sh(e.center) };
-        return { ...e, at: { x: (e as Vertex | TextEl).at.x + dx, y: (e as Vertex | TextEl).at.y + dy } } as El;
-      }
+      if (!(d.ids ?? new Set([selected])).has(e.id)) return e;
+      if (d.mode === 'move') return shiftEl(e, dx, dy);
       // Reshaping a piece of a split line makes it a line of its own.
       if (e.type === 'edge' && d.mode === 'from') return { ...detachPiece(e), from: snap(p) };
       if (e.type === 'edge' && d.mode === 'to') return { ...detachPiece(e), to: snap(p) };
@@ -1449,6 +1554,15 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
     if (!d) return;
     onMove(ev);
     dragRef.current = null;
+    if (d.mode === 'box') {
+      const p = mouse(ev);
+      setBox(null);
+      const x1 = Math.min(d.start.x, p.x), x2 = Math.max(d.start.x, p.x), y1 = Math.min(d.start.y, p.y), y2 = Math.max(d.start.y, p.y);
+      if (x2 - x1 < 4 && y2 - y1 < 4) return;   // a click, not a box
+      const inBox = els.filter(e => keyPoints(e).every(q => q.x >= x1 && q.x <= x2 && q.y >= y1 && q.y <= y2)).map(e => e.id);
+      setSelection(d.additive ? [...selIds, ...inBox.filter(id => !selSet.has(id))] : inBox);
+      return;
+    }
     if (d.mode === 'draw' && draftRef.current) {
       const { a, b } = draftRef.current;
       draftRef.current = null;
@@ -1479,32 +1593,46 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
     dragRef.current = null;
     draftRef.current = null;
     setDraft(null);
-    if (drag) { elsRef.current = drag.snapshot; setEls(drag.snapshot); }
+    setBox(null);
+    if (drag && drag.mode !== 'box') { elsRef.current = drag.snapshot; setEls(drag.snapshot); }
   };
 
-  const update = (patch: Partial<El>) => {
+  // Change the selected elements (all of them, or only those of the given types when several are selected).
+  const update = (patch: Partial<El>, types?: El['type'][]) => {
     const fields = Object.keys(patch);
-    const key = fields.length === 1 ? `${selected}:${fields[0]}` : undefined;
+    const key = fields.length === 1 ? `${selKey}:${fields[0]}` : undefined;
     // Changing the bend or the shape of a piece of a split line makes it a line of its own.
     const reshapes = 'bend' in patch || 'arc' in patch || 'ellipse' in patch;
-    commit(els.map(e => e.id === selected ? { ...(e.type === 'edge' && reshapes ? detachPiece(e) : e), ...patch } as El : e), key);
+    commit(els.map(e => selSet.has(e.id) && (!types || types.includes(e.type))
+      ? { ...(e.type === 'edge' && reshapes ? detachPiece(e) : e), ...patch } as El : e), key);
   };
-  const removeSel = () => { if (selected != null) { commit(els.filter(e => e.id !== selected)); setSelected(null); } };
+  const removeSel = () => { if (selIds.length) { commit(els.filter(e => !selSet.has(e.id))); setSelected(null); } };
+  // A copy of the selection, a little down and to the right, selected in its place.
+  const duplicateSel = () => {
+    if (!selIds.length) return;
+    const copies = els.filter(e => selSet.has(e.id)).map(e => ({ ...shiftEl(e, 20, 20), id: idRef.current++ } as El));
+    commit([...els, ...copies]);
+    setSelection(copies.map(e => e.id));
+  };
 
   useEffect(() => {
     const onKey = (ev: KeyboardEvent) => {
       const tag = (ev.target as HTMLElement).tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
       if (ev.key === 'Escape' && splitting) { ev.preventDefault(); ev.stopPropagation(); setSplitting(false); return; }
-      if ((ev.key === 'Delete' || ev.key === 'Backspace') && selected != null) { ev.preventDefault(); removeSel(); }
+      if (ev.key === 'Escape' && selIds.length) { ev.preventDefault(); ev.stopPropagation(); setSelected(null); return; }
+      if ((ev.key === 'Delete' || ev.key === 'Backspace') && selIds.length) { ev.preventDefault(); removeSel(); }
+      if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === 'a' && els.length) { ev.preventDefault(); ev.stopPropagation(); setTool('select'); setSelection(els.map(e => e.id)); }
+      if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === 'd' && selIds.length) { ev.preventDefault(); ev.stopPropagation(); duplicateSel(); }
       if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === 'z') {
         ev.preventDefault();
         ev.stopPropagation();
         if (ev.shiftKey) redo(); else undo();
       }
     };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    // In the capture phase: the code editor underneath takes ⌘A and ⌘D for itself further down.
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
   });
 
   // ---- code generation ----
@@ -1536,8 +1664,8 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
     onInsert('\n' + body + '\n\n', imports.trim());
   };
 
-  const renderEdge = useCallback((e: Edge) => drawEdge(e, selected), [selected]);
-  const renderLoop = useCallback((l: Loop) => drawLoop(l, selected), [selected]);
+  const renderEdge = useCallback((e: Edge) => drawEdge(e, selSet.has(e.id) ? e.id : null), [selKey]);   // eslint-disable-line react-hooks/exhaustive-deps
+  const renderLoop = useCallback((l: Loop) => drawLoop(l, selSet.has(l.id) ? l.id : null), [selKey]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   const field = (label: string, el: React.ReactNode) => (
     <label className="form-field"><span>{label}</span>{el}</label>
@@ -1560,10 +1688,10 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
   const diagram = useMemo(() => behindFirst(els).map(e =>
     e.type === 'edge' ? renderEdge(e)
     : e.type === 'loop' ? renderLoop(e)
-    : e.type === 'oval' ? drawOval(e, selected)
-    : e.type === 'vertex' ? drawVertex(e, selected)
-    : <text key={e.id} x={e.at.x} y={e.at.y} fontSize="14" fontStyle="italic" fontFamily={LABEL_FONT} textAnchor="middle" dominantBaseline="middle" fill={previewCol(e.color, e.id === selected)}>{prettyLabel(e.text) || '…'}</text>
-  ), [els, selected, renderEdge, renderLoop]);
+    : e.type === 'oval' ? drawOval(e, selSet.has(e.id) ? e.id : null)
+    : e.type === 'vertex' ? drawVertex(e, selSet.has(e.id) ? e.id : null)
+    : <text key={e.id} x={e.at.x} y={e.at.y} fontSize="14" fontStyle="italic" fontFamily={LABEL_FONT} textAnchor="middle" dominantBaseline="middle" fill={previewCol(e.color, selSet.has(e.id))}>{prettyLabel(e.text) || '…'}</text>
+  ), [els, selKey, renderEdge, renderLoop]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -1642,6 +1770,8 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
               {draft && tool === 'edge' && <line x1={draft.a.x} y1={draft.a.y} x2={draft.b.x} y2={draft.b.y} stroke="#7c3aed" strokeWidth="1.5" strokeDasharray="4 4" />}
               {draft && tool === 'oval' && <ellipse cx={draft.a.x} cy={draft.a.y} rx={Math.max(2, Math.abs(draft.b.x - draft.a.x))} ry={Math.max(2, Math.abs(draft.b.y - draft.a.y))} fill="none" stroke="#7c3aed" strokeWidth="1.5" strokeDasharray="4 4" />}
               {draft && tool === 'loop' && <circle cx={draft.a.x} cy={draft.a.y} r={Math.max(2, Math.hypot(draft.b.x - draft.a.x, draft.b.y - draft.a.y))} fill="none" stroke="#7c3aed" strokeWidth="1.5" strokeDasharray="4 4" />}
+              {box && <rect x={Math.min(box.a.x, box.b.x)} y={Math.min(box.a.y, box.b.y)} width={Math.abs(box.b.x - box.a.x)} height={Math.abs(box.b.y - box.a.y)}
+                fill="rgba(124, 58, 237, 0.06)" stroke="#7c3aed" strokeWidth="1" strokeDasharray="4 3" />}
               {sel && tool === 'select' && handlePoints(sel).map(([mode, p], i) => (
                 <circle key={i} cx={p.x} cy={p.y} r="6" fill="#fff" stroke="#7c3aed" strokeWidth="2" style={{ cursor: mode === 'bend' ? 'ns-resize' : 'move' }} />
               ))}
@@ -1649,13 +1779,35 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
             {splitting && <div className="form-hint" style={{ marginTop: '6px', color: '#7c3aed', fontWeight: 600 }}>Click the point on the selected line where it should be cut (Esc cancels).</div>}
             <div className="form-hint" style={{ marginTop: '6px' }}>
               <b>Line / Circle / Oval</b>: click &amp; drag to draw (an oval from its centre). <b>Select</b>: click an element, then drag it or its handles
-              (line endpoints snap to nearby vertices; the middle handle bends the line into an arc). <b>⌫</b> deletes, <b>{keys('⌘Z')}</b> undoes.
+              (line endpoints snap to nearby vertices; the middle handle bends the line into an arc). Several at once: <b>⇧</b>-click, drag a box on empty canvas, or <b>{keys('⌘A')}</b>; then drag any of them to move them together, <b>{keys('⌘D')}</b> duplicates. <b>⌫</b> deletes, <b>{keys('⌘Z')}</b> undoes.
               The grid (bold lines = 1 unit) is a drawing guide only and is never added to the diagram.
             </div>
           </div>
 
-          <div style={{ flex: '0 0 250px', borderLeft: '1px solid #e2e8f0', paddingLeft: '12px' }}>
-            {!sel && <div className="form-hint">Nothing selected.<br /><br />Draw a line or circle, or add a template — then switch to <b>Select</b> to edit thickness, wiggle amplitude, bend, hatching and labels.</div>}
+          {/* Scrolls within its own height, so selecting another kind of element does not resize the dialog. */}
+          <div style={{ flex: '0 0 250px', borderLeft: '1px solid #e2e8f0', paddingLeft: '12px', paddingRight: '4px', maxHeight: '62vh', overflowY: 'auto' }}>
+            {multi && (() => {
+              const chosen = els.filter(e => selSet.has(e.id));
+              const strokes = chosen.filter((e): e is Edge | Loop | Oval => e.type === 'edge' || e.type === 'loop' || e.type === 'oval');
+              const styled = chosen.filter((e): e is Edge | Loop => e.type === 'edge' || e.type === 'loop');
+              return (
+                <>
+                  <div className="form-hint" style={{ marginBottom: 8 }}><b>{chosen.length} selected.</b> Drag any of them to move them all; changes below apply to each.</div>
+                  {colorField(chosen.find(e => e.color)?.color)}
+                  {strokes.length > 0 && field(`Thickness — ${num(strokes[0].thickness)}pt`, <input type="range" min="0.4" max="3" step="0.1" value={strokes[0].thickness} onChange={e => update({ thickness: Number(e.target.value) }, ['edge', 'loop', 'oval'])} />)}
+                  {styled.length > 0 && field('Style', (
+                    <select value={styled[0].style ?? 'normal'} onChange={e => update({ style: e.target.value as LineStyle }, ['edge', 'loop'])}>
+                      <option value="normal">Normal</option>
+                      <option value="faded">Faded (a cut / removed line)</option>
+                      <option value="hidden">Hidden (keeps its place, not drawn)</option>
+                    </select>
+                  ))}
+                  <button className="btn-ghost" style={{ marginTop: '6px', width: '100%' }} onClick={duplicateSel} title={keys('Duplicate (⌘D)')}>Duplicate</button>
+                  <button className="btn-ghost" style={{ marginTop: '6px', width: '100%' }} onClick={removeSel}>Delete {chosen.length} elements</button>
+                </>
+              );
+            })()}
+            {!sel && !multi && <div className="form-hint">Nothing selected.<br /><br />Draw a line or circle, or add a template — then switch to <b>Select</b> to edit thickness, wiggle amplitude, bend, hatching and labels.</div>}
 
             {sel?.type === 'edge' && (
               <>
@@ -1731,7 +1883,17 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
                   <select value={sel.fill} onChange={e => update({ fill: e.target.value as LoopFill })}>
                     <option value="none">None (open loop)</option>
                     <option value="hatched">Hatched (blob)</option>
-                    <option value="shaded">Shaded grey</option>
+                    <option value="shaded">Shaded (flat)</option>
+                    <option value="gradient">Shading (3-D, from the colour)</option>
+                  </select>
+                ))}
+                {(sel.kind === 'plain' || sel.kind === 'scalar') && sel.fill !== 'none' && field('Fill only', (
+                  <select value={sel.half ?? 'whole'} onChange={e => update({ half: e.target.value as Half })}>
+                    <option value="whole">The whole circle</option>
+                    <option value="left">The left half</option>
+                    <option value="right">The right half</option>
+                    <option value="top">The top half</option>
+                    <option value="bottom">The bottom half</option>
                   </select>
                 ))}
                 {field('Fermion flow (arrows)', (
@@ -1796,6 +1958,23 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
                   <input type="checkbox" checked={sel.outline} onChange={e => update({ outline: e.target.checked })} />
                   Outline
                 </label>
+                {sel.outline && field('Line type', (
+                  <select value={sel.kind ?? 'plain'} onChange={e => update({ kind: e.target.value as LoopKind })}>
+                    <option value="plain">Plain</option>
+                    <option value="scalar">Dashed (scalar)</option>
+                    <option value="photon">Wavy (photon)</option>
+                    <option value="gluon">Coiled (gluon)</option>
+                  </select>
+                ))}
+                {sel.outline && (sel.kind === 'photon' || sel.kind === 'gluon') &&
+                  field(`Wiggle size — ${num((sel.amplitude ?? 5) / UNIT)}`, <input type="range" min="2" max="14" step="0.5" value={sel.amplitude ?? 5} onChange={e => update({ amplitude: Number(e.target.value) })} />)}
+                {sel.outline && field('Fermion flow (arrows)', (
+                  <select value={sel.arrow ?? 0} onChange={e => update({ arrow: Number(e.target.value) as 0 | 1 | -1 })}>
+                    <option value={0}>None</option>
+                    <option value={1}>Clockwise ↻</option>
+                    <option value={-1}>Counter-clockwise ↺</option>
+                  </select>
+                ))}
                 {field(`Width — ${num(2 * sel.rx / UNIT)}`, <input type="range" min="6" max="320" step="2" value={sel.rx} onChange={e => update({ rx: Number(e.target.value) })} />)}
                 {field(`Height — ${num(2 * sel.ry / UNIT)}`, <input type="range" min="6" max="190" step="2" value={sel.ry} onChange={e => update({ ry: Number(e.target.value) })} />)}
                 {sel.outline && field(`Thickness — ${num(sel.thickness)}pt`, <input type="range" min="0.4" max="3" step="0.1" value={sel.thickness} onChange={e => update({ thickness: Number(e.target.value) })} />)}
@@ -1825,7 +2004,10 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
               </>
             )}
 
-            {sel && <button className="btn-ghost" style={{ marginTop: '10px', width: '100%' }} onClick={removeSel}>Delete element</button>}
+            {sel && <div style={{ display: 'flex', gap: 6, marginTop: '10px' }}>
+              <button className="btn-ghost" style={{ flex: 1 }} onClick={duplicateSel} title={keys('Duplicate (⌘D)')}>Duplicate</button>
+              <button className="btn-ghost" style={{ flex: 1 }} onClick={removeSel}>Delete element</button>
+            </div>}
 
             <div style={{ marginTop: '14px', borderTop: '1px solid #e2e8f0', paddingTop: '10px' }}>
               <label className="form-check">
