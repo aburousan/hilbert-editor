@@ -126,9 +126,35 @@ try {
     return true;
   }, label, value);
 
+  let c;
+  // Zoom: scrolling zooms about the pointer (that point stays put), Space-drag pans, the % button resets.
+  const viewBox = () => page.$eval('.modal-body svg[aspect-ratio], .modal-body svg', () => [...document.querySelectorAll('.modal-body svg')].find(x => x.getAttribute('style')?.includes('aspect-ratio'))?.getAttribute('viewBox'));
+  const fixed = await at(200, 100);
+  await page.mouse.move(fixed.x, fixed.y);
+  await page.mouse.wheel({ deltaY: -400 });
+  await sleep(200);
+  const zoomed = await viewBox();
+  const pct = await page.$eval('.zoom-level', b => b.textContent);
+  check('scrolling up zooms in', zoomed !== '0 0 680 400' && parseInt(pct) > 150, `${pct}, viewBox ${zoomed}`);
+  await clickText('.seg button', 'Vertex');
+  await page.mouse.click(fixed.x, fixed.y);
+  await sleep(150);
+  c = await code();
+  check('the point under the pointer stayed put: a vertex there is at (5, 7.5)', /circle\(\(5, 7\.5\), radius/.test(c), c.split('\n').find(l => l.includes('circle(')));
+  await page.keyboard.down('Space');
+  await page.mouse.move(fixed.x, fixed.y); await page.mouse.down(); await page.mouse.move(fixed.x + 100, fixed.y, { steps: 5 }); await page.mouse.up();
+  await page.keyboard.up('Space');
+  await sleep(150);
+  const panned = await viewBox();
+  check('Space-drag pans (the view moves left by 100 screen px)', Number(panned.split(' ')[0]) < Number(zoomed.split(' ')[0]) - 10 && (await code()) === c, `${zoomed} → ${panned}`);
+  await page.click('.zoom-level');
+  await sleep(150);
+  check('the % button goes back to 100%', await viewBox() === '0 0 680 400' && await page.$eval('.zoom-level', b => b.textContent) === '100%');
+  await clickText('button', 'Clear');
+
   await clickText('.seg button', 'Oval');
   await drag([340, 200], [500, 260]);
-  let c = await code();
+  c = await code();
   check('oval tool: drag from the centre draws a 4 × 1.5 oval', /circle\(\(8\.5, 5\), radius: \(4, 1\.5\), fill: gray\.lighten\(50%\), stroke: 1pt\)/.test(c), c.split('\n').find(l => l.includes('circle(')));
   check('oval: shading and right half', await setSelect('Fill', 'gradient') && await setSelect('Fill only', 'right'));
   await sleep(150);

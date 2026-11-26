@@ -1353,6 +1353,36 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
   const [showCode, setShowCode] = useState(false);
 
   const svgRef = useRef<SVGSVGElement>(null);
+  // What part of the drawing the canvas shows: its top-left corner and width, in drawing units (the height
+  // follows the canvas's shape). Scrolling zooms about the pointer; Space-drag or the middle button pans.
+  // Only the view changes: the diagram's coordinates, and so its code, stay the same.
+  const [view, setView] = useState({ x: 0, y: 0, w: W });
+  const viewRef = useRef(view);
+  viewRef.current = view;
+  const zoom = W / view.w;
+  const panRef = useRef<null | { cx: number, cy: number, view: { x: number, y: number, w: number } }>(null);
+  const spaceRef = useRef(false);
+  const zoomAbout = (factor: number, at?: Pt) => setView(v => {
+    const w = Math.min(W * 2, Math.max(W / 8, v.w * factor));
+    const p = at ?? { x: v.x + v.w / 2, y: v.y + v.w * H / W / 2 };
+    const k = w / v.w;
+    return { x: p.x - (p.x - v.x) * k, y: p.y - (p.y - v.y) * k, w };
+  });
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    // A native listener, not React's onWheel: that one is passive and cannot keep the dialog from scrolling.
+    const onWheel = (ev: WheelEvent) => {
+      ev.preventDefault();
+      const r = svg.getBoundingClientRect(), v = viewRef.current;
+      const at = { x: v.x + (ev.clientX - r.left) * (v.w / r.width), y: v.y + (ev.clientY - r.top) * (v.w / r.width) };
+      // A trackpad pinch arrives as a wheel with Ctrl held and small steps: let it zoom faster per step.
+      const unit = ev.deltaMode === 1 ? 33 : ev.deltaMode === 2 ? 400 : 1;
+      zoomAbout(Math.exp(ev.deltaY * unit * (ev.ctrlKey ? 0.01 : 0.0015)), at);
+    };
+    svg.addEventListener('wheel', onWheel, { passive: false });
+    return () => svg.removeEventListener('wheel', onWheel);
+  }, []);   // eslint-disable-line react-hooks/exhaustive-deps
   const idRef = useRef(1);
   const historyRef = useRef(createHistory<El[]>());
   const draftRef = useRef<{ a: Pt, b: Pt } | null>(null);
@@ -1408,7 +1438,8 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
   const pressRectRef = useRef<DOMRect | null>(null);
   const mouse = (ev: React.MouseEvent): Pt => {
     const r = (dragRef.current && pressRectRef.current) || svgRef.current!.getBoundingClientRect();
-    return { x: (ev.clientX - r.left) * (W / r.width), y: (ev.clientY - r.top) * (H / r.height) };
+    const v = viewRef.current;
+    return { x: v.x + (ev.clientX - r.left) * (v.w / r.width), y: v.y + (ev.clientY - r.top) * (v.w * H / W / r.height) };
   };
 
   const hitTest = (p: Pt): number | null => {
@@ -1436,6 +1467,12 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
   };
 
   const onDown = (ev: React.PointerEvent) => {
+    if (ev.isPrimary && (ev.button === 1 || (ev.button === 0 && spaceRef.current))) {
+      ev.preventDefault();
+      ev.currentTarget.setPointerCapture(ev.pointerId);
+      panRef.current = { cx: ev.clientX, cy: ev.clientY, view: viewRef.current };
+      return;
+    }
     if (!ev.isPrimary || ev.button !== 0) return;
     ev.preventDefault();
     ev.currentTarget.setPointerCapture(ev.pointerId);
@@ -1513,6 +1550,12 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
   };
 
   const onMove = (ev: React.MouseEvent) => {
+    const pan = panRef.current;
+    if (pan) {
+      const r = svgRef.current!.getBoundingClientRect(), k = pan.view.w / r.width;
+      setView({ ...pan.view, x: pan.view.x - (ev.clientX - pan.cx) * k, y: pan.view.y - (ev.clientY - pan.cy) * k });
+      return;
+    }
     const d = dragRef.current;
     if (!d) return;
     const p = mouse(ev);
@@ -1550,6 +1593,7 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
   };
 
   const onUp = (ev: React.PointerEvent) => {
+    if (panRef.current) { panRef.current = null; return; }
     const d = dragRef.current;
     if (!d) return;
     onMove(ev);
@@ -1619,6 +1663,8 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
     const onKey = (ev: KeyboardEvent) => {
       const tag = (ev.target as HTMLElement).tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (ev.code === 'Space' && tag !== 'BUTTON') { ev.preventDefault(); spaceRef.current = true; return; }
+      if ((ev.metaKey || ev.ctrlKey) && ev.key === '0') { ev.preventDefault(); ev.stopPropagation(); setView({ x: 0, y: 0, w: W }); return; }
       if (ev.key === 'Escape' && splitting) { ev.preventDefault(); ev.stopPropagation(); setSplitting(false); return; }
       if (ev.key === 'Escape' && selIds.length) { ev.preventDefault(); ev.stopPropagation(); setSelected(null); return; }
       if ((ev.key === 'Delete' || ev.key === 'Backspace') && selIds.length) { ev.preventDefault(); removeSel(); }
@@ -1631,8 +1677,10 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
       }
     };
     // In the capture phase: the code editor underneath takes ⌘A and ⌘D for itself further down.
+    const onKeyUp = (ev: KeyboardEvent) => { if (ev.code === 'Space') spaceRef.current = false; };
     window.addEventListener('keydown', onKey, true);
-    return () => window.removeEventListener('keydown', onKey, true);
+    window.addEventListener('keyup', onKeyUp, true);
+    return () => { window.removeEventListener('keydown', onKey, true); window.removeEventListener('keyup', onKeyUp, true); };
   });
 
   // ---- code generation ----
@@ -1750,6 +1798,11 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
                 </select>
               )}
               <button className="btn-ghost" onClick={() => setShowExamples(true)}>Examples…</button>
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 2 }} title={`Scroll on the canvas to zoom; Space-drag or the middle button to pan; ${keys('⌘0')} resets`}>
+                <button className="btn-ghost" onClick={() => zoomAbout(1.25)} aria-label="Zoom out">−</button>
+                <button className="btn-ghost zoom-level" style={{ minWidth: 52 }} onClick={() => setView({ x: 0, y: 0, w: W })} title="Back to 100%, the whole canvas">{Math.round(zoom * 100)}%</button>
+                <button className="btn-ghost" onClick={() => zoomAbout(0.8)} aria-label="Zoom in">+</button>
+              </span>
               <button className="btn-ghost" onClick={undo} disabled={!historyRef.current.canUndo()} title={keys('Undo (⌘Z)')} aria-label="Undo">↶</button>
               <button className="btn-ghost" onClick={redo} disabled={!historyRef.current.canRedo()} title={keys('Redo (⌘⇧Z)')} aria-label="Redo">↷</button>
               <button className="btn-ghost" disabled={!els.some(e => e.type === 'edge')} onClick={() => commit(numberLines(els))}
@@ -1757,7 +1810,7 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
               <button className="btn-ghost" disabled={!els.length} onClick={() => { commit([]); setSelected(null); }}>Clear</button>
             </div>
 
-            <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', background: '#fff', border: '1px solid #cbd5e1', borderRadius: '6px', cursor: tool === 'select' ? 'default' : 'crosshair', touchAction: 'none', display: 'block' }}
+            <svg ref={svgRef} viewBox={`${view.x} ${view.y} ${view.w} ${view.w * H / W}`} style={{ width: '100%', aspectRatio: `${W} / ${H}`, background: '#fff', border: '1px solid #cbd5e1', borderRadius: '6px', cursor: tool === 'select' ? 'default' : 'crosshair', touchAction: 'none', display: 'block' }}
               onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={cancelDrag} onLostPointerCapture={cancelDrag}>
               {/* Alignment grid: minor lines every GRID px, stronger lines every
                   UNIT px (= 1 cetz unit). Drawing aid only — never exported.
@@ -1773,13 +1826,13 @@ export default function FeynmanBuilder({ onClose, onInsert }: { onClose: () => v
               {box && <rect x={Math.min(box.a.x, box.b.x)} y={Math.min(box.a.y, box.b.y)} width={Math.abs(box.b.x - box.a.x)} height={Math.abs(box.b.y - box.a.y)}
                 fill="rgba(124, 58, 237, 0.06)" stroke="#7c3aed" strokeWidth="1" strokeDasharray="4 3" />}
               {sel && tool === 'select' && handlePoints(sel).map(([mode, p], i) => (
-                <circle key={i} cx={p.x} cy={p.y} r="6" fill="#fff" stroke="#7c3aed" strokeWidth="2" style={{ cursor: mode === 'bend' ? 'ns-resize' : 'move' }} />
+                <circle key={i} cx={p.x} cy={p.y} r={6 / zoom} fill="#fff" stroke="#7c3aed" strokeWidth={2 / zoom} style={{ cursor: mode === 'bend' ? 'ns-resize' : 'move' }} />
               ))}
             </svg>
             {splitting && <div className="form-hint" style={{ marginTop: '6px', color: '#7c3aed', fontWeight: 600 }}>Click the point on the selected line where it should be cut (Esc cancels).</div>}
             <div className="form-hint" style={{ marginTop: '6px' }}>
               <b>Line / Circle / Oval</b>: click &amp; drag to draw (an oval from its centre). <b>Select</b>: click an element, then drag it or its handles
-              (line endpoints snap to nearby vertices; the middle handle bends the line into an arc). Several at once: <b>⇧</b>-click, drag a box on empty canvas, or <b>{keys('⌘A')}</b>; then drag any of them to move them together, <b>{keys('⌘D')}</b> duplicates. <b>⌫</b> deletes, <b>{keys('⌘Z')}</b> undoes.
+              (line endpoints snap to nearby vertices; the middle handle bends the line into an arc). Scroll to zoom, <b>Space</b>-drag to pan. Several at once: <b>⇧</b>-click, drag a box on empty canvas, or <b>{keys('⌘A')}</b>; then drag any of them to move them together, <b>{keys('⌘D')}</b> duplicates. <b>⌫</b> deletes, <b>{keys('⌘Z')}</b> undoes.
               The grid (bold lines = 1 unit) is a drawing guide only and is never added to the diagram.
             </div>
           </div>
