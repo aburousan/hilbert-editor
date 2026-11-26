@@ -4,6 +4,69 @@ Paste the current section into the GitHub release when you cut a tag.
 
 ---
 
+## 0.2.13
+
+You can open the file an #include points at, or create it if it is missing. The file tree lists folders first, and printing prints the preview. The Feynman studio can now draw loop-integral notes and hadron-correlator figures. A saving bug from 0.2.12 is fixed.
+
+### Saving after another program changed a file
+
+In 0.2.12, after another program changed a file you had open and Hilbert reloaded it, your next change was not saved. Hilbert said the file had changed outside Hilbert, the change it had just taken in, and asked you to compare versions. Now a reload counts as the version Hilbert last saw, and saving carries on as normal.
+
+### Open the file an #include points at (issue #50)
+
+Ctrl+click (⌘-click on a Mac) a path in #include or #import, or in image(), read(), csv(), json(), bibliography() and the other functions that read a file, and Hilbert opens it. You can also right-click the path and choose Open File. An image or a PDF opens as a preview. A package import such as "@preview/cetz:0.4.2" opens that package's page on Typst Universe.
+
+If the file does not exist yet, the menu says Create File… instead. If creating it would also make a new folder, Hilbert tells you first and asks you to check the path for a typo. When a folder with a close name already exists, such as content/ch-3 when you wrote content/ch3, it names that folder. Cancel creates nothing.
+
+### Folders first in the file tree (issue #52)
+
+Every folder in the file tree now lists its subfolders before its files, as most file managers do. To go back to plain name order, turn off View → Folders First in File Tree, or right-click an empty part of the tree.
+
+### Printing (issue #48)
+
+Ctrl+P (⌘P on a Mac) and File → Print PDF Preview now print the compiled PDF at its own page size. Before, they printed the app window.
+
+### New files get .typ (issue #49)
+
+A new file named without an extension gets .typ, so "notes" becomes notes.typ. A name that already has an extension, or starts with a dot, stays as you typed it. For files such as Makefile, untick the box in the New File dialog. Hilbert remembers the choice.
+
+### Toggle comment with several cursors (issue #51)
+
+Toggle comment (Ctrl+/, or ⌘/ on a Mac) now comments every line that has a cursor, not only the line of the main one.
+
+### Feynman studio
+
+For loop-integral (IBP) notes:
+
+- A line can bend as a true circular arc.
+- A line can carry a momentum arrow beside it, a label past its end for an external leg (p_1 … p_4), and dots that raise that propagator's power.
+- A line can be faded (dotted grey, for a cut line in a spanning tree) or hidden.
+- A circle can be cut into arcs at the vertices on it.
+- Number lines labels the internal lines 1, 2, 3 in the order you drew them.
+- New examples: the one-loop bubble and box, and a two-loop graph with lines numbered and with two of them cut.
+
+For hadron-correlator figures, as in lattice notes:
+
+- A new Oval tool. An oval can be filled flat, hatched, or with a 3-D shading made from its colour, and the fill can cover only one half. Its outline can be plain, dashed, wavy or coiled, with flow arrows. Circles get the same shading and half fills.
+- A vertex can be a dot, a cross (an insertion), an open circle, or hidden.
+- A line can bend as half an ellipse, so it leaves its ends square, like the outline of a hadron.
+- Split line at a point cuts a line in two along its exact curve, so part of it can have another colour or label.
+- New examples: the proton three-point function, the fixed-sink sequential source, and three baryon contraction panels (current on a line, exchanged, and a disconnected loop).
+
+Editing:
+
+- Select several elements with Shift-click, a box dragged on empty canvas, or Ctrl+A (⌘A on a Mac). Then drag any of them to move them all, duplicate them with Ctrl+D (⌘D), delete them, or change their colour, thickness or style together.
+- Scroll on the canvas to zoom, and hold Space and drag to move around. The button showing the zoom level goes back to 100%.
+- Clicking an element no longer nudges it.
+
+The labels on the canvas show arrow(p) as p⃗ and Typst subscripts such as x_(1 2), as the document will.
+
+### Building from source
+
+npm run desktop in a git checkout no longer opens a blank window. This fix was contributed by Excustic (#47).
+
+---
+
 ## 0.2.12
 
 Writing maths by hand is smoother, Linux draws much faster on many machines, and there is a Christmas theme.
