@@ -17,8 +17,11 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const dir = await mkdtemp(join(tmpdir(), 'hilbert-open-'));
 const ws = join(dir, 'ws');
 await mkdir(ws);
-await writeFile(join(ws, 'main.typ'), '// CHAPTER 1\n  #include "content/ch-1/_intro.typ"\n#import "@preview/cetz:0.4.2": canvas\n#include "content/ch-2/new.typ"\nplain text line\n');
+await writeFile(join(ws, 'main.typ'), '// CHAPTER 1\n  #include "content/ch-1/_intro.typ"\n#import "@preview/cetz:0.4.2": canvas\n#include "content/ch-2/new.typ"\nplain text line\n'
+  + '#include "content/ch3/geometry.typ"\n#include "content/ch-1/extra.typ"\n');
 await mkdir(join(ws, 'content/ch-1'), { recursive: true });
+await mkdir(join(ws, 'content/ch-3'), { recursive: true });
+await writeFile(join(ws, 'content/ch-3/ergun.typ'), '= Ergun\n');
 await writeFile(join(ws, 'content/ch-1/_intro.typ'), '= Introduction chapter\n');
 const token = 'hilbert-open-test-token-0123456789abcd';
 const server = spawn(binary, ['--headless'], {
@@ -119,20 +122,58 @@ try {
   const urls = await page.evaluate(() => window.__opened);
   check('it opens https://typst.app/universe/package/cetz/0.4.2', urls[0] === 'https://typst.app/universe/package/cetz/0.4.2', urls.join(' '));
 
-  // 5. A missing .typ: asked first, then created and opened.
-  p = await pointOf(3, 'content/ch-2');
-  await page.mouse.move(p.x, p.y);
-  await page.keyboard.down(mod);
-  await page.mouse.move(p.x + 1, p.y);
-  await sleep(300);
-  await page.mouse.click(p.x + 1, p.y);
-  await page.keyboard.up(mod);
-  const asked = await page.waitForFunction(() => [...document.querySelectorAll('.modal-content')].some(m => /does not exist yet/.test(m.textContent)), { timeout: 8000 }).then(() => true).catch(() => false);
-  check('a missing .typ asks before creating', asked && !existsSync(join(ws, 'content/ch-2/new.typ')));
-  await page.evaluate(() => [...document.querySelectorAll('.modal-content button')].find(b => b.textContent.trim() === 'Create')?.click());
+  const ctrlClick = async (line, text) => {
+    const at = await pointOf(line, text);
+    await page.mouse.move(at.x, at.y);
+    await page.keyboard.down(mod);
+    await page.mouse.move(at.x + 1, at.y);
+    await sleep(300);
+    await page.mouse.click(at.x + 1, at.y);
+    await page.keyboard.up(mod);
+  };
+  const dialogText = () => page.waitForFunction(() => [...document.querySelectorAll('.modal-content')].find(m => /does not exist yet/.test(m.textContent))?.textContent, { timeout: 8000 })
+    .then(h => h.jsonValue()).catch(() => '');
+  const dialogButton = label => page.evaluate(label => {
+    const b = [...document.querySelectorAll('.modal-content button')].find(b => b.textContent.trim() === label);
+    b?.click();
+    return !!b;
+  }, label);
+  const tabOpen = name => page.evaluate(name => [...document.querySelectorAll('.tab')].some(t => t.textContent.includes(name)), name);
+
+  // 5. A missing file in a folder that exists: the menu says Create File…, and creating asks plainly.
+  await backToMain();
+  p = await pointOf(6, 'content/ch-1/extra');
+  await page.mouse.click(p.x, p.y, { button: 'right' });
+  await sleep(500);
+  const onMissing = await menuItems();
+  check('right-click on a missing file offers Create File… instead of Open File', onMissing.includes('Create File…') && !onMissing.includes('Open File'), onMissing.slice(0, 4).join(' | '));
+  await clickMenu('Create File…');
+  let text = await dialogText();
+  check('it asks first, with no folder warning (content/ch-1 exists)', text.includes('content/ch-1/extra.typ does not exist yet') && !text.includes('folder') && !existsSync(join(ws, 'content/ch-1/extra.typ')), text);
+  check('…and the button is Create', await dialogButton('Create'));
   await sleep(1200);
-  const tabOpen = await page.evaluate(() => [...document.querySelectorAll('.tab')].some(t => t.textContent.includes('new.typ')));
-  check('after Create the file exists and is open', existsSync(join(ws, 'content/ch-2/new.typ')) && tabOpen);
+  check('after Create the file exists and is open', existsSync(join(ws, 'content/ch-1/extra.typ')) && await tabOpen('extra.typ'));
+
+  // 6. The reporter's typo: content/ch3 for content/ch-3. The warning names the new folder and the near one;
+  // Cancel creates nothing.
+  await backToMain();
+  await ctrlClick(5, 'content/ch3');
+  text = await dialogText();
+  check('a missing folder is named before anything is created', text.includes('The folder content/ch3/ does not exist either') && text.includes('Check the path for a typo'), text);
+  check('the folder with the close name is suggested', text.includes('Did you mean the folder content/ch-3/?'), text);
+  check('…and confirming says it makes a folder', await page.evaluate(() => [...document.querySelectorAll('.modal-content button')].some(b => b.textContent.trim() === 'Create File and Folder')));
+  await dialogButton('Cancel');
+  await sleep(400);
+  check('Cancel creates neither the folder nor the file', !existsSync(join(ws, 'content/ch3')));
+
+  // 7. A new chapter folder (content/ch-2): warned, no false suggestion of ch-1 or ch-3, and created on confirm.
+  await backToMain();
+  await ctrlClick(3, 'content/ch-2');
+  text = await dialogText();
+  check('a genuinely new folder is warned about, with no suggestion', text.includes('The folder content/ch-2/ does not exist either') && !text.includes('Did you mean'), text);
+  await dialogButton('Create File and Folder');
+  await sleep(1200);
+  check('after confirming, the folder and file exist and the file is open', existsSync(join(ws, 'content/ch-2/new.typ')) && await tabOpen('new.typ'));
   check('no page errors', errors.length === 0, errors.slice(0, 2).join(' | '));
 } finally {
   await browser?.close();

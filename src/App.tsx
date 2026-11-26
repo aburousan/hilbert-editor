@@ -89,7 +89,7 @@ import type { ProjectSync } from './projectCollab';
 import { isProjectTextPath } from './projectFileTypes';
 import { deriveWorkspaceStatus } from './workspaceStatus';
 import { inactiveModelsToDiscard, limitNotebookResults } from './performanceLimits';
-import { resolveTypstPath, typstPathAt, typstPathLinks, universeUrl, type TypstPathLink } from './typstPaths';
+import { resolveTypstPath, similarName, typstPathAt, typstPathLinks, universeUrl, type TypstPathLink } from './typstPaths';
 import { loadFoldersFirst, orderTree, saveFoldersFirst } from './treeOrder';
 import './index.css';
 import './PackageInstaller.css';
@@ -929,7 +929,7 @@ export default function App() {
   const [settingsSearch, setSettingsSearch] = useState('');
   const [activeMenu, setActiveMenu] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, node?: FileNode, type: 'file' | 'folder' | 'empty' } | null>(null);
-  const [editorMenu, setEditorMenu] = useState<{ x: number, y: number, path?: { link: TypstPathLink, fromFile: string } } | null>(null);
+  const [editorMenu, setEditorMenu] = useState<{ x: number, y: number, path?: { link: TypstPathLink, fromFile: string, exists?: boolean } } | null>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
   // The menu opens at the click point and grows down and to the right, so a
   // right-click low in the file tree or near the right edge would run it off
@@ -1205,6 +1205,7 @@ export default function App() {
   const toggleNumberingRef = useRef<() => void>(() => {});
   const toggleCommentRef = useRef<() => void>(() => {});
   const openTypstPathRef = useRef<(link: TypstPathLink, fromFile: string) => void>(() => {});
+  const pathExistsRef = useRef<(path: string) => Promise<boolean>>(async () => true);
 
   const monaco = useMonaco();
 
@@ -1241,10 +1242,12 @@ export default function App() {
       const caret = editor.getPosition?.();
       const link = model && caret && model.getLanguageId?.() === 'typst'
         ? typstPathAt(model.getLineContent(caret.lineNumber), caret.column) : null;
-      setEditorMenu({
-        x: ev.clientX, y: ev.clientY,
-        path: link ? { link, fromFile: String(model.uri.path || '').replace(/^\/+/, '') } : undefined,
-      });
+      const fromFile = link ? String(model.uri.path || '').replace(/^\/+/, '') : '';
+      setEditorMenu({ x: ev.clientX, y: ev.clientY, path: link ? { link, fromFile } : undefined });
+      // A missing file is offered as Create File… rather than Open File.
+      const target = link?.kind === 'file' ? resolveTypstPath(fromFile, link.raw) : null;
+      if (target) void pathExistsRef.current(target).then(exists =>
+        setEditorMenu(m => m?.path?.link === link ? { ...m, path: { ...m.path, exists } } : m));
     };
     document.addEventListener('contextmenu', openEditorMenu, true);
     return () => document.removeEventListener('contextmenu', openEditorMenu, true);
@@ -4760,6 +4763,33 @@ export default function App() {
   // Issue #50: open what a path in the source points at. A file opens in its own tab (an image or a PDF
   // as a preview); a .typ that does not exist yet can be created; a package import opens its Typst
   // Universe page, or says it is a local package.
+  const pathExists = async (path: string) => {
+    try { return (await fetch(`${API}/workspace/raw?path=${encodeURIComponent(path)}`, { method: 'HEAD' })).ok; } catch { return false; }
+  };
+  // The folders on the way to `target` that do not exist, outermost first, and the folder names beside
+  // the outermost one (to spot a typo).
+  const missingFolders = async (target: string): Promise<{ missing: string[], siblings: string[] }> => {
+    const parts = target.split('/').slice(0, -1);
+    const missing: string[] = [];
+    let siblings: string[] = [];
+    for (let i = parts.length; i >= 0; i--) {
+      const dir = parts.slice(0, i).join('/');
+      if (!dir) {
+        siblings = fileTreeRef.current.filter(n => n.type === 'directory').map(n => n.name);
+        break;
+      }
+      const response = await fetch(`${API}/workspace/subtree?path=${encodeURIComponent(dir)}`).catch(() => null);
+      if (response?.ok) {
+        const children: FileNode[] = await response.json().catch(() => []);
+        siblings = children.filter(n => n.type === 'directory').map(n => n.name);
+        break;
+      }
+      missing.unshift(dir);
+    }
+    return { missing, siblings };
+  };
+  pathExistsRef.current = pathExists;
+
   const openTypstPath = async (link: TypstPathLink, fromFile: string) => {
     if (link.kind === 'package') {
       const url = universeUrl(link);
@@ -4769,11 +4799,20 @@ export default function App() {
     }
     const target = resolveTypstPath(fromFile, link.raw);
     if (!target) { notify(`"${link.raw}" points outside the project.`, 'info'); return; }
-    let exists = false;
-    try { exists = (await fetch(`${API}/workspace/raw?path=${encodeURIComponent(target)}`, { method: 'HEAD' })).ok; } catch { /* treat as missing */ }
-    if (exists) { await openFileRef.current(target); return; }
+    if (await pathExists(target)) { await openFileRef.current(target); return; }
     if (!target.toLowerCase().endsWith('.typ')) { notify(`${target} was not found in the project.`, 'info'); return; }
-    if (!(await confirmDialog(`${target} does not exist yet. Create it?`, { confirmLabel: 'Create' }))) return;
+    // Creating the file makes any folder on its way. A folder that is not there yet is often a typo in the
+    // path (content/ch3 for content/ch-3), so say which, and name a folder with a close name if one exists.
+    const { missing, siblings } = await missingFolders(target);
+    let message = `${target} does not exist yet. Create it?`;
+    if (missing.length) {
+      const first = missing[0], name = first.split('/').pop()!, parent = first.includes('/') ? first.slice(0, first.lastIndexOf('/') + 1) : '';
+      const near = similarName(name, siblings);
+      message = `${target} does not exist yet.\n\nThe folder ${missing[missing.length - 1]}/ does not exist either. Creating the file would also create `
+        + (missing.length > 1 ? `the folders ${missing.map(d => d + '/').join(', ')}` : 'that folder') + '. Check the path for a typo.'
+        + (near ? `\n\nDid you mean the folder ${parent}${near}/? It already exists.` : '');
+    }
+    if (!(await confirmDialog(message, missing.length ? { confirmLabel: 'Create File and Folder', danger: true } : { confirmLabel: 'Create' }))) return;
     const created = await fetch(`${API}/workspace/file?create=1&path=${encodeURIComponent(target)}`, { method: 'POST', body: '' });
     if (!created.ok && created.status !== 409) { notify(`Could not create ${target}.`); return; }
     if (created.ok) await mirrorLocalPath(target, '', true);
@@ -8820,7 +8859,8 @@ ${byline ? `
           editor={editorRef.current}
           onClose={() => setEditorMenu(null)}
           openPath={editorMenu.path ? {
-            label: editorMenu.path.link.kind === 'package' ? 'Open Package Page on Typst Universe' : 'Open File',
+            label: editorMenu.path.link.kind === 'package' ? 'Open Package Page on Typst Universe'
+              : editorMenu.path.exists === false ? (editorMenu.path.link.raw.toLowerCase().endsWith('.typ') ? 'Create File…' : 'File Not Found') : 'Open File',
             hint: editorMenu.path.link.kind === 'package' ? editorMenu.path.link.raw : (resolveTypstPath(editorMenu.path.fromFile, editorMenu.path.link.raw) ?? ''),
             run: () => { const p = editorMenu.path!; openTypstPathRef.current(p.link, p.fromFile); },
           } : undefined}

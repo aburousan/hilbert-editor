@@ -12,7 +12,7 @@ const source = fs.readFileSync(path.join(root, 'src/typstPaths.ts'), 'utf8');
 const output = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2023 } }).outputText;
 const module = { exports: {} };
 Function('exports', 'module', 'require', output)(module.exports, module, () => { throw new Error('unexpected import'); });
-const { typstPathLinks, typstPathAt, resolveTypstPath, universeUrl } = module.exports;
+const { typstPathLinks, typstPathAt, resolveTypstPath, universeUrl, similarName } = module.exports;
 
 const raws = line => typstPathLinks(line).map(l => l.raw);
 
@@ -66,5 +66,12 @@ assert.equal(resolveTypstPath('content/ch-1/_intro.typ', '/template.typ'), 'temp
 assert.equal(resolveTypstPath('content/ch-1/_intro.typ', './figs//a.png'), 'content/ch-1/figs/a.png');
 assert.equal(resolveTypstPath('main.typ', '../outside.typ'), null, 'cannot climb out of the project');
 assert.equal(resolveTypstPath('a/b.typ', '../../x.typ'), null);
+
+// A folder name close to a typo'd one: punctuation and case, small slips; never a different number.
+assert.equal(similarName('ch3', ['ch-1', 'ch-3']), 'ch-3');
+assert.equal(similarName('ch-2', ['ch-1', 'ch-3']), null);
+assert.equal(similarName('figrues', ['figures', 'data']), 'figures');
+assert.equal(similarName('Content', ['content']), 'content');
+assert.equal(similarName('img', ['images']), null);
 
 console.log('typst-paths tests passed');

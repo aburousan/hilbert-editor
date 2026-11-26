@@ -78,3 +78,28 @@ function commentStart(line: string): number {
   }
   return line.length;
 }
+
+// A folder name close to `name` among `candidates` (another folder at the same place), for a path with a
+// typo: `ch3` when the project has `ch-3`. Names that differ only in case or punctuation count as the
+// same; otherwise a small edit distance, scaled with the name's length. Names with different numbers are
+// different folders (ch-2 is a new chapter, not a typo for ch-1).
+export function similarName(name: string, candidates: string[]): string | null {
+  const squash = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+  const distance = (a: string, b: string) => {
+    let row = Array.from({ length: b.length + 1 }, (_, j) => j);
+    for (let i = 1; i <= a.length; i++) {
+      const next = [i];
+      for (let j = 1; j <= b.length; j++) next[j] = Math.min(row[j] + 1, next[j - 1] + 1, row[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      row = next;
+    }
+    return row[b.length];
+  };
+  let best: string | null = null, bestD = Infinity;
+  const digits = (s: string) => s.replace(/\D/g, '');
+  for (const c of candidates) {
+    if (c === name || digits(c) !== digits(name)) continue;
+    const d = squash(c) && squash(c) === squash(name) ? 0 : distance(c.toLowerCase(), name.toLowerCase());
+    if (d < bestD) { bestD = d; best = c; }
+  }
+  return best !== null && bestD <= Math.max(1, Math.floor(name.length / 3)) ? best : null;
+}
