@@ -74,6 +74,7 @@
     "test:typst-paths": "node scripts/test-typst-paths.mjs",
     "test:open-include": "node scripts/test-open-include.mjs",
     "test:tree-order": "node scripts/test-tree-order.mjs",
+    "test:reload-save": "node scripts/test-reload-save.mjs",
     "test:feynman-ibp": "node scripts/test-feynman-ibp.mjs",
     "test:feynman-hadron": "node scripts/test-feynman-hadron.mjs",
     "stress": "node scripts/stress-session.mjs",

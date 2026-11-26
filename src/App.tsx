@@ -1974,6 +1974,11 @@ export default function App() {
       setTabs(prev => prev.map(item => item.path === path ? { ...item, diskHash: disk.hash } : item));
       return;
     }
+    // The save check compares the disk with what this app last wrote before the tab's own hash, so the
+    // reloaded text has to become that too; left behind, the next save after a reload reported the very
+    // change it had just taken in as a conflict, and the save did not happen.
+    const open = tabsRef.current.find(item => item.path === path);
+    if (open && !open.isDirty && disk.hash) lastWrittenRef.current.set(path, { content: disk.content, hash: disk.hash });
     setTabs(prev => prev.map(item => item.path === path && !item.isDirty
       ? { ...item, content: disk.content, diskHash: disk.hash, isDirty: false }
       : item));
